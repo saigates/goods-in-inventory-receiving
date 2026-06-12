@@ -35,6 +35,40 @@ app.get('/', async (c) => {
   return c.json({ devices: results })
 })
 
+// Delete a received device. Restores the original manifest line to 'pending'
+// (so it can be re-scanned), and removes any associated print jobs.
+app.delete('/:id', async (c) => {
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+
+  const device = await c.env.DB.prepare('SELECT * FROM received_devices WHERE id = ?')
+    .bind(id).first<{ id: number; expected_device_id: number | null; imei: string; manifest_id: number | null }>()
+  if (!device) return c.json({ error: 'Not found' }, 404)
+
+  const stmts = []
+  // Re-open the manifest line if this came from a manifest
+  if (device.expected_device_id) {
+    stmts.push(
+      c.env.DB.prepare(
+        `UPDATE expected_devices
+         SET status = 'pending', received_at = NULL, received_device_id = NULL
+         WHERE id = ?`
+      ).bind(device.expected_device_id)
+    )
+  }
+  // Audit log
+  stmts.push(
+    c.env.DB.prepare(
+      "INSERT INTO scan_events (manifest_id, imei, outcome, message) VALUES (?, ?, 'rejected', 'Received device deleted by operator')"
+    ).bind(device.manifest_id, device.imei)
+  )
+  // print_jobs are cascade-deleted via FK
+  stmts.push(c.env.DB.prepare('DELETE FROM received_devices WHERE id = ?').bind(id))
+
+  await c.env.DB.batch(stmts)
+  return c.json({ ok: true, restored_expected: !!device.expected_device_id })
+})
+
 // Global stats
 app.get('/stats', async (c) => {
   const stats = await c.env.DB.prepare(`

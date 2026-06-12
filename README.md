@@ -38,14 +38,16 @@ A modern, scanner-first web application for the **Goods In** (inbound receiving)
 ### D. Print Label (PrintNode / QZ Tray ready)
 - On confirm, a print job is queued in the `print_jobs` table with a JSON payload.
 - **Two label formats supported** (toggle in the top bar — preference persists per browser via `localStorage`):
-  - **Zebra 50×30mm** (landscape) — QR + side-by-side metadata. Targets a Zebra ZD420 on the warehouse floor.
-  - **DYMO 32×57mm** (portrait) — stacked layout with a centred QR. Targets a DYMO LabelWriter at the receiving desk.
-- Both labels carry the same data:
+  - **DYMO 50×30mm** (landscape) — large-format label for the warehouse floor.
+  - **DYMO 32×57mm** (portrait) — compact label for the receiving desk.
+- Both labels carry the same data and **two QR codes**:
+  - **Main QR** — encodes `{uuid, sku, imei}` as JSON. Routes the device to any internal scan target.
+  - **IMEI QR** — plain-text IMEI only. Lets cheap or basic scanners (or warranty/repair tools that expect raw IMEIs) read the IMEI directly from the printed label without parsing JSON.
+- Plus the human-readable fields:
   - Internal **UUID** (12-char short code)
   - Clean human-readable **SKU**
-  - **IMEI**
-  - Brand · Model · Capacity · Grade (incl. the new **UG / Ungraded** state)
-  - **2D QR code** encoding `{uuid, sku, imei}` (DataMatrix payload-equivalent)
+  - **IMEI** in monospace
+  - Brand · Model · Capacity · Grade (incl. the **UG / Ungraded** state)
 - The `Print Queue` view renders the labels in whatever size you've selected, with `Send` / `Send all` buttons. In production the `/api/print/send/:id` endpoint posts the payload to PrintNode or QZ Tray — here it flips the job to `sent` and stamps `received_devices.label_printed_at`.
 
 ### E. Inventory Update
@@ -76,6 +78,7 @@ A modern, scanner-first web application for the **Goods In** (inbound receiving)
 | `POST` | `/api/scan/reject` | Audit-log a rejection |
 | `GET`  | `/api/scan/events/:manifestId` | Recent scan events |
 | `GET`  | `/api/inventory` | List received devices. Query: `q`, `source`, `manifest_id`, `limit` |
+| `DELETE` | `/api/inventory/:id` | Delete a received device. Restores its manifest line to `pending`, removes queued labels |
 | `GET`  | `/api/print/queue` | Pending print jobs with payloads |
 | `GET`  | `/api/print/job/:id` | Single job |
 | `POST` | `/api/print/send/:id` | Mark single job sent |
@@ -116,7 +119,7 @@ Printer       ◄── POST /api/print/send/:id     ──► print_jobs.status
 5. Start scanning. Each successful scan opens the SKU-confirm modal — most fields are pre-filled, just press **Enter** to confirm.
 6. If an off-manifest IMEI is scanned the screen flashes red — either **Reject** or **Force-add** with notes.
 7. As you scan, the right pane ticks devices over from pending → received, and the print queue fills with labels.
-8. When done, go to **Print Queue** and click **Send all** (in production this fires the labels to your warehouse Zebra/Brother printer via PrintNode or QZ Tray).
+8. When done, go to **Print Queue** and click **Send all** (in production this fires the labels to your DYMO LabelWriter via PrintNode or QZ Tray).
 9. Browse the finished stock in **Inventory** — no grade is set, so the devices are visible to operations but not to sales platforms.
 
 ### Keyboard
@@ -132,7 +135,7 @@ Printer       ◄── POST /api/print/send/:id     ──► print_jobs.status
 - **Platform**: Cloudflare Pages + Workers
 - **Status**: ✅ Running in sandbox (port 3000 via Wrangler)
 - **Tech Stack**: Hono · TypeScript · Cloudflare D1 · vanilla JS SPA · Tailwind CDN
-- **Last Updated**: 2026-06-12 (added `UG` grade + DYMO 32×57mm label format)
+- **Last Updated**: 2026-06-12 (UG grade + dual DYMO formats with separate IMEI QR + delete received device)
 
 ### Local dev
 ```bash

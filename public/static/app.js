@@ -38,7 +38,7 @@
     pendingUnrec: null,   // { imei }
     soundOn: true,
     autoPrint: true,
-    labelSize: localStorage.getItem('labelSize') || 'zebra', // 'zebra' (50x30mm) | 'dymo' (32x57mm)
+    labelSize: localStorage.getItem('labelSize') || 'large', // 'large' (DYMO 50x30mm) | 'small' (DYMO 32x57mm)
   };
   function setLabelSize(v) { state.labelSize = v; localStorage.setItem('labelSize', v); }
 
@@ -155,6 +155,7 @@
       state.pendingMatch ? ConfirmSkuModal() : null,
       state.pendingUnrec ? UnreconciledModal() : null,
       state.labelPreview ? LabelPreviewModal() : null,
+      state.deleteDevice ? DeleteDeviceModal() : null,
     );
   }
 
@@ -190,16 +191,16 @@
             h('span', { class: 'text-cyan-300 font-semibold mono' }, state.activeManifest.reference),
             h('span', { class: 'badge ' + (state.activeManifest.status === 'open' ? 'badge-green' : 'badge-slate') }, state.activeManifest.status)
           ) : null,
-          h('div', { class: 'flex items-center gap-1 bg-slate-900/60 border border-slate-800 rounded-lg p-1', title: 'Label format' },
+          h('div', { class: 'flex items-center gap-1 bg-slate-900/60 border border-slate-800 rounded-lg p-1', title: 'DYMO label format' },
             h('button', {
               class: 'px-2 py-1 rounded-md text-xs font-medium transition ' +
-                (state.labelSize === 'zebra' ? 'bg-cyan-500/20 text-cyan-300' : 'text-slate-400 hover:text-slate-200'),
-              onclick: () => { setLabelSize('zebra'); render(); },
-            }, h('i', { class: 'fas fa-tag mr-1' }), 'Zebra 50×30'),
+                (state.labelSize === 'large' ? 'bg-cyan-500/20 text-cyan-300' : 'text-slate-400 hover:text-slate-200'),
+              onclick: () => { setLabelSize('large'); render(); },
+            }, h('i', { class: 'fas fa-tag mr-1' }), 'DYMO 50×30'),
             h('button', {
               class: 'px-2 py-1 rounded-md text-xs font-medium transition ' +
-                (state.labelSize === 'dymo' ? 'bg-indigo-500/20 text-indigo-300' : 'text-slate-400 hover:text-slate-200'),
-              onclick: () => { setLabelSize('dymo'); render(); },
+                (state.labelSize === 'small' ? 'bg-indigo-500/20 text-indigo-300' : 'text-slate-400 hover:text-slate-200'),
+              onclick: () => { setLabelSize('small'); render(); },
             }, h('i', { class: 'fas fa-receipt mr-1' }), 'DYMO 32×57'),
           ),
           h('button', {
@@ -989,13 +990,13 @@
 
   // ───────── Label preview ─────────
   const LABEL_SIZES = {
-    zebra: { id: 'zebra', name: 'Zebra 50×30mm',  printer: 'Zebra-ZD420-Bay1' },
-    dymo:  { id: 'dymo',  name: 'DYMO 32×57mm',  printer: 'DYMO-LabelWriter-Bay2' },
+    large: { id: 'large', name: 'DYMO 50×30mm', printer: 'DYMO-LW550-Bay1' },
+    small: { id: 'small', name: 'DYMO 32×57mm', printer: 'DYMO-LW550-Bay2' },
   };
 
   function LabelPreviewModal() {
     const lp = state.labelPreview;
-    const sizeInfo = LABEL_SIZES[state.labelSize] || LABEL_SIZES.zebra;
+    const sizeInfo = LABEL_SIZES[state.labelSize] || LABEL_SIZES.large;
     return h('div', { class: 'modal-backdrop', onclick: () => { state.labelPreview = null; render(); } },
       h('div', { class: 'modal p-6 max-w-md', onclick: (e) => e.stopPropagation() },
         h('div', { class: 'flex items-center justify-between mb-4' },
@@ -1014,13 +1015,16 @@
   }
 
   function renderLabel(p, canvasId, size) {
-    size = size || state.labelSize || 'zebra';
-    const isDymo = size === 'dymo';
-    const wrap = h('div', { class: 'label-preview ' + (isDymo ? 'label-dymo' : 'label-zebra') });
-    const qrPx = isDymo ? 110 : 100;
+    size = size || state.labelSize || 'large';
+    const isSmall = size === 'small';
+    const wrap = h('div', { class: 'label-preview ' + (isSmall ? 'label-small' : 'label-large') });
+    const mainQrPx = isSmall ? 100 : 90;
+    const imeiQrPx = isSmall ? 88 : 70;
+    const mainQrId = canvasId + '-main';
+    const imeiQrId = canvasId + '-imei';
 
-    if (isDymo) {
-      // DYMO 32×57mm — portrait orientation (taller than wide), stacked layout
+    if (isSmall) {
+      // DYMO 32×57mm — portrait orientation, stacked layout
       // Real ratio 32:57 ≈ 0.561; preview at 200x356
       const subtitle = [p.brand, p.model].filter(Boolean).join(' ');
       const variant = [p.capacity, p.color].filter(Boolean).join(' · ');
@@ -1031,42 +1035,57 @@
       wrap.appendChild(h('div', { class: 'dymo-sku' }, p.sku));
       if (subtitle) wrap.appendChild(h('div', { class: 'dymo-sub' }, subtitle));
       if (variant) wrap.appendChild(h('div', { class: 'dymo-variant' }, variant));
+      // Main QR (uuid + sku + imei)
       wrap.appendChild(h('div', { class: 'dymo-qr' },
-        h('canvas', { id: canvasId, width: qrPx, height: qrPx })
+        h('canvas', { id: mainQrId, width: mainQrPx, height: mainQrPx })
+      ));
+      wrap.appendChild(h('div', { class: 'dymo-qr-cap' }, 'Internal UUID')); 
+      // Dedicated IMEI QR
+      wrap.appendChild(h('div', { class: 'dymo-imei-block' },
+        h('canvas', { id: imeiQrId, width: imeiQrPx, height: imeiQrPx }),
+        h('div', { class: 'dymo-imei-num mono' }, p.imei),
+        h('div', { class: 'dymo-imei-cap' }, 'IMEI')
       ));
       wrap.appendChild(h('div', { class: 'dymo-foot' },
-        h('div', { class: 'dymo-row' },
-          h('span', { class: 'dymo-lbl' }, 'IMEI'),
-          h('span', { class: 'dymo-val mono' }, p.imei)),
         h('div', { class: 'dymo-row' },
           h('span', { class: 'dymo-lbl' }, 'UUID'),
           h('span', { class: 'dymo-val mono' }, p.uuid)),
       ));
     } else {
-      // Zebra 50×30mm — landscape, side-by-side
-      wrap.appendChild(h('div', { class: 'qr' },
-        h('canvas', { id: canvasId, width: qrPx, height: qrPx })
-      ));
-      wrap.appendChild(h('div', { class: 'meta' },
+      // DYMO 50×30mm — landscape, two-column with dual QRs
+      // Left: SKU + brand info on top, IMEI QR + IMEI digits below
+      // Right: Main QR (UUID/SKU/IMEI), UUID, grade
+      wrap.appendChild(h('div', { class: 'lg-left' },
         h('div', {},
-          h('div', { class: 'sku' }, p.sku),
-          h('div', { style: 'font-size:10px;color:#444;margin-top:2px' }, [p.brand, p.model, p.capacity].filter(Boolean).join(' · '))
+          h('div', { class: 'lg-sku' }, p.sku),
+          h('div', { class: 'lg-sub' }, [p.brand, p.model, p.capacity].filter(Boolean).join(' · '))
         ),
-        h('div', {},
-          h('div', { class: 'row' }, h('span', { style: 'color:#666' }, 'IMEI'), h('span', { class: 'imei' }, p.imei)),
-          h('div', { class: 'row mt-1' }, h('span', { style: 'color:#666' }, 'UUID'), h('span', { class: 'imei' }, p.uuid)),
-          p.grade ? h('div', { class: 'row mt-1' }, h('span', { style: 'color:#666' }, 'Grade'),
-            h('span', { style: 'font-weight:700' }, p.grade)) : null,
-        )
+        h('div', { class: 'lg-imei-block' },
+          h('canvas', { id: imeiQrId, width: imeiQrPx, height: imeiQrPx }),
+          h('div', { class: 'lg-imei-side' },
+            h('div', { class: 'lg-imei-cap' }, 'IMEI'),
+            h('div', { class: 'lg-imei-num mono' }, p.imei)
+          )
+        ),
+      ));
+      wrap.appendChild(h('div', { class: 'lg-right' },
+        h('canvas', { id: mainQrId, width: mainQrPx, height: mainQrPx }),
+        h('div', { class: 'lg-uuid mono' }, p.uuid),
+        p.grade ? h('div', { class: 'lg-grade' }, p.grade) : null,
       ));
     }
 
-    // Render QR after DOM insertion
+    // Render both QR codes after DOM insertion
     setTimeout(() => {
-      const canvas = document.getElementById(canvasId);
-      if (canvas && window.QRCode) {
+      const mainCanvas = document.getElementById(mainQrId);
+      const imeiCanvas = document.getElementById(imeiQrId);
+      if (mainCanvas && window.QRCode) {
         const payload = JSON.stringify({ uuid: p.uuid, sku: p.sku, imei: p.imei });
-        QRCode.toCanvas(canvas, payload, { width: qrPx, margin: 1, color: { dark: '#000', light: '#fff' } });
+        QRCode.toCanvas(mainCanvas, payload, { width: mainQrPx, margin: 1, color: { dark: '#000', light: '#fff' } });
+      }
+      if (imeiCanvas && window.QRCode) {
+        // IMEI-only QR — plain text so a basic IMEI-only barcode scanner reads it cleanly
+        QRCode.toCanvas(imeiCanvas, p.imei, { width: imeiQrPx, margin: 1, color: { dark: '#000', light: '#fff' } });
       }
     }, 30);
     return wrap;
@@ -1098,12 +1117,13 @@
               h('th', { class: 'text-left px-4 py-3' }, 'Grade'),
               h('th', { class: 'text-left px-4 py-3' }, 'Source'),
               h('th', { class: 'text-left px-4 py-3' }, 'Received'),
-              h('th', { class: 'text-left px-4 py-3' }, 'Label')
+              h('th', { class: 'text-left px-4 py-3' }, 'Label'),
+              h('th', { class: 'text-right px-4 py-3' }, '')
             )
           ),
           h('tbody', { class: 'divide-y divide-slate-800' },
             state.inventory.length === 0
-              ? h('tr', {}, h('td', { colspan: 8, class: 'text-center py-10 text-slate-500' }, 'No devices yet.'))
+              ? h('tr', {}, h('td', { colspan: 9, class: 'text-center py-10 text-slate-500' }, 'No devices yet.'))
               : state.inventory.map(d => h('tr', { class: 'row-strip' },
                 h('td', { class: 'px-4 py-2 mono text-xs text-slate-300' }, d.uuid),
                 h('td', { class: 'px-4 py-2 mono text-xs' }, d.imei),
@@ -1123,9 +1143,78 @@
                   d.label_printed_at
                     ? h('span', { class: 'badge badge-green text-[10px]' },
                         h('i', { class: 'fas fa-check mr-1' }), 'printed')
-                    : h('span', { class: 'badge badge-amber text-[10px]' }, 'queued'))
+                    : h('span', { class: 'badge badge-amber text-[10px]' }, 'queued')),
+                h('td', { class: 'px-4 py-2 text-right' },
+                  h('button', {
+                    class: 'btn btn-danger text-xs',
+                    title: 'Delete received device — manifest line will be restored to pending',
+                    onclick: () => openDeleteDeviceModal(d),
+                  }, h('i', { class: 'fas fa-trash' })))
               ))
           )
+        )
+      )
+    );
+  }
+
+  // Delete-device confirmation modal
+  function openDeleteDeviceModal(d) {
+    state.deleteDevice = d;
+    render();
+  }
+  function DeleteDeviceModal() {
+    const d = state.deleteDevice;
+    const close = () => { state.deleteDevice = null; render(); };
+    const doDelete = async () => {
+      try {
+        const r = await api.del(`/inventory/${d.id}`);
+        toast(
+          `Deleted <span class="mono">${d.imei}</span>` +
+            (r.restored_expected ? '<br><span class="text-xs text-slate-400">Manifest line restored to pending</span>' : ''),
+          'warn'
+        );
+        state.deleteDevice = null;
+        await Promise.all([refreshInventory(), refreshActiveManifest(), refreshStats()]);
+        render();
+      } catch (err) {
+        toast(err.response?.data?.error || 'Failed to delete', 'err');
+      }
+    };
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-md border border-red-500/30' },
+        h('div', { class: 'flex items-center gap-3 mb-3' },
+          h('div', { class: 'w-10 h-10 rounded-xl bg-red-500/10 text-red-400 flex items-center justify-center' },
+            h('i', { class: 'fas fa-triangle-exclamation' })),
+          h('div', {},
+            h('h2', { class: 'text-lg font-semibold' }, 'Delete received device?'),
+            h('p', { class: 'text-xs text-slate-400' }, 'This removes the device from inventory and any queued label.')
+          )
+        ),
+        h('div', { class: 'card p-3 bg-slate-900/40 mt-3 space-y-1' },
+          h('div', { class: 'flex justify-between text-xs' },
+            h('span', { class: 'text-slate-500' }, 'UUID'),
+            h('span', { class: 'mono' }, d.uuid)),
+          h('div', { class: 'flex justify-between text-xs' },
+            h('span', { class: 'text-slate-500' }, 'IMEI'),
+            h('span', { class: 'mono font-semibold' }, d.imei)),
+          h('div', { class: 'flex justify-between text-xs' },
+            h('span', { class: 'text-slate-500' }, 'SKU'),
+            h('span', { class: 'mono font-semibold text-cyan-300' }, d.sku)),
+          h('div', { class: 'flex justify-between text-xs' },
+            h('span', { class: 'text-slate-500' }, 'Source'),
+            h('span', {}, d.source)),
+        ),
+        d.source === 'manifest'
+          ? h('div', { class: 'mt-3 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-xs text-amber-200' },
+              h('i', { class: 'fas fa-circle-info mr-2' }),
+              'The manifest line will be restored to pending so this IMEI can be scanned again.')
+          : h('div', { class: 'mt-3 p-3 rounded-lg bg-slate-800/40 border border-slate-700/40 text-xs text-slate-400' },
+              h('i', { class: 'fas fa-circle-info mr-2' }),
+              'This was force-added (unreconciled). Deletion is permanent.'),
+        h('div', { class: 'mt-5 flex justify-end gap-2' },
+          h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
+          h('button', { class: 'btn btn-danger', onclick: doDelete },
+            h('i', { class: 'fas fa-trash' }), 'Delete Device')
         )
       )
     );

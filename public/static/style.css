@@ -96,82 +96,132 @@ body {
   box-shadow: 0 10px 30px rgba(0,0,0,.5);
 }
 
-/* Zebra 50x30mm (landscape, ratio 50:30 = 5:3) — preview 360x216 */
-.label-preview.label-zebra {
-  width: 360px;
-  height: 216px;
-  padding: 14px;
+/* DYMO 50x30mm large (landscape, ratio 50:30 = 5:3) — preview 400x240 */
+.label-preview.label-large {
+  width: 400px;
+  height: 240px;
+  padding: 12px;
   display: grid;
-  grid-template-columns: 110px 1fr;
-  gap: 12px;
+  grid-template-columns: 1fr 110px;
+  gap: 10px;
 }
-.label-preview.label-zebra .qr {
-  display: flex; align-items: center; justify-content: center;
-}
-.label-preview.label-zebra .meta {
+.label-preview.label-large .lg-left {
   display: flex; flex-direction: column; justify-content: space-between;
-  font-size: 11px;
+  min-width: 0;
 }
-.label-preview.label-zebra .meta .sku { font-size: 18px; font-weight: 800; letter-spacing: .5px; }
-.label-preview.label-zebra .meta .imei { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
-.label-preview.label-zebra .meta .row { display: flex; justify-content: space-between; }
-
-/* DYMO 32x57mm (portrait, ratio 32:57 ≈ 0.56) — preview 200x356 */
-.label-preview.label-dymo {
-  width: 200px;
-  height: 356px;
-  padding: 12px 12px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+.label-preview.label-large .lg-sku {
+  font-size: 22px; font-weight: 800; letter-spacing: .5px; line-height: 1.1;
+  word-break: break-all;
 }
-.label-preview.label-dymo .dymo-header {
-  display: flex; justify-content: space-between; align-items: center;
-  border-bottom: 1px dashed #cbd5e1;
-  padding-bottom: 6px;
+.label-preview.label-large .lg-sub {
+  font-size: 10px; color: #475569; margin-top: 2px;
 }
-.label-preview.label-dymo .dymo-brand {
-  font-size: 9px; font-weight: 700; letter-spacing: 2px; color: #475569;
+.label-preview.label-large .lg-imei-block {
+  display: flex; align-items: center; gap: 8px;
+  border-top: 1px dashed #cbd5e1;
+  padding-top: 6px;
 }
-.label-preview.label-dymo .dymo-grade {
+.label-preview.label-large .lg-imei-block canvas {
+  flex-shrink: 0;
+}
+.label-preview.label-large .lg-imei-side {
+  display: flex; flex-direction: column; justify-content: center;
+}
+.label-preview.label-large .lg-imei-cap {
+  font-size: 8px; font-weight: 700; letter-spacing: 1.5px; color: #64748b;
+}
+.label-preview.label-large .lg-imei-num {
+  font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 700;
+  letter-spacing: -.3px;
+}
+.label-preview.label-large .lg-right {
+  display: flex; flex-direction: column; align-items: center; justify-content: space-between;
+  border-left: 1px dashed #cbd5e1;
+  padding-left: 10px;
+}
+.label-preview.label-large .lg-uuid {
+  font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 600;
+  letter-spacing: 0.5px;
+}
+.label-preview.label-large .lg-grade {
   font-size: 14px; font-weight: 800;
-  padding: 2px 8px;
+  padding: 1px 8px;
   border: 2px solid #000;
   border-radius: 4px;
   font-family: 'JetBrains Mono', monospace;
 }
-.label-preview.label-dymo .dymo-sku {
-  font-size: 22px; font-weight: 800; letter-spacing: .5px;
+
+/* DYMO 32x57mm small (portrait, ratio 32:57 ≈ 0.56) — preview 200x356 */
+.label-preview.label-small {
+  width: 200px;
+  height: 356px;
+  padding: 10px 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.label-preview.label-small .dymo-header {
+  display: flex; justify-content: space-between; align-items: center;
+  border-bottom: 1px dashed #cbd5e1;
+  padding-bottom: 4px;
+}
+.label-preview.label-small .dymo-brand {
+  font-size: 9px; font-weight: 700; letter-spacing: 2px; color: #475569;
+}
+.label-preview.label-small .dymo-grade {
+  font-size: 13px; font-weight: 800;
+  padding: 1px 6px;
+  border: 2px solid #000;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.label-preview.label-small .dymo-sku {
+  font-size: 18px; font-weight: 800; letter-spacing: .3px;
   text-align: center;
-  margin-top: 4px;
+  margin-top: 2px;
   word-break: break-all;
   line-height: 1.05;
 }
-.label-preview.label-dymo .dymo-sub {
-  font-size: 11px; font-weight: 600; text-align: center; color: #1e293b;
+.label-preview.label-small .dymo-sub {
+  font-size: 10px; font-weight: 600; text-align: center; color: #1e293b;
 }
-.label-preview.label-dymo .dymo-variant {
-  font-size: 10px; text-align: center; color: #475569;
+.label-preview.label-small .dymo-variant {
+  font-size: 9px; text-align: center; color: #475569;
 }
-.label-preview.label-dymo .dymo-qr {
+.label-preview.label-small .dymo-qr {
   display: flex; justify-content: center; align-items: center;
-  margin: 4px 0;
-  flex: 1;
+  margin: 2px 0 0 0;
 }
-.label-preview.label-dymo .dymo-foot {
+.label-preview.label-small .dymo-qr-cap {
+  font-size: 7px; font-weight: 600; letter-spacing: 1.2px; text-align: center; color: #64748b;
+  margin-top: -2px;
+}
+.label-preview.label-small .dymo-imei-block {
   border-top: 1px dashed #cbd5e1;
-  padding-top: 6px;
-  display: flex; flex-direction: column; gap: 3px;
+  padding-top: 4px;
+  display: flex; flex-direction: column; align-items: center; gap: 1px;
 }
-.label-preview.label-dymo .dymo-row {
+.label-preview.label-small .dymo-imei-num {
+  font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700;
+}
+.label-preview.label-small .dymo-imei-cap {
+  font-size: 7px; font-weight: 600; letter-spacing: 1.2px; color: #64748b;
+}
+.label-preview.label-small .dymo-foot {
+  border-top: 1px dashed #cbd5e1;
+  padding-top: 4px;
+  display: flex; flex-direction: column; gap: 2px;
+  margin-top: auto;
+}
+.label-preview.label-small .dymo-row {
   display: flex; justify-content: space-between; align-items: baseline;
   font-size: 9px;
 }
-.label-preview.label-dymo .dymo-lbl {
+.label-preview.label-small .dymo-lbl {
   color: #64748b; font-weight: 600; letter-spacing: 0.5px;
 }
-.label-preview.label-dymo .dymo-val {
-  font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 600;
+.label-preview.label-small .dymo-val {
+  font-family: 'JetBrains Mono', monospace; font-size: 9px; font-weight: 600;
 }
 .label-preview .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
 
