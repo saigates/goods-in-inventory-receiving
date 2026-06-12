@@ -1064,7 +1064,7 @@
     if (isSmall) {
       // DYMO 32×57mm — portrait orientation, stacked layout
       // Real ratio 32:57 ≈ 0.561; preview at 200x356
-      const subtitle = [p.brand, p.model].filter(Boolean).join(' ');
+      const subtitle = p.brand || '';
       const variant = [p.capacity, p.color].filter(Boolean).join(' · ');
       wrap.appendChild(h('div', { class: 'dymo-header' },
         h('div', { class: 'dymo-brand' }, 'GOODS IN'),
@@ -1091,7 +1091,7 @@
       wrap.appendChild(h('div', { class: 'lg-left' },
         h('div', {},
           h('div', { class: 'lg-sku' }, p.sku),
-          h('div', { class: 'lg-sub' }, [p.brand, p.model, p.capacity].filter(Boolean).join(' · '))
+          h('div', { class: 'lg-sub' }, [p.brand, p.capacity, p.color].filter(Boolean).join(' · '))
         ),
         h('div', { class: 'lg-imei-block' },
           h('canvas', { id: imeiQrId, width: imeiQrPx, height: imeiQrPx }),

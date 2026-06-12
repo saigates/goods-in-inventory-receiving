@@ -23,7 +23,7 @@ function labelHtml(payload: any, size: 'large' | 'small'): string {
   // Real label dimensions in mm
   const widthMm = isSmall ? 32 : 50
   const heightMm = isSmall ? 57 : 30
-  const subtitle = [payload.brand, payload.model].filter(Boolean).join(' ')
+  const subtitle = payload.brand || ''
   const variant = [payload.capacity, payload.color].filter(Boolean).join(' · ')
 
   // Note: data is escaped at the call site via JSON.stringify into a JS const.
@@ -95,7 +95,7 @@ ${isSmall ? `
   <div class="left">
     <div>
       <div class="sku">${payload.sku || ''}</div>
-      <div class="sub">${[payload.brand, payload.model, payload.capacity].filter(Boolean).join(' · ')}</div>
+      <div class="sub">${[payload.brand, payload.capacity, payload.color].filter(Boolean).join(' · ')}</div>
     </div>
     <div class="imei-blk">
       <canvas id="qimei"></canvas>
@@ -383,7 +383,7 @@ app.get('/labels', async (c) => {
   const heightMm = isSmall ? 57 : 30
 
   const labels = rows.map((row, idx) => {
-    const subtitle = [row.brand, row.model].filter(Boolean).join(' ')
+    const subtitle = row.brand || ''
     const variant = [row.capacity, row.color].filter(Boolean).join(' · ')
     return `
     <div class="label" data-uuid="${row.uuid}" data-imei="${row.imei}">
@@ -406,7 +406,7 @@ app.get('/labels', async (c) => {
         <div class="left">
           <div>
             <div class="sku">${row.sku || ''}</div>
-            <div class="sub">${[row.brand, row.model, row.capacity].filter(Boolean).join(' · ')}</div>
+            <div class="sub">${[row.brand, row.capacity, row.color].filter(Boolean).join(' · ')}</div>
           </div>
           <div class="imei-blk">
             <canvas id="qimei-${idx}"></canvas>
