@@ -17,26 +17,43 @@ async function loadSettings(c: any): Promise<Settings> {
   return row || { print_mode: 'browser', printnode_api_key: null, printnode_printer_id_large: null, printnode_printer_id_small: null }
 }
 
-// Build a printable HTML for a single label (used by browser-print mode)
+// Build a printable HTML for a single label (used by browser-print mode).
+// The page renders a screen-only preflight banner (paper size + header-off
+// checklist) — the @media print block hides it so the printed page is
+// JUST the label, sized exactly to the @page box.
 function labelHtml(payload: any, size: 'large' | 'small'): string {
   const isSmall = size === 'small'
   // Real label dimensions in mm
-  const widthMm = isSmall ? 32 : 50
-  const heightMm = isSmall ? 57 : 30
+  const widthMm = isSmall ? 32 : 57
+  const heightMm = isSmall ? 57 : 32
   const subtitle = payload.brand || ''
   const variant = [payload.capacity, payload.color].filter(Boolean).join(' · ')
 
-  // Note: data is escaped at the call site via JSON.stringify into a JS const.
-  // QR codes are rendered client-side with QRious so this HTML can be used
-  // both by window.print() and by PrintNode (which would re-render server-side
-  // — for that path we send raw text + QR-as-PNG instead).
   return `<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
-<title>Label ${payload.uuid}</title>
+<title>${payload.sku} · ${payload.imei}</title>
 <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
 <style>
   @page { size: ${widthMm}mm ${heightMm}mm; margin: 0; }
-  html, body { margin: 0; padding: 0; background: #fff; }
+  html, body { margin: 0; padding: 0; background: #f5f5f5; font-family: system-ui, sans-serif; }
+  /* Screen-only preflight (hidden when printing) */
+  @media screen {
+    body { padding: 20px; }
+    .preflight { max-width: 520px; margin: 0 auto 20px; background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+    .preflight h2 { margin: 0 0 8px; font-size: 14px; color: #0f172a; }
+    .preflight ol { margin: 8px 0 12px 18px; padding: 0; font-size: 12px; color: #334155; line-height: 1.6; }
+    .preflight .btn { display: inline-block; background: linear-gradient(135deg,#06b6d4,#6366f1); color:#fff; border:none; border-radius:6px; padding:8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+    .preflight .btn:hover { filter: brightness(1.08); }
+    .label-frame { max-width: 520px; margin: 0 auto; background:#fff; border: 1px dashed #94a3b8; padding: 12px; border-radius: 6px; }
+    .label-frame > .label { box-shadow: 0 0 0 1px #cbd5e1; }
+    .scale-note { text-align:center; font-size: 11px; color: #64748b; margin-top: 8px; }
+  }
+  @media print {
+    body { background: #fff !important; padding: 0 !important; }
+    .preflight, .label-frame > .scale-note, .label-frame { display: contents; }
+    .label-frame { padding: 0 !important; border: 0 !important; }
+    .preflight { display: none !important; }
+  }
   * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .label {
     width: ${widthMm}mm; height: ${heightMm}mm;
@@ -44,7 +61,7 @@ function labelHtml(payload: any, size: 'large' | 'small'): string {
     display: ${isSmall ? 'flex' : 'grid'};
     ${isSmall
       ? 'flex-direction: column; gap: 0.4mm;'
-      : 'grid-template-columns: 1fr 11mm; gap: 1mm;'}
+      : 'grid-template-columns: 1fr 13mm; gap: 1mm;'}
   }
   .mono { font-family: 'Courier New', monospace; }
   ${isSmall ? `
@@ -63,18 +80,31 @@ function labelHtml(payload: any, size: 'large' | 'small'): string {
   .row       { display:flex; justify-content:space-between; font-size: 1.5mm; }
   ` : `
   .left      { display:flex; flex-direction:column; justify-content:space-between; min-width: 0; }
-  .sku       { font-size: 4mm; font-weight: 800; letter-spacing: 0.1mm; line-height: 1.05; word-break: break-all; }
-  .sub       { font-size: 1.8mm; color: #444; }
+  .sku       { font-size: 4.6mm; font-weight: 800; letter-spacing: 0.1mm; line-height: 1.05; word-break: break-all; }
+  .sub       { font-size: 2mm; color: #444; margin-top: 0.4mm; }
   .imei-blk  { display:flex; align-items:center; gap:1.2mm; border-top: 0.15mm dashed #888; padding-top: 0.8mm; }
   .imei-side { display:flex; flex-direction:column; justify-content:center; }
   .imei-cap  { font-size: 1.4mm; font-weight: 700; letter-spacing: 0.3mm; color: #666; }
-  .imei-num  { font-size: 2.4mm; font-weight: 700; }
+  .imei-num  { font-size: 2.6mm; font-weight: 700; }
   .right     { display:flex; flex-direction:column; align-items:center; justify-content:space-between; border-left: 0.15mm dashed #888; padding-left: 1mm; }
-  .uuid      { font-size: 1.6mm; font-weight: 600; }
-  .grade     { font-size: 2.6mm; font-weight: 800; padding: 0.2mm 1mm; border: 0.25mm solid #000; border-radius: 0.4mm; }
+  .uuid      { font-size: 1.8mm; font-weight: 600; }
+  .grade     { font-size: 3mm; font-weight: 800; padding: 0.2mm 1mm; border: 0.25mm solid #000; border-radius: 0.4mm; }
   `}
 </style></head>
 <body>
+<div class="preflight">
+  <h2>🖨️ Print preflight — ${widthMm}×${heightMm} mm DYMO label</h2>
+  <ol>
+    <li>In the print dialog, set <b>Destination</b> to your DYMO LabelWriter (e.g. <i>DYMO LabelWriter 450</i>).</li>
+    <li>Set <b>Paper size</b> to <b>${widthMm} × ${heightMm} mm</b> (or the closest custom size — usually appears as "${widthMm}mm x ${heightMm}mm" once the DYMO is selected).</li>
+    <li>Set <b>Margins</b> to <b>None</b> and <b>Scale</b> to <b>100%</b>.</li>
+    <li>Open <b>More settings</b> and <b>uncheck "Headers and footers"</b> — this removes the date/URL printed at the top of the label.</li>
+    <li>Click <b>Print</b>.</li>
+  </ol>
+  <button class="btn" onclick="window.print()">Open print dialog</button>
+  <span style="margin-left:10px; font-size:11px; color:#64748b">Tip: tick "Remember settings" or save as a Chrome preset so you only set this up once.</span>
+</div>
+<div class="label-frame">
 <div class="label">
 ${isSmall ? `
   <div class="h">
@@ -112,6 +142,8 @@ ${isSmall ? `
   </div>
 `}
 </div>
+<div class="scale-note">Preview rendered at real ${widthMm}×${heightMm} mm — the print dialog should produce the same size.</div>
+</div>
 <script>
   (function(){
     const payload = ${JSON.stringify(JSON.stringify({ uuid: payload.uuid, sku: payload.sku, imei: payload.imei }))};
@@ -122,8 +154,7 @@ ${isSmall ? `
       if (!window.QRious) { setTimeout(render, 50); return; }
       new QRious({ element: document.getElementById('qmain'), value: payload, size: mainPx, level: 'M' });
       new QRious({ element: document.getElementById('qimei'), value: imei, size: imeiPx, level: 'M' });
-      // Give a moment for canvas paint, then trigger print
-      setTimeout(() => { window.print(); }, 200);
+      // No auto-print — user clicks the button after confirming settings
     }
     render();
     window.addEventListener('afterprint', () => { setTimeout(() => window.close(), 100); });
@@ -379,8 +410,8 @@ app.get('/labels', async (c) => {
 
   // Build a multi-label HTML — each label is one @page in the print preview
   const isSmall = size === 'small'
-  const widthMm = isSmall ? 32 : 50
-  const heightMm = isSmall ? 57 : 30
+  const widthMm = isSmall ? 32 : 57
+  const heightMm = isSmall ? 57 : 32
 
   const labels = rows.map((row, idx) => {
     const subtitle = row.brand || ''
@@ -426,11 +457,26 @@ app.get('/labels', async (c) => {
   }).join('\n')
 
   const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<title>Print ${rows.length} labels</title>
+<title>Print ${rows.length} labels (${widthMm}×${heightMm}mm)</title>
 <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
 <style>
   @page { size: ${widthMm}mm ${heightMm}mm; margin: 0; }
-  html, body { margin: 0; padding: 0; background: #fff; }
+  html, body { margin: 0; padding: 0; background: #f5f5f5; font-family: system-ui, sans-serif; }
+  @media screen {
+    body { padding: 20px; }
+    .preflight { max-width: 560px; margin: 0 auto 20px; background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 16px; }
+    .preflight h2 { margin: 0 0 8px; font-size: 14px; color: #0f172a; }
+    .preflight ol { margin: 8px 0 12px 18px; padding: 0; font-size: 12px; color: #334155; line-height: 1.6; }
+    .preflight .btn { background: linear-gradient(135deg,#06b6d4,#6366f1); color:#fff; border:none; border-radius:6px; padding:8px 16px; font-size:13px; font-weight:600; cursor:pointer; }
+    .labels-wrap { max-width: 560px; margin: 0 auto; }
+    .labels-wrap .label { background: #fff; box-shadow: 0 0 0 1px #cbd5e1; margin-bottom: 8px; }
+  }
+  @media print {
+    body { background: #fff !important; padding: 0 !important; }
+    .preflight { display: none !important; }
+    .labels-wrap { max-width: none !important; margin: 0 !important; }
+    .labels-wrap .label { box-shadow: none !important; margin: 0 !important; }
+  }
   * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .label {
     width: ${widthMm}mm; height: ${heightMm}mm;
@@ -439,7 +485,7 @@ app.get('/labels', async (c) => {
     display: ${isSmall ? 'flex' : 'grid'};
     ${isSmall
       ? 'flex-direction: column; gap: 0.4mm;'
-      : 'grid-template-columns: 1fr 11mm; gap: 1mm;'}
+      : 'grid-template-columns: 1fr 13mm; gap: 1mm;'}
   }
   .label:last-child { page-break-after: auto; break-after: auto; }
   .mono { font-family: 'Courier New', monospace; }
@@ -458,19 +504,31 @@ app.get('/labels', async (c) => {
   .row       { display:flex; justify-content:space-between; font-size: 1.5mm; }
   ` : `
   .left      { display:flex; flex-direction:column; justify-content:space-between; min-width: 0; }
-  .sku       { font-size: 4mm; font-weight: 800; letter-spacing: 0.1mm; line-height: 1.05; word-break: break-all; }
-  .sub       { font-size: 1.8mm; color: #444; }
+  .sku       { font-size: 4.6mm; font-weight: 800; letter-spacing: 0.1mm; line-height: 1.05; word-break: break-all; }
+  .sub       { font-size: 2mm; color: #444; margin-top: 0.4mm; }
   .imei-blk  { display:flex; align-items:center; gap:1.2mm; border-top: 0.15mm dashed #888; padding-top: 0.8mm; }
   .imei-side { display:flex; flex-direction:column; justify-content:center; }
   .imei-cap  { font-size: 1.4mm; font-weight: 700; letter-spacing: 0.3mm; color: #666; }
-  .imei-num  { font-size: 2.4mm; font-weight: 700; }
+  .imei-num  { font-size: 2.6mm; font-weight: 700; }
   .right     { display:flex; flex-direction:column; align-items:center; justify-content:space-between; border-left: 0.15mm dashed #888; padding-left: 1mm; }
-  .uuid      { font-size: 1.6mm; font-weight: 600; }
-  .grade     { font-size: 2.6mm; font-weight: 800; padding: 0.2mm 1mm; border: 0.25mm solid #000; border-radius: 0.4mm; }
+  .uuid      { font-size: 1.8mm; font-weight: 600; }
+  .grade     { font-size: 3mm; font-weight: 800; padding: 0.2mm 1mm; border: 0.25mm solid #000; border-radius: 0.4mm; }
   `}
 </style></head>
 <body>
+<div class="preflight">
+  <h2>🖨️ Print preflight — ${rows.length} × ${widthMm}×${heightMm} mm DYMO labels</h2>
+  <ol>
+    <li><b>Destination</b>: DYMO LabelWriter 450</li>
+    <li><b>Paper size</b>: ${widthMm} × ${heightMm} mm</li>
+    <li><b>Margins</b>: None &nbsp; · &nbsp; <b>Scale</b>: 100%</li>
+    <li>Open <b>More settings</b> and <b>uncheck "Headers and footers"</b> (otherwise the date/URL prints on each label).</li>
+  </ol>
+  <button class="btn" onclick="window.print()">Open print dialog (${rows.length} label${rows.length === 1 ? '' : 's'})</button>
+</div>
+<div class="labels-wrap">
 ${labels}
+</div>
 <script>
   const rows = ${JSON.stringify(rows.map(r => ({ uuid: r.uuid, sku: r.sku, imei: r.imei })))};
   const mainPx = ${isSmall ? 105 : 95};
@@ -482,7 +540,7 @@ ${labels}
       new QRious({ element: document.getElementById('qmain-'+i), value: payload, size: mainPx, level: 'M' });
       new QRious({ element: document.getElementById('qimei-'+i), value: r.imei, size: imeiPx, level: 'M' });
     });
-    setTimeout(() => { window.print(); }, 300);
+    // No auto-print — user clicks the button after confirming dialog settings
   }
   render();
   // Tell the parent window to mark all jobs as sent

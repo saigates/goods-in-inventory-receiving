@@ -96,13 +96,13 @@ body {
   box-shadow: 0 10px 30px rgba(0,0,0,.5);
 }
 
-/* DYMO 50x30mm large (landscape, ratio 50:30 = 5:3) — preview 400x240 */
+/* DYMO 57x32mm large (landscape, ratio 57:32 ≈ 1.78) — preview 400x224 */
 .label-preview.label-large {
   width: 400px;
-  height: 240px;
-  padding: 12px;
+  height: 224px;
+  padding: 10px;
   display: grid;
-  grid-template-columns: 1fr 110px;
+  grid-template-columns: 1fr 100px;
   gap: 10px;
 }
 .label-preview.label-large .lg-left {

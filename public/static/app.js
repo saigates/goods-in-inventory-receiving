@@ -38,7 +38,8 @@
     pendingUnrec: null,   // { imei }
     soundOn: true,
     autoPrint: true,
-    labelSize: localStorage.getItem('labelSize') || 'large', // 'large' (DYMO 50x30mm) | 'small' (DYMO 32x57mm)
+    // 'large' (DYMO 57x32mm landscape, default) | 'small' (DYMO 32x57mm portrait)
+    labelSize: (['large','small'].includes(localStorage.getItem('labelSize')) ? localStorage.getItem('labelSize') : 'large'),
     printSettings: null,         // { print_mode, printnode_api_key_set, printnode_printer_id_large, printnode_printer_id_small }
     printnodePrinters: null,     // [] from /printnode/printers
     settingsSaving: false,
@@ -201,7 +202,7 @@
               class: 'px-2 py-1 rounded-md text-xs font-medium transition ' +
                 (state.labelSize === 'large' ? 'bg-cyan-500/20 text-cyan-300' : 'text-slate-400 hover:text-slate-200'),
               onclick: () => { setLabelSize('large'); render(); },
-            }, h('i', { class: 'fas fa-tag mr-1' }), 'DYMO 50×30'),
+            }, h('i', { class: 'fas fa-tag mr-1' }), 'DYMO 57×32'),
             h('button', {
               class: 'px-2 py-1 rounded-md text-xs font-medium transition ' +
                 (state.labelSize === 'small' ? 'bg-indigo-500/20 text-indigo-300' : 'text-slate-400 hover:text-slate-200'),
@@ -1028,7 +1029,7 @@
 
   // ───────── Label preview ─────────
   const LABEL_SIZES = {
-    large: { id: 'large', name: 'DYMO 50×30mm', printer: 'DYMO LabelWriter 450' },
+    large: { id: 'large', name: 'DYMO 57×32mm', printer: 'DYMO LabelWriter 450' },
     small: { id: 'small', name: 'DYMO 32×57mm', printer: 'DYMO LabelWriter 450' },
   };
 
@@ -1085,7 +1086,7 @@
         h('div', { class: 'dymo-imei-cap' }, 'IMEI')
       ));
     } else {
-      // DYMO 50×30mm — landscape, two-column with dual QRs
+      // DYMO 57×32mm — landscape, two-column with dual QRs
       // Left: SKU + brand info on top, IMEI QR + IMEI digits below
       // Right: Main QR (UUID/SKU/IMEI), UUID, grade
       wrap.appendChild(h('div', { class: 'lg-left' },
@@ -1331,7 +1332,7 @@
         h('ol', { class: 'list-decimal list-inside text-sm text-slate-300 space-y-1.5' },
           h('li', {}, 'Install the DYMO LabelWriter driver on the workstation that runs the browser.'),
           h('li', {}, 'Plug in the DYMO LW550 / LW450 / etc. via USB. Make sure it shows up in your OS Printers list.'),
-          h('li', {}, 'Make sure the loaded label stock matches the selected size in the topbar (DYMO 50×30 or DYMO 32×57).'),
+          h('li', {}, 'Make sure the loaded label stock matches the selected size in the topbar (DYMO 57×32 or DYMO 32×57).'),
           h('li', {}, 'Allow pop-ups for this site — each "Send" button opens a print window.'),
           h('li', {}, 'Click Send on a print job; in the print dialog, choose the DYMO printer and click Print.'),
         ),
@@ -1437,7 +1438,7 @@
           }, h('i', { class: 'fas fa-rotate' }), 'Reload printers')
         ),
         h('div', { class: 'space-y-1.5' },
-          h('label', { class: 'text-xs text-slate-400' }, 'DYMO 50×30 mm (large label)'),
+          h('label', { class: 'text-xs text-slate-400' }, 'DYMO 57×32 mm (large label)'),
           printerSelect('large', s.printnode_printer_id_large)
         ),
         h('div', { class: 'space-y-1.5' },
