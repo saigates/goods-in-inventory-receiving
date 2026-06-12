@@ -35,12 +35,12 @@ A modern, scanner-first web application for the **Goods In** (inbound receiving)
 - **Grade options**: `A+`, `A`, `B+`, `B`, `C+`, `C`, `D`, and **`UG`** (Ungraded / Untested — for devices arriving without a supplier grade or routed straight to QC). `UG` shows up as a violet badge throughout the UI to make ungraded stock easy to spot.
 - Force-add path generates the same SKU shape for off-manifest devices.
 
-### D. Print Label (PrintNode / QZ Tray ready)
+### D. Print Label — connects to a real DYMO LabelWriter
 - On confirm, a print job is queued in the `print_jobs` table with a JSON payload.
 - **Two label formats supported** (toggle in the top bar — preference persists per browser via `localStorage`):
   - **DYMO 50×30mm** (landscape) — large-format label for the warehouse floor.
   - **DYMO 32×57mm** (portrait) — compact label for the receiving desk.
-- Both labels carry the same data and **two QR codes**:
+- Both labels carry the same data and **two QR codes** (rendered by `qrious@4.0.2`):
   - **Main QR** — encodes `{uuid, sku, imei}` as JSON. Routes the device to any internal scan target.
   - **IMEI QR** — plain-text IMEI only. Lets cheap or basic scanners (or warranty/repair tools that expect raw IMEIs) read the IMEI directly from the printed label without parsing JSON.
 - Plus the human-readable fields:
@@ -48,7 +48,16 @@ A modern, scanner-first web application for the **Goods In** (inbound receiving)
   - Clean human-readable **SKU**
   - **IMEI** in monospace
   - Brand · Model · Capacity · Grade (incl. the **UG / Ungraded** state)
-- The `Print Queue` view renders the labels in whatever size you've selected, with `Send` / `Send all` buttons. In production the `/api/print/send/:id` endpoint posts the payload to PrintNode or QZ Tray — here it flips the job to `sent` and stamps `received_devices.label_printed_at`.
+
+#### Three printer modes (choose in **Settings**)
+
+| Mode | What happens when you click `Send` | When to use |
+|---|---|---|
+| **Browser Print** (default) | App opens a print window pre-sized via `@page size: 50mm 30mm` (or 32×57mm) — your OS print dialog appears, you pick the DYMO printer and click Print. After printing, the window posts back and jobs are marked `sent` automatically. | Easiest setup — just install the DYMO driver. Works for single-operator stations. |
+| **PrintNode** (cloud) | Server-side `POST` to `https://api.printnode.com/printjobs` with `pdf_uri` pointing back at `/api/print/label/:id`. The PrintNode agent on the warehouse PC picks up the job and feeds it straight to the DYMO LabelWriter — no operator print dialog. | Multi-station / hands-off / unattended printing. Requires a PrintNode account + agent installed on the LAN. |
+| **Manual / Off** | Just flips `print_jobs.status` to `sent`. No physical print. | Testing / when labels are printed via some external workflow. |
+
+The Settings view (gear icon in the top bar) toggles between modes, lets you paste & store a PrintNode API key (kept server-side — never returned to the browser), and pulls the live list of available printers from PrintNode so you can map the DYMO 50×30 and DYMO 32×57 stations independently.
 
 ### E. Inventory Update
 - A successful confirm writes an immutable `received_devices` row (status `received`, no grade locked-in, no listing flag).
@@ -81,8 +90,15 @@ A modern, scanner-first web application for the **Goods In** (inbound receiving)
 | `DELETE` | `/api/inventory/:id` | Delete a received device. Restores its manifest line to `pending`, removes queued labels |
 | `GET`  | `/api/print/queue` | Pending print jobs with payloads |
 | `GET`  | `/api/print/job/:id` | Single job |
-| `POST` | `/api/print/send/:id` | Mark single job sent |
-| `POST` | `/api/print/send-all` | Flush queue |
+| `GET`  | `/api/print/settings` | Print settings (mode + whether PrintNode is configured) |
+| `POST` | `/api/print/settings` | Update settings. Body: `{print_mode?, printnode_api_key?, printnode_printer_id_large?, printnode_printer_id_small?}` (`null` clears) |
+| `GET`  | `/api/print/printnode/printers` | Proxy to PrintNode — list available printers for the configured account |
+| `GET`  | `/api/print/label/:id?size=large\|small` | Standalone HTML label page (`@page size` in real mm). Auto-fires `window.print()`. |
+| `GET`  | `/api/print/labels?ids=1,2,3&size=…` | Bulk version with all labels separated by `page-break-after` |
+| `POST` | `/api/print/send/:id?size=…` | Dispatch one label. Returns `{mode, url}` for browser mode, `{mode, printnode_job_id}` for PrintNode |
+| `POST` | `/api/print/send-all?size=…` | Bulk send / open one print window for all queued labels |
+| `POST` | `/api/print/mark-sent/:id` | Mark a single job as sent (used by the browser-print window) |
+| `POST` | `/api/print/mark-sent-batch` | Body: `{ids: [...]}`. Called by `postMessage` from the browser-print window after `afterprint` fires |
 
 ## Data Architecture
 
@@ -127,15 +143,37 @@ Printer       ◄── POST /api/print/send/:id     ──► print_jobs.status
 - `Enter` inside the SKU-confirm modal → confirm and queue print.
 
 ## Production Integration Notes
-- **Cloud printing**: swap the `app.post('/send/:id')` body for a `fetch()` to your PrintNode API (header `Authorization: Basic …`) or a WebSocket call to QZ Tray. The payload schema is already in `print_jobs.payload_json`.
+
+### Connecting a physical DYMO LabelWriter
+
+**Option 1 — Browser Print (default, easiest):**
+1. Install the official DYMO LabelWriter driver on the workstation running the browser.
+2. Plug in the DYMO LW550 / LW450 / LW4XL etc. — make sure it appears in your OS Printers panel.
+3. Load the correct label stock (50×30 mm or 32×57 mm) and select the matching size in the top bar.
+4. Allow pop-ups for this site so the print window can open.
+5. Click `Send` — the system print dialog appears. Select the DYMO printer, set **Margins: None** and **Scale: 100%**, click Print.
+6. The print window posts back to `/api/print/mark-sent-batch` automatically once `afterprint` fires.
+
+**Option 2 — PrintNode (cloud, unattended):**
+1. Create a PrintNode account at <https://www.printnode.com/>.
+2. Install the PrintNode agent on the warehouse PC connected to the DYMO printer.
+3. Power on the printer; confirm it appears in the PrintNode dashboard.
+4. In the app go to **Settings** → switch mode to **PrintNode** → paste your API key → save.
+5. Click **Load printers** and map the DYMO 50×30 and DYMO 32×57 stations to specific PrintNode printer IDs.
+6. Now `Send` calls the PrintNode REST API server-side (`pdf_uri` pointing back at `/api/print/label/:id`) and the agent feeds the label to the printer with zero operator interaction.
+
+**Option 3 — Manual / Off:** Use during testing or if you print via some external workflow. `Send` only flips the DB flag.
+
+### Other production concerns
 - **Authentication**: not implemented — add Cloudflare Access in front of the Pages project, or Hono's `jwt` middleware on `/api/*` for app-level auth.
 - **Multi-tenant**: add `organisation_id` foreign keys to every table and a Hono middleware that sets it from the JWT.
+- **PrintNode key storage**: stored server-side in the `app_settings` D1 table. The `GET /api/print/settings` endpoint only returns whether the key is configured — never the raw value.
 
 ## Deployment
 - **Platform**: Cloudflare Pages + Workers
 - **Status**: ✅ Running in sandbox (port 3000 via Wrangler)
 - **Tech Stack**: Hono · TypeScript · Cloudflare D1 · vanilla JS SPA · Tailwind CDN
-- **Last Updated**: 2026-06-12 (UG grade + dual DYMO formats with separate IMEI QR + delete received device)
+- **Last Updated**: 2026-06-12 (Real DYMO printer support: Browser Print + PrintNode + Manual modes, Settings view, switched QR library to `qrious@4.0.2`)
 
 ### Local dev
 ```bash
@@ -155,7 +193,7 @@ npm run deploy
 
 ## Not Yet Implemented / Next Steps
 - Grading workflow (next stage after Goods In).
-- Live PrintNode / QZ Tray wire-up (currently the print endpoint just flips the DB flag).
+- QZ Tray local-WebSocket bridge (alternative to PrintNode for sites that don't want cloud printing).
 - User accounts + per-operator scan attribution.
 - Multi-warehouse / multi-location.
 - Webhook out to ERP / accounting on receive.

@@ -39,6 +39,9 @@
     soundOn: true,
     autoPrint: true,
     labelSize: localStorage.getItem('labelSize') || 'large', // 'large' (DYMO 50x30mm) | 'small' (DYMO 32x57mm)
+    printSettings: null,         // { print_mode, printnode_api_key_set, printnode_printer_id_large, printnode_printer_id_small }
+    printnodePrinters: null,     // [] from /printnode/printers
+    settingsSaving: false,
   };
   function setLabelSize(v) { state.labelSize = v; localStorage.setItem('labelSize', v); }
 
@@ -150,6 +153,7 @@
         : state.view === 'receive' ? ReceiveView()
         : state.view === 'inventory' ? InventoryView()
         : state.view === 'print' ? PrintView()
+        : state.view === 'settings' ? SettingsView()
         : h('div', {}, 'Not found')
       ),
       state.pendingMatch ? ConfirmSkuModal() : null,
@@ -184,6 +188,7 @@
           Tab('receive', 'Receive', 'barcode'),
           Tab('inventory', 'Inventory', 'warehouse'),
           Tab('print', 'Print Queue', 'print'),
+          Tab('settings', 'Settings', 'gear'),
         ),
         h('div', { class: 'ml-auto flex items-center gap-3' },
           state.activeManifest ? h('div', { class: 'text-xs text-slate-400 hidden md:flex items-center gap-2' },
@@ -220,7 +225,40 @@
     else if (v === 'receive') refreshManifests().then(refreshActiveManifest).then(render);
     else if (v === 'inventory') refreshInventory().then(render);
     else if (v === 'print') refreshPrint().then(render);
+    else if (v === 'settings') refreshSettings().then(render);
     render();
+  }
+
+  // ───────── Settings ─────────
+  async function refreshSettings() {
+    try {
+      state.printSettings = await api.get('/print/settings');
+    } catch (e) {
+      console.error(e);
+      toast('Failed to load settings: ' + e.message, 'err');
+    }
+  }
+  async function refreshPrintnodePrinters() {
+    try {
+      const r = await api.get('/print/printnode/printers');
+      state.printnodePrinters = r.printers || [];
+    } catch (e) {
+      state.printnodePrinters = [];
+      toast('PrintNode: ' + (e.response?.data?.error || e.message), 'err');
+    }
+  }
+  async function saveSettings(patch) {
+    state.settingsSaving = true; render();
+    try {
+      await api.post('/print/settings', patch);
+      await refreshSettings();
+      toast('Settings saved', 'ok');
+    } catch (e) {
+      toast('Save failed: ' + (e.response?.data?.error || e.message), 'err');
+    } finally {
+      state.settingsSaving = false;
+      render();
+    }
   }
 
   // ───────── Dashboard ─────────
@@ -1075,17 +1113,21 @@
       ));
     }
 
-    // Render both QR codes after DOM insertion
+    // Render both QR codes after DOM insertion (uses QRious library)
     setTimeout(() => {
       const mainCanvas = document.getElementById(mainQrId);
       const imeiCanvas = document.getElementById(imeiQrId);
-      if (mainCanvas && window.QRCode) {
-        const payload = JSON.stringify({ uuid: p.uuid, sku: p.sku, imei: p.imei });
-        QRCode.toCanvas(mainCanvas, payload, { width: mainQrPx, margin: 1, color: { dark: '#000', light: '#fff' } });
+      if (!window.QRious) {
+        console.error('QRious library not loaded');
+        return;
       }
-      if (imeiCanvas && window.QRCode) {
+      if (mainCanvas) {
+        const payload = JSON.stringify({ uuid: p.uuid, sku: p.sku, imei: p.imei });
+        new QRious({ element: mainCanvas, value: payload, size: mainQrPx, level: 'M', background: '#fff', foreground: '#000' });
+      }
+      if (imeiCanvas) {
         // IMEI-only QR — plain text so a basic IMEI-only barcode scanner reads it cleanly
-        QRCode.toCanvas(imeiCanvas, p.imei, { width: imeiQrPx, margin: 1, color: { dark: '#000', light: '#fff' } });
+        new QRious({ element: imeiCanvas, value: p.imei, size: imeiQrPx, level: 'M', background: '#fff', foreground: '#000' });
       }
     }, 30);
     return wrap;
@@ -1229,6 +1271,188 @@
     }, 200);
   }
 
+  // ───────── Settings view ─────────
+  function SettingsView() {
+    const s = state.printSettings;
+    if (!s) {
+      return h('div', { class: 'card p-10 text-center text-slate-400' },
+        h('i', { class: 'fas fa-spinner fa-spin text-2xl mb-3' }),
+        h('div', {}, 'Loading settings…')
+      );
+    }
+
+    const ModeCard = (mode, title, subtitle, icon) => h('label', {
+      class: 'card p-4 cursor-pointer border-2 transition ' +
+        (s.print_mode === mode ? 'border-cyan-500/60 bg-cyan-500/5' : 'border-slate-800 hover:border-slate-700'),
+    },
+      h('div', { class: 'flex items-start gap-3' },
+        h('input', {
+          type: 'radio', name: 'print-mode', value: mode,
+          checked: s.print_mode === mode ? 'checked' : null,
+          class: 'mt-1 accent-cyan-500',
+          onchange: () => saveSettings({ print_mode: mode }),
+        }),
+        h('div', { class: 'flex-1' },
+          h('div', { class: 'flex items-center gap-2 mb-1' },
+            h('i', { class: `fas fa-${icon} text-cyan-300` }),
+            h('div', { class: 'font-semibold' }, title)
+          ),
+          h('div', { class: 'text-xs text-slate-400 leading-relaxed' }, subtitle)
+        )
+      )
+    );
+
+    return h('div', { class: 'space-y-6 max-w-3xl' },
+      h('div', {},
+        h('h1', { class: 'text-2xl font-bold' }, 'Settings'),
+        h('p', { class: 'text-slate-400 text-sm' }, 'Configure how labels reach your physical DYMO LabelWriter.')
+      ),
+
+      // Print mode selector
+      h('div', { class: 'space-y-3' },
+        h('div', { class: 'text-sm font-semibold text-slate-300 uppercase tracking-wider' }, 'Print mode'),
+        h('div', { class: 'grid grid-cols-1 md:grid-cols-3 gap-3' },
+          ModeCard('browser', 'Browser Print',
+            'Opens a print dialog with the label sized to real DYMO dimensions (50×30 mm or 32×57 mm). Use your OS print queue / DYMO Web Service. Easiest to set up — no extra software needed beyond the DYMO driver.',
+            'window-restore'),
+          ModeCard('printnode', 'PrintNode (cloud)',
+            'Server-side dispatch via the PrintNode REST API. Install the PrintNode agent on the warehouse PC and the printer becomes reachable from this app — no operator interaction required.',
+            'cloud-arrow-up'),
+          ModeCard('manual', 'Manual / Off',
+            'Don\'t actually print — just mark jobs as sent. Useful if you print labels via another path or during testing.',
+            'hand'),
+        )
+      ),
+
+      // PrintNode config
+      s.print_mode === 'printnode' ? PrintNodeConfig(s) : null,
+
+      // Browser-print help
+      s.print_mode === 'browser' ? h('div', { class: 'card p-5 space-y-3' },
+        h('div', { class: 'flex items-center gap-2 text-cyan-300 font-semibold' },
+          h('i', { class: 'fas fa-circle-info' }),
+          'Browser Print setup'
+        ),
+        h('ol', { class: 'list-decimal list-inside text-sm text-slate-300 space-y-1.5' },
+          h('li', {}, 'Install the DYMO LabelWriter driver on the workstation that runs the browser.'),
+          h('li', {}, 'Plug in the DYMO LW550 / LW450 / etc. via USB. Make sure it shows up in your OS Printers list.'),
+          h('li', {}, 'Make sure the loaded label stock matches the selected size in the topbar (DYMO 50×30 or DYMO 32×57).'),
+          h('li', {}, 'Allow pop-ups for this site — each "Send" button opens a print window.'),
+          h('li', {}, 'Click Send on a print job; in the print dialog, choose the DYMO printer and click Print.'),
+        ),
+        h('div', { class: 'text-xs text-slate-500 mt-2' },
+          h('i', { class: 'fas fa-lightbulb mr-1' }),
+          'Tip: in the print dialog, set "Margins: None" and "Scale: 100%" to avoid distortion. Modern browsers honour the @page size embedded in the label HTML.'
+        )
+      ) : null,
+
+      // Manual help
+      s.print_mode === 'manual' ? h('div', { class: 'card p-5' },
+        h('div', { class: 'text-sm text-slate-300' },
+          h('i', { class: 'fas fa-circle-info text-cyan-300 mr-2' }),
+          'In manual mode the "Send" button only marks the job as printed in the database — nothing actually goes to a printer. Use this for testing the receiving workflow without spending labels.'
+        )
+      ) : null,
+    );
+  }
+
+  function PrintNodeConfig(s) {
+    const apiKeyInput = h('input', {
+      type: 'password',
+      class: 'input w-full mono text-xs',
+      placeholder: s.printnode_api_key_set ? '••••••••••• (configured — leave blank to keep)' : 'Paste your PrintNode API key',
+      id: 'printnode-api-key',
+    });
+    const printerSelect = (which, current) => {
+      if (!state.printnodePrinters) {
+        return h('div', { class: 'text-xs text-slate-500' },
+          h('button', {
+            class: 'btn btn-ghost text-xs',
+            onclick: async () => { await refreshPrintnodePrinters(); render(); },
+          }, h('i', { class: 'fas fa-rotate' }), 'Load printers from PrintNode')
+        );
+      }
+      if (state.printnodePrinters.length === 0) {
+        return h('div', { class: 'text-xs text-amber-400' }, 'No printers reported by PrintNode — is the agent running on the warehouse PC?');
+      }
+      return h('select', {
+        class: 'input w-full text-sm',
+        onchange: (e) => {
+          const val = e.target.value === '' ? null : Number(e.target.value);
+          const patch = which === 'large' ? { printnode_printer_id_large: val } : { printnode_printer_id_small: val };
+          saveSettings(patch);
+        },
+      },
+        h('option', { value: '' }, '— select printer —'),
+        state.printnodePrinters.map(p => h('option', {
+          value: p.id,
+          selected: current === p.id ? 'selected' : null,
+        }, `#${p.id} · ${p.name}${p.computer?.name ? ' (' + p.computer.name + ')' : ''}`))
+      );
+    };
+
+    return h('div', { class: 'card p-5 space-y-4' },
+      h('div', { class: 'flex items-center gap-2 text-cyan-300 font-semibold' },
+        h('i', { class: 'fas fa-cloud' }),
+        'PrintNode configuration'
+      ),
+      h('div', { class: 'text-xs text-slate-400' },
+        'Sign up at ',
+        h('a', { href: 'https://www.printnode.com/', target: '_blank', class: 'text-cyan-400 underline' }, 'printnode.com'),
+        ', install the PrintNode agent on the warehouse PC, plug in the DYMO printer, then paste the API key here.'
+      ),
+
+      // API key
+      h('div', { class: 'space-y-1.5' },
+        h('label', { class: 'text-xs font-semibold text-slate-300 uppercase tracking-wider' }, 'API key'),
+        h('div', { class: 'flex gap-2' },
+          apiKeyInput,
+          h('button', {
+            class: 'btn btn-primary text-xs whitespace-nowrap',
+            disabled: state.settingsSaving ? 'disabled' : null,
+            onclick: async () => {
+              const v = apiKeyInput.value.trim();
+              if (!v) { toast('Enter an API key first (or click Clear to remove)', 'warn'); return; }
+              await saveSettings({ printnode_api_key: v });
+              apiKeyInput.value = '';
+              state.printnodePrinters = null; // force reload
+            },
+          }, h('i', { class: 'fas fa-save' }), 'Save key'),
+          s.printnode_api_key_set ? h('button', {
+            class: 'btn btn-ghost text-xs',
+            onclick: async () => {
+              if (!confirm('Clear stored PrintNode API key?')) return;
+              await saveSettings({ printnode_api_key: null });
+              state.printnodePrinters = null;
+            },
+          }, 'Clear') : null
+        ),
+        s.printnode_api_key_set
+          ? h('div', { class: 'text-[11px] text-green-400' }, h('i', { class: 'fas fa-check mr-1' }), 'API key is configured')
+          : h('div', { class: 'text-[11px] text-amber-400' }, h('i', { class: 'fas fa-triangle-exclamation mr-1' }), 'No API key on file — PrintNode mode will fail')
+      ),
+
+      // Printer selection
+      s.printnode_api_key_set ? h('div', { class: 'space-y-3 pt-2 border-t border-slate-800' },
+        h('div', { class: 'flex items-center justify-between' },
+          h('div', { class: 'text-xs font-semibold text-slate-300 uppercase tracking-wider' }, 'Printer mapping'),
+          h('button', {
+            class: 'btn btn-ghost text-xs',
+            onclick: async () => { state.printnodePrinters = null; render(); await refreshPrintnodePrinters(); render(); },
+          }, h('i', { class: 'fas fa-rotate' }), 'Reload printers')
+        ),
+        h('div', { class: 'space-y-1.5' },
+          h('label', { class: 'text-xs text-slate-400' }, 'DYMO 50×30 mm (large label)'),
+          printerSelect('large', s.printnode_printer_id_large)
+        ),
+        h('div', { class: 'space-y-1.5' },
+          h('label', { class: 'text-xs text-slate-400' }, 'DYMO 32×57 mm (small label)'),
+          printerSelect('small', s.printnode_printer_id_small)
+        ),
+      ) : null
+    );
+  }
+
   // ───────── Print queue ─────────
   function PrintView() {
     return h('div', { class: 'space-y-5' },
@@ -1263,15 +1487,62 @@
     );
   }
   async function sendPrint(id) {
-    await api.post(`/print/send/${id}`);
-    toast('Label sent to printer', 'ok');
-    await refreshPrint(); render();
+    try {
+      const r = await api.post(`/print/send/${id}?size=${state.labelSize}`);
+      if (r.mode === 'browser') {
+        const win = window.open(r.url, '_blank', 'width=720,height=520');
+        if (!win) {
+          toast('Pop-up blocked — please allow pop-ups for this site', 'err', 4000);
+          return;
+        }
+        toast('Print window opened — review and confirm in the dialog', 'ok');
+      } else if (r.mode === 'printnode') {
+        toast(`Label sent to PrintNode (job #${r.printnode_job_id})`, 'ok');
+        await refreshPrint(); render();
+      } else {
+        toast('Label sent', 'ok');
+        await refreshPrint(); render();
+      }
+    } catch (e) {
+      toast('Send failed: ' + (e.response?.data?.error || e.message), 'err', 4000);
+    }
   }
   async function sendAllPrint() {
-    const r = await api.post('/print/send-all');
-    toast(`Sent ${r.sent} labels`, 'ok');
-    await refreshPrint(); render();
+    try {
+      const r = await api.post(`/print/send-all?size=${state.labelSize}`);
+      if (r.mode === 'browser') {
+        const win = window.open(r.url, '_blank', 'width=720,height=520');
+        if (!win) {
+          toast('Pop-up blocked — please allow pop-ups for this site', 'err', 4000);
+          return;
+        }
+        toast(`Print window opened for ${r.count} labels`, 'ok');
+      } else if (r.mode === 'printnode') {
+        toast(`Sent ${r.sent} labels to PrintNode`, 'ok');
+        await refreshPrint(); render();
+      } else {
+        toast(`Sent ${r.sent || 0} labels`, 'ok');
+        await refreshPrint(); render();
+      }
+    } catch (e) {
+      toast('Send all failed: ' + (e.response?.data?.error || e.message), 'err', 4000);
+    }
   }
+
+  // Listen for the print window telling us labels have been printed
+  window.addEventListener('message', async (ev) => {
+    if (!ev.data || ev.data.type !== 'labels-printed') return;
+    const ids = Array.isArray(ev.data.ids) ? ev.data.ids : [];
+    if (!ids.length) return;
+    try {
+      await api.post('/print/mark-sent-batch', { ids });
+      if (state.view === 'print') { await refreshPrint(); render(); }
+      else { await refreshStats(); }
+      toast(`Marked ${ids.length} label${ids.length === 1 ? '' : 's'} as printed`, 'ok');
+    } catch (e) {
+      console.error('mark-sent-batch failed', e);
+    }
+  });
 
   // ───────── Boot ─────────
   document.addEventListener('keydown', (e) => {

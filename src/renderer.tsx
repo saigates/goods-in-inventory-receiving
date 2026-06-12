@@ -14,7 +14,7 @@ export const renderer = jsxRenderer(({ children }) => {
         <link href="/static/style.css" rel="stylesheet" />
         <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-        <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
       </head>
       <body class="bg-slate-950 text-slate-100 font-sans antialiased">{children}</body>
     </html>

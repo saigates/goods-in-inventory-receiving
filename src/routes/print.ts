@@ -3,7 +3,196 @@ import type { Bindings } from '../types'
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-// Pending print queue (what would be sent to PrintNode / QZ Tray)
+type Settings = {
+  print_mode: 'browser' | 'printnode' | 'manual'
+  printnode_api_key: string | null
+  printnode_printer_id_large: number | null
+  printnode_printer_id_small: number | null
+}
+
+async function loadSettings(c: any): Promise<Settings> {
+  const row = await c.env.DB.prepare(
+    'SELECT print_mode, printnode_api_key, printnode_printer_id_large, printnode_printer_id_small FROM app_settings WHERE id = 1'
+  ).first<Settings>()
+  return row || { print_mode: 'browser', printnode_api_key: null, printnode_printer_id_large: null, printnode_printer_id_small: null }
+}
+
+// Build a printable HTML for a single label (used by browser-print mode)
+function labelHtml(payload: any, size: 'large' | 'small'): string {
+  const isSmall = size === 'small'
+  // Real label dimensions in mm
+  const widthMm = isSmall ? 32 : 50
+  const heightMm = isSmall ? 57 : 30
+  const subtitle = [payload.brand, payload.model].filter(Boolean).join(' ')
+  const variant = [payload.capacity, payload.color].filter(Boolean).join(' · ')
+
+  // Note: data is escaped at the call site via JSON.stringify into a JS const.
+  // QR codes are rendered client-side with QRious so this HTML can be used
+  // both by window.print() and by PrintNode (which would re-render server-side
+  // — for that path we send raw text + QR-as-PNG instead).
+  return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<title>Label ${payload.uuid}</title>
+<script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
+<style>
+  @page { size: ${widthMm}mm ${heightMm}mm; margin: 0; }
+  html, body { margin: 0; padding: 0; background: #fff; }
+  * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .label {
+    width: ${widthMm}mm; height: ${heightMm}mm;
+    padding: 1.2mm; color: #000; font-family: Arial, Helvetica, sans-serif;
+    display: ${isSmall ? 'flex' : 'grid'};
+    ${isSmall
+      ? 'flex-direction: column; gap: 0.4mm;'
+      : 'grid-template-columns: 1fr 11mm; gap: 1mm;'}
+  }
+  .mono { font-family: 'Courier New', monospace; }
+  ${isSmall ? `
+  .h { display:flex; justify-content:space-between; align-items:center; border-bottom: 0.15mm dashed #888; padding-bottom: 0.4mm; }
+  .brand { font-size: 1.6mm; font-weight: 700; letter-spacing: 0.3mm; color: #555; }
+  .grade { font-size: 2.4mm; font-weight: 800; padding: 0.2mm 0.8mm; border: 0.25mm solid #000; border-radius: 0.4mm; }
+  .sku   { font-size: 3.2mm; font-weight: 800; text-align: center; line-height: 1.05; word-break: break-all; margin-top: 0.3mm; }
+  .sub   { font-size: 1.8mm; font-weight: 600; text-align: center; }
+  .var   { font-size: 1.6mm; text-align: center; color: #444; }
+  .qr-main   { display:flex; justify-content:center; margin: 0.3mm 0; }
+  .qr-cap    { font-size: 1.2mm; text-align:center; color: #666; letter-spacing: 0.2mm; }
+  .imei-blk  { border-top: 0.15mm dashed #888; padding-top: 0.4mm; display:flex; flex-direction:column; align-items:center; gap:0.2mm; }
+  .imei-num  { font-size: 2mm; font-weight: 700; }
+  .imei-cap  { font-size: 1.2mm; color: #666; letter-spacing: 0.2mm; }
+  .foot      { border-top: 0.15mm dashed #888; padding-top: 0.3mm; margin-top: auto; }
+  .row       { display:flex; justify-content:space-between; font-size: 1.5mm; }
+  ` : `
+  .left      { display:flex; flex-direction:column; justify-content:space-between; min-width: 0; }
+  .sku       { font-size: 4mm; font-weight: 800; letter-spacing: 0.1mm; line-height: 1.05; word-break: break-all; }
+  .sub       { font-size: 1.8mm; color: #444; }
+  .imei-blk  { display:flex; align-items:center; gap:1.2mm; border-top: 0.15mm dashed #888; padding-top: 0.8mm; }
+  .imei-side { display:flex; flex-direction:column; justify-content:center; }
+  .imei-cap  { font-size: 1.4mm; font-weight: 700; letter-spacing: 0.3mm; color: #666; }
+  .imei-num  { font-size: 2.4mm; font-weight: 700; }
+  .right     { display:flex; flex-direction:column; align-items:center; justify-content:space-between; border-left: 0.15mm dashed #888; padding-left: 1mm; }
+  .uuid      { font-size: 1.6mm; font-weight: 600; }
+  .grade     { font-size: 2.6mm; font-weight: 800; padding: 0.2mm 1mm; border: 0.25mm solid #000; border-radius: 0.4mm; }
+  `}
+</style></head>
+<body>
+<div class="label">
+${isSmall ? `
+  <div class="h">
+    <div class="brand">GOODS IN</div>
+    ${payload.grade ? `<div class="grade">${payload.grade}</div>` : ''}
+  </div>
+  <div class="sku">${payload.sku || ''}</div>
+  ${subtitle ? `<div class="sub">${subtitle}</div>` : ''}
+  ${variant ? `<div class="var">${variant}</div>` : ''}
+  <div class="qr-main"><canvas id="qmain"></canvas></div>
+  <div class="imei-blk">
+    <canvas id="qimei"></canvas>
+    <div class="imei-num mono">${payload.imei}</div>
+    <div class="imei-cap">IMEI</div>
+  </div>
+  <div class="foot"><div class="row"><span>UUID</span><span class="mono">${payload.uuid}</span></div></div>
+` : `
+  <div class="left">
+    <div>
+      <div class="sku">${payload.sku || ''}</div>
+      <div class="sub">${[payload.brand, payload.model, payload.capacity].filter(Boolean).join(' · ')}</div>
+    </div>
+    <div class="imei-blk">
+      <canvas id="qimei"></canvas>
+      <div class="imei-side">
+        <div class="imei-cap">IMEI</div>
+        <div class="imei-num mono">${payload.imei}</div>
+      </div>
+    </div>
+  </div>
+  <div class="right">
+    <canvas id="qmain"></canvas>
+    <div class="uuid mono">${payload.uuid}</div>
+    ${payload.grade ? `<div class="grade">${payload.grade}</div>` : ''}
+  </div>
+`}
+</div>
+<script>
+  (function(){
+    const payload = ${JSON.stringify(JSON.stringify({ uuid: payload.uuid, sku: payload.sku, imei: payload.imei }))};
+    const imei = ${JSON.stringify(payload.imei)};
+    const mainPx = ${isSmall ? 105 : 95};
+    const imeiPx = ${isSmall ? 90 : 70};
+    function render() {
+      if (!window.QRious) { setTimeout(render, 50); return; }
+      new QRious({ element: document.getElementById('qmain'), value: payload, size: mainPx, level: 'M' });
+      new QRious({ element: document.getElementById('qimei'), value: imei, size: imeiPx, level: 'M' });
+      // Give a moment for canvas paint, then trigger print
+      setTimeout(() => { window.print(); }, 200);
+    }
+    render();
+    window.addEventListener('afterprint', () => { setTimeout(() => window.close(), 100); });
+  })();
+</script>
+</body></html>`
+}
+
+// ───────── Settings ─────────
+app.get('/settings', async (c) => {
+  const s = await loadSettings(c)
+  // Don't return the raw API key — return whether it's set
+  return c.json({
+    print_mode: s.print_mode,
+    printnode_api_key_set: !!s.printnode_api_key,
+    printnode_printer_id_large: s.printnode_printer_id_large,
+    printnode_printer_id_small: s.printnode_printer_id_small,
+  })
+})
+
+app.post('/settings', async (c) => {
+  const body = await c.req.json<{
+    print_mode?: 'browser' | 'printnode' | 'manual'
+    printnode_api_key?: string | null  // null = clear, undefined = unchanged
+    printnode_printer_id_large?: number | null
+    printnode_printer_id_small?: number | null
+  }>()
+
+  const cur = await loadSettings(c)
+  const next: Settings = {
+    print_mode: body.print_mode ?? cur.print_mode,
+    printnode_api_key:
+      body.printnode_api_key === undefined ? cur.printnode_api_key : body.printnode_api_key,
+    printnode_printer_id_large:
+      body.printnode_printer_id_large === undefined ? cur.printnode_printer_id_large : body.printnode_printer_id_large,
+    printnode_printer_id_small:
+      body.printnode_printer_id_small === undefined ? cur.printnode_printer_id_small : body.printnode_printer_id_small,
+  }
+
+  await c.env.DB.prepare(`
+    UPDATE app_settings
+    SET print_mode = ?, printnode_api_key = ?, printnode_printer_id_large = ?, printnode_printer_id_small = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = 1
+  `).bind(
+    next.print_mode,
+    next.printnode_api_key,
+    next.printnode_printer_id_large,
+    next.printnode_printer_id_small
+  ).run()
+
+  return c.json({ ok: true })
+})
+
+// List PrintNode printers (proxy that calls the PrintNode API so we don't
+// leak the API key into the browser). Useful for the settings dropdown.
+app.get('/printnode/printers', async (c) => {
+  const s = await loadSettings(c)
+  if (!s.printnode_api_key) return c.json({ error: 'PrintNode API key not configured' }, 400)
+  const r = await fetch('https://api.printnode.com/printers', {
+    headers: {
+      Authorization: 'Basic ' + btoa(s.printnode_api_key + ':'),
+    },
+  })
+  if (!r.ok) return c.json({ error: `PrintNode error ${r.status}` }, 502)
+  const printers = await r.json()
+  return c.json({ printers })
+})
+
+// ───────── Queue ─────────
 app.get('/queue', async (c) => {
   const { results } = await c.env.DB.prepare(`
     SELECT pj.*, rd.uuid, rd.imei, rd.sku, rd.brand, rd.model, rd.capacity, rd.color, rd.grade
@@ -16,39 +205,7 @@ app.get('/queue', async (c) => {
   return c.json({ queue: results })
 })
 
-// "Send" a job — in production this would POST to PrintNode / QZ Tray.
-// Here we just flip status to 'sent' and stamp received_devices.label_printed_at.
-app.post('/send/:id', async (c) => {
-  const id = Number(c.req.param('id'))
-  const job = await c.env.DB.prepare('SELECT * FROM print_jobs WHERE id = ?').bind(id).first<{
-    id: number
-    received_device_id: number
-    status: string
-  }>()
-  if (!job) return c.json({ error: 'Not found' }, 404)
-  if (job.status === 'sent') return c.json({ ok: true, already: true })
-
-  await c.env.DB.batch([
-    c.env.DB.prepare("UPDATE print_jobs SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?").bind(id),
-    c.env.DB.prepare("UPDATE received_devices SET label_printed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(job.received_device_id),
-  ])
-  return c.json({ ok: true })
-})
-
-// Send all queued (bulk "release print spooler")
-app.post('/send-all', async (c) => {
-  const { results } = await c.env.DB.prepare(
-    "SELECT id, received_device_id FROM print_jobs WHERE status = 'queued'"
-  ).all<{ id: number; received_device_id: number }>()
-  const stmts = results.flatMap((j) => [
-    c.env.DB.prepare("UPDATE print_jobs SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?").bind(j.id),
-    c.env.DB.prepare("UPDATE received_devices SET label_printed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(j.received_device_id),
-  ])
-  if (stmts.length) await c.env.DB.batch(stmts)
-  return c.json({ ok: true, sent: results.length })
-})
-
-// Fetch a print job payload (for the label preview popup)
+// Fetch a single job (used by browser-print mode to retrieve payload)
 app.get('/job/:id', async (c) => {
   const id = Number(c.req.param('id'))
   const job = await c.env.DB.prepare(`
@@ -59,6 +216,302 @@ app.get('/job/:id', async (c) => {
   `).bind(id).first()
   if (!job) return c.json({ error: 'Not found' }, 404)
   return c.json({ job })
+})
+
+// Stand-alone HTML page for a label (browser-print path).
+// The page renders the label, calls window.print() automatically, and closes.
+app.get('/label/:id', async (c) => {
+  const id = Number(c.req.param('id'))
+  const size = (c.req.query('size') as 'large' | 'small') || 'large'
+  const row = await c.env.DB.prepare(`
+    SELECT pj.payload_json, rd.uuid, rd.imei, rd.sku, rd.brand, rd.model, rd.capacity, rd.color, rd.grade
+    FROM print_jobs pj
+    JOIN received_devices rd ON rd.id = pj.received_device_id
+    WHERE pj.id = ?
+  `).bind(id).first<any>()
+  if (!row) return c.text('Not found', 404)
+  const payload = {
+    uuid: row.uuid, imei: row.imei, sku: row.sku,
+    brand: row.brand, model: row.model, capacity: row.capacity,
+    color: row.color, grade: row.grade,
+  }
+  return c.html(labelHtml(payload, size))
+})
+
+// Mark a job as sent (called by the browser-print path after it's dispatched
+// the label to window.print, or by the operator when using manual mode).
+app.post('/mark-sent/:id', async (c) => {
+  const id = Number(c.req.param('id'))
+  const job = await c.env.DB.prepare('SELECT * FROM print_jobs WHERE id = ?').bind(id).first<{
+    id: number; received_device_id: number; status: string
+  }>()
+  if (!job) return c.json({ error: 'Not found' }, 404)
+  if (job.status === 'sent') return c.json({ ok: true, already: true })
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE print_jobs SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?").bind(id),
+    c.env.DB.prepare("UPDATE received_devices SET label_printed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(job.received_device_id),
+  ])
+  return c.json({ ok: true })
+})
+
+// Server-driven send. Behaviour depends on the configured print_mode:
+//   - 'browser' / 'manual': just returns { mode: 'browser', url: '/api/print/label/:id?size=...' }
+//                           and the frontend opens that URL in a print window.
+//   - 'printnode': server calls PrintNode API directly and the job is sent
+//                  to a real DYMO LabelWriter on the warehouse PC.
+app.post('/send/:id', async (c) => {
+  const id = Number(c.req.param('id'))
+  const size = (c.req.query('size') as 'large' | 'small') || 'large'
+  const s = await loadSettings(c)
+
+  const job = await c.env.DB.prepare(`
+    SELECT pj.id, pj.received_device_id, pj.status, pj.payload_json,
+           rd.uuid, rd.imei, rd.sku, rd.brand, rd.model, rd.capacity, rd.color, rd.grade
+    FROM print_jobs pj
+    JOIN received_devices rd ON rd.id = pj.received_device_id
+    WHERE pj.id = ?
+  `).bind(id).first<any>()
+  if (!job) return c.json({ error: 'Not found' }, 404)
+
+  if (s.print_mode === 'browser' || s.print_mode === 'manual') {
+    // Frontend will open the label HTML in a window and trigger print.
+    return c.json({ ok: true, mode: 'browser', url: `/api/print/label/${id}?size=${size}` })
+  }
+
+  if (s.print_mode === 'printnode') {
+    if (!s.printnode_api_key) return c.json({ error: 'PrintNode API key not configured' }, 400)
+    const printerId = size === 'small' ? s.printnode_printer_id_small : s.printnode_printer_id_large
+    if (!printerId) return c.json({ error: `PrintNode printer for size '${size}' not configured` }, 400)
+
+    // Render the label HTML and send to PrintNode as raw_uri pointing at our endpoint.
+    // PrintNode supports content types: pdf_uri, pdf_base64, raw_uri, raw_base64.
+    // Our endpoint returns HTML that PrintNode renders via headless Chrome.
+    // (Alternatively you can pre-render a PDF — see README.)
+    const labelUrl = new URL(c.req.url)
+    labelUrl.pathname = `/api/print/label/${id}`
+    labelUrl.search = `?size=${size}`
+
+    const pnResp = await fetch('https://api.printnode.com/printjobs', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Basic ' + btoa(s.printnode_api_key + ':'),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        printerId,
+        title: `Goods In · ${job.sku} · ${job.imei}`,
+        contentType: 'pdf_uri',
+        content: labelUrl.toString(),
+        source: 'goods-in-app',
+      }),
+    })
+
+    if (!pnResp.ok) {
+      const errText = await pnResp.text()
+      return c.json({ error: `PrintNode rejected job: ${pnResp.status} ${errText}` }, 502)
+    }
+    const pnJobId = await pnResp.json()
+
+    await c.env.DB.batch([
+      c.env.DB.prepare("UPDATE print_jobs SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?").bind(id),
+      c.env.DB.prepare("UPDATE received_devices SET label_printed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(job.received_device_id),
+    ])
+    return c.json({ ok: true, mode: 'printnode', printnode_job_id: pnJobId })
+  }
+
+  return c.json({ error: `Unknown print_mode: ${s.print_mode}` }, 500)
+})
+
+// Bulk send. For browser-print mode, the frontend will open ONE print window
+// containing all queued labels stacked — much faster than spawning N windows.
+app.post('/send-all', async (c) => {
+  const s = await loadSettings(c)
+  const { results } = await c.env.DB.prepare(
+    "SELECT id, received_device_id FROM print_jobs WHERE status = 'queued' ORDER BY id ASC"
+  ).all<{ id: number; received_device_id: number }>()
+
+  if (results.length === 0) return c.json({ ok: true, sent: 0 })
+
+  if (s.print_mode === 'browser' || s.print_mode === 'manual') {
+    const ids = results.map(r => r.id).join(',')
+    return c.json({
+      ok: true,
+      mode: 'browser',
+      url: `/api/print/labels?ids=${ids}`,
+      count: results.length,
+    })
+  }
+
+  if (s.print_mode === 'printnode') {
+    // For simplicity, kick off jobs sequentially. They are sent to PrintNode
+    // independently so the warehouse printer queues them in order.
+    let sent = 0
+    for (const r of results) {
+      const resp = await fetch(new URL(`/api/print/send/${r.id}`, c.req.url).toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (resp.ok) sent++
+    }
+    return c.json({ ok: true, mode: 'printnode', sent })
+  }
+
+  return c.json({ error: `Unknown print_mode: ${s.print_mode}` }, 500)
+})
+
+// Bulk label HTML — all jobs in a single printable page (browser-print mode).
+app.get('/labels', async (c) => {
+  const idsParam = c.req.query('ids') || ''
+  const size = (c.req.query('size') as 'large' | 'small') || 'large'
+  const ids = idsParam.split(',').map(Number).filter(Boolean)
+  if (!ids.length) return c.text('No ids', 400)
+
+  // Fetch one-by-one (D1 has no easy IN-clause with ?n binding here)
+  const rows: any[] = []
+  for (const id of ids) {
+    const row = await c.env.DB.prepare(`
+      SELECT pj.id, rd.uuid, rd.imei, rd.sku, rd.brand, rd.model, rd.capacity, rd.color, rd.grade
+      FROM print_jobs pj JOIN received_devices rd ON rd.id = pj.received_device_id
+      WHERE pj.id = ?
+    `).bind(id).first()
+    if (row) rows.push(row)
+  }
+
+  // Build a multi-label HTML — each label is one @page in the print preview
+  const isSmall = size === 'small'
+  const widthMm = isSmall ? 32 : 50
+  const heightMm = isSmall ? 57 : 30
+
+  const labels = rows.map((row, idx) => {
+    const subtitle = [row.brand, row.model].filter(Boolean).join(' ')
+    const variant = [row.capacity, row.color].filter(Boolean).join(' · ')
+    return `
+    <div class="label" data-uuid="${row.uuid}" data-imei="${row.imei}">
+      ${isSmall ? `
+        <div class="h">
+          <div class="brand">GOODS IN</div>
+          ${row.grade ? `<div class="grade">${row.grade}</div>` : ''}
+        </div>
+        <div class="sku">${row.sku || ''}</div>
+        ${subtitle ? `<div class="sub">${subtitle}</div>` : ''}
+        ${variant ? `<div class="var">${variant}</div>` : ''}
+        <div class="qr-main"><canvas id="qmain-${idx}"></canvas></div>
+        <div class="imei-blk">
+          <canvas id="qimei-${idx}"></canvas>
+          <div class="imei-num mono">${row.imei}</div>
+          <div class="imei-cap">IMEI</div>
+        </div>
+        <div class="foot"><div class="row"><span>UUID</span><span class="mono">${row.uuid}</span></div></div>
+      ` : `
+        <div class="left">
+          <div>
+            <div class="sku">${row.sku || ''}</div>
+            <div class="sub">${[row.brand, row.model, row.capacity].filter(Boolean).join(' · ')}</div>
+          </div>
+          <div class="imei-blk">
+            <canvas id="qimei-${idx}"></canvas>
+            <div class="imei-side">
+              <div class="imei-cap">IMEI</div>
+              <div class="imei-num mono">${row.imei}</div>
+            </div>
+          </div>
+        </div>
+        <div class="right">
+          <canvas id="qmain-${idx}"></canvas>
+          <div class="uuid mono">${row.uuid}</div>
+          ${row.grade ? `<div class="grade">${row.grade}</div>` : ''}
+        </div>
+      `}
+    </div>`
+  }).join('\n')
+
+  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Print ${rows.length} labels</title>
+<script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
+<style>
+  @page { size: ${widthMm}mm ${heightMm}mm; margin: 0; }
+  html, body { margin: 0; padding: 0; background: #fff; }
+  * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .label {
+    width: ${widthMm}mm; height: ${heightMm}mm;
+    page-break-after: always; break-after: page;
+    padding: 1.2mm; color: #000; font-family: Arial, Helvetica, sans-serif;
+    display: ${isSmall ? 'flex' : 'grid'};
+    ${isSmall
+      ? 'flex-direction: column; gap: 0.4mm;'
+      : 'grid-template-columns: 1fr 11mm; gap: 1mm;'}
+  }
+  .label:last-child { page-break-after: auto; break-after: auto; }
+  .mono { font-family: 'Courier New', monospace; }
+  ${isSmall ? `
+  .h { display:flex; justify-content:space-between; align-items:center; border-bottom: 0.15mm dashed #888; padding-bottom: 0.4mm; }
+  .brand { font-size: 1.6mm; font-weight: 700; letter-spacing: 0.3mm; color: #555; }
+  .grade { font-size: 2.4mm; font-weight: 800; padding: 0.2mm 0.8mm; border: 0.25mm solid #000; border-radius: 0.4mm; }
+  .sku   { font-size: 3.2mm; font-weight: 800; text-align: center; line-height: 1.05; word-break: break-all; margin-top: 0.3mm; }
+  .sub   { font-size: 1.8mm; font-weight: 600; text-align: center; }
+  .var   { font-size: 1.6mm; text-align: center; color: #444; }
+  .qr-main   { display:flex; justify-content:center; margin: 0.3mm 0; }
+  .imei-blk  { border-top: 0.15mm dashed #888; padding-top: 0.4mm; display:flex; flex-direction:column; align-items:center; gap:0.2mm; }
+  .imei-num  { font-size: 2mm; font-weight: 700; }
+  .imei-cap  { font-size: 1.2mm; color: #666; letter-spacing: 0.2mm; }
+  .foot      { border-top: 0.15mm dashed #888; padding-top: 0.3mm; margin-top: auto; }
+  .row       { display:flex; justify-content:space-between; font-size: 1.5mm; }
+  ` : `
+  .left      { display:flex; flex-direction:column; justify-content:space-between; min-width: 0; }
+  .sku       { font-size: 4mm; font-weight: 800; letter-spacing: 0.1mm; line-height: 1.05; word-break: break-all; }
+  .sub       { font-size: 1.8mm; color: #444; }
+  .imei-blk  { display:flex; align-items:center; gap:1.2mm; border-top: 0.15mm dashed #888; padding-top: 0.8mm; }
+  .imei-side { display:flex; flex-direction:column; justify-content:center; }
+  .imei-cap  { font-size: 1.4mm; font-weight: 700; letter-spacing: 0.3mm; color: #666; }
+  .imei-num  { font-size: 2.4mm; font-weight: 700; }
+  .right     { display:flex; flex-direction:column; align-items:center; justify-content:space-between; border-left: 0.15mm dashed #888; padding-left: 1mm; }
+  .uuid      { font-size: 1.6mm; font-weight: 600; }
+  .grade     { font-size: 2.6mm; font-weight: 800; padding: 0.2mm 1mm; border: 0.25mm solid #000; border-radius: 0.4mm; }
+  `}
+</style></head>
+<body>
+${labels}
+<script>
+  const rows = ${JSON.stringify(rows.map(r => ({ uuid: r.uuid, sku: r.sku, imei: r.imei })))};
+  const mainPx = ${isSmall ? 105 : 95};
+  const imeiPx = ${isSmall ? 90 : 70};
+  function render() {
+    if (!window.QRious) { setTimeout(render, 50); return; }
+    rows.forEach((r, i) => {
+      const payload = JSON.stringify({ uuid: r.uuid, sku: r.sku, imei: r.imei });
+      new QRious({ element: document.getElementById('qmain-'+i), value: payload, size: mainPx, level: 'M' });
+      new QRious({ element: document.getElementById('qimei-'+i), value: r.imei, size: imeiPx, level: 'M' });
+    });
+    setTimeout(() => { window.print(); }, 300);
+  }
+  render();
+  // Tell the parent window to mark all jobs as sent
+  window.addEventListener('afterprint', () => {
+    if (window.opener && !window.opener.closed) {
+      try { window.opener.postMessage({ type: 'labels-printed', ids: ${JSON.stringify(ids)} }, '*'); } catch(e){}
+    }
+    setTimeout(() => window.close(), 200);
+  });
+</script>
+</body></html>`
+  return c.html(html)
+})
+
+// Mark a batch of jobs as sent (called by browser-print after window.print)
+app.post('/mark-sent-batch', async (c) => {
+  const body = await c.req.json<{ ids: number[] }>()
+  const ids = (body.ids || []).map(Number).filter(Boolean)
+  if (!ids.length) return c.json({ ok: true, sent: 0 })
+
+  const stmts = []
+  for (const id of ids) {
+    const job = await c.env.DB.prepare('SELECT received_device_id, status FROM print_jobs WHERE id = ?').bind(id).first<{ received_device_id: number; status: string }>()
+    if (!job || job.status === 'sent') continue
+    stmts.push(c.env.DB.prepare("UPDATE print_jobs SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?").bind(id))
+    stmts.push(c.env.DB.prepare("UPDATE received_devices SET label_printed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(job.received_device_id))
+  }
+  if (stmts.length) await c.env.DB.batch(stmts)
+  return c.json({ ok: true, sent: stmts.length / 2 })
 })
 
 export default app
