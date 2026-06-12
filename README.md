@@ -32,17 +32,21 @@ A modern, scanner-first web application for the **Goods In** (inbound receiving)
 ### C. Add / Confirm SKU
 - If the manifest's description maps cleanly, the suggested SKU is auto-built using `BRAND-MODELSHORT-CAPACITY-COLOR` (e.g. `SMSG-S24-512-PBK`).
 - Operator can override any field (brand / model / capacity / color / grade) before confirming.
+- **Grade options**: `A+`, `A`, `B+`, `B`, `C+`, `C`, `D`, and **`UG`** (Ungraded / Untested — for devices arriving without a supplier grade or routed straight to QC). `UG` shows up as a violet badge throughout the UI to make ungraded stock easy to spot.
 - Force-add path generates the same SKU shape for off-manifest devices.
 
 ### D. Print Label (PrintNode / QZ Tray ready)
 - On confirm, a print job is queued in the `print_jobs` table with a JSON payload.
-- The label preview pops up briefly showing what was sent to the printer — a real **50×30mm Zebra-style label** with:
+- **Two label formats supported** (toggle in the top bar — preference persists per browser via `localStorage`):
+  - **Zebra 50×30mm** (landscape) — QR + side-by-side metadata. Targets a Zebra ZD420 on the warehouse floor.
+  - **DYMO 32×57mm** (portrait) — stacked layout with a centred QR. Targets a DYMO LabelWriter at the receiving desk.
+- Both labels carry the same data:
   - Internal **UUID** (12-char short code)
   - Clean human-readable **SKU**
   - **IMEI**
-  - Brand · Model · Capacity · Grade
+  - Brand · Model · Capacity · Grade (incl. the new **UG / Ungraded** state)
   - **2D QR code** encoding `{uuid, sku, imei}` (DataMatrix payload-equivalent)
-- The `Print Queue` view shows every queued job, with `Send` / `Send all` buttons. In production the `/api/print/send/:id` endpoint posts the payload to PrintNode or QZ Tray — here it flips the job to `sent` and stamps `received_devices.label_printed_at`.
+- The `Print Queue` view renders the labels in whatever size you've selected, with `Send` / `Send all` buttons. In production the `/api/print/send/:id` endpoint posts the payload to PrintNode or QZ Tray — here it flips the job to `sent` and stamps `received_devices.label_printed_at`.
 
 ### E. Inventory Update
 - A successful confirm writes an immutable `received_devices` row (status `received`, no grade locked-in, no listing flag).
@@ -128,7 +132,7 @@ Printer       ◄── POST /api/print/send/:id     ──► print_jobs.status
 - **Platform**: Cloudflare Pages + Workers
 - **Status**: ✅ Running in sandbox (port 3000 via Wrangler)
 - **Tech Stack**: Hono · TypeScript · Cloudflare D1 · vanilla JS SPA · Tailwind CDN
-- **Last Updated**: 2026-06-12
+- **Last Updated**: 2026-06-12 (added `UG` grade + DYMO 32×57mm label format)
 
 ### Local dev
 ```bash

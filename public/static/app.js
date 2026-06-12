@@ -19,6 +19,7 @@
     return el;
   };
   const fmtDate = (s) => s ? new Date(s.replace(' ', 'T') + 'Z').toLocaleString() : '—';
+  const gradeBadgeClass = (g) => g === 'UG' ? 'badge badge-violet text-[10px]' : 'badge badge-cyan text-[10px]';
 
   // ───────── State ─────────
   const state = {
@@ -37,7 +38,9 @@
     pendingUnrec: null,   // { imei }
     soundOn: true,
     autoPrint: true,
+    labelSize: localStorage.getItem('labelSize') || 'zebra', // 'zebra' (50x30mm) | 'dymo' (32x57mm)
   };
+  function setLabelSize(v) { state.labelSize = v; localStorage.setItem('labelSize', v); }
 
   // ───────── Toast ─────────
   const toastWrap = h('div', { class: 'toast-wrap' });
@@ -187,6 +190,18 @@
             h('span', { class: 'text-cyan-300 font-semibold mono' }, state.activeManifest.reference),
             h('span', { class: 'badge ' + (state.activeManifest.status === 'open' ? 'badge-green' : 'badge-slate') }, state.activeManifest.status)
           ) : null,
+          h('div', { class: 'flex items-center gap-1 bg-slate-900/60 border border-slate-800 rounded-lg p-1', title: 'Label format' },
+            h('button', {
+              class: 'px-2 py-1 rounded-md text-xs font-medium transition ' +
+                (state.labelSize === 'zebra' ? 'bg-cyan-500/20 text-cyan-300' : 'text-slate-400 hover:text-slate-200'),
+              onclick: () => { setLabelSize('zebra'); render(); },
+            }, h('i', { class: 'fas fa-tag mr-1' }), 'Zebra 50×30'),
+            h('button', {
+              class: 'px-2 py-1 rounded-md text-xs font-medium transition ' +
+                (state.labelSize === 'dymo' ? 'bg-indigo-500/20 text-indigo-300' : 'text-slate-400 hover:text-slate-200'),
+              onclick: () => { setLabelSize('dymo'); render(); },
+            }, h('i', { class: 'fas fa-receipt mr-1' }), 'DYMO 32×57'),
+          ),
           h('button', {
             class: 'btn btn-ghost text-xs',
             title: 'Toggle scanner sound',
@@ -716,7 +731,7 @@
                   h('div', { class: 'text-sm font-medium truncate' }, e.description || '(no description)'),
                   h('div', { class: 'text-xs text-slate-400 mono truncate' }, e.imei)
                 ),
-                e.grade ? h('span', { class: 'badge badge-cyan text-[10px]' }, e.grade) : null,
+                e.grade ? h('span', { class: gradeBadgeClass(e.grade) }, e.grade) : null,
                 e.status === 'received'
                   ? h('span', { class: 'badge badge-green text-[10px]' }, 'received')
                   : h('span', { class: 'badge badge-slate text-[10px]' }, 'pending')
@@ -876,7 +891,7 @@
               class: 'input mono',
               onchange: (e) => update('grade', e.target.value),
             },
-              ['','A+','A','B+','B','C+','C','D'].map(o =>
+              ['','A+','A','B+','B','C+','C','D','UG'].map(o =>
                 h('option', { value: o, selected: o === ctx.grade ? 'selected' : null }, o || '— none —'))
             )
           ),
@@ -954,7 +969,7 @@
           h('div', {},
             h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Grade'),
             h('select', { class: 'input mono', onchange: (e) => update('grade', e.target.value) },
-              ['','A+','A','B+','B','C+','C','D'].map(o =>
+              ['','A+','A','B+','B','C+','C','D','UG'].map(o =>
                 h('option', { value: o, selected: o === ctx.grade ? 'selected' : null }, o || '— none —')))
           ),
         ),
@@ -973,8 +988,14 @@
   }
 
   // ───────── Label preview ─────────
+  const LABEL_SIZES = {
+    zebra: { id: 'zebra', name: 'Zebra 50×30mm',  printer: 'Zebra-ZD420-Bay1' },
+    dymo:  { id: 'dymo',  name: 'DYMO 32×57mm',  printer: 'DYMO-LabelWriter-Bay2' },
+  };
+
   function LabelPreviewModal() {
     const lp = state.labelPreview;
+    const sizeInfo = LABEL_SIZES[state.labelSize] || LABEL_SIZES.zebra;
     return h('div', { class: 'modal-backdrop', onclick: () => { state.labelPreview = null; render(); } },
       h('div', { class: 'modal p-6 max-w-md', onclick: (e) => e.stopPropagation() },
         h('div', { class: 'flex items-center justify-between mb-4' },
@@ -983,38 +1004,69 @@
           h('button', { class: 'btn btn-ghost text-xs', onclick: () => { state.labelPreview = null; render(); } },
             h('i', { class: 'fas fa-times' }))
         ),
-        h('div', { class: 'flex justify-center' }, renderLabel(lp.payload, `lbl-${lp.jobId}`)),
+        h('div', { class: 'flex justify-center min-h-[240px] items-center' }, renderLabel(lp.payload, `lbl-${lp.jobId}`, state.labelSize)),
         h('div', { class: 'mt-4 text-center text-xs text-slate-400' },
-          'Zebra-ZD420-Bay1 · Job #', lp.jobId,
+          `${sizeInfo.printer} · ${sizeInfo.name} · Job #${lp.jobId}`,
           h('br'),
           'In production this is sent via PrintNode / QZ Tray to the warehouse printer.')
       )
     );
   }
 
-  function renderLabel(p, canvasId) {
-    const wrap = h('div', { class: 'label-preview' });
-    const qrBox = h('div', { class: 'qr' }, h('canvas', { id: canvasId, width: 100, height: 100 }));
-    const meta = h('div', { class: 'meta' },
-      h('div', {},
-        h('div', { class: 'sku' }, p.sku),
-        h('div', { style: 'font-size:10px;color:#444;margin-top:2px' }, [p.brand, p.model, p.capacity].filter(Boolean).join(' · '))
-      ),
-      h('div', {},
-        h('div', { class: 'row' }, h('span', { style: 'color:#666' }, 'IMEI'), h('span', { class: 'imei' }, p.imei)),
-        h('div', { class: 'row mt-1' }, h('span', { style: 'color:#666' }, 'UUID'), h('span', { class: 'imei' }, p.uuid)),
-        p.grade ? h('div', { class: 'row mt-1' }, h('span', { style: 'color:#666' }, 'Grade'),
-          h('span', { style: 'font-weight:700' }, p.grade)) : null,
-      )
-    );
-    wrap.appendChild(qrBox);
-    wrap.appendChild(meta);
+  function renderLabel(p, canvasId, size) {
+    size = size || state.labelSize || 'zebra';
+    const isDymo = size === 'dymo';
+    const wrap = h('div', { class: 'label-preview ' + (isDymo ? 'label-dymo' : 'label-zebra') });
+    const qrPx = isDymo ? 110 : 100;
+
+    if (isDymo) {
+      // DYMO 32×57mm — portrait orientation (taller than wide), stacked layout
+      // Real ratio 32:57 ≈ 0.561; preview at 200x356
+      const subtitle = [p.brand, p.model].filter(Boolean).join(' ');
+      const variant = [p.capacity, p.color].filter(Boolean).join(' · ');
+      wrap.appendChild(h('div', { class: 'dymo-header' },
+        h('div', { class: 'dymo-brand' }, 'GOODS IN'),
+        p.grade ? h('div', { class: 'dymo-grade' }, p.grade) : null,
+      ));
+      wrap.appendChild(h('div', { class: 'dymo-sku' }, p.sku));
+      if (subtitle) wrap.appendChild(h('div', { class: 'dymo-sub' }, subtitle));
+      if (variant) wrap.appendChild(h('div', { class: 'dymo-variant' }, variant));
+      wrap.appendChild(h('div', { class: 'dymo-qr' },
+        h('canvas', { id: canvasId, width: qrPx, height: qrPx })
+      ));
+      wrap.appendChild(h('div', { class: 'dymo-foot' },
+        h('div', { class: 'dymo-row' },
+          h('span', { class: 'dymo-lbl' }, 'IMEI'),
+          h('span', { class: 'dymo-val mono' }, p.imei)),
+        h('div', { class: 'dymo-row' },
+          h('span', { class: 'dymo-lbl' }, 'UUID'),
+          h('span', { class: 'dymo-val mono' }, p.uuid)),
+      ));
+    } else {
+      // Zebra 50×30mm — landscape, side-by-side
+      wrap.appendChild(h('div', { class: 'qr' },
+        h('canvas', { id: canvasId, width: qrPx, height: qrPx })
+      ));
+      wrap.appendChild(h('div', { class: 'meta' },
+        h('div', {},
+          h('div', { class: 'sku' }, p.sku),
+          h('div', { style: 'font-size:10px;color:#444;margin-top:2px' }, [p.brand, p.model, p.capacity].filter(Boolean).join(' · '))
+        ),
+        h('div', {},
+          h('div', { class: 'row' }, h('span', { style: 'color:#666' }, 'IMEI'), h('span', { class: 'imei' }, p.imei)),
+          h('div', { class: 'row mt-1' }, h('span', { style: 'color:#666' }, 'UUID'), h('span', { class: 'imei' }, p.uuid)),
+          p.grade ? h('div', { class: 'row mt-1' }, h('span', { style: 'color:#666' }, 'Grade'),
+            h('span', { style: 'font-weight:700' }, p.grade)) : null,
+        )
+      ));
+    }
+
     // Render QR after DOM insertion
     setTimeout(() => {
       const canvas = document.getElementById(canvasId);
       if (canvas && window.QRCode) {
         const payload = JSON.stringify({ uuid: p.uuid, sku: p.sku, imei: p.imei });
-        QRCode.toCanvas(canvas, payload, { width: 100, margin: 1, color: { dark: '#000', light: '#fff' } });
+        QRCode.toCanvas(canvas, payload, { width: qrPx, margin: 1, color: { dark: '#000', light: '#fff' } });
       }
     }, 30);
     return wrap;
@@ -1061,7 +1113,7 @@
                   h('div', { class: 'text-slate-500' }, [d.capacity, d.color].filter(Boolean).join(' · '))
                 ),
                 h('td', { class: 'px-4 py-2' },
-                  d.grade ? h('span', { class: 'badge badge-cyan text-[10px]' }, d.grade) : h('span', { class: 'text-slate-600' }, '—')),
+                  d.grade ? h('span', { class: gradeBadgeClass(d.grade) }, d.grade) : h('span', { class: 'text-slate-600' }, '—')),
                 h('td', { class: 'px-4 py-2' },
                   d.source === 'manifest'
                     ? h('span', { class: 'badge badge-green text-[10px]' }, 'manifest')
