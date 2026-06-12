@@ -38,8 +38,9 @@ A modern, scanner-first web application for the **Goods In** (inbound receiving)
 ### D. Print Label — connects to a real DYMO LabelWriter
 - On confirm, a print job is queued in the `print_jobs` table with a JSON payload.
 - **Two label formats supported** (toggle in the top bar — preference persists per browser via `localStorage`):
-  - **DYMO 50×30mm** (landscape) — large-format label for the warehouse floor.
+  - **DYMO 57×32mm** (landscape, default) — large-format label for the warehouse floor.
   - **DYMO 32×57mm** (portrait) — compact label for the receiving desk.
+- **Rotate-90° toggle** (top bar ↻ icon, also exposed in Settings) — for DYMO LabelWriter setups where the label roll feeds the **short edge first**, so a 57×32 landscape page would otherwise come out sideways and overflow onto a second sticker. With rotate on, the `@page` is declared as 32×57 (what the printer expects) while the label content stays landscape and is CSS-rotated 90° internally — one label, correct orientation, one sticker. Persisted as `labelRotate.v1` in `localStorage`.
 - Both labels carry the same data and **two QR codes** (rendered by `qrious@4.0.2`):
   - **Main QR** — encodes `{uuid, sku, imei}` as JSON. Routes the device to any internal scan target.
   - **IMEI QR** — plain-text IMEI only. Lets cheap or basic scanners (or warranty/repair tools that expect raw IMEIs) read the IMEI directly from the printed label without parsing JSON.

@@ -21,11 +21,17 @@ async function loadSettings(c: any): Promise<Settings> {
 // The page renders a screen-only preflight banner (paper size + header-off
 // checklist) — the @media print block hides it so the printed page is
 // JUST the label, sized exactly to the @page box.
-function labelHtml(payload: any, size: 'large' | 'small'): string {
+function labelHtml(payload: any, size: 'large' | 'small', rotate: boolean = false): string {
   const isSmall = size === 'small'
-  // Real label dimensions in mm
-  const widthMm = isSmall ? 32 : 57
-  const heightMm = isSmall ? 57 : 32
+  // Real label dimensions in mm. When rotate=true we swap them so the printer
+  // sees the label feed direction the same way physical DYMO rolls feed
+  // (short edge along the feed direction) while our content stays landscape.
+  // Use rotate=true if your DYMO is printing the label 90° rotated and
+  // spreading content across two stickers.
+  const contentW = isSmall ? 32 : 57
+  const contentH = isSmall ? 57 : 32
+  const pageW = rotate ? contentH : contentW
+  const pageH = rotate ? contentW : contentH
   const subtitle = payload.brand || ''
   const variant = [payload.capacity, payload.color].filter(Boolean).join(' · ')
 
@@ -34,7 +40,7 @@ function labelHtml(payload: any, size: 'large' | 'small'): string {
 <title>${payload.sku} · ${payload.imei}</title>
 <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
 <style>
-  @page { size: ${widthMm}mm ${heightMm}mm; margin: 0; }
+  @page { size: ${pageW}mm ${pageH}mm; margin: 0; }
   html, body { margin: 0; padding: 0; background: #f5f5f5; font-family: system-ui, sans-serif; }
   /* Screen-only preflight (hidden when printing) */
   @media screen {
@@ -49,17 +55,17 @@ function labelHtml(payload: any, size: 'large' | 'small'): string {
     .scale-note { text-align:center; font-size: 11px; color: #64748b; margin-top: 8px; }
   }
   @media print {
-    html, body { background: #fff !important; padding: 0 !important; margin: 0 !important; width: ${widthMm}mm !important; height: ${heightMm}mm !important; overflow: hidden !important; }
+    html, body { background: #fff !important; padding: 0 !important; margin: 0 !important; width: ${pageW}mm !important; height: ${pageH}mm !important; overflow: hidden !important; }
     /* Hide every chrome wrapper */
     .preflight, .scale-note { display: none !important; }
     /* Strip the screen-only frame around the label */
-    .label-frame { max-width: none !important; margin: 0 !important; padding: 0 !important; border: 0 !important; background: #fff !important; box-shadow: none !important; }
+    .label-frame { max-width: none !important; margin: 0 !important; padding: 0 !important; border: 0 !important; background: #fff !important; box-shadow: none !important; ${rotate ? `position: relative; width: ${pageW}mm !important; height: ${pageH}mm !important;` : ''} }
     /* Label itself must be exactly the page size, no extras */
-    .label { box-shadow: none !important; margin: 0 !important; }
+    .label { box-shadow: none !important; margin: 0 !important; ${rotate ? `position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(90deg); transform-origin: center center;` : ''} }
   }
   * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .label {
-    width: ${widthMm}mm; height: ${heightMm}mm;
+    width: ${contentW}mm; height: ${contentH}mm;
     padding: 1.2mm; color: #000; font-family: Arial, Helvetica, sans-serif;
     display: ${isSmall ? 'flex' : 'grid'};
     ${isSmall
@@ -96,10 +102,10 @@ function labelHtml(payload: any, size: 'large' | 'small'): string {
 </style></head>
 <body>
 <div class="preflight">
-  <h2>🖨️ Print preflight — ${widthMm}×${heightMm} mm DYMO label</h2>
+  <h2>🖨️ Print preflight — ${contentW}×${contentH} mm DYMO label${rotate ? ' <span style="font-size:11px;color:#64748b;font-weight:500">(rotated 90° for sideways feed)</span>' : ''}</h2>
   <ol>
     <li>In the print dialog, set <b>Destination</b> to your DYMO LabelWriter (e.g. <i>DYMO LabelWriter 450</i>).</li>
-    <li>Set <b>Paper size</b> to <b>${widthMm} × ${heightMm} mm</b> (or the closest custom size — usually appears as "${widthMm}mm x ${heightMm}mm" once the DYMO is selected).</li>
+    <li>Set <b>Paper size</b> to <b>${pageW} × ${pageH} mm</b> (or the closest DYMO preset — once the DYMO is selected the right size usually appears as "${pageW}mm x ${pageH}mm").</li>
     <li>Set <b>Margins</b> to <b>None</b> and <b>Scale</b> to <b>100%</b>.</li>
     <li>Open <b>More settings</b> and <b>uncheck "Headers and footers"</b> — this removes the date/URL printed at the top of the label.</li>
     <li>Click <b>Print</b>.</li>
@@ -145,7 +151,7 @@ ${isSmall ? `
   </div>
 `}
 </div>
-<div class="scale-note">Preview rendered at real ${widthMm}×${heightMm} mm — the print dialog should produce the same size.</div>
+<div class="scale-note">Preview rendered at real ${contentW}×${contentH} mm — the print dialog should produce the same size${rotate ? ' (label will be rotated 90° to match the DYMO feed direction)' : ''}.</div>
 </div>
 <script>
   (function(){
@@ -257,6 +263,7 @@ app.get('/job/:id', async (c) => {
 app.get('/label/:id', async (c) => {
   const id = Number(c.req.param('id'))
   const size = (c.req.query('size') as 'large' | 'small') || 'large'
+  const rotate = c.req.query('rotate') === '1'
   const row = await c.env.DB.prepare(`
     SELECT pj.payload_json, rd.uuid, rd.imei, rd.sku, rd.brand, rd.model, rd.capacity, rd.color, rd.grade
     FROM print_jobs pj
@@ -269,7 +276,7 @@ app.get('/label/:id', async (c) => {
     brand: row.brand, model: row.model, capacity: row.capacity,
     color: row.color, grade: row.grade,
   }
-  return c.html(labelHtml(payload, size))
+  return c.html(labelHtml(payload, size, rotate))
 })
 
 // Mark a job as sent (called by the browser-print path after it's dispatched
@@ -296,6 +303,7 @@ app.post('/mark-sent/:id', async (c) => {
 app.post('/send/:id', async (c) => {
   const id = Number(c.req.param('id'))
   const size = (c.req.query('size') as 'large' | 'small') || 'large'
+  const rotate = c.req.query('rotate') === '1'
   const s = await loadSettings(c)
 
   const job = await c.env.DB.prepare(`
@@ -309,7 +317,7 @@ app.post('/send/:id', async (c) => {
 
   if (s.print_mode === 'browser' || s.print_mode === 'manual') {
     // Frontend will open the label HTML in a window and trigger print.
-    return c.json({ ok: true, mode: 'browser', url: `/api/print/label/${id}?size=${size}` })
+    return c.json({ ok: true, mode: 'browser', url: `/api/print/label/${id}?size=${size}${rotate ? '&rotate=1' : ''}` })
   }
 
   if (s.print_mode === 'printnode') {
@@ -359,6 +367,8 @@ app.post('/send/:id', async (c) => {
 // Bulk send. For browser-print mode, the frontend will open ONE print window
 // containing all queued labels stacked — much faster than spawning N windows.
 app.post('/send-all', async (c) => {
+  const size = (c.req.query('size') as 'large' | 'small') || 'large'
+  const rotate = c.req.query('rotate') === '1'
   const s = await loadSettings(c)
   const { results } = await c.env.DB.prepare(
     "SELECT id, received_device_id FROM print_jobs WHERE status = 'queued' ORDER BY id ASC"
@@ -371,7 +381,7 @@ app.post('/send-all', async (c) => {
     return c.json({
       ok: true,
       mode: 'browser',
-      url: `/api/print/labels?ids=${ids}`,
+      url: `/api/print/labels?ids=${ids}&size=${size}${rotate ? '&rotate=1' : ''}`,
       count: results.length,
     })
   }
@@ -397,6 +407,7 @@ app.post('/send-all', async (c) => {
 app.get('/labels', async (c) => {
   const idsParam = c.req.query('ids') || ''
   const size = (c.req.query('size') as 'large' | 'small') || 'large'
+  const rotate = c.req.query('rotate') === '1'
   const ids = idsParam.split(',').map(Number).filter(Boolean)
   if (!ids.length) return c.text('No ids', 400)
 
@@ -411,15 +422,22 @@ app.get('/labels', async (c) => {
     if (row) rows.push(row)
   }
 
-  // Build a multi-label HTML — each label is one @page in the print preview
+  // Build a multi-label HTML — each label is one @page in the print preview.
+  // contentW/H is the visual layout of the label; pageW/H is what we tell the
+  // printer the page is. When rotate=true they swap, and we CSS-rotate each
+  // label 90° so the printer sees its expected feed direction without us
+  // having to redesign the layout.
   const isSmall = size === 'small'
-  const widthMm = isSmall ? 32 : 57
-  const heightMm = isSmall ? 57 : 32
+  const contentW = isSmall ? 32 : 57
+  const contentH = isSmall ? 57 : 32
+  const pageW = rotate ? contentH : contentW
+  const pageH = rotate ? contentW : contentH
 
   const labels = rows.map((row, idx) => {
     const subtitle = row.brand || ''
     const variant = [row.capacity, row.color].filter(Boolean).join(' · ')
     return `
+    <div class="label-page">
     <div class="label" data-uuid="${row.uuid}" data-imei="${row.imei}">
       ${isSmall ? `
         <div class="h">
@@ -456,14 +474,15 @@ app.get('/labels', async (c) => {
           ${row.grade ? `<div class="grade">${row.grade}</div>` : ''}
         </div>
       `}
+    </div>
     </div>`
   }).join('\n')
 
   const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
-<title>Print ${rows.length} labels (${widthMm}×${heightMm}mm)</title>
+<title>Print ${rows.length} labels (${contentW}×${contentH}mm${rotate ? ', rotated 90°' : ''})</title>
 <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
 <style>
-  @page { size: ${widthMm}mm ${heightMm}mm; margin: 0; }
+  @page { size: ${pageW}mm ${pageH}mm; margin: 0; }
   html, body { margin: 0; padding: 0; background: #f5f5f5; font-family: system-ui, sans-serif; }
   @media screen {
     body { padding: 20px; }
@@ -472,25 +491,34 @@ app.get('/labels', async (c) => {
     .preflight ol { margin: 8px 0 12px 18px; padding: 0; font-size: 12px; color: #334155; line-height: 1.6; }
     .preflight .btn { background: linear-gradient(135deg,#06b6d4,#6366f1); color:#fff; border:none; border-radius:6px; padding:8px 16px; font-size:13px; font-weight:600; cursor:pointer; }
     .labels-wrap { max-width: 560px; margin: 0 auto; }
-    .labels-wrap .label { background: #fff; box-shadow: 0 0 0 1px #cbd5e1; margin-bottom: 8px; }
+    .labels-wrap .label-page { display:flex; align-items:center; justify-content:center; margin-bottom: 8px; }
+    .labels-wrap .label { background: #fff; box-shadow: 0 0 0 1px #cbd5e1; }
   }
   @media print {
-    html, body { background: #fff !important; padding: 0 !important; margin: 0 !important; }
+    html, body { background: #fff !important; padding: 0 !important; margin: 0 !important; overflow: hidden !important; }
     .preflight { display: none !important; }
     .labels-wrap { max-width: none !important; margin: 0 !important; padding: 0 !important; }
-    .labels-wrap .label { box-shadow: none !important; margin: 0 !important; }
+    .label-page {
+      width: ${pageW}mm; height: ${pageH}mm;
+      page-break-after: always; break-after: page;
+      ${rotate ? 'position: relative;' : ''}
+      overflow: hidden;
+    }
+    .label-page:last-child { page-break-after: auto; break-after: auto; }
+    .label {
+      box-shadow: none !important; margin: 0 !important;
+      ${rotate ? `position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(90deg); transform-origin: center center;` : ''}
+    }
   }
   * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .label {
-    width: ${widthMm}mm; height: ${heightMm}mm;
-    page-break-after: always; break-after: page;
+    width: ${contentW}mm; height: ${contentH}mm;
     padding: 1.2mm; color: #000; font-family: Arial, Helvetica, sans-serif;
     display: ${isSmall ? 'flex' : 'grid'};
     ${isSmall
       ? 'flex-direction: column; gap: 0.4mm;'
       : 'grid-template-columns: 1fr 13mm; gap: 1mm;'}
   }
-  .label:last-child { page-break-after: auto; break-after: auto; }
   .mono { font-family: 'Courier New', monospace; }
   ${isSmall ? `
   .h { display:flex; justify-content:space-between; align-items:center; border-bottom: 0.15mm dashed #888; padding-bottom: 0.4mm; }
@@ -520,10 +548,10 @@ app.get('/labels', async (c) => {
 </style></head>
 <body>
 <div class="preflight">
-  <h2>🖨️ Print preflight — ${rows.length} × ${widthMm}×${heightMm} mm DYMO labels</h2>
+  <h2>🖨️ Print preflight — ${rows.length} × ${contentW}×${contentH} mm DYMO labels${rotate ? ' <span style="font-size:11px;color:#64748b;font-weight:500">(rotated 90° for sideways feed)</span>' : ''}</h2>
   <ol>
     <li><b>Destination</b>: DYMO LabelWriter 450</li>
-    <li><b>Paper size</b>: ${widthMm} × ${heightMm} mm</li>
+    <li><b>Paper size</b>: ${pageW} × ${pageH} mm</li>
     <li><b>Margins</b>: None &nbsp; · &nbsp; <b>Scale</b>: 100%</li>
     <li>Open <b>More settings</b> and <b>uncheck "Headers and footers"</b> (otherwise the date/URL prints on each label).</li>
   </ol>

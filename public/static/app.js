@@ -41,11 +41,18 @@
     // 'large' (DYMO 57x32mm landscape, default) | 'small' (DYMO 32x57mm portrait)
     // v2 key — bumps any user still cached on 'small' back to landscape default
     labelSize: (['large','small'].includes(localStorage.getItem('labelSize.v2')) ? localStorage.getItem('labelSize.v2') : 'large'),
+    // Some DYMO LabelWriter setups feed labels with the short edge first, so a
+    // 57×32 landscape page comes out rotated 90° and runs over onto the next
+    // sticker. Turning this on swaps the @page dimensions and CSS-rotates the
+    // label content 90° so the printer sees a 32×57 page but the content still
+    // renders landscape. Persisted in localStorage.
+    labelRotate: localStorage.getItem('labelRotate.v1') === '1',
     printSettings: null,         // { print_mode, printnode_api_key_set, printnode_printer_id_large, printnode_printer_id_small }
     printnodePrinters: null,     // [] from /printnode/printers
     settingsSaving: false,
   };
   function setLabelSize(v) { state.labelSize = v; localStorage.setItem('labelSize.v2', v); }
+  function setLabelRotate(on) { state.labelRotate = !!on; localStorage.setItem('labelRotate.v1', on ? '1' : '0'); }
 
   // ───────── Toast ─────────
   const toastWrap = h('div', { class: 'toast-wrap' });
@@ -210,6 +217,13 @@
               onclick: () => { setLabelSize('small'); render(); },
             }, h('i', { class: 'fas fa-receipt mr-1' }), 'DYMO 32×57'),
           ),
+          h('button', {
+            class: 'btn btn-ghost text-xs ' + (state.labelRotate ? '!bg-amber-500/20 !text-amber-300 !border-amber-500/40' : ''),
+            title: state.labelRotate
+              ? 'Label rotation ON — content rotated 90° to match DYMO feed direction. Click to disable.'
+              : 'Label rotation OFF. Turn on if labels print sideways across two stickers.',
+            onclick: () => { setLabelRotate(!state.labelRotate); render(); toast(`Label rotation ${state.labelRotate ? 'enabled' : 'disabled'}`, 'ok'); },
+          }, h('i', { class: 'fas fa-rotate' + (state.labelRotate ? '' : '-right') })),
           h('button', {
             class: 'btn btn-ghost text-xs',
             title: 'Toggle scanner sound',
@@ -1321,6 +1335,34 @@
         )
       ),
 
+      // Label orientation (handles DYMOs that feed labels sideways)
+      h('div', { class: 'card p-5 space-y-3' },
+        h('div', { class: 'flex items-center gap-2 text-cyan-300 font-semibold' },
+          h('i', { class: 'fas fa-rotate' }),
+          'Label orientation'
+        ),
+        h('div', { class: 'text-xs text-slate-400 leading-relaxed' },
+          'If the printed label comes out rotated 90° and the content spills onto a second sticker, turn this on. ',
+          'It tells the printer the page is portrait (32×57 mm) and rotates the landscape content 90° to fit the feed direction of your DYMO roll.'
+        ),
+        h('label', { class: 'flex items-center gap-3 cursor-pointer select-none' },
+          h('input', {
+            type: 'checkbox',
+            class: 'w-4 h-4 accent-cyan-500',
+            checked: state.labelRotate ? 'checked' : null,
+            onchange: (e) => { setLabelRotate(e.target.checked); render(); toast(`Label rotation ${e.target.checked ? 'enabled' : 'disabled'}`, 'ok'); },
+          }),
+          h('div', { class: 'flex-1' },
+            h('div', { class: 'text-sm font-medium' }, 'Rotate label 90° to match DYMO feed direction'),
+            h('div', { class: 'text-[11px] text-slate-500 mt-0.5' },
+              state.labelRotate
+                ? 'On — page sent as ' + (state.labelSize === 'small' ? '57×32' : '32×57') + ' mm, content rotated 90°'
+                : 'Off — page sent as ' + (state.labelSize === 'small' ? '32×57' : '57×32') + ' mm, content not rotated'
+            )
+          )
+        )
+      ),
+
       // PrintNode config
       s.print_mode === 'printnode' ? PrintNodeConfig(s) : null,
 
@@ -1485,7 +1527,7 @@
   }
   async function sendPrint(id) {
     try {
-      const r = await api.post(`/print/send/${id}?size=${state.labelSize}`);
+      const r = await api.post(`/print/send/${id}?size=${state.labelSize}${state.labelRotate ? '&rotate=1' : ''}`);
       if (r.mode === 'browser') {
         const win = window.open(r.url, '_blank', 'width=720,height=520');
         if (!win) {
@@ -1506,7 +1548,7 @@
   }
   async function sendAllPrint() {
     try {
-      const r = await api.post(`/print/send-all?size=${state.labelSize}`);
+      const r = await api.post(`/print/send-all?size=${state.labelSize}${state.labelRotate ? '&rotate=1' : ''}`);
       if (r.mode === 'browser') {
         const win = window.open(r.url, '_blank', 'width=720,height=520');
         if (!win) {
