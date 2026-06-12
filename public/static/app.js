@@ -39,12 +39,13 @@
     soundOn: true,
     autoPrint: true,
     // 'large' (DYMO 57x32mm landscape, default) | 'small' (DYMO 32x57mm portrait)
-    labelSize: (['large','small'].includes(localStorage.getItem('labelSize')) ? localStorage.getItem('labelSize') : 'large'),
+    // v2 key — bumps any user still cached on 'small' back to landscape default
+    labelSize: (['large','small'].includes(localStorage.getItem('labelSize.v2')) ? localStorage.getItem('labelSize.v2') : 'large'),
     printSettings: null,         // { print_mode, printnode_api_key_set, printnode_printer_id_large, printnode_printer_id_small }
     printnodePrinters: null,     // [] from /printnode/printers
     settingsSaving: false,
   };
-  function setLabelSize(v) { state.labelSize = v; localStorage.setItem('labelSize', v); }
+  function setLabelSize(v) { state.labelSize = v; localStorage.setItem('labelSize.v2', v); }
 
   // ───────── Toast ─────────
   const toastWrap = h('div', { class: 'toast-wrap' });

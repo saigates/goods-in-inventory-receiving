@@ -49,10 +49,13 @@ function labelHtml(payload: any, size: 'large' | 'small'): string {
     .scale-note { text-align:center; font-size: 11px; color: #64748b; margin-top: 8px; }
   }
   @media print {
-    body { background: #fff !important; padding: 0 !important; }
-    .preflight, .label-frame > .scale-note, .label-frame { display: contents; }
-    .label-frame { padding: 0 !important; border: 0 !important; }
-    .preflight { display: none !important; }
+    html, body { background: #fff !important; padding: 0 !important; margin: 0 !important; width: ${widthMm}mm !important; height: ${heightMm}mm !important; overflow: hidden !important; }
+    /* Hide every chrome wrapper */
+    .preflight, .scale-note { display: none !important; }
+    /* Strip the screen-only frame around the label */
+    .label-frame { max-width: none !important; margin: 0 !important; padding: 0 !important; border: 0 !important; background: #fff !important; box-shadow: none !important; }
+    /* Label itself must be exactly the page size, no extras */
+    .label { box-shadow: none !important; margin: 0 !important; }
   }
   * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .label {
@@ -472,9 +475,9 @@ app.get('/labels', async (c) => {
     .labels-wrap .label { background: #fff; box-shadow: 0 0 0 1px #cbd5e1; margin-bottom: 8px; }
   }
   @media print {
-    body { background: #fff !important; padding: 0 !important; }
+    html, body { background: #fff !important; padding: 0 !important; margin: 0 !important; }
     .preflight { display: none !important; }
-    .labels-wrap { max-width: none !important; margin: 0 !important; }
+    .labels-wrap { max-width: none !important; margin: 0 !important; padding: 0 !important; }
     .labels-wrap .label { box-shadow: none !important; margin: 0 !important; }
   }
   * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
