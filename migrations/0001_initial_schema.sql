@@ -72,7 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_received_manifest ON received_devices(manifest_id
 CREATE TABLE IF NOT EXISTS print_jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   received_device_id INTEGER NOT NULL,
-  printer TEXT NOT NULL DEFAULT 'DYMO-LW550-Bay1',
+  printer TEXT NOT NULL DEFAULT 'DYMO LabelWriter 450',
   payload_json TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'queued', -- queued | sent | error
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,

@@ -193,7 +193,7 @@ body {
   margin: 2px 0 0 0;
 }
 .label-preview.label-small .dymo-qr-cap {
-  font-size: 7px; font-weight: 600; letter-spacing: 1.2px; text-align: center; color: #64748b;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.5px; text-align: center; color: #0f172a;
   margin-top: -2px;
 }
 .label-preview.label-small .dymo-imei-block {

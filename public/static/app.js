@@ -1028,8 +1028,8 @@
 
   // ───────── Label preview ─────────
   const LABEL_SIZES = {
-    large: { id: 'large', name: 'DYMO 50×30mm', printer: 'DYMO-LW550-Bay1' },
-    small: { id: 'small', name: 'DYMO 32×57mm', printer: 'DYMO-LW550-Bay2' },
+    large: { id: 'large', name: 'DYMO 50×30mm', printer: 'DYMO LabelWriter 450' },
+    small: { id: 'small', name: 'DYMO 32×57mm', printer: 'DYMO LabelWriter 450' },
   };
 
   function LabelPreviewModal() {
@@ -1073,21 +1073,16 @@
       wrap.appendChild(h('div', { class: 'dymo-sku' }, p.sku));
       if (subtitle) wrap.appendChild(h('div', { class: 'dymo-sub' }, subtitle));
       if (variant) wrap.appendChild(h('div', { class: 'dymo-variant' }, variant));
-      // Main QR (uuid + sku + imei)
+      // Main QR (uuid + sku + imei) — caption shows the actual UUID value
       wrap.appendChild(h('div', { class: 'dymo-qr' },
         h('canvas', { id: mainQrId, width: mainQrPx, height: mainQrPx })
       ));
-      wrap.appendChild(h('div', { class: 'dymo-qr-cap' }, 'Internal UUID')); 
+      wrap.appendChild(h('div', { class: 'dymo-qr-cap mono' }, p.uuid));
       // Dedicated IMEI QR
       wrap.appendChild(h('div', { class: 'dymo-imei-block' },
         h('canvas', { id: imeiQrId, width: imeiQrPx, height: imeiQrPx }),
         h('div', { class: 'dymo-imei-num mono' }, p.imei),
         h('div', { class: 'dymo-imei-cap' }, 'IMEI')
-      ));
-      wrap.appendChild(h('div', { class: 'dymo-foot' },
-        h('div', { class: 'dymo-row' },
-          h('span', { class: 'dymo-lbl' }, 'UUID'),
-          h('span', { class: 'dymo-val mono' }, p.uuid)),
       ));
     } else {
       // DYMO 50×30mm — landscape, two-column with dual QRs
