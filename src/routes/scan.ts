@@ -2,6 +2,15 @@ import { Hono } from 'hono'
 import type { Bindings, ExpectedDevice, ReceivedDevice } from '../types'
 import { buildSku } from '../lib/sku'
 import { shortUuid } from '../lib/uuid'
+import { normalizeGrade } from '../lib/grade'
+
+// SQLite raises 'UNIQUE constraint failed: received_devices.imei' if a
+// duplicate IMEI slips past the pre-check. Detect that so we can return
+// a friendly outcome instead of a 500.
+function isImeiUniqueError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return /UNIQUE constraint failed:\s*received_devices\.imei/i.test(msg)
+}
 
 const app = new Hono<{ Bindings: Bindings }>()
 
@@ -89,24 +98,45 @@ app.post('/confirm', async (c) => {
     return c.json({ error: 'Already received' }, 409)
   }
 
+  // Defensive: someone could have raced ahead and received this IMEI between
+  // the scan event and the confirm. UNIQUE constraint will catch it too.
+  const existing = await c.env.DB.prepare('SELECT id, uuid, sku FROM received_devices WHERE imei = ?')
+    .bind(expected.imei).first<{ id: number; uuid: string; sku: string }>()
+  if (existing) {
+    return c.json({ error: `IMEI ${expected.imei} already received (UUID ${existing.uuid}, SKU ${existing.sku})` }, 409)
+  }
+
+  // Force grade into the strict A|B|C|UG set. The body grade wins if valid;
+  // otherwise we fall back to the (already-normalised) manifest grade; if
+  // both are missing we default to UG.
+  const grade = normalizeGrade(body.grade ?? expected.grade)
+
   const uuid = shortUuid()
-  const insRecv = await c.env.DB.prepare(
-    `INSERT INTO received_devices
-     (uuid, imei, sku, brand, model, capacity, color, grade, source, manifest_id, expected_device_id, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manifest', ?, ?, ?)`
-  ).bind(
-    uuid,
-    expected.imei,
-    body.sku,
-    body.brand ?? null,
-    body.model ?? null,
-    body.capacity ?? null,
-    body.color ?? null,
-    body.grade ?? expected.grade ?? null,
-    expected.manifest_id,
-    expected.id,
-    body.notes ?? null
-  ).run()
+  let insRecv
+  try {
+    insRecv = await c.env.DB.prepare(
+      `INSERT INTO received_devices
+       (uuid, imei, sku, brand, model, capacity, color, grade, source, manifest_id, expected_device_id, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manifest', ?, ?, ?)`
+    ).bind(
+      uuid,
+      expected.imei,
+      body.sku,
+      body.brand ?? null,
+      body.model ?? null,
+      body.capacity ?? null,
+      body.color ?? null,
+      grade,
+      expected.manifest_id,
+      expected.id,
+      body.notes ?? null
+    ).run()
+  } catch (err) {
+    if (isImeiUniqueError(err)) {
+      return c.json({ error: `IMEI ${expected.imei} already received` }, 409)
+    }
+    throw err
+  }
 
   const receivedId = insRecv.meta.last_row_id as number
 
@@ -127,7 +157,7 @@ app.post('/confirm', async (c) => {
       model: body.model,
       capacity: body.capacity,
       color: body.color,
-      grade: body.grade ?? expected.grade,
+      grade,
     }
     const pj = await c.env.DB.prepare(
       `INSERT INTO print_jobs (received_device_id, payload_json) VALUES (?, ?)`
@@ -158,31 +188,40 @@ app.post('/force-add', async (c) => {
     return c.json({ error: 'Invalid IMEI' }, 400)
   }
 
-  const dup = await c.env.DB.prepare('SELECT id FROM received_devices WHERE imei = ?')
-    .bind(imei).first()
-  if (dup) return c.json({ error: 'IMEI already received' }, 409)
+  const dup = await c.env.DB.prepare('SELECT id, uuid, sku FROM received_devices WHERE imei = ?')
+    .bind(imei).first<{ id: number; uuid: string; sku: string }>()
+  if (dup) return c.json({ error: `IMEI ${imei} already received (UUID ${dup.uuid}, SKU ${dup.sku})` }, 409)
 
   const built = buildSku({
     oem: body.oem || 'UNK',
     description: body.description || 'Unknown',
     color: body.color || null,
   })
+  const grade = normalizeGrade(body.grade)
 
   const uuid = shortUuid()
-  const ins = await c.env.DB.prepare(
-    `INSERT INTO received_devices
-     (uuid, imei, sku, brand, model, capacity, color, grade, source, manifest_id, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unreconciled', ?, ?)`
-  ).bind(
-    uuid, imei, built.sku, built.brand, built.model, built.capacity, built.color,
-    body.grade || null, body.manifest_id || null,
-    body.notes || 'Force-added: not on manifest. Pending manager review.'
-  ).run()
+  let ins
+  try {
+    ins = await c.env.DB.prepare(
+      `INSERT INTO received_devices
+       (uuid, imei, sku, brand, model, capacity, color, grade, source, manifest_id, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unreconciled', ?, ?)`
+    ).bind(
+      uuid, imei, built.sku, built.brand, built.model, built.capacity, built.color,
+      grade, body.manifest_id || null,
+      body.notes || 'Force-added: not on manifest. Pending manager review.'
+    ).run()
+  } catch (err) {
+    if (isImeiUniqueError(err)) {
+      return c.json({ error: `IMEI ${imei} already received` }, 409)
+    }
+    throw err
+  }
 
   const receivedId = ins.meta.last_row_id as number
 
   // Queue print job
-  const payload = { uuid, sku: built.sku, imei, ...built, grade: body.grade }
+  const payload = { uuid, sku: built.sku, imei, ...built, grade }
   await c.env.DB.prepare(
     `INSERT INTO print_jobs (received_device_id, payload_json) VALUES (?, ?)`
   ).bind(receivedId, JSON.stringify(payload)).run()
@@ -191,6 +230,111 @@ app.post('/force-add', async (c) => {
     .bind(receivedId).first<ReceivedDevice>()
 
   return c.json({ ok: true, received })
+})
+
+// ───────── Manual receive (no manifest required) ─────────
+// Used for the "Quick receive" path when there is no ASN/manifest. The
+// operator scans/types an IMEI, picks a SKU (typically from the catalogue),
+// and the device gets booked into inventory with source='manual'.
+app.post('/manual', async (c) => {
+  const body = await c.req.json<{
+    imei: string
+    sku?: string
+    brand?: string
+    model?: string
+    capacity?: string
+    color?: string
+    grade?: string
+    notes?: string
+    auto_print?: boolean
+  }>()
+
+  const imei = String(body.imei || '').trim()
+  if (!imei || !/^\d{14,17}$/.test(imei)) {
+    return c.json({ error: 'IMEI must be 14-17 digits' }, 400)
+  }
+
+  // Duplicate check — same friendly path as scan/confirm.
+  const existing = await c.env.DB.prepare('SELECT id, uuid, sku FROM received_devices WHERE imei = ?')
+    .bind(imei).first<{ id: number; uuid: string; sku: string }>()
+  if (existing) {
+    return c.json({
+      error: `IMEI ${imei} already received`,
+      detail: { uuid: existing.uuid, sku: existing.sku },
+    }, 409)
+  }
+
+  // Resolve SKU. If the caller supplied an explicit SKU we use it as-is;
+  // otherwise we try to look it up by (brand+model+capacity) from the
+  // catalogue; otherwise we fall back to buildSku() like force-add does.
+  let sku = body.sku?.trim() || ''
+  let brand = body.brand?.trim() || null
+  let model = body.model?.trim() || null
+  let capacity = body.capacity?.trim() || null
+  let color = body.color?.trim() || null
+
+  if (sku) {
+    // Try to enrich from the catalogue so the printed label has full info
+    const row = await c.env.DB.prepare(
+      'SELECT brand, model, capacity, color FROM sku_catalog WHERE sku = ?'
+    ).bind(sku).first<{ brand: string; model: string; capacity: string | null; color: string | null }>()
+    if (row) {
+      brand = brand || row.brand
+      model = model || row.model
+      capacity = capacity || row.capacity
+      color = color || row.color
+    }
+  } else {
+    // No SKU given — derive one (same algorithm as force-add)
+    const built = buildSku({ oem: brand, description: [model, capacity].filter(Boolean).join(' '), color })
+    sku = built.sku
+    brand = brand || built.brand
+    model = model || built.model
+    capacity = capacity || built.capacity
+    color = color || built.color
+  }
+
+  const grade = normalizeGrade(body.grade)
+  const uuid = shortUuid()
+
+  let ins
+  try {
+    ins = await c.env.DB.prepare(
+      `INSERT INTO received_devices
+       (uuid, imei, sku, brand, model, capacity, color, grade, source, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)`
+    ).bind(
+      uuid, imei, sku, brand, model, capacity, color, grade,
+      body.notes || null
+    ).run()
+  } catch (err) {
+    if (isImeiUniqueError(err)) {
+      return c.json({ error: `IMEI ${imei} already received` }, 409)
+    }
+    throw err
+  }
+
+  const receivedId = ins.meta.last_row_id as number
+
+  // Audit log (reuse scan_events with outcome='matched' but no manifest)
+  await c.env.DB.prepare(
+    "INSERT INTO scan_events (manifest_id, imei, outcome, message) VALUES (NULL, ?, 'matched', 'Manual receive')"
+  ).bind(imei).run()
+
+  // Queue print job by default
+  let printJobId: number | null = null
+  if (body.auto_print !== false) {
+    const payload = { uuid, sku, imei, brand, model, capacity, color, grade }
+    const pj = await c.env.DB.prepare(
+      'INSERT INTO print_jobs (received_device_id, payload_json) VALUES (?, ?)'
+    ).bind(receivedId, JSON.stringify(payload)).run()
+    printJobId = pj.meta.last_row_id as number
+  }
+
+  const received = await c.env.DB.prepare('SELECT * FROM received_devices WHERE id = ?')
+    .bind(receivedId).first<ReceivedDevice>()
+
+  return c.json({ ok: true, received, print_job_id: printJobId })
 })
 
 // Reject an unreconciled scan (just log it)

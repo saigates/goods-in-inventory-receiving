@@ -19,11 +19,32 @@
     return el;
   };
   const fmtDate = (s) => s ? new Date(s.replace(' ', 'T') + 'Z').toLocaleString() : '—';
-  const gradeBadgeClass = (g) => g === 'UG' ? 'badge badge-violet text-[10px]' : 'badge badge-cyan text-[10px]';
+
+  // ───────── Grade helpers (strict A | B | C | UG) ─────────
+  // UG is stored as 'UG' but displayed as 'Ungraded' in human-facing copy.
+  const GRADES = ['A', 'B', 'C', 'UG'];
+  const gradeLabel = (g) => !g ? 'Ungraded' : g === 'UG' ? 'Ungraded' : g;
+  const gradeBadgeClass = (g) =>
+    g === 'UG' || !g
+      ? 'badge badge-violet text-[10px]'
+      : 'badge badge-cyan text-[10px]';
+  // Dropdown rendered as a <select> with the strict 4 options.
+  function gradeSelect(currentValue, onChange, extraAttrs = {}) {
+    const sel = h('select', Object.assign({
+      class: 'input mono',
+      onchange: (e) => onChange(e.target.value),
+    }, extraAttrs));
+    GRADES.forEach(g => {
+      const opt = h('option', { value: g }, gradeLabel(g));
+      if (g === currentValue) opt.setAttribute('selected', 'selected');
+      sel.appendChild(opt);
+    });
+    return sel;
+  }
 
   // ───────── State ─────────
   const state = {
-    view: 'receive',     // dashboard | manifests | receive | inventory | print
+    view: 'receive',     // dashboard | manifests | receive | inventory | catalog | print
     manifests: [],
     activeManifestId: null,
     activeManifest: null,
@@ -32,6 +53,11 @@
     summary: { expected_count: 0, received_count: 0 },
     events: [],
     inventory: [],
+    inventorySelected: new Set(),   // Set<deviceId> for bulk operations on Inventory view
+    bulkGradeOpen: false,            // bulk grade modal visibility
+    catalog: [],                     // sku_catalog rows
+    catalogUpload: null,             // { fileName, rows, report, summary } during preview
+    manualReceiveOpen: false,        // manual-receive (no manifest) modal
     printQueue: [],
     stats: {},
     pendingMatch: null,   // { expected, suggested_sku }
@@ -132,6 +158,16 @@
   async function refreshInventory() {
     const r = await api.get('/inventory?limit=200');
     state.inventory = r.devices || [];
+    // Drop any selected ids that are no longer present (e.g. deleted in another tab).
+    const present = new Set(state.inventory.map(d => d.id));
+    for (const id of Array.from(state.inventorySelected)) {
+      if (!present.has(id)) state.inventorySelected.delete(id);
+    }
+  }
+  async function refreshCatalog(q) {
+    const url = q ? `/catalog?q=${encodeURIComponent(q)}` : '/catalog';
+    const r = await api.get(url);
+    state.catalog = r.catalog || [];
   }
   async function refreshPrint() {
     const r = await api.get('/print/queue');
@@ -161,6 +197,7 @@
         : state.view === 'manifests' ? ManifestsView()
         : state.view === 'receive' ? ReceiveView()
         : state.view === 'inventory' ? InventoryView()
+        : state.view === 'catalog' ? CatalogView()
         : state.view === 'print' ? PrintView()
         : state.view === 'settings' ? SettingsView()
         : h('div', {}, 'Not found')
@@ -169,6 +206,7 @@
       state.pendingUnrec ? UnreconciledModal() : null,
       state.labelPreview ? LabelPreviewModal() : null,
       state.deleteDevice ? DeleteDeviceModal() : null,
+      state.manualReceiveOpen ? ManualReceiveModal() : null,
     );
   }
 
@@ -196,6 +234,7 @@
           Tab('manifests', 'Manifests', 'file-invoice'),
           Tab('receive', 'Receive', 'barcode'),
           Tab('inventory', 'Inventory', 'warehouse'),
+          Tab('catalog', 'Catalog', 'tags'),
           Tab('print', 'Print Queue', 'print'),
           Tab('settings', 'Settings', 'gear'),
         ),
@@ -240,6 +279,7 @@
     else if (v === 'manifests') refreshManifests().then(render);
     else if (v === 'receive') refreshManifests().then(refreshActiveManifest).then(render);
     else if (v === 'inventory') refreshInventory().then(render);
+    else if (v === 'catalog') refreshCatalog().then(render);
     else if (v === 'print') refreshPrint().then(render);
     else if (v === 'settings') refreshSettings().then(render);
     render();
@@ -665,13 +705,24 @@
 
   // ───────── Receive (scan) view ─────────
   function ReceiveView() {
+    // No manifests is no longer a dead end — operators can quick-receive
+    // devices without an ASN/manifest at all.
     if (!state.manifests.length) {
-      return h('div', { class: 'card p-10 text-center' },
-        h('i', { class: 'fas fa-file-invoice text-5xl text-slate-700 mb-4' }),
-        h('h2', { class: 'text-xl font-semibold mb-2' }, 'No manifests yet'),
-        h('p', { class: 'text-slate-400 mb-4' }, 'Upload a shipping manifest first, then come back to start scanning.'),
-        h('button', { class: 'btn btn-primary', onclick: () => switchView('manifests') },
-          h('i', { class: 'fas fa-cloud-arrow-up' }), 'Upload Manifest')
+      return h('div', { class: 'space-y-5' },
+        h('div', { class: 'card p-10 text-center' },
+          h('i', { class: 'fas fa-file-invoice text-5xl text-slate-700 mb-4' }),
+          h('h2', { class: 'text-xl font-semibold mb-2' }, 'No manifests yet'),
+          h('p', { class: 'text-slate-400 mb-4' },
+            'You can upload a shipping manifest to scan against, or just receive devices directly without one.'),
+          h('div', { class: 'flex gap-2 justify-center flex-wrap' },
+            h('button', { class: 'btn btn-primary', onclick: () => switchView('manifests') },
+              h('i', { class: 'fas fa-cloud-arrow-up' }), 'Upload Manifest'),
+            h('button', {
+              class: 'btn btn-ghost',
+              onclick: () => { state.manualReceiveOpen = true; render(); }
+            }, h('i', { class: 'fas fa-plus' }), 'Quick receive (no manifest)')
+          )
+        )
       );
     }
 
@@ -701,6 +752,11 @@
               }, `${opt.reference} · ${opt.supplier} · ${opt.received_count}/${opt.expected_count}`))
             )
           ),
+          h('button', {
+            class: 'btn btn-ghost text-xs',
+            onclick: () => { state.manualReceiveOpen = true; render(); },
+            title: 'Receive a device without a manifest',
+          }, h('i', { class: 'fas fa-plus' }), 'Quick receive'),
           m ? h('div', { class: 'text-right' },
             h('div', { class: 'text-3xl font-bold mono' },
               h('span', { class: 'text-cyan-300' }, state.summary.received_count),
@@ -786,7 +842,7 @@
                   h('div', { class: 'text-sm font-medium truncate' }, e.description || '(no description)'),
                   h('div', { class: 'text-xs text-slate-400 mono truncate' }, e.imei)
                 ),
-                e.grade ? h('span', { class: gradeBadgeClass(e.grade) }, e.grade) : null,
+                e.grade ? h('span', { class: gradeBadgeClass(e.grade), title: gradeLabel(e.grade) }, e.grade) : null,
                 e.status === 'received'
                   ? h('span', { class: 'badge badge-green text-[10px]' }, 'received')
                   : h('span', { class: 'badge badge-slate text-[10px]' }, 'pending')
@@ -915,7 +971,7 @@
             h('div', { class: 'font-medium' }, expected.description || '(no description)'),
             h('div', { class: 'text-xs text-slate-400 mt-1' },
               h('span', { class: 'mono' }, expected.model_no || '—'),
-              ' · ', expected.oem || '—', ' · grade ', expected.grade || '—')
+              ' · ', expected.oem || '—', ' · grade ', gradeLabel(expected.grade))
           ),
           h('div', { class: 'card p-3 bg-slate-900/40' },
             h('div', { class: 'text-[10px] uppercase tracking-wider text-slate-500 mb-1' }, 'IMEI'),
@@ -942,13 +998,7 @@
           ),
           h('div', {},
             h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Grade'),
-            h('select', {
-              class: 'input mono',
-              onchange: (e) => update('grade', e.target.value),
-            },
-              ['','A+','A','B+','B','C+','C','D','UG'].map(o =>
-                h('option', { value: o, selected: o === ctx.grade ? 'selected' : null }, o || '— none —'))
-            )
+            gradeSelect(ctx.grade || 'UG', (v) => update('grade', v))
           ),
           h('label', { class: 'flex items-center gap-2 text-sm text-slate-300 select-none' },
             h('input', { type: 'checkbox', class: 'accent-cyan-500', checked: state.autoPrint ? 'checked' : null,
@@ -979,7 +1029,7 @@
   // ───────── Unreconciled modal ─────────
   function UnreconciledModal() {
     const { imei } = state.pendingUnrec;
-    const ctx = state._unrecCtx ||= { oem: 'SMSG', description: '', grade: 'B', color: 'Phantom Black', notes: '' };
+    const ctx = state._unrecCtx ||= { oem: 'SMSG', description: '', grade: 'UG', color: 'Phantom Black', notes: '' };
     const close = () => { state.pendingUnrec = null; state._unrecCtx = null; render(); };
     const reject = async () => {
       await api.post('/scan/reject', { manifest_id: state.activeManifestId, imei, reason: 'Not on manifest — rejected by operator' });
@@ -1023,9 +1073,7 @@
           ),
           h('div', {},
             h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Grade'),
-            h('select', { class: 'input mono', onchange: (e) => update('grade', e.target.value) },
-              ['','A+','A','B+','B','C+','C','D','UG'].map(o =>
-                h('option', { value: o, selected: o === ctx.grade ? 'selected' : null }, o || '— none —')))
+            gradeSelect(ctx.grade || 'UG', (v) => update('grade', v))
           ),
         ),
         h('div', { class: 'mt-3' },
@@ -1146,23 +1194,73 @@
 
   // ───────── Inventory ─────────
   function InventoryView() {
+    const selected = state.inventorySelected;
+    const allIds = state.inventory.map(d => d.id);
+    const allSelected = allIds.length > 0 && allIds.every(id => selected.has(id));
+    const someSelected = selected.size > 0;
+
+    const toggleOne = (id) => {
+      if (selected.has(id)) selected.delete(id);
+      else selected.add(id);
+      render();
+    };
+    const toggleAll = () => {
+      if (allSelected) selected.clear();
+      else allIds.forEach(id => selected.add(id));
+      render();
+    };
+
     return h('div', { class: 'space-y-5' },
-      h('div', { class: 'flex items-center justify-between' },
+      h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
         h('div', {},
           h('h1', { class: 'text-2xl font-bold' }, 'Inventory'),
-          h('p', { class: 'text-slate-400 text-sm' }, 'Devices that have been physically received. Grading happens downstream.')
+          h('p', { class: 'text-slate-400 text-sm' }, 'Devices that have been physically received. Grade overrides write to the audit log.')
         ),
-        h('div', { class: 'flex gap-2' },
+        h('div', { class: 'flex gap-2 items-center flex-wrap' },
+          h('button', {
+            class: 'btn btn-primary text-xs',
+            onclick: () => { state.manualReceiveOpen = true; render(); },
+            title: 'Receive a device without a manifest',
+          }, h('i', { class: 'fas fa-plus' }), 'Quick receive'),
           h('input', {
             class: 'input', placeholder: 'Search IMEI / SKU / UUID',
             oninput: (e) => debouncedSearch(e.target.value),
           }),
         )
       ),
+
+      // Bulk action toolbar (visible whenever rows are selected)
+      someSelected ? h('div', { class: 'card p-3 bg-cyan-500/5 border border-cyan-500/30 flex items-center gap-3 flex-wrap' },
+        h('div', { class: 'text-sm font-medium text-cyan-200' },
+          h('i', { class: 'fas fa-square-check mr-1' }),
+          `${selected.size} selected`
+        ),
+        h('div', { class: 'flex items-center gap-2 text-xs' },
+          h('span', { class: 'text-slate-400' }, 'Set grade to:'),
+          ...GRADES.map(g => h('button', {
+            class: 'btn btn-ghost text-xs',
+            onclick: () => bulkSetGrade(g),
+          }, gradeLabel(g))),
+        ),
+        h('button', {
+          class: 'btn btn-ghost text-xs ml-auto',
+          onclick: () => { selected.clear(); render(); },
+        }, 'Clear selection')
+      ) : null,
+
       h('div', { class: 'card overflow-hidden' },
         h('table', { class: 'w-full text-sm' },
           h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
             h('tr', {},
+              h('th', { class: 'px-3 py-3 w-8' },
+                h('input', {
+                  type: 'checkbox',
+                  class: 'accent-cyan-500',
+                  checked: allSelected ? 'checked' : null,
+                  onchange: toggleAll,
+                  title: allSelected ? 'Deselect all' : 'Select all',
+                })
+              ),
               h('th', { class: 'text-left px-4 py-3' }, 'UUID'),
               h('th', { class: 'text-left px-4 py-3' }, 'IMEI'),
               h('th', { class: 'text-left px-4 py-3' }, 'SKU'),
@@ -1176,8 +1274,16 @@
           ),
           h('tbody', { class: 'divide-y divide-slate-800' },
             state.inventory.length === 0
-              ? h('tr', {}, h('td', { colspan: 9, class: 'text-center py-10 text-slate-500' }, 'No devices yet.'))
-              : state.inventory.map(d => h('tr', { class: 'row-strip' },
+              ? h('tr', {}, h('td', { colspan: 10, class: 'text-center py-10 text-slate-500' }, 'No devices yet.'))
+              : state.inventory.map(d => h('tr', { class: 'row-strip ' + (selected.has(d.id) ? 'bg-cyan-500/5' : '') },
+                h('td', { class: 'px-3 py-2' },
+                  h('input', {
+                    type: 'checkbox',
+                    class: 'accent-cyan-500',
+                    checked: selected.has(d.id) ? 'checked' : null,
+                    onchange: () => toggleOne(d.id),
+                  })
+                ),
                 h('td', { class: 'px-4 py-2 mono text-xs text-slate-300' }, d.uuid),
                 h('td', { class: 'px-4 py-2 mono text-xs' }, d.imei),
                 h('td', { class: 'px-4 py-2 mono text-xs font-semibold text-cyan-300' }, d.sku),
@@ -1185,12 +1291,19 @@
                   h('div', { class: 'font-medium' }, [d.brand, d.model].filter(Boolean).join(' ')),
                   h('div', { class: 'text-slate-500' }, [d.capacity, d.color].filter(Boolean).join(' · '))
                 ),
+                // Grade: inline dropdown override (writes one audit row per change)
                 h('td', { class: 'px-4 py-2' },
-                  d.grade ? h('span', { class: gradeBadgeClass(d.grade) }, d.grade) : h('span', { class: 'text-slate-600' }, '—')),
+                  gradeSelect(d.grade || 'UG', (v) => singleSetGrade(d, v), {
+                    class: 'input mono text-xs py-1 px-2 w-28',
+                    title: 'Change grade (writes audit log)',
+                  })
+                ),
                 h('td', { class: 'px-4 py-2' },
                   d.source === 'manifest'
                     ? h('span', { class: 'badge badge-green text-[10px]' }, 'manifest')
-                    : h('span', { class: 'badge badge-red text-[10px]' }, 'unreconciled')),
+                    : d.source === 'manual'
+                      ? h('span', { class: 'badge badge-cyan text-[10px]' }, 'manual')
+                      : h('span', { class: 'badge badge-red text-[10px]' }, 'unreconciled')),
                 h('td', { class: 'px-4 py-2 text-xs text-slate-400' }, fmtDate(d.created_at)),
                 h('td', { class: 'px-4 py-2 text-xs' },
                   d.label_printed_at
@@ -1208,6 +1321,50 @@
         )
       )
     );
+  }
+
+  // ───────── Grade override (single + bulk) ─────────
+  async function singleSetGrade(device, newGrade) {
+    if (device.grade === newGrade) return;
+    try {
+      const r = await api.post('/inventory/grade', {
+        ids: [device.id],
+        grade: newGrade,
+        actor: 'operator',
+        reason: 'Inline override from Inventory grid',
+      });
+      if (r.updated_count > 0) {
+        toast(`<span class="mono">${device.imei}</span> · ${gradeLabel(device.grade)} → ${gradeLabel(newGrade)}`, 'ok');
+        await refreshInventory(); render();
+      } else {
+        toast('No change applied', 'warn');
+      }
+    } catch (err) {
+      toast('Failed to update grade: ' + (err.response?.data?.error || err.message), 'err');
+    }
+  }
+
+  async function bulkSetGrade(newGrade) {
+    const ids = Array.from(state.inventorySelected);
+    if (!ids.length) return;
+    if (!confirm(`Set ${ids.length} device${ids.length === 1 ? '' : 's'} to grade "${gradeLabel(newGrade)}"?\nThis writes one audit log row per device.`)) return;
+    try {
+      const r = await api.post('/inventory/grade', {
+        ids,
+        grade: newGrade,
+        actor: 'operator',
+        reason: `Bulk grade override (${ids.length} devices)`,
+      });
+      toast(
+        `Updated <b>${r.updated_count}</b> · skipped ${r.skipped.length}` +
+        (r.bulk_id ? `<br><span class="text-xs text-slate-400 mono">${r.bulk_id}</span>` : ''),
+        'ok', 3500
+      );
+      state.inventorySelected.clear();
+      await refreshInventory(); render();
+    } catch (err) {
+      toast('Bulk update failed: ' + (err.response?.data?.error || err.message), 'err');
+    }
   }
 
   // Delete-device confirmation modal
@@ -1261,9 +1418,13 @@
           ? h('div', { class: 'mt-3 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-xs text-amber-200' },
               h('i', { class: 'fas fa-circle-info mr-2' }),
               'The manifest line will be restored to pending so this IMEI can be scanned again.')
-          : h('div', { class: 'mt-3 p-3 rounded-lg bg-slate-800/40 border border-slate-700/40 text-xs text-slate-400' },
-              h('i', { class: 'fas fa-circle-info mr-2' }),
-              'This was force-added (unreconciled). Deletion is permanent.'),
+          : d.source === 'manual'
+            ? h('div', { class: 'mt-3 p-3 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-xs text-cyan-200' },
+                h('i', { class: 'fas fa-circle-info mr-2' }),
+                'This was added via Quick receive (no manifest). Deletion is permanent.')
+            : h('div', { class: 'mt-3 p-3 rounded-lg bg-slate-800/40 border border-slate-700/40 text-xs text-slate-400' },
+                h('i', { class: 'fas fa-circle-info mr-2' }),
+                'This was force-added (unreconciled). Deletion is permanent.'),
         h('div', { class: 'mt-5 flex justify-end gap-2' },
           h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
           h('button', { class: 'btn btn-danger', onclick: doDelete },
@@ -1272,6 +1433,474 @@
       )
     );
   }
+
+  // ───────── Manual receive modal (no manifest required) ─────────
+  // Lets the operator enter an IMEI + pick/define a SKU and book the device
+  // straight into inventory with source='manual'. Used when there's no
+  // manifest for the incoming pallet, or for one-off receives.
+  function ManualReceiveModal() {
+    const ctx = state._manualCtx ||= {
+      imei: '',
+      sku_pick: '',         // chosen sku_code from catalogue (empty = custom)
+      brand: '',
+      model: '',
+      capacity: '',
+      color: 'Phantom Black',
+      grade: 'UG',
+      notes: '',
+    };
+    const close = () => {
+      state.manualReceiveOpen = false;
+      state._manualCtx = null;
+      render();
+    };
+    const update = (k, v) => { ctx[k] = v; state._manualCtx = ctx; render(); };
+
+    // When the operator picks a catalogue SKU, prefill the brand/model/capacity/color fields.
+    const onPickSku = (sku) => {
+      ctx.sku_pick = sku;
+      if (sku) {
+        const row = state.catalog.find(c => c.sku === sku);
+        if (row) {
+          ctx.brand = row.brand;
+          ctx.model = row.model;
+          ctx.capacity = row.capacity || '';
+          ctx.color = row.color || ctx.color;
+        }
+      }
+      state._manualCtx = ctx; render();
+    };
+
+    const submit = async () => {
+      const imei = ctx.imei.trim();
+      if (!/^\d{14,17}$/.test(imei)) { toast('IMEI must be 14-17 digits', 'warn'); return; }
+      try {
+        const body = {
+          imei,
+          grade: ctx.grade,
+          notes: ctx.notes || null,
+          auto_print: state.autoPrint,
+        };
+        if (ctx.sku_pick) {
+          // Use catalogue SKU as-is. Server will enrich brand/model/etc.
+          body.sku = ctx.sku_pick;
+        } else {
+          // Custom row — send fields and let the server derive a SKU.
+          body.brand = ctx.brand;
+          body.model = ctx.model;
+          body.capacity = ctx.capacity;
+          body.color = ctx.color;
+        }
+        const r = await api.post('/scan/manual', body);
+        toast(
+          `Received <span class="mono">${r.received.imei}</span> · ${r.received.sku}` +
+          (state.autoPrint ? ' · 🖨️ label queued' : ''),
+          'ok'
+        );
+        beep('ok');
+        close();
+        await Promise.all([refreshInventory(), refreshPrint(), refreshStats()]);
+        render();
+        if (state.autoPrint && r.print_job_id) {
+          state.labelPreview = { jobId: r.print_job_id, payload: {
+            uuid: r.received.uuid, sku: r.received.sku, imei: r.received.imei,
+            brand: r.received.brand, model: r.received.model,
+            capacity: r.received.capacity, color: r.received.color, grade: r.received.grade,
+          }};
+          render();
+          setTimeout(() => { if (state.labelPreview?.jobId === r.print_job_id) { state.labelPreview = null; render(); } }, 2500);
+        }
+      } catch (err) {
+        toast(err.response?.data?.error || 'Failed to receive', 'err');
+      }
+    };
+
+    // Lazy-load catalog the first time the modal opens so the SKU dropdown
+    // has something to show.
+    if (state.catalog.length === 0) {
+      refreshCatalog().then(render);
+    }
+
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-xl' },
+        h('div', { class: 'flex items-center gap-3 mb-3' },
+          h('div', { class: 'w-10 h-10 rounded-xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center' },
+            h('i', { class: 'fas fa-plus' })),
+          h('div', {},
+            h('h2', { class: 'text-lg font-semibold' }, 'Quick receive (no manifest)'),
+            h('p', { class: 'text-xs text-slate-400' }, 'Add a device straight to inventory. Source will be marked "manual".')
+          )
+        ),
+
+        h('div', { class: 'mt-3' },
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'IMEI *'),
+          h('input', {
+            class: 'input mono text-lg tracking-widest text-center', autofocus: 'true',
+            placeholder: 'Scan or type IMEI…',
+            value: ctx.imei,
+            oninput: (e) => update('imei', e.target.value),
+            onkeydown: (e) => { if (e.key === 'Enter') submit(); },
+          })
+        ),
+
+        h('div', { class: 'mt-3' },
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'SKU — pick from catalogue'),
+          h('select', {
+            class: 'input mono',
+            onchange: (e) => onPickSku(e.target.value),
+          },
+            h('option', { value: '' }, '— enter brand/model below instead —'),
+            state.catalog.map(c => h('option', {
+              value: c.sku,
+              selected: c.sku === ctx.sku_pick ? 'selected' : null,
+            }, `${c.sku} · ${c.brand} ${c.model}${c.capacity ? ' ' + c.capacity : ''}`))
+          ),
+          h('div', { class: 'text-[11px] text-slate-500 mt-1' },
+            state.catalog.length === 0
+              ? 'Catalogue is empty — fill brand/model/capacity below to derive a SKU.'
+              : 'Pick a known SKU, or leave as "— enter brand/model below —" to define a new one inline.')
+        ),
+
+        // Per-field fallback (used when no SKU is picked, or to override picked one)
+        h('div', { class: 'mt-3 grid grid-cols-2 gap-3' },
+          field('Brand', ctx.brand, (v) => update('brand', v)),
+          field('Model', ctx.model, (v) => update('model', v)),
+          field('Capacity', ctx.capacity, (v) => update('capacity', v), 'mono'),
+          h('div', {},
+            h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Color'),
+            h('select', { class: 'input', onchange: (e) => update('color', e.target.value) },
+              ['Phantom Black','Phantom Gray','Graphite','Cream','Lavender','Violet','Mint','Cloud Navy','Silver','White'].map(o =>
+                h('option', { value: o, selected: o === ctx.color ? 'selected' : null }, o)))
+          ),
+          h('div', {},
+            h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Grade'),
+            gradeSelect(ctx.grade, (v) => update('grade', v))
+          ),
+          h('label', { class: 'flex items-center gap-2 text-sm text-slate-300 select-none mt-6' },
+            h('input', { type: 'checkbox', class: 'accent-cyan-500', checked: state.autoPrint ? 'checked' : null,
+              onchange: (e) => { state.autoPrint = e.target.checked; } }),
+            'Auto-queue print label'
+          ),
+        ),
+
+        h('div', { class: 'mt-3' },
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Notes (optional)'),
+          h('textarea', { class: 'input', rows: 2, value: ctx.notes, oninput: (e) => update('notes', e.target.value) })
+        ),
+
+        h('div', { class: 'mt-5 flex justify-end gap-2' },
+          h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
+          h('button', { class: 'btn btn-primary', onclick: submit },
+            h('i', { class: 'fas fa-check' }), 'Receive & Print')
+        )
+      )
+    );
+  }
+
+  // ───────── Catalog view ─────────
+  function CatalogView() {
+    return h('div', { class: 'space-y-5' },
+      h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
+        h('div', {},
+          h('h1', { class: 'text-2xl font-bold' }, 'SKU Catalogue'),
+          h('p', { class: 'text-slate-400 text-sm' },
+            'The shared spine for product identity. Upload your master list in bulk — duplicates are flagged, never silently merged.')
+        ),
+        h('div', { class: 'flex gap-2 items-center' },
+          h('input', {
+            class: 'input', placeholder: 'Search SKU / brand / model',
+            oninput: (e) => debouncedCatalogSearch(e.target.value),
+          }),
+          h('button', { class: 'btn btn-primary', onclick: openCatalogUpload },
+            h('i', { class: 'fas fa-cloud-arrow-up' }), 'Upload Catalogue')
+        )
+      ),
+      h('div', { class: 'card overflow-hidden' },
+        h('table', { class: 'w-full text-sm' },
+          h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+            h('tr', {},
+              h('th', { class: 'text-left px-4 py-3' }, 'SKU'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Brand'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Model'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Capacity'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Color'),
+              h('th', { class: 'text-right px-4 py-3' }, '')
+            )
+          ),
+          h('tbody', { class: 'divide-y divide-slate-800' },
+            state.catalog.length === 0
+              ? h('tr', {}, h('td', { colspan: 6, class: 'text-center py-10 text-slate-500' },
+                  'Catalogue is empty — upload a CSV to populate it.'))
+              : state.catalog.map(c => h('tr', { class: 'row-strip' },
+                  h('td', { class: 'px-4 py-2 mono text-xs font-semibold text-cyan-300' }, c.sku),
+                  h('td', { class: 'px-4 py-2 text-xs' }, c.brand),
+                  h('td', { class: 'px-4 py-2 text-xs' }, c.model),
+                  h('td', { class: 'px-4 py-2 text-xs mono' }, c.capacity || '—'),
+                  h('td', { class: 'px-4 py-2 text-xs' }, c.color || '—'),
+                  h('td', { class: 'px-4 py-2 text-right' },
+                    h('button', {
+                      class: 'btn btn-danger text-xs',
+                      title: 'Remove SKU from catalogue (received devices keep their copy)',
+                      onclick: () => deleteCatalogEntry(c),
+                    }, h('i', { class: 'fas fa-trash' })))
+                ))
+          )
+        )
+      )
+    );
+  }
+
+  let catalogSearchTimer;
+  function debouncedCatalogSearch(q) {
+    clearTimeout(catalogSearchTimer);
+    catalogSearchTimer = setTimeout(async () => {
+      await refreshCatalog(q);
+      render();
+    }, 200);
+  }
+
+  async function deleteCatalogEntry(c) {
+    if (!confirm(`Remove "${c.sku}" from the catalogue?\nReceived devices that already reference this SKU will not be affected.`)) return;
+    try {
+      await api.del(`/catalog/${c.id}`);
+      toast(`Removed ${c.sku}`, 'warn');
+      await refreshCatalog(); render();
+    } catch (err) {
+      toast(err.response?.data?.error || 'Failed to delete', 'err');
+    }
+  }
+
+  // ───────── Catalog upload modal ─────────
+  function openCatalogUpload() {
+    state.catalogUpload = { fileName: '', rows: [], report: null, summary: null };
+    renderCatalogUploadModal();
+  }
+
+  function renderCatalogUploadModal() {
+    const m = $('#cat-upload-modal');
+    if (m) m.remove();
+    const ctx = state.catalogUpload;
+
+    const handleFile = (file) => {
+      if (!file) return;
+      ctx.fileName = file.name;
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const data = new Uint8Array(e.target.result);
+          const wb = XLSX.read(data, { type: 'array' });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+          const parsed = parseCatalogRows(rows);
+          ctx.rows = parsed;
+          ctx.report = null;
+          ctx.summary = null;
+          toast(`Parsed ${parsed.length} rows`, 'ok');
+          renderCatalogUploadModal();
+        } catch (err) {
+          console.error(err);
+          toast('Failed to parse file', 'err');
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    };
+
+    const previewOrCommit = async (dryRun) => {
+      if (!ctx.rows.length) { toast('No rows to upload', 'warn'); return; }
+      try {
+        const url = dryRun ? '/catalog/upload?dry_run=1' : '/catalog/upload';
+        const r = await api.post(url, { rows: ctx.rows });
+        ctx.report = r.report;
+        ctx.summary = r.summary;
+        if (!dryRun && r.summary.inserted > 0) {
+          toast(`Inserted ${r.summary.inserted} SKU${r.summary.inserted === 1 ? '' : 's'}`, 'ok');
+          await refreshCatalog();
+        }
+        renderCatalogUploadModal();
+      } catch (err) {
+        toast(err.response?.data?.error || 'Upload failed', 'err');
+      }
+    };
+
+    const modal = h('div', { id: 'cat-upload-modal', class: 'modal-backdrop' },
+      h('div', { class: 'modal p-6 max-w-3xl' },
+        h('div', { class: 'flex items-center justify-between mb-4' },
+          h('h2', { class: 'text-lg font-semibold' }, 'Upload SKU Catalogue'),
+          h('button', { class: 'btn btn-ghost text-xs', onclick: () => { state.catalogUpload = null; $('#cat-upload-modal').remove(); } },
+            h('i', { class: 'fas fa-times' }))
+        ),
+        h('div', { class: 'text-xs text-slate-400 mb-3' },
+          'Expected columns (case-insensitive, any order): ',
+          h('code', { class: 'text-cyan-300' }, 'brand'), ', ',
+          h('code', { class: 'text-cyan-300' }, 'model'), ', ',
+          h('code', { class: 'text-cyan-300' }, 'capacity'), ', ',
+          h('code', { class: 'text-cyan-300' }, 'color'), '. ',
+          'An optional ', h('code', { class: 'text-cyan-300' }, 'sku'), ' column overrides the auto-derived code.'
+        ),
+
+        // Dropzone
+        h('div', {
+          class: 'dropzone rounded-xl p-6 text-center cursor-pointer mb-4',
+          id: 'cat-dz',
+          onclick: () => $('#cat-file').click(),
+          ondragover: (e) => { e.preventDefault(); $('#cat-dz').classList.add('is-over'); },
+          ondragleave: () => $('#cat-dz').classList.remove('is-over'),
+          ondrop: (e) => { e.preventDefault(); $('#cat-dz').classList.remove('is-over'); handleFile(e.dataTransfer.files[0]); },
+        },
+          h('i', { class: 'fas fa-cloud-arrow-up text-2xl text-slate-500 mb-2' }),
+          h('div', { class: 'text-sm text-slate-300' }, ctx.fileName || 'Drop CSV or Excel file, or click to browse'),
+          h('input', {
+            type: 'file', id: 'cat-file', class: 'hidden',
+            accept: '.csv,.xls,.xlsx',
+            onchange: (e) => handleFile(e.target.files[0]),
+          })
+        ),
+
+        // Parsed preview
+        ctx.rows.length > 0 ? h('div', { class: 'mb-4' },
+          h('div', { class: 'flex items-center justify-between mb-2' },
+            h('div', { class: 'text-sm font-medium' },
+              `Parsed ${ctx.rows.length} rows`,
+              h('span', { class: 'text-xs text-slate-400 ml-2' }, 'preview first 5')
+            ),
+            h('div', { class: 'flex gap-2' },
+              h('button', { class: 'btn btn-ghost text-xs', onclick: () => previewOrCommit(true) },
+                h('i', { class: 'fas fa-magnifying-glass' }), 'Dry-run preview'),
+              h('button', { class: 'btn btn-primary text-xs', onclick: () => previewOrCommit(false) },
+                h('i', { class: 'fas fa-check' }), `Commit ${ctx.rows.length}`)
+            )
+          ),
+          h('div', { class: 'border border-slate-800 rounded-lg overflow-hidden' },
+            h('table', { class: 'w-full text-xs' },
+              h('thead', { class: 'bg-slate-900/50 text-slate-400' },
+                h('tr', {},
+                  h('th', { class: 'text-left px-3 py-2' }, 'Brand'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Model'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Capacity'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Color'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'SKU (override)')
+                )
+              ),
+              h('tbody', { class: 'divide-y divide-slate-800' },
+                ctx.rows.slice(0, 5).map(r => h('tr', {},
+                  h('td', { class: 'px-3 py-2' }, r.brand || '—'),
+                  h('td', { class: 'px-3 py-2' }, r.model || '—'),
+                  h('td', { class: 'px-3 py-2 mono' }, r.capacity || '—'),
+                  h('td', { class: 'px-3 py-2' }, r.color || '—'),
+                  h('td', { class: 'px-3 py-2 mono' }, r.sku || '—')
+                ))
+              )
+            )
+          )
+        ) : null,
+
+        // Server report (after dry-run or commit)
+        ctx.report ? h('div', { class: 'mb-4' },
+          h('div', { class: 'text-sm font-medium mb-2 flex items-center gap-3 flex-wrap' },
+            ctx.summary.dry_run
+              ? h('span', { class: 'badge badge-amber text-[10px]' }, 'DRY RUN — nothing written')
+              : h('span', { class: 'badge badge-green text-[10px]' }, 'COMMITTED'),
+            h('span', {}, `${ctx.summary.total} total`),
+            h('span', { class: 'text-green-400' }, `${ctx.summary.inserted} would-insert / inserted`),
+            ctx.summary.duplicate > 0 ? h('span', { class: 'text-slate-400' }, `${ctx.summary.duplicate} duplicate (skipped)`) : null,
+            ctx.summary.collision > 0 ? h('span', { class: 'text-red-400 font-semibold' }, `${ctx.summary.collision} COLLISION`) : null,
+            ctx.summary.invalid > 0 ? h('span', { class: 'text-amber-400' }, `${ctx.summary.invalid} invalid`) : null
+          ),
+          ctx.summary.collision > 0 ? h('div', { class: 'mb-2 p-2 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-200' },
+            h('i', { class: 'fas fa-triangle-exclamation mr-2' }),
+            'Collisions are NOT merged. Rename or remove the existing/conflicting SKU and try again.'
+          ) : null,
+          // Show only the rows that need operator attention
+          h('div', { class: 'border border-slate-800 rounded-lg overflow-hidden max-h-72 overflow-y-auto' },
+            h('table', { class: 'w-full text-xs' },
+              h('thead', { class: 'bg-slate-900/50 text-slate-400 sticky top-0' },
+                h('tr', {},
+                  h('th', { class: 'text-left px-3 py-2' }, 'Row'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Outcome'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'SKU'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Detail')
+                )
+              ),
+              h('tbody', { class: 'divide-y divide-slate-800' },
+                ctx.report.filter(r => r.outcome !== 'inserted').length === 0
+                  ? h('tr', {}, h('td', { colspan: 4, class: 'px-3 py-3 text-center text-green-400' },
+                      'All rows clean — no duplicates, collisions, or invalid entries.'))
+                  : ctx.report.filter(r => r.outcome !== 'inserted').map(r => h('tr', {},
+                    h('td', { class: 'px-3 py-2 mono text-slate-500' }, '#' + (r.row_index + 1)),
+                    h('td', { class: 'px-3 py-2' },
+                      h('span', { class: 'badge text-[10px] ' + (
+                        r.outcome === 'collision' ? 'badge-red'
+                        : r.outcome === 'duplicate' ? 'badge-slate'
+                        : 'badge-amber'
+                      ) }, r.outcome)
+                    ),
+                    h('td', { class: 'px-3 py-2 mono text-cyan-300' }, r.sku || '—'),
+                    h('td', { class: 'px-3 py-2 text-slate-300' },
+                      r.message || '—',
+                      r.existing ? h('div', { class: 'text-[10px] text-slate-500 mt-0.5' },
+                        `existing: ${r.existing.brand} / ${r.existing.model}${r.existing.capacity ? ' / ' + r.existing.capacity : ''}${r.existing.color ? ' / ' + r.existing.color : ''}`
+                      ) : null
+                    )
+                  ))
+              )
+            )
+          )
+        ) : null,
+
+        h('div', { class: 'flex justify-end gap-2' },
+          h('button', {
+            class: 'btn btn-ghost',
+            onclick: () => { state.catalogUpload = null; $('#cat-upload-modal').remove(); }
+          }, 'Close')
+        )
+      )
+    );
+    document.body.appendChild(modal);
+  }
+
+  // Normalise spreadsheet rows for catalogue upload.
+  // Accepts headers: brand, model, capacity, color, sku (any case, any order)
+  function parseCatalogRows(rows) {
+    if (!rows || !rows.length) return [];
+    let headerIdx = -1;
+    let headers = null;
+    for (let i = 0; i < Math.min(rows.length, 10); i++) {
+      const r = rows[i] || [];
+      const lower = r.map(c => c == null ? '' : String(c).toLowerCase().trim());
+      if (lower.includes('brand') && lower.includes('model')) {
+        headerIdx = i;
+        headers = lower;
+        break;
+      }
+    }
+    if (headerIdx < 0) {
+      toast('Could not find header row with "brand" and "model" columns', 'warn', 4000);
+      return [];
+    }
+    const idx = {
+      brand: headers.indexOf('brand'),
+      model: headers.indexOf('model'),
+      capacity: headers.findIndex(h => h === 'capacity' || h === 'storage'),
+      color: headers.findIndex(h => h === 'color' || h === 'colour'),
+      sku: headers.indexOf('sku'),
+    };
+    const out = [];
+    for (let i = headerIdx + 1; i < rows.length; i++) {
+      const r = rows[i] || [];
+      const brand = idx.brand >= 0 ? r[idx.brand] : null;
+      const model = idx.model >= 0 ? r[idx.model] : null;
+      if (!brand || !model) continue;
+      out.push({
+        brand: String(brand).trim(),
+        model: String(model).trim(),
+        capacity: idx.capacity >= 0 && r[idx.capacity] != null ? String(r[idx.capacity]).trim() : null,
+        color: idx.color >= 0 && r[idx.color] != null ? String(r[idx.color]).trim() : null,
+        sku: idx.sku >= 0 && r[idx.sku] != null ? String(r[idx.sku]).trim() : null,
+      });
+    }
+    return out;
+  }
+
   let searchTimer;
   function debouncedSearch(q) {
     clearTimeout(searchTimer);

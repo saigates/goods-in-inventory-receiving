@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import type { Bindings } from '../types'
 import { buildSku } from '../lib/sku'
+import { normalizeGrade } from '../lib/grade'
 
 const app = new Hono<{ Bindings: Bindings }>()
 
@@ -93,6 +94,9 @@ app.post('/', async (c) => {
       // Best-effort prepopulation; color will be defaulted, manager can adjust at scan time
       sku = buildSku({ oem: r.oem, description: r.description }).sku
     }
+    // Supplier-declared grade is only a hint — normalise to A | B | C | UG.
+    // Anything else (B+, A-, missing, junk) → UG. Real grade assigned at QC.
+    const grade = normalizeGrade(r.grade)
     return c.env.DB.prepare(
       `INSERT INTO expected_devices
        (manifest_id, oem, condition, description, grade, model_no, imei, unit_cost, sku)
@@ -102,7 +106,7 @@ app.post('/', async (c) => {
       r.oem || null,
       r.condition || null,
       r.description || null,
-      r.grade || null,
+      grade,
       r.model_no || null,
       imei,
       r.unit_cost ?? null,

@@ -6,6 +6,7 @@ import manifestsRoute from './routes/manifests'
 import scanRoute from './routes/scan'
 import inventoryRoute from './routes/inventory'
 import printRoute from './routes/print'
+import catalogRoute from './routes/catalog'
 
 const app = new Hono<{ Bindings: Bindings }>()
 
@@ -16,6 +17,7 @@ app.route('/api/manifests', manifestsRoute)
 app.route('/api/scan', scanRoute)
 app.route('/api/inventory', inventoryRoute)
 app.route('/api/print', printRoute)
+app.route('/api/catalog', catalogRoute)
 
 app.get('/api/health', (c) => c.json({ ok: true, ts: new Date().toISOString() }))
 
