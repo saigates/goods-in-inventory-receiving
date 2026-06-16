@@ -149,19 +149,44 @@ app.post('/:id/reopen', async (c) => {
   return c.json({ ok: true })
 })
 
-// Delete manifest. expected_devices cascade. received_devices stay in
-// inventory — their manifest_id / expected_device_id are SET NULL by FK.
+// Delete manifest AND every device booked against it.
+// Treat the manifest as never happened: received_devices → print_jobs and
+// grade_audit cascade away (FK ON DELETE CASCADE from 0001/0004); expected
+// lines cascade from manifests; scan_events for this manifest are cleaned
+// up by hand (no FK, just an int reference).
 app.delete('/:id', async (c) => {
   const id = Number(c.req.param('id'))
-  // Count surviving received_devices for the response so the operator knows
-  // what was orphaned into the general inventory bucket.
-  const orphan = await c.env.DB.prepare(
-    'SELECT COUNT(*) AS c FROM received_devices WHERE manifest_id = ?'
-  ).bind(id).first<{ c: number }>()
   try {
-    const res = await c.env.DB.prepare('DELETE FROM manifests WHERE id = ?').bind(id).run()
+    // Count what we're about to destroy so the toast can tell the operator.
+    const recv = await c.env.DB.prepare(
+      'SELECT COUNT(*) AS c FROM received_devices WHERE manifest_id = ?'
+    ).bind(id).first<{ c: number }>()
+    const exp = await c.env.DB.prepare(
+      'SELECT COUNT(*) AS c FROM expected_devices WHERE manifest_id = ?'
+    ).bind(id).first<{ c: number }>()
+
+    // 1. Kill received_devices linked to this manifest. CASCADE on
+    //    print_jobs and grade_audit pulls their dependents along.
+    await c.env.DB.prepare(
+      'DELETE FROM received_devices WHERE manifest_id = ?'
+    ).bind(id).run()
+
+    // 2. Tidy scan_events (no FK, otherwise they'd orphan).
+    await c.env.DB.prepare(
+      'DELETE FROM scan_events WHERE manifest_id = ?'
+    ).bind(id).run()
+
+    // 3. Delete the manifest — cascades into expected_devices.
+    const res = await c.env.DB.prepare(
+      'DELETE FROM manifests WHERE id = ?'
+    ).bind(id).run()
     if (!res.meta.changes) return c.json({ error: 'Manifest not found' }, 404)
-    return c.json({ ok: true, kept_in_inventory: orphan?.c ?? 0 })
+
+    return c.json({
+      ok: true,
+      deleted_received: recv?.c ?? 0,
+      deleted_expected: exp?.c ?? 0,
+    })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     return c.json({ error: `Could not delete manifest: ${msg}` }, 500)

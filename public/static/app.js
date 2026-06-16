@@ -493,15 +493,32 @@
     await refreshManifests(); render();
   }
   async function deleteManifest(id) {
-    if (!confirm('Delete this manifest and all expected lines? Received devices will remain in inventory.')) return;
+    // Find a friendly name + the receive count for the confirm dialog.
+    const m = state.manifests.find(x => x.id === id);
+    const recvCount = m?.received_count || 0;
+    const lines = [
+      `Delete manifest ${m?.reference || `#${id}`}?`,
+      '',
+      'This treats the manifest as if it never happened:',
+      `  · ${m?.expected_count ?? '?'} expected lines will be removed`,
+    ];
+    if (recvCount > 0) {
+      lines.push(`  · ${recvCount} already-received device${recvCount === 1 ? '' : 's'} will be DELETED from inventory`);
+      lines.push('  · Their labels, print jobs and grade history go too');
+    }
+    lines.push('', 'This cannot be undone.');
+    if (!confirm(lines.join('\n'))) return;
     try {
       const r = await api.del(`/manifests/${id}`);
       if (state.activeManifestId === id) state.activeManifestId = null;
-      const kept = r?.kept_in_inventory || 0;
-      toast(kept > 0
-        ? `Manifest deleted · ${kept} received device${kept === 1 ? '' : 's'} kept in inventory`
+      const dr = r?.deleted_received || 0;
+      toast(dr > 0
+        ? `Manifest deleted · ${dr} received device${dr === 1 ? '' : 's'} removed from inventory`
         : 'Manifest deleted', 'ok');
-      await refreshManifests(); render();
+      // Inventory may have shrunk — refresh both lists so the dashboard
+      // and inventory views stay in sync.
+      await Promise.all([refreshManifests(), refreshInventory()]);
+      render();
     } catch (e) {
       toast(e.response?.data?.error || 'Failed to delete manifest', 'err');
     }
