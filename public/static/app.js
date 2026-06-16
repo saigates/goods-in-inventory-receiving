@@ -494,10 +494,17 @@
   }
   async function deleteManifest(id) {
     if (!confirm('Delete this manifest and all expected lines? Received devices will remain in inventory.')) return;
-    await api.del(`/manifests/${id}`);
-    if (state.activeManifestId === id) state.activeManifestId = null;
-    toast('Manifest deleted');
-    await refreshManifests(); render();
+    try {
+      const r = await api.del(`/manifests/${id}`);
+      if (state.activeManifestId === id) state.activeManifestId = null;
+      const kept = r?.kept_in_inventory || 0;
+      toast(kept > 0
+        ? `Manifest deleted · ${kept} received device${kept === 1 ? '' : 's'} kept in inventory`
+        : 'Manifest deleted', 'ok');
+      await refreshManifests(); render();
+    } catch (e) {
+      toast(e.response?.data?.error || 'Failed to delete manifest', 'err');
+    }
   }
 
   // ───────── Manifest upload modal ─────────

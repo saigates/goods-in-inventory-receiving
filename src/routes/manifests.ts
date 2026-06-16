@@ -149,11 +149,23 @@ app.post('/:id/reopen', async (c) => {
   return c.json({ ok: true })
 })
 
-// Delete manifest (cascade kills expected_devices). Received devices remain.
+// Delete manifest. expected_devices cascade. received_devices stay in
+// inventory — their manifest_id / expected_device_id are SET NULL by FK.
 app.delete('/:id', async (c) => {
   const id = Number(c.req.param('id'))
-  await c.env.DB.prepare('DELETE FROM manifests WHERE id = ?').bind(id).run()
-  return c.json({ ok: true })
+  // Count surviving received_devices for the response so the operator knows
+  // what was orphaned into the general inventory bucket.
+  const orphan = await c.env.DB.prepare(
+    'SELECT COUNT(*) AS c FROM received_devices WHERE manifest_id = ?'
+  ).bind(id).first<{ c: number }>()
+  try {
+    const res = await c.env.DB.prepare('DELETE FROM manifests WHERE id = ?').bind(id).run()
+    if (!res.meta.changes) return c.json({ error: 'Manifest not found' }, 404)
+    return c.json({ ok: true, kept_in_inventory: orphan?.c ?? 0 })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return c.json({ error: `Could not delete manifest: ${msg}` }, 500)
+  }
 })
 
 export default app
