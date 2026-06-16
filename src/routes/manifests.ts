@@ -60,6 +60,8 @@ type ImportRow = {
   model_no?: string | null
   imei: string | number
   unit_cost?: number | null
+  capacity?: string | null
+  color?: string | null
 }
 
 // Create a manifest with a batch of expected devices (JSON body)
@@ -89,18 +91,26 @@ app.post('/', async (c) => {
   // Pre-resolve SKU when possible
   const stmts = body.rows.map((r) => {
     const imei = String(r.imei).trim()
+    const capacity = r.capacity ? String(r.capacity).trim() || null : null
+    const color = r.color ? String(r.color).trim() || null : null
     let sku: string | null = null
     if (r.description && r.oem) {
-      // Best-effort prepopulation; color will be defaulted, manager can adjust at scan time
-      sku = buildSku({ oem: r.oem, description: r.description }).sku
+      // Best-effort prepopulation; if capacity/color were supplied in the manifest,
+      // fold them into the SKU so receiving doesn't have to guess.
+      sku = buildSku({
+        oem: r.oem,
+        description: r.description,
+        capacity,
+        color,
+      }).sku
     }
     // Supplier-declared grade is only a hint — normalise to A | B | C | UG.
     // Anything else (B+, A-, missing, junk) → UG. Real grade assigned at QC.
     const grade = normalizeGrade(r.grade)
     return c.env.DB.prepare(
       `INSERT INTO expected_devices
-       (manifest_id, oem, condition, description, grade, model_no, imei, unit_cost, sku)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (manifest_id, oem, condition, description, grade, model_no, imei, unit_cost, sku, capacity, color)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       manifestId,
       r.oem || null,
@@ -110,7 +120,9 @@ app.post('/', async (c) => {
       r.model_no || null,
       imei,
       r.unit_cost ?? null,
-      sku
+      sku,
+      capacity,
+      color,
     )
   })
 

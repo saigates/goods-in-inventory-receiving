@@ -502,8 +502,27 @@
 
   // ───────── Manifest upload modal ─────────
   let uploadCtx = null;
+  const MAPPABLE_FIELDS = [
+    { key: 'imei',        label: 'IMEI *',       hint: 'serial / IMEI' },
+    { key: 'oem',         label: 'OEM / Brand',  hint: 'Apple, Samsung…' },
+    { key: 'description', label: 'Description',  hint: 'iPhone 15 Pro, Galaxy S24…' },
+    { key: 'model_no',    label: 'Model No.',    hint: 'SM-S921N, A2890…' },
+    { key: 'capacity',    label: 'Storage',      hint: '128GB, 256G…' },
+    { key: 'color',       label: 'Color',        hint: 'Phantom Black…' },
+    { key: 'grade',       label: 'Grade',        hint: 'A | B | C (anything else → UG)' },
+    { key: 'condition',   label: 'Condition',    hint: 'New / Used' },
+    { key: 'unit_cost',   label: 'Unit cost',    hint: 'numeric' },
+  ];
   function openManifestUpload() {
-    uploadCtx = { reference: '', supplier: '', notes: '', rows: [], fileName: '' };
+    uploadCtx = {
+      reference: '', supplier: '', notes: '',
+      fileName: '',
+      rawRows: [],     // every row of the sheet, including header
+      headers: [],     // normalised header row (lowercased strings)
+      headerIdx: -1,   // index of the detected header row in rawRows
+      mapping: {},     // { fieldKey: columnIndex | -1 }
+      rows: [],        // parsed rows (the payload we POST)
+    };
     renderUploadModal();
   }
   function renderUploadModal() {
@@ -551,13 +570,49 @@
         },
           h('i', { class: 'fas fa-cloud-arrow-up text-3xl text-slate-500 mb-2' }),
           h('div', { class: 'text-sm text-slate-300' }, uploadCtx.fileName || 'Drop CSV or Excel file, or click to browse'),
-          h('div', { class: 'text-xs text-slate-500 mt-1' }, 'Expected columns: OEM, Condition, Description, Grade, MODEL NO., IMEI'),
+          h('div', { class: 'text-xs text-slate-500 mt-1' }, 'CSV or Excel. Columns are auto-detected — you can remap any of them below.'),
           h('input', {
             type: 'file', id: 'mf-file', class: 'hidden',
             accept: '.csv,.xls,.xlsx',
             onchange: (e) => handleFile(e.target.files[0]),
           })
         ),
+        // ── Column mapping panel ──
+        uploadCtx.headers.length > 0 ? h('div', { class: 'card p-4 mb-4' },
+          h('div', { class: 'flex items-center justify-between mb-3' },
+            h('div', { class: 'text-sm font-medium' },
+              h('i', { class: 'fas fa-columns text-slate-400 mr-2' }),
+              'Column mapping'),
+            h('div', { class: 'text-xs text-slate-500' },
+              `Detected ${uploadCtx.headers.filter(Boolean).length} columns in row ${uploadCtx.headerIdx + 1}`)
+          ),
+          h('div', { class: 'grid grid-cols-2 md:grid-cols-3 gap-3' },
+            MAPPABLE_FIELDS.map(f => h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, f.label),
+              h('select', {
+                class: 'input text-xs',
+                value: String(uploadCtx.mapping[f.key] ?? -1),
+                onchange: (e) => {
+                  uploadCtx.mapping[f.key] = Number(e.target.value);
+                  reparseFromMapping();
+                  renderUploadModal();
+                },
+              },
+                h('option', { value: '-1' }, '— not in file —'),
+                uploadCtx.headers.map((hd, idx) => h('option', { value: String(idx) },
+                  hd ? `${colLetter(idx)} · ${hd}` : `${colLetter(idx)} · (blank)`
+                ))
+              ),
+              h('div', { class: 'text-[10px] text-slate-500 mt-1' }, f.hint),
+            ))
+          ),
+          // Warn if IMEI not mapped
+          (uploadCtx.mapping.imei ?? -1) < 0
+            ? h('div', { class: 'mt-3 text-xs text-amber-300 bg-amber-900/20 border border-amber-800/40 rounded px-3 py-2' },
+                h('i', { class: 'fas fa-triangle-exclamation mr-2' }),
+                'An IMEI column must be selected before this manifest can be created.')
+            : null
+        ) : null,
         uploadCtx.rows.length > 0 ? h('div', { class: 'mb-4' },
           h('div', { class: 'flex items-center justify-between mb-2' },
             h('div', { class: 'text-sm font-medium' },
@@ -571,6 +626,8 @@
                 h('tr', {},
                   h('th', { class: 'text-left px-3 py-2' }, 'OEM'),
                   h('th', { class: 'text-left px-3 py-2' }, 'Description'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Storage'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Color'),
                   h('th', { class: 'text-left px-3 py-2' }, 'Grade'),
                   h('th', { class: 'text-left px-3 py-2' }, 'Model No.'),
                   h('th', { class: 'text-left px-3 py-2' }, 'IMEI'),
@@ -580,6 +637,8 @@
                 uploadCtx.rows.slice(0, 5).map(r => h('tr', {},
                   h('td', { class: 'px-3 py-2' }, r.oem || '—'),
                   h('td', { class: 'px-3 py-2' }, r.description || '—'),
+                  h('td', { class: 'px-3 py-2' }, r.capacity || '—'),
+                  h('td', { class: 'px-3 py-2' }, r.color || '—'),
                   h('td', { class: 'px-3 py-2' }, r.grade || '—'),
                   h('td', { class: 'px-3 py-2 mono' }, r.model_no || '—'),
                   h('td', { class: 'px-3 py-2 mono' }, r.imei),
@@ -601,6 +660,17 @@
     setTimeout(() => $('#mf-ref')?.focus(), 30);
   }
 
+  // Spreadsheet column letter helper (0 → A, 25 → Z, 26 → AA…)
+  function colLetter(i) {
+    let s = '';
+    let n = i;
+    while (n >= 0) {
+      s = String.fromCharCode(65 + (n % 26)) + s;
+      n = Math.floor(n / 26) - 1;
+    }
+    return s;
+  }
+
   function handleFile(file) {
     if (!file) return;
     uploadCtx.fileName = file.name;
@@ -616,14 +686,23 @@
         const wb = XLSX.read(data, { type: 'array' });
         const ws = wb.Sheets[wb.SheetNames[0]];
         const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
-        const parsed = parseRows(rows);
-        uploadCtx.rows = parsed;
+        // Detect header row + auto-map columns
+        const { headerIdx, headers, mapping } = detectHeadersAndMapping(rows);
+        uploadCtx.rawRows = rows;
+        uploadCtx.headerIdx = headerIdx;
+        uploadCtx.headers = headers;
+        uploadCtx.mapping = mapping;
+        uploadCtx.rows = applyMapping(rows, headerIdx, mapping);
         if (!uploadCtx.supplier) {
           // Try to grab supplier from filename
           const m = file.name.match(/-(.+?)_/);
           if (m) uploadCtx.supplier = m[1].trim();
         }
-        toast(`Parsed ${parsed.length} devices`, 'ok');
+        if (headerIdx < 0) {
+          toast('No header row found — pick the IMEI column manually', 'warn');
+        } else {
+          toast(`Parsed ${uploadCtx.rows.length} devices`, 'ok');
+        }
         renderUploadModal();
       } catch (err) {
         console.error(err);
@@ -633,51 +712,89 @@
     reader.readAsArrayBuffer(file);
   }
 
-  // Normalise spreadsheet rows. Accepts headers like:
-  //   OEM, Condition, Description, [grade col D unnamed], MODEL NO., IMEI, ...
-  function parseRows(rows) {
-    if (!rows || !rows.length) return [];
-    // Find header row (first row that contains "IMEI" case-insensitive)
+  // Re-derive parsed rows from the current mapping (called when the user
+  // changes a column in the mapping panel).
+  function reparseFromMapping() {
+    if (!uploadCtx.rawRows.length) return;
+    uploadCtx.rows = applyMapping(uploadCtx.rawRows, uploadCtx.headerIdx, uploadCtx.mapping);
+  }
+
+  // Find header row (first row that contains "imei", or the first non-empty
+  // row if none found) and auto-detect each known field's column index.
+  function detectHeadersAndMapping(rows) {
+    if (!rows || !rows.length) {
+      return { headerIdx: -1, headers: [], mapping: emptyMapping() };
+    }
     let headerIdx = -1;
-    let headers = null;
-    for (let i = 0; i < Math.min(rows.length, 10); i++) {
+    for (let i = 0; i < Math.min(rows.length, 15); i++) {
       const r = rows[i] || [];
       if (r.some(c => c && String(c).toLowerCase().trim() === 'imei')) {
-        headerIdx = i;
-        headers = r.map(c => c == null ? '' : String(c).toLowerCase().trim());
-        break;
+        headerIdx = i; break;
       }
     }
-    if (headerIdx < 0) return [];
-    const colIdx = {
-      oem: headers.findIndex(h => ['oem','brand','manufacturer'].includes(h)),
-      condition: headers.findIndex(h => h === 'condition'),
-      description: headers.findIndex(h => ['description','desc','model'].includes(h)),
-      grade: headers.findIndex(h => h === 'grade'),
-      model_no: headers.findIndex(h => ['model no.','model no','model number','model_no'].includes(h)),
-      imei: headers.findIndex(h => h === 'imei'),
-      unit_cost: headers.findIndex(h => ['unit cost','cost','price','unit_cost'].includes(h)),
-    };
-    // Handle the common case where column D (index 3) is grade but unnamed
-    if (colIdx.grade < 0 && colIdx.description >= 0 && colIdx.model_no >= 0
-        && colIdx.model_no - colIdx.description === 2) {
-      colIdx.grade = colIdx.description + 1;
+    // Fallback: first non-empty row
+    if (headerIdx < 0) {
+      for (let i = 0; i < Math.min(rows.length, 15); i++) {
+        const r = rows[i] || [];
+        if (r.some(c => c != null && String(c).trim() !== '')) { headerIdx = i; break; }
+      }
     }
+    if (headerIdx < 0) return { headerIdx: -1, headers: [], mapping: emptyMapping() };
+    const rawHeaders = rows[headerIdx] || [];
+    const headers = rawHeaders.map(c => c == null ? '' : String(c).toLowerCase().trim());
+    const find = (preds) => {
+      for (let i = 0; i < headers.length; i++) {
+        if (preds(headers[i], i)) return i;
+      }
+      return -1;
+    };
+    const mapping = {
+      imei: find(h => h === 'imei' || h === 'imei1' || h === 'imei/sn' || h === 'serial' || h === 'sn'),
+      oem: find(h => ['oem','brand','manufacturer','make'].includes(h)),
+      description: find(h => ['description','desc','model','model name','product','product name','item'].includes(h)),
+      grade: find(h => h === 'grade' || h === 'quality' || h === 'cosmetic grade'),
+      model_no: find(h => ['model no.','model no','model number','model_no','model code','sku','part no','part number'].includes(h)),
+      condition: find(h => h === 'condition' || h === 'status'),
+      capacity: find(h => ['storage','capacity','memory','size','rom','gb'].includes(h)),
+      color: find(h => ['color','colour'].includes(h)),
+      unit_cost: find(h => ['unit cost','cost','price','unit_cost','unit price'].includes(h)),
+    };
+    // Heuristic: if grade isn't found but there's a 1-col gap between
+    // description and model_no, that gap is usually an unnamed grade col.
+    if (mapping.grade < 0 && mapping.description >= 0 && mapping.model_no >= 0
+        && mapping.model_no - mapping.description === 2) {
+      mapping.grade = mapping.description + 1;
+    }
+    return { headerIdx, headers, mapping };
+  }
+
+  function emptyMapping() {
+    return { imei: -1, oem: -1, description: -1, grade: -1, model_no: -1,
+             condition: -1, capacity: -1, color: -1, unit_cost: -1 };
+  }
+
+  // Apply a column-mapping to raw rows. Skips rows whose IMEI doesn't look
+  // like 14–17 digits, so header noise and trailing summary rows fall away.
+  function applyMapping(rows, headerIdx, mapping) {
+    if (!rows.length || headerIdx < 0 || (mapping.imei ?? -1) < 0) return [];
+    const pick = (r, idx) => idx >= 0 ? (r[idx] ?? null) : null;
     const out = [];
     for (let i = headerIdx + 1; i < rows.length; i++) {
       const r = rows[i] || [];
-      const imeiVal = colIdx.imei >= 0 ? r[colIdx.imei] : null;
+      const imeiVal = pick(r, mapping.imei);
       if (imeiVal == null || imeiVal === '') continue;
       const imei = String(imeiVal).trim();
       if (!/^\d{14,17}$/.test(imei)) continue;
       out.push({
-        oem: colIdx.oem >= 0 ? (r[colIdx.oem] ?? null) : null,
-        condition: colIdx.condition >= 0 ? (r[colIdx.condition] ?? null) : null,
-        description: colIdx.description >= 0 ? (r[colIdx.description] ?? null) : null,
-        grade: colIdx.grade >= 0 ? (r[colIdx.grade] ?? null) : null,
-        model_no: colIdx.model_no >= 0 ? (r[colIdx.model_no] ?? null) : null,
+        oem: pick(r, mapping.oem),
+        condition: pick(r, mapping.condition),
+        description: pick(r, mapping.description),
+        grade: pick(r, mapping.grade),
+        model_no: pick(r, mapping.model_no),
+        capacity: pick(r, mapping.capacity),
+        color: pick(r, mapping.color),
         imei,
-        unit_cost: colIdx.unit_cost >= 0 ? (Number(r[colIdx.unit_cost]) || null) : null,
+        unit_cost: mapping.unit_cost >= 0 ? (Number(r[mapping.unit_cost]) || null) : null,
       });
     }
     return out;
@@ -685,6 +802,7 @@
 
   async function submitManifest() {
     if (!uploadCtx.reference || !uploadCtx.supplier) { toast('Reference and supplier are required', 'warn'); return; }
+    if ((uploadCtx.mapping?.imei ?? -1) < 0) { toast('Map the IMEI column before continuing', 'warn'); return; }
     if (!uploadCtx.rows.length) { toast('No valid rows found in file', 'warn'); return; }
     try {
       const r = await api.post('/manifests', {

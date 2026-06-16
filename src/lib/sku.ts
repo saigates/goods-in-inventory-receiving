@@ -92,12 +92,21 @@ export function buildSku(opts: {
   oem: string | null | undefined
   description: string | null | undefined
   color?: string | null
+  capacity?: string | null
 }): { sku: string; brand: string; model: string; capacity: string | null; color: string } {
   const { brandCode, brandName } = brandFromOem(opts.oem)
-  const { modelShort, modelName, capacity } = parseDescription(opts.description)
+  const parsed = parseDescription(opts.description)
+  // Explicit capacity from the manifest column wins over what we scraped out
+  // of the description. Normalise "256GB"/"256 GB"/"256G" → "256G".
+  let capacity: string | null = parsed.capacity
+  if (opts.capacity) {
+    const m = String(opts.capacity).match(/(\d+)\s*G(?:B)?/i)
+    if (m) capacity = `${m[1]}G`
+    else if (/^\d+$/.test(String(opts.capacity).trim())) capacity = `${String(opts.capacity).trim()}G`
+  }
   const color = opts.color || 'Phantom Black'
   const colorCode = colorShortCode(color)
   const capPart = capacity ? capacity.replace('G', '') : 'XX'
-  const sku = `${brandCode}-${modelShort}-${capPart}-${colorCode}`
-  return { sku, brand: brandName, model: modelName, capacity, color }
+  const sku = `${brandCode}-${parsed.modelShort}-${capPart}-${colorCode}`
+  return { sku, brand: brandName, model: parsed.modelName, capacity, color }
 }
