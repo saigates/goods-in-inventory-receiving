@@ -611,24 +611,30 @@
               `Detected ${uploadCtx.headers.filter(Boolean).length} columns in row ${uploadCtx.headerIdx + 1}`)
           ),
           h('div', { class: 'grid grid-cols-2 md:grid-cols-3 gap-3' },
-            MAPPABLE_FIELDS.map(f => h('div', {},
-              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, f.label),
-              h('select', {
-                class: 'input text-xs',
-                value: String(uploadCtx.mapping[f.key] ?? -1),
-                onchange: (e) => {
-                  uploadCtx.mapping[f.key] = Number(e.target.value);
-                  reparseFromMapping();
-                  renderUploadModal();
+            MAPPABLE_FIELDS.map(f => {
+              const cur = uploadCtx.mapping[f.key] ?? -1;
+              const mkOpt = (val, label) => {
+                const attrs = { value: String(val) };
+                if (val === cur) attrs.selected = 'selected';
+                return h('option', attrs, label);
+              };
+              return h('div', {},
+                h('label', { class: 'text-xs text-slate-400 mb-1 block' }, f.label),
+                h('select', {
+                  class: 'input text-xs',
+                  onchange: (e) => {
+                    uploadCtx.mapping[f.key] = Number(e.target.value);
+                    reparseFromMapping();
+                    renderUploadModal();
+                  },
                 },
-              },
-                h('option', { value: '-1' }, '— not in file —'),
-                uploadCtx.headers.map((hd, idx) => h('option', { value: String(idx) },
-                  hd ? `${colLetter(idx)} · ${hd}` : `${colLetter(idx)} · (blank)`
-                ))
-              ),
-              h('div', { class: 'text-[10px] text-slate-500 mt-1' }, f.hint),
-            ))
+                  mkOpt(-1, '— not in file —'),
+                  uploadCtx.headers.map((hd, idx) =>
+                    mkOpt(idx, hd ? `${colLetter(idx)} · ${hd}` : `${colLetter(idx)} · (blank)`))
+                ),
+                h('div', { class: 'text-[10px] text-slate-500 mt-1' }, f.hint),
+              );
+            })
           ),
           // Warn if IMEI not mapped
           (uploadCtx.mapping.imei ?? -1) < 0
