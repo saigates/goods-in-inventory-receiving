@@ -923,7 +923,8 @@
               ? h('div', { class: 'p-6 text-center text-sm text-slate-500' }, 'No scans yet. Start by scanning an IMEI.')
               : state.events.map(ev => {
                 const cls = {
-                  matched: 'badge-green', duplicate: 'badge-amber',
+                  matched: 'badge-green', received: 'badge-cyan',
+                  duplicate: 'badge-amber',
                   unreconciled: 'badge-red', rejected: 'badge-slate',
                 }[ev.outcome] || 'badge-slate';
                 return h('div', { class: 'flex items-center gap-3 px-4 py-2 border-b border-slate-800/50 row-strip' },

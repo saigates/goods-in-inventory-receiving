@@ -146,6 +146,14 @@ app.post('/confirm', async (c) => {
      WHERE id = ?`
   ).bind(receivedId, expected.id).run()
 
+  // Audit the receive itself. The initial scan-lookup wrote a 'matched'
+  // event; this 'received' event records that the modal was actually
+  // confirmed, so the Recent scans panel stays in lock-step with
+  // received_devices even if the lookup step was skipped (direct API).
+  await c.env.DB.prepare(
+    "INSERT INTO scan_events (manifest_id, imei, outcome, message) VALUES (?, ?, 'received', ?)"
+  ).bind(expected.manifest_id, expected.imei, `SKU ${body.sku} · grade ${grade}`).run()
+
   // Queue print job
   let printJobId: number | null = null
   if (body.auto_print !== false) {
@@ -219,6 +227,12 @@ app.post('/force-add', async (c) => {
   }
 
   const receivedId = ins.meta.last_row_id as number
+
+  // Audit the force-add (unreconciled receive). Pairs with the 'unreconciled'
+  // lookup event written by POST / so Recent scans shows both halves.
+  await c.env.DB.prepare(
+    "INSERT INTO scan_events (manifest_id, imei, outcome, message) VALUES (?, ?, 'received', ?)"
+  ).bind(body.manifest_id || null, imei, `Force-added · SKU ${built.sku} · grade ${grade}`).run()
 
   // Queue print job
   const payload = { uuid, sku: built.sku, imei, ...built, grade }
