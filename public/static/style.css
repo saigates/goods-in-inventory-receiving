@@ -285,6 +285,12 @@ body {
   border-color: rgba(248,113,113,.3);
 }
 .btn-danger:hover { background: rgba(248,113,113,.2); }
+.btn-amber {
+  background: rgba(251,191,36,.12);
+  color: #fcd34d;
+  border-color: rgba(251,191,36,.35);
+}
+.btn-amber:hover { background: rgba(251,191,36,.2); }
 
 .input, select.input, textarea.input {
   width: 100%;

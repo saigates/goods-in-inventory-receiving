@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import type { Bindings } from '../types'
-import { buildSku } from '../lib/sku'
 import { normalizeGrade } from '../lib/grade'
+import { resolveCatalogSku, normalizeCapacity } from '../lib/catalog'
 
 const app = new Hono<{ Bindings: Bindings }>()
 
@@ -88,26 +88,39 @@ app.post('/', async (c) => {
   ).bind(body.reference, body.supplier, body.notes || null).run()
   const manifestId = ins.meta.last_row_id as number
 
-  // Pre-resolve SKU when possible
-  const stmts = body.rows.map((r) => {
+  // Pre-resolve SKU from CATALOG (source of truth). We don't invent SKUs
+  // anymore — if the catalog has no entry for (model, capacity, color, grade),
+  // the manifest line gets sku=NULL and the scan modal will prompt the
+  // operator to fix it. Count unmatched lines so we can surface them.
+  const stmts: D1PreparedStatement[] = []
+  let unmatched = 0
+  for (const r of body.rows) {
     const imei = String(r.imei).trim()
-    const capacity = r.capacity ? String(r.capacity).trim() || null : null
+    const capacity = normalizeCapacity(r.capacity)
     const color = r.color ? String(r.color).trim() || null : null
+    // Grade taken verbatim from the manifest column (operator edited the
+    // spreadsheet to A|B|C|UG). Anything else → UG.
+    const grade = normalizeGrade(r.grade)
+    // Prefer model_no as the model carrier (Apple-style files put the
+    // human-readable model name there); fall back to description if model_no
+    // is empty (older manifests where description holds "Galaxy S24_256G").
+    const modelForLookup = r.model_no || r.description || null
+
     let sku: string | null = null
-    if (r.description && r.oem) {
-      // Best-effort prepopulation; if capacity/color were supplied in the manifest,
-      // fold them into the SKU so receiving doesn't have to guess.
-      sku = buildSku({
-        oem: r.oem,
-        description: r.description,
+    if (modelForLookup) {
+      const lookup = await resolveCatalogSku(c.env.DB, {
+        model: modelForLookup,
         capacity,
         color,
-      }).sku
+        grade,
+      })
+      if (lookup.status === 'match') sku = lookup.row.sku
+      else unmatched += 1
+    } else {
+      unmatched += 1
     }
-    // Supplier-declared grade is only a hint — normalise to A | B | C | UG.
-    // Anything else (B+, A-, missing, junk) → UG. Real grade assigned at QC.
-    const grade = normalizeGrade(r.grade)
-    return c.env.DB.prepare(
+
+    stmts.push(c.env.DB.prepare(
       `INSERT INTO expected_devices
        (manifest_id, oem, condition, description, grade, model_no, imei, unit_cost, sku, capacity, color)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -123,13 +136,18 @@ app.post('/', async (c) => {
       sku,
       capacity,
       color,
-    )
-  })
+    ))
+  }
 
   // D1 batch
   await c.env.DB.batch(stmts)
 
-  return c.json({ ok: true, manifest_id: manifestId, count: body.rows.length })
+  return c.json({
+    ok: true,
+    manifest_id: manifestId,
+    count: body.rows.length,
+    catalog_unmatched: unmatched,
+  })
 })
 
 // Close/reopen a manifest

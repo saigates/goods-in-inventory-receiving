@@ -3,6 +3,7 @@ import type { Bindings, ExpectedDevice, ReceivedDevice } from '../types'
 import { buildSku } from '../lib/sku'
 import { shortUuid } from '../lib/uuid'
 import { normalizeGrade } from '../lib/grade'
+import { resolveCatalogSku, normalizeCapacity } from '../lib/catalog'
 
 // SQLite raises 'UNIQUE constraint failed: received_devices.imei' if a
 // duplicate IMEI slips past the pre-check. Detect that so we can return
@@ -57,17 +58,45 @@ app.post('/', async (c) => {
     })
   }
 
-  // Compute a suggested SKU using parsed description and a default color
-  const suggested = buildSku({ oem: expected.oem, description: expected.description })
+  // Catalog is the source of truth. Resolve the manifest line to a real
+  // catalog SKU by (model, capacity, color, grade). The grade on the
+  // manifest is taken verbatim — operator is expected to have set it to
+  // A | B | C | UG before import (normalised at import time anyway).
+  const grade = normalizeGrade(expected.grade)
+  // Prefer model (the actual model column) over description for lookup.
+  // expected.description is now optional and may be a junk code like "FL".
+  const modelForLookup = expected.model_no || expected.description || null
+  const lookup = await resolveCatalogSku(c.env.DB, {
+    model: modelForLookup,
+    capacity: expected.capacity,
+    color: expected.color,
+    grade,
+  })
 
   await c.env.DB.prepare(
     "INSERT INTO scan_events (manifest_id, imei, outcome, message) VALUES (?, ?, 'matched', NULL)"
   ).bind(manifestId, imei).run()
 
+  // Normalised echo back to the UI so it can re-render with canonical values.
+  const expectedOut = {
+    ...expected,
+    capacity: normalizeCapacity(expected.capacity),
+  }
+
+  if (lookup.status === 'match') {
+    return c.json({
+      outcome: 'matched',
+      expected: expectedOut,
+      catalog_match: { status: 'match', row: lookup.row },
+    })
+  }
+
+  // No clean catalog match — surface it to the operator with the candidate
+  // list so they can pick or correct. Modal opens with a red banner.
   return c.json({
     outcome: 'matched',
-    expected,
-    suggested_sku: suggested,
+    expected: expectedOut,
+    catalog_match: lookup, // { status: 'no_match' | 'ambiguous', candidates, reason }
   })
 })
 
@@ -98,6 +127,19 @@ app.post('/confirm', async (c) => {
     return c.json({ error: 'Already received' }, 409)
   }
 
+  // Catalog is the source of truth. The chosen SKU MUST exist in
+  // sku_catalog — refuse otherwise so an operator can't print a label
+  // for a SKU that isn't in the master list.
+  const catalogRow = await c.env.DB.prepare(
+    'SELECT sku, brand, model, capacity, color, grade FROM sku_catalog WHERE sku = ?'
+  ).bind(body.sku).first<{ sku: string; brand: string; model: string; capacity: string | null; color: string | null; grade: string | null }>()
+  if (!catalogRow) {
+    return c.json({
+      error: `SKU '${body.sku}' is not in the catalogue. Add it via the Catalog tab, then retry.`,
+      code: 'sku_not_in_catalog',
+    }, 422)
+  }
+
   // Defensive: someone could have raced ahead and received this IMEI between
   // the scan event and the confirm. UNIQUE constraint will catch it too.
   const existing = await c.env.DB.prepare('SELECT id, uuid, sku FROM received_devices WHERE imei = ?')
@@ -107,10 +149,12 @@ app.post('/confirm', async (c) => {
   }
 
   // Force grade into the strict A|B|C|UG set. The body grade wins if valid;
-  // otherwise we fall back to the (already-normalised) manifest grade; if
-  // both are missing we default to UG.
-  const grade = normalizeGrade(body.grade ?? expected.grade)
+  // Grade: prefer the catalog row's grade (authoritative since the SKU
+  // exists for that grade), fall back to body/manifest.
+  const grade = normalizeGrade(catalogRow.grade ?? body.grade ?? expected.grade)
 
+  // Use catalog's brand/model/capacity/color so we never drift from the
+  // master list. The body's values are ignored on purpose.
   const uuid = shortUuid()
   let insRecv
   try {
@@ -121,11 +165,11 @@ app.post('/confirm', async (c) => {
     ).bind(
       uuid,
       expected.imei,
-      body.sku,
-      body.brand ?? null,
-      body.model ?? null,
-      body.capacity ?? null,
-      body.color ?? null,
+      catalogRow.sku,
+      catalogRow.brand,
+      catalogRow.model,
+      catalogRow.capacity,
+      catalogRow.color,
       grade,
       expected.manifest_id,
       expected.id,
@@ -159,12 +203,12 @@ app.post('/confirm', async (c) => {
   if (body.auto_print !== false) {
     const payload = {
       uuid,
-      sku: body.sku,
+      sku: catalogRow.sku,
       imei: expected.imei,
-      brand: body.brand,
-      model: body.model,
-      capacity: body.capacity,
-      color: body.color,
+      brand: catalogRow.brand,
+      model: catalogRow.model,
+      capacity: catalogRow.capacity,
+      color: catalogRow.color,
       grade,
     }
     const pj = await c.env.DB.prepare(

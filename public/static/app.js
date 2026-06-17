@@ -60,7 +60,7 @@
     manualReceiveOpen: false,        // manual-receive (no manifest) modal
     printQueue: [],
     stats: {},
-    pendingMatch: null,   // { expected, suggested_sku }
+    pendingMatch: null,   // { expected, catalog_match: { status, row? , candidates?, reason? } }
     pendingUnrec: null,   // { imei }
     soundOn: true,
     autoPrint: true,
@@ -526,16 +526,19 @@
 
   // ───────── Manifest upload modal ─────────
   let uploadCtx = null;
+  // Fields marked * are needed for catalogue SKU lookup at scan time.
+  // Description is optional now — model_no + capacity + color + grade are what
+  // the catalog is keyed on. Description is just a human-readable label.
   const MAPPABLE_FIELDS = [
-    { key: 'imei',        label: 'IMEI *',       hint: 'serial / IMEI' },
-    { key: 'oem',         label: 'OEM / Brand',  hint: 'Apple, Samsung…' },
-    { key: 'description', label: 'Description',  hint: 'iPhone 15 Pro, Galaxy S24…' },
-    { key: 'model_no',    label: 'Model No.',    hint: 'SM-S921N, A2890…' },
-    { key: 'capacity',    label: 'Storage',      hint: '128GB, 256G…' },
-    { key: 'color',       label: 'Color',        hint: 'Phantom Black…' },
-    { key: 'grade',       label: 'Grade',        hint: 'A | B | C (anything else → UG)' },
-    { key: 'condition',   label: 'Condition',    hint: 'New / Used' },
-    { key: 'unit_cost',   label: 'Unit cost',    hint: 'numeric' },
+    { key: 'imei',        label: 'IMEI *',         hint: 'serial / IMEI' },
+    { key: 'oem',         label: 'OEM / Brand',    hint: 'Apple, Samsung…' },
+    { key: 'model_no',    label: 'Model No. *',    hint: 'iPhone 15 Pro, Galaxy S24… (used for catalogue lookup)' },
+    { key: 'capacity',    label: 'Storage *',      hint: '128GB, 256G… (normalised to 128GB form)' },
+    { key: 'color',       label: 'Color *',        hint: 'Phantom Black… (case-insensitive)' },
+    { key: 'grade',       label: 'Grade *',        hint: 'A | B | C (anything else → UG)' },
+    { key: 'description', label: 'Description',    hint: 'optional · human label only' },
+    { key: 'condition',   label: 'Condition',      hint: 'New / Used' },
+    { key: 'unit_cost',   label: 'Unit cost',      hint: 'numeric' },
   ];
   function openManifestUpload() {
     uploadCtx = {
@@ -1037,8 +1040,12 @@
     try {
       const r = await api.post('/scan', { manifest_id: state.activeManifestId, imei });
       if (r.outcome === 'matched') {
-        beep('ok');
-        state.pendingMatch = { expected: r.expected, suggested_sku: r.suggested_sku };
+        // Two cases:
+        //  - catalog_match.status === 'match'  → green path, SKU is locked from catalogue
+        //  - status === 'no_match' | 'ambiguous' → red banner with candidates; operator
+        //    can edit fields (live re-lookup) or mint a new catalog row
+        beep(r.catalog_match?.status === 'match' ? 'ok' : 'warn');
+        state.pendingMatch = { expected: r.expected, catalog_match: r.catalog_match };
         render();
       } else if (r.outcome === 'duplicate') {
         beep('warn');
@@ -1059,19 +1066,114 @@
   }
 
   // ───────── Confirm SKU modal (matched scan) ─────────
+  // The catalog is the source of truth. Backend response shape:
+  //   { outcome: 'matched', expected, catalog_match: { status, row?, candidates?, reason? } }
+  // - status === 'match'     → green path; SKU is read-only with "from catalogue" badge.
+  // - status === 'no_match'  → red banner; show candidates the operator can pick from,
+  //                            edit fields for live re-lookup, or mint a new catalog row.
+  // - status === 'ambiguous' → red banner; multiple matches — operator must pick one.
   function ConfirmSkuModal() {
-    const { expected, suggested_sku } = state.pendingMatch;
-    const ctx = state._confirmCtx ||= {
-      sku: suggested_sku.sku,
-      brand: suggested_sku.brand,
-      model: suggested_sku.model,
-      capacity: suggested_sku.capacity || '',
-      color: suggested_sku.color,
-      grade: expected.grade || '',
-      notes: '',
-    };
+    const { expected, catalog_match } = state.pendingMatch;
+
+    // Seed ctx. Priority: persisted edits > catalog row (if matched) > expected manifest fields.
+    if (!state._confirmCtx) {
+      const cm = catalog_match || {};
+      const matchRow = cm.status === 'match' ? cm.row : null;
+      state._confirmCtx = {
+        // SKU is only meaningful when we have a catalogue match
+        sku: matchRow?.sku || '',
+        brand: matchRow?.brand || expected.oem || '',
+        model: matchRow?.model || expected.model_no || expected.description || '',
+        capacity: matchRow?.capacity || expected.capacity || '',
+        color: matchRow?.color || expected.color || '',
+        grade: matchRow?.grade || expected.grade || 'UG',
+        notes: '',
+        // Live lookup state — re-resolved as operator edits fields below
+        live: cm,            // { status, row?, candidates?, reason? }
+        liveBusy: false,
+      };
+    }
+    const ctx = state._confirmCtx;
+    const live = ctx.live || { status: 'no_match', candidates: [], reason: 'No match' };
+    const matched = live.status === 'match';
+
     const close = () => { state.pendingMatch = null; state._confirmCtx = null; render(); };
+
+    // Re-resolve via POST /catalog/lookup whenever the operator edits a field.
+    // Debounced via a sequence counter so a slow earlier request can't overwrite
+    // a later one.
+    let lookupSeq = (state._lookupSeq || 0);
+    const reLookup = async () => {
+      state._lookupSeq = ++lookupSeq;
+      const mySeq = lookupSeq;
+      ctx.liveBusy = true;
+      try {
+        const r = await api.post('/catalog/lookup', {
+          model: ctx.model, capacity: ctx.capacity, color: ctx.color, grade: ctx.grade,
+        });
+        if (mySeq !== state._lookupSeq) return; // a later edit superseded us
+        ctx.live = r;
+        if (r.status === 'match') ctx.sku = r.row.sku;
+        else ctx.sku = '';
+      } catch (err) {
+        // ignore — leave previous result in place
+      } finally {
+        if (mySeq === state._lookupSeq) ctx.liveBusy = false;
+        render();
+      }
+    };
+
+    const update = (k, v) => {
+      ctx[k] = v;
+      state._confirmCtx = ctx;
+      if (['model', 'capacity', 'color', 'grade'].includes(k)) {
+        reLookup();
+      } else {
+        render();
+      }
+    };
+
+    // Pick one of the candidate rows — copies its fields back into ctx.
+    const pickCandidate = (row) => {
+      ctx.sku = row.sku;
+      ctx.brand = row.brand;
+      ctx.model = row.model;
+      ctx.capacity = row.capacity || '';
+      ctx.color = row.color || '';
+      ctx.grade = row.grade || 'UG';
+      ctx.live = { status: 'match', row };
+      state._confirmCtx = ctx;
+      render();
+    };
+
+    // Mint a new catalogue row from the current fields, then continue receiving.
+    const addToCatalogAndReceive = async () => {
+      try {
+        const r = await api.post('/catalog', {
+          brand: ctx.brand, model: ctx.model,
+          capacity: ctx.capacity, color: ctx.color, grade: ctx.grade,
+        });
+        toast(`Added <span class="mono">${r.row.sku}</span> to catalogue`, 'ok');
+        ctx.sku = r.row.sku;
+        ctx.live = { status: 'match', row: r.row };
+        state._confirmCtx = ctx;
+        render();
+        // Receive immediately
+        await confirmIt();
+      } catch (err) {
+        const data = err.response?.data;
+        if (data?.existing) {
+          // Server says this combination already exists — adopt it
+          toast('Combination already in catalogue — using existing SKU', 'warn');
+          pickCandidate(data.existing);
+        } else {
+          toast(data?.error || 'Failed to add to catalogue', 'err');
+        }
+      }
+    };
+
     const confirmIt = async () => {
+      if (!ctx.sku) { toast('No catalogue SKU — pick a candidate or add to catalogue first', 'warn'); return; }
       try {
         const r = await api.post('/scan/confirm', {
           expected_device_id: expected.id,
@@ -1099,54 +1201,113 @@
           setTimeout(() => { if (state.labelPreview?.jobId === r.print_job_id) { state.labelPreview = null; render(); } }, 2500);
         }
       } catch (err) {
-        toast(err.response?.data?.error || 'Failed to confirm', 'err');
+        const data = err.response?.data;
+        if (data?.code === 'sku_not_in_catalog') {
+          toast(`SKU ${ctx.sku} not in catalogue — re-resolve or add it first`, 'err');
+          reLookup();
+        } else {
+          toast(data?.error || 'Failed to confirm', 'err');
+        }
       }
     };
-    const update = (k, v) => { ctx[k] = v; state._confirmCtx = ctx; render(); };
+
+    // ── Header (state-dependent: green if matched, red if not) ──
+    const headerIcon = matched
+      ? h('div', { class: 'w-10 h-10 rounded-xl bg-green-500/10 text-green-400 flex items-center justify-center' },
+          h('i', { class: 'fas fa-check' }))
+      : h('div', { class: 'w-10 h-10 rounded-xl bg-red-500/10 text-red-400 flex items-center justify-center' },
+          h('i', { class: 'fas fa-triangle-exclamation' }));
+    const headerTitle = matched
+      ? h('h2', { class: 'text-lg font-semibold' }, 'Matched on manifest')
+      : h('h2', { class: 'text-lg font-semibold text-red-300' },
+          live.status === 'ambiguous' ? 'Multiple catalogue matches' : 'No catalogue SKU');
+    const headerSub = matched
+      ? h('p', { class: 'text-xs text-slate-400' },
+          'SKU resolved from the catalogue. Confirm to receive and print the label.')
+      : h('p', { class: 'text-xs text-slate-400' },
+          'Pick a candidate below, tweak the fields to re-resolve, or add a new catalogue entry.');
+
+    // ── Live status banner ──
+    const banner = matched
+      ? h('div', { class: 'mt-3 px-3 py-2 rounded-lg bg-green-500/10 border border-green-500/30 text-xs text-green-200 flex items-center gap-2' },
+          h('i', { class: 'fas fa-circle-check' }),
+          h('span', {}, 'Catalogue SKU '),
+          h('span', { class: 'mono font-semibold text-green-100' }, ctx.sku),
+          h('span', { class: 'badge badge-green text-[10px] ml-auto' }, 'from catalogue'))
+      : h('div', { class: 'mt-3 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-200' },
+          h('i', { class: 'fas fa-triangle-exclamation mr-2' }),
+          h('span', {}, live.reason || 'No catalogue SKU for this combination.'),
+          ctx.liveBusy ? h('span', { class: 'ml-2 text-slate-400' }, h('i', { class: 'fas fa-spinner fa-spin mr-1' }), 're-resolving…') : null
+        );
+
+    // ── Candidate picker (only when not matched) ──
+    const candidates = (!matched && Array.isArray(live.candidates) && live.candidates.length > 0)
+      ? h('div', { class: 'mt-3 card p-3 bg-slate-900/40' },
+          h('div', { class: 'text-[10px] uppercase tracking-wider text-slate-500 mb-2' },
+            `Closest catalogue rows (${live.candidates.length})`),
+          h('div', { class: 'max-h-40 overflow-y-auto divide-y divide-slate-800' },
+            live.candidates.slice(0, 30).map(row => h('div', {
+              class: 'flex items-center justify-between gap-3 py-2 px-1 hover:bg-slate-800/40 rounded',
+            },
+              h('div', { class: 'flex-1 min-w-0' },
+                h('div', { class: 'mono text-sm text-cyan-300' }, row.sku),
+                h('div', { class: 'text-[11px] text-slate-400 truncate' },
+                  [row.brand, row.model, row.capacity, row.color, `grade ${row.grade || '?'}`].filter(Boolean).join(' · '))
+              ),
+              h('button', { class: 'btn btn-ghost text-[11px]', onclick: () => pickCandidate(row) },
+                h('i', { class: 'fas fa-check' }), 'Use this')
+            ))
+          )
+        )
+      : null;
 
     return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
-      h('div', { class: 'modal p-6' },
+      h('div', { class: 'modal p-6' + (matched ? '' : ' border-2 border-red-500/30') },
         h('div', { class: 'flex items-center gap-3 mb-1' },
-          h('div', { class: 'w-10 h-10 rounded-xl bg-green-500/10 text-green-400 flex items-center justify-center' },
-            h('i', { class: 'fas fa-check' })),
-          h('div', {},
-            h('h2', { class: 'text-lg font-semibold' }, 'Matched on manifest'),
-            h('p', { class: 'text-xs text-slate-400' }, 'Confirm the SKU mapping for this device.')
-          )
+          headerIcon,
+          h('div', {}, headerTitle, headerSub)
         ),
+        banner,
+        // Manifest line / IMEI summary card
         h('div', { class: 'mt-4 grid grid-cols-3 gap-3 text-sm' },
           h('div', { class: 'col-span-2 card p-3 bg-slate-900/40' },
             h('div', { class: 'text-[10px] uppercase tracking-wider text-slate-500 mb-1' }, 'Manifest line'),
-            h('div', { class: 'font-medium' }, expected.description || '(no description)'),
+            h('div', { class: 'font-medium' },
+              expected.model_no || expected.description || '(no model)'),
             h('div', { class: 'text-xs text-slate-400 mt-1' },
-              h('span', { class: 'mono' }, expected.model_no || '—'),
-              ' · ', expected.oem || '—', ' · grade ', gradeLabel(expected.grade))
+              h('span', {}, expected.oem || '—'),
+              ' · ', h('span', { class: 'mono' }, expected.capacity || '?'),
+              ' · ', expected.color || '?',
+              ' · grade ', gradeLabel(expected.grade))
           ),
           h('div', { class: 'card p-3 bg-slate-900/40' },
             h('div', { class: 'text-[10px] uppercase tracking-wider text-slate-500 mb-1' }, 'IMEI'),
             h('div', { class: 'mono font-semibold' }, expected.imei)
           )
         ),
+        // Candidate picker (only if not matched)
+        candidates,
+        // SKU display (read-only when matched; hidden until we have one when not)
         h('div', { class: 'mt-4' },
-          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'SKU (auto-generated)'),
-          h('input', { class: 'input mono text-lg font-bold', value: ctx.sku, oninput: (e) => update('sku', e.target.value) })
+          h('label', { class: 'text-xs text-slate-400 mb-1 block flex items-center gap-2' },
+            h('span', {}, matched ? 'Catalogue SKU' : 'SKU (resolved from catalogue)'),
+            matched ? h('span', { class: 'badge badge-green text-[10px]' }, 'from catalogue') : null
+          ),
+          h('input', {
+            class: 'input mono text-lg font-bold' + (matched ? ' opacity-90' : ' text-slate-500'),
+            value: ctx.sku || '(no match yet — edit fields below to re-resolve)',
+            readonly: 'readonly',
+            tabindex: '-1',
+          })
         ),
+        // Editable lookup fields — change any of these to trigger live re-lookup
         h('div', { class: 'mt-3 grid grid-cols-2 gap-3' },
           field('Brand', ctx.brand, (v) => update('brand', v)),
-          field('Model', ctx.model, (v) => update('model', v)),
-          field('Capacity', ctx.capacity, (v) => update('capacity', v), 'mono'),
+          field('Model *', ctx.model, (v) => update('model', v)),
+          field('Capacity *', ctx.capacity, (v) => update('capacity', v), 'mono'),
+          field('Color *', ctx.color, (v) => update('color', v)),
           h('div', {},
-            h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Color'),
-            h('select', {
-              class: 'input',
-              onchange: (e) => update('color', e.target.value),
-            },
-              ['Phantom Black','Phantom Gray','Graphite','Cream','Lavender','Violet','Mint','Cloud Navy','Silver','White'].map(o =>
-                h('option', { value: o, selected: o === ctx.color ? 'selected' : null }, o))
-            )
-          ),
-          h('div', {},
-            h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Grade'),
+            h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Grade *'),
             gradeSelect(ctx.grade || 'UG', (v) => update('grade', v))
           ),
           h('label', { class: 'flex items-center gap-2 text-sm text-slate-300 select-none' },
@@ -1155,13 +1316,28 @@
             'Auto-queue print label'
           ),
         ),
+        // Optional notes
+        h('div', { class: 'mt-3' },
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Notes (optional)'),
+          h('textarea', { class: 'input', rows: 2, value: ctx.notes,
+            oninput: (e) => { ctx.notes = e.target.value; state._confirmCtx = ctx; } })
+        ),
+        // Footer
         h('div', { class: 'mt-5 flex items-center justify-between' },
           h('div', { class: 'text-xs text-slate-500' },
-            'Press ', h('span', { class: 'kbd' }, 'Enter'), ' to confirm · ',
-            h('span', { class: 'kbd' }, 'Esc'), ' to cancel'),
+            'Press ', h('span', { class: 'kbd' }, 'Esc'), ' to cancel'),
           h('div', { class: 'flex gap-2' },
             h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
-            h('button', { class: 'btn btn-primary', onclick: confirmIt },
+            !matched
+              ? h('button', { class: 'btn btn-amber', onclick: addToCatalogAndReceive,
+                  title: 'Mint a new catalogue row for this combination, then receive' },
+                  h('i', { class: 'fas fa-plus' }), 'Add to catalogue & receive')
+              : null,
+            h('button', {
+              class: 'btn ' + (matched ? 'btn-primary' : 'btn-ghost opacity-50 cursor-not-allowed'),
+              onclick: confirmIt,
+              disabled: !matched ? 'disabled' : null,
+            },
               h('i', { class: 'fas fa-check' }), 'Confirm & Print')
           )
         )
@@ -1773,12 +1949,13 @@
               h('th', { class: 'text-left px-4 py-3' }, 'Model'),
               h('th', { class: 'text-left px-4 py-3' }, 'Capacity'),
               h('th', { class: 'text-left px-4 py-3' }, 'Color'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Grade'),
               h('th', { class: 'text-right px-4 py-3' }, '')
             )
           ),
           h('tbody', { class: 'divide-y divide-slate-800' },
             state.catalog.length === 0
-              ? h('tr', {}, h('td', { colspan: 6, class: 'text-center py-10 text-slate-500' },
+              ? h('tr', {}, h('td', { colspan: 7, class: 'text-center py-10 text-slate-500' },
                   'Catalogue is empty — upload a CSV to populate it.'))
               : state.catalog.map(c => h('tr', { class: 'row-strip' },
                   h('td', { class: 'px-4 py-2 mono text-xs font-semibold text-cyan-300' }, c.sku),
@@ -1786,6 +1963,8 @@
                   h('td', { class: 'px-4 py-2 text-xs' }, c.model),
                   h('td', { class: 'px-4 py-2 text-xs mono' }, c.capacity || '—'),
                   h('td', { class: 'px-4 py-2 text-xs' }, c.color || '—'),
+                  h('td', { class: 'px-4 py-2 text-xs' },
+                    h('span', { class: gradeBadgeClass(c.grade) }, gradeLabel(c.grade))),
                   h('td', { class: 'px-4 py-2 text-right' },
                     h('button', {
                       class: 'btn btn-danger text-xs',
@@ -1883,7 +2062,8 @@
           h('code', { class: 'text-cyan-300' }, 'brand'), ', ',
           h('code', { class: 'text-cyan-300' }, 'model'), ', ',
           h('code', { class: 'text-cyan-300' }, 'capacity'), ', ',
-          h('code', { class: 'text-cyan-300' }, 'color'), '. ',
+          h('code', { class: 'text-cyan-300' }, 'color'), ', ',
+          h('code', { class: 'text-cyan-300' }, 'grade'), '. ',
           'An optional ', h('code', { class: 'text-cyan-300' }, 'sku'), ' column overrides the auto-derived code.'
         ),
 
@@ -1927,6 +2107,7 @@
                   h('th', { class: 'text-left px-3 py-2' }, 'Model'),
                   h('th', { class: 'text-left px-3 py-2' }, 'Capacity'),
                   h('th', { class: 'text-left px-3 py-2' }, 'Color'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Grade'),
                   h('th', { class: 'text-left px-3 py-2' }, 'SKU (override)')
                 )
               ),
@@ -1936,6 +2117,7 @@
                   h('td', { class: 'px-3 py-2' }, r.model || '—'),
                   h('td', { class: 'px-3 py-2 mono' }, r.capacity || '—'),
                   h('td', { class: 'px-3 py-2' }, r.color || '—'),
+                  h('td', { class: 'px-3 py-2 mono' }, r.grade || '—'),
                   h('td', { class: 'px-3 py-2 mono' }, r.sku || '—')
                 ))
               )
@@ -2031,6 +2213,7 @@
       model: headers.indexOf('model'),
       capacity: headers.findIndex(h => h === 'capacity' || h === 'storage'),
       color: headers.findIndex(h => h === 'color' || h === 'colour'),
+      grade: headers.findIndex(h => h === 'grade' || h === 'condition'),
       sku: headers.indexOf('sku'),
     };
     const out = [];
@@ -2044,6 +2227,7 @@
         model: String(model).trim(),
         capacity: idx.capacity >= 0 && r[idx.capacity] != null ? String(r[idx.capacity]).trim() : null,
         color: idx.color >= 0 && r[idx.color] != null ? String(r[idx.color]).trim() : null,
+        grade: idx.grade >= 0 && r[idx.grade] != null ? String(r[idx.grade]).trim() : null,
         sku: idx.sku >= 0 && r[idx.sku] != null ? String(r[idx.sku]).trim() : null,
       });
     }
