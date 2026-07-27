@@ -363,9 +363,12 @@ paths:
       tags: [Scan]
       summary: Force-add an off-manifest (unreconciled) IMEI to inventory
       description: >
-        Same body shape as `/scan/confirm`. Valuation fields are optional
-        here but still server-validated if present — an off-manifest
-        device with an invalid `currency`/`vat_type` is still rejected.
+        Same body shape as `/scan/confirm`, and the SAME valuation
+        requirements: `buy_price` and `vat_type` are required, `currency`
+        must be a valid ISO 4217 code (default GBP). The off-manifest
+        exception branch cannot be used to bypass required valuation
+        fields — a request missing them is rejected with 422 and no
+        device/audit/print rows are written.
       requestBody:
         required: true
         content:
@@ -384,7 +387,7 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "422":
-          description: Invalid valuation fields, if supplied
+          description: Missing or invalid valuation fields (buy_price / vat_type required; currency must be valid ISO 4217)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -393,7 +396,9 @@ paths:
     post:
       tags: [Scan]
       summary: Manually add a device outside the scan flow
-      description: Same valuation rules as `/scan/force-add`.
+      description: >
+        Valuation fields are optional here (unlike `/scan/confirm` and
+        `/scan/force-add`) but still server-validated if supplied.
       requestBody:
         required: true
         content:
