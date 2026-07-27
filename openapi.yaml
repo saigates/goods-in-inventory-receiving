@@ -1,0 +1,1286 @@
+openapi: 3.0.3
+info:
+  title: Goods In — Inventory Receiving API
+  description: >
+    Scanner-first IMEI receiving, manifest reconciliation, SKU confirmation,
+    device lifecycle management, and DYMO label printing for wholesale
+    device traders, refurbishers, and graders.
+
+
+    Every route under `/api/*` requires a valid JWT **except**
+    `GET /api/health` and `POST /api/auth/dev-login`. All data is scoped to
+    the caller's `organisation_id`, resolved server-side from the verified
+    token — it is never accepted as a request parameter.
+
+
+    Out of scope for this version of the API: grading workflow, OPR
+    export/import documentation, C&E1154, commercial-invoice generation,
+    and the export/return/sale lifecycle transitions (the corresponding
+    device statuses exist in the enum but have no transitions wired to
+    them yet).
+  version: "1.1.0"
+  license:
+    name: Proprietary
+
+servers:
+  - url: /api
+    description: Same-origin (the SPA and API are served from one Cloudflare Pages project)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Auth
+    description: Login and token introspection
+  - name: Manifests
+    description: Supplier ASN / packing-list management
+  - name: Scan
+    description: Scanner-first IMEI receiving
+  - name: Inventory
+    description: Browse, delete, and grade received devices
+  - name: Devices
+    description: Filterable read API, CSV export, and the device status state machine
+  - name: Webhooks
+    description: Outbound signed notifications on device status change
+  - name: Print
+    description: DYMO label generation and dispatch (Browser Print / PrintNode / Manual)
+
+paths:
+  /health:
+    get:
+      tags: [Auth]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  ts: { type: string, format: date-time }
+
+  /auth/dev-login:
+    post:
+      tags: [Auth]
+      summary: Dev/demo login — exchange a seeded user's email for a JWT
+      description: >
+        There is no password yet — this app has no real IdP wired up.
+        Swapping this route for real credential checking or Cloudflare
+        Access is a self-contained change; every other route only consumes
+        the verified `c.var.user` and doesn't care how it was populated.
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                  format: email
+                  description: Defaults to the seeded admin (admin@goodsin.local) if omitted.
+      responses:
+        "200":
+          description: Token issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string, description: "HS256 JWT, 12h TTL" }
+                  user: { $ref: "#/components/schemas/AuthUser" }
+        "404":
+          description: No user found for that email
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: Server auth not configured (JWT_SECRET missing)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Who am I — validates the current token
+      responses:
+        "200":
+          description: Token is valid
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: "#/components/schemas/AuthUser" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /manifests:
+    get:
+      tags: [Manifests]
+      summary: List manifests with progress counts (org-scoped)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  manifests:
+                    type: array
+                    items: { $ref: "#/components/schemas/Manifest" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Manifests]
+      summary: Create a manifest with a batch of expected devices
+      description: >
+        Each row's IMEI is validated server-side (14-16 digits + Luhn at 15
+        digits) regardless of any client-side checks; invalid rows are
+        skipped and reported in `invalid_imeis` rather than failing the
+        whole batch. SKUs are pre-resolved against the catalog (source of
+        truth) — unmatched rows get `sku=NULL` and are counted in
+        `catalog_unmatched`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reference, supplier, rows]
+              properties:
+                reference: { type: string }
+                supplier: { type: string }
+                notes: { type: string, nullable: true }
+                rows:
+                  type: array
+                  items:
+                    type: object
+                    required: [imei]
+                    properties:
+                      oem: { type: string, nullable: true }
+                      condition: { type: string, nullable: true }
+                      description: { type: string, nullable: true }
+                      grade: { type: string, nullable: true }
+                      model_no: { type: string, nullable: true }
+                      imei:
+                        oneOf:
+                          - type: string
+                          - type: number
+                      unit_cost: { type: number, nullable: true }
+                      capacity: { type: string, nullable: true }
+                      color: { type: string, nullable: true }
+      responses:
+        "200":
+          description: Manifest created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  manifest_id: { type: integer }
+                  count: { type: integer, description: Rows successfully inserted }
+                  catalog_unmatched: { type: integer }
+                  invalid_imeis:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        row_index: { type: integer }
+                        imei: {}
+                        reason: { type: string }
+        "400":
+          description: Missing reference/supplier/rows
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Manifest reference already exists
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /manifests/{id}:
+    parameters:
+      - $ref: "#/components/parameters/PathId"
+    get:
+      tags: [Manifests]
+      summary: Manifest detail with expected lines, unreconciled scans, and progress summary
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  manifest: { $ref: "#/components/schemas/Manifest" }
+                  expected: { type: array, items: { type: object } }
+                  unreconciled: { type: array, items: { $ref: "#/components/schemas/Device" } }
+                  summary:
+                    type: object
+                    properties:
+                      expected_count: { type: integer }
+                      received_count: { type: integer }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Manifests]
+      summary: Delete a manifest and everything received against it
+      description: >
+        Cascade-deletes received devices, print jobs, and grade audit rows;
+        cleans up scan_events referencing this manifest.
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /manifests/{id}/close:
+    post:
+      tags: [Manifests]
+      summary: Close a manifest
+      parameters: [{ $ref: "#/components/parameters/PathId" }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { ok: { type: boolean } } } } } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /manifests/{id}/reopen:
+    post:
+      tags: [Manifests]
+      summary: Reopen a closed manifest
+      parameters: [{ $ref: "#/components/parameters/PathId" }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { ok: { type: boolean } } } } } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /scan:
+    post:
+      tags: [Scan]
+      summary: Scan an IMEI against the active manifest
+      description: >
+        Server re-validates the IMEI (14-16 digits + Luhn at 15 digits)
+        regardless of client-side checks. Returns one of four outcomes:
+        `matched`, `duplicate`, `unreconciled`, or `rejected` (malformed
+        IMEI).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [manifest_id, imei]
+              properties:
+                manifest_id: { type: integer }
+                imei: { type: string }
+      responses:
+        "200":
+          description: Scan outcome
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  outcome:
+                    type: string
+                    enum: [matched, duplicate, unreconciled, rejected]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /scan/confirm:
+    post:
+      tags: [Scan]
+      summary: Confirm a matched SKU and receive the device
+      description: >
+        Valuation fields (`buy_price`, `currency`, `vat_type`) are
+        **required** and validated authoritatively server-side
+        (`src/lib/validate.ts`) — an unrecognised ISO 4217 currency code
+        (e.g. `UKL`) is rejected with `422` regardless of what any client
+        allowed through. On success, writes `received_devices`
+        (`status=RECEIVED`), a `RECEIVE` `device_events` row, a
+        `print_jobs` row, and marks the manifest line `received`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_device_id, sku, buy_price, currency, vat_type]
+              properties:
+                expected_device_id: { type: integer }
+                sku: { type: string }
+                brand: { type: string }
+                model: { type: string }
+                capacity: { type: string }
+                color: { type: string }
+                grade: { type: string, description: "A+, A, B+, B, C+, C, D, or UG" }
+                notes: { type: string, nullable: true }
+                auto_print: { type: boolean }
+                buy_price: { type: number, minimum: 0, maximum: 1000000 }
+                currency: { type: string, description: "ISO 4217, e.g. GBP", default: GBP }
+                vat_type: { type: string, enum: [MARGIN, STANDARD, ZERO] }
+                supplier_id: { type: integer, nullable: true }
+      responses:
+        "200":
+          description: Device received
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { $ref: "#/components/schemas/Device" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          description: Missing/invalid valuation fields (e.g. unrecognised currency code)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /scan/force-add:
+    post:
+      tags: [Scan]
+      summary: Force-add an off-manifest (unreconciled) IMEI to inventory
+      description: >
+        Same body shape as `/scan/confirm`. Valuation fields are optional
+        here but still server-validated if present — an off-manifest
+        device with an invalid `currency`/`vat_type` is still rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScanConfirmRequest"
+      responses:
+        "200":
+          description: Device force-added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { $ref: "#/components/schemas/Device" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          description: Invalid valuation fields, if supplied
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /scan/manual:
+    post:
+      tags: [Scan]
+      summary: Manually add a device outside the scan flow
+      description: Same valuation rules as `/scan/force-add`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScanConfirmRequest"
+      responses:
+        "200":
+          description: Device added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { $ref: "#/components/schemas/Device" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /scan/reject:
+    post:
+      tags: [Scan]
+      summary: Audit-log a rejection (writes a REJECT device_events row)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                manifest_id: { type: integer }
+                imei: { type: string }
+                notes: { type: string, nullable: true }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean } } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /scan/events/{manifestId}:
+    get:
+      tags: [Scan]
+      summary: Recent scan events for a manifest
+      parameters:
+        - name: manifestId
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events: { type: array, items: { type: object } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /inventory:
+    get:
+      tags: [Inventory]
+      summary: Browse received devices with filters
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Matches against imei, sku, or uuid (LIKE)
+        - name: source
+          in: query
+          schema: { type: string, enum: [manifest, unreconciled] }
+        - name: manifest_id
+          in: query
+          schema: { type: integer }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 500 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  devices:
+                    type: array
+                    items: { $ref: "#/components/schemas/Device" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /inventory/{id}:
+    delete:
+      tags: [Inventory]
+      summary: Delete a received device
+      description: >
+        Restores its manifest line to `pending` (so it can be re-scanned),
+        removes queued print jobs, and writes a `DEVICE_DELETED`
+        `device_events` row.
+      parameters: [{ $ref: "#/components/parameters/PathId" }]
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  restored_expected: { type: boolean }
+        "400":
+          description: Invalid id
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /inventory/grade:
+    post:
+      tags: [Inventory]
+      summary: Set/override grade for one or more devices (single or bulk)
+      description: One `grade_audit` row and one `GRADE_CHANGE` `device_events` row is written per changed device. Unchanged/not-found ids are reported in `skipped`, not treated as errors.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, grade]
+              properties:
+                ids: { type: array, items: { type: integer } }
+                grade: { type: string, enum: ["A+", "A", "B+", "B", "C+", "C", "D", "UG"] }
+                actor: { type: string, nullable: true }
+                reason: { type: string, nullable: true }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  grade: { type: string }
+                  updated_count: { type: integer }
+                  updated_ids: { type: array, items: { type: integer } }
+                  skipped:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        reason: { type: string }
+                  bulk_id: { type: string, nullable: true }
+        "400":
+          description: Missing ids[] or invalid grade
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /inventory/grade-audit/{id}:
+    get:
+      tags: [Inventory]
+      summary: Grade-change history for a single device
+      parameters: [{ $ref: "#/components/parameters/PathId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  audit: { type: array, items: { type: object } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /inventory/stats:
+    get:
+      tags: [Inventory]
+      summary: Dashboard tile counts
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats:
+                    type: object
+                    properties:
+                      open_manifests: { type: integer }
+                      pending_devices: { type: integer }
+                      received_total: { type: integer }
+                      unreconciled_total: { type: integer }
+                      print_queue: { type: integer }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /devices:
+    get:
+      tags: [Devices]
+      summary: Filterable, paginated device list (primary CRM/OPR integration seam)
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string }
+          description: Comma-separated list of DeviceStatus values. An unrecognised value returns 400.
+        - name: source
+          in: query
+          schema: { type: string, enum: [manifest, unreconciled] }
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Matches imei, sku, or uuid (LIKE)
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  devices:
+                    type: array
+                    items: { $ref: "#/components/schemas/Device" }
+                  page: { type: integer }
+                  page_size: { type: integer }
+                  total: { type: integer }
+        "400":
+          description: Invalid status value(s)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /devices/{id}:
+    get:
+      tags: [Devices]
+      summary: Full device record with event history
+      parameters: [{ $ref: "#/components/parameters/PathId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device: { $ref: "#/components/schemas/Device" }
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/DeviceEvent" }
+        "400":
+          description: Invalid id
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /devices/export/csv:
+    get:
+      tags: [Devices]
+      summary: CSV export of devices
+      description: >
+        `ids` (comma-separated) takes precedence over `status`/`source`
+        for exporting an exact operator-picked selection. Response is
+        `text/csv` with `Content-Disposition: attachment`.
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string }
+        - name: source
+          in: query
+          schema: { type: string }
+        - name: ids
+          in: query
+          schema: { type: string }
+          description: Comma-separated device ids
+      responses:
+        "200":
+          description: CSV file
+          content:
+            text/csv:
+              schema: { type: string }
+        "400":
+          description: ids supplied but empty/non-numeric
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /devices/meta/statuses:
+    get:
+      tags: [Devices]
+      summary: Full status enum and allowed-transition map
+      description: Lets a future UI/CRM render valid next-states without hardcoding the state machine.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  statuses:
+                    type: array
+                    items: { $ref: "#/components/schemas/DeviceStatus" }
+                  transitions:
+                    type: object
+                    additionalProperties:
+                      type: array
+                      items: { $ref: "#/components/schemas/DeviceStatus" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /devices/{id}/transition:
+    post:
+      tags: [Devices]
+      summary: The single entry point for device status changes
+      description: >
+        Validates the requested transition against the allowed-transition
+        map; writes the `received_devices` UPDATE and a `device_events`
+        INSERT atomically (D1 `batch()`), so a device's `status` always
+        equals the `to_status` of its own most recent event. Fires any
+        enabled webhooks for the organisation on success.
+      parameters: [{ $ref: "#/components/parameters/PathId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_status]
+              properties:
+                to_status: { $ref: "#/components/schemas/DeviceStatus" }
+                reference: { type: string, nullable: true }
+                metadata: { type: object, nullable: true, additionalProperties: true }
+      responses:
+        "200":
+          description: Transition applied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  device: { $ref: "#/components/schemas/Device" }
+                  event: { $ref: "#/components/schemas/DeviceEvent" }
+        "400":
+          description: to_status missing/unrecognised
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Device not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Transition not allowed from the device's current status
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - type: object
+                    properties:
+                      code: { type: string, example: invalid_transition }
+
+  /webhooks:
+    get:
+      tags: [Webhooks]
+      summary: List this organisation's webhooks
+      description: The signing secret is never included in list/detail responses.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhooks:
+                    type: array
+                    items: { $ref: "#/components/schemas/WebhookSummary" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Webhooks]
+      summary: Register a webhook
+      description: The signing secret is returned **once**, at creation time only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri }
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  id: { type: integer }
+                  url: { type: string }
+                  secret: { type: string, description: "Save this now — it is never shown again" }
+                  enabled: { type: boolean }
+        "400":
+          description: Missing/invalid url
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /webhooks/{id}/toggle:
+    post:
+      tags: [Webhooks]
+      summary: Enable/disable delivery without deleting the config
+      parameters: [{ $ref: "#/components/parameters/PathId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: { type: boolean }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean } } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /webhooks/{id}:
+    delete:
+      tags: [Webhooks]
+      summary: Remove a webhook
+      parameters: [{ $ref: "#/components/parameters/PathId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean } } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /print/settings:
+    get:
+      tags: [Print]
+      summary: Get print settings
+      description: Returns whether a PrintNode API key is configured — never the raw key.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  print_mode: { type: string, enum: [browser, printnode, manual] }
+                  printnode_api_key_set: { type: boolean }
+                  printnode_printer_id_large: { type: integer, nullable: true }
+                  printnode_printer_id_small: { type: integer, nullable: true }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Print]
+      summary: Update print settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                print_mode: { type: string, enum: [browser, printnode, manual] }
+                printnode_api_key: { type: string, nullable: true, description: "null clears; omit to leave unchanged" }
+                printnode_printer_id_large: { type: integer, nullable: true }
+                printnode_printer_id_small: { type: integer, nullable: true }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean } } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /print/printnode/printers:
+    get:
+      tags: [Print]
+      summary: Proxy to PrintNode — list available printers for the configured account
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  printers: { type: array, items: { type: object } }
+        "400":
+          description: PrintNode API key not configured
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "502":
+          description: PrintNode API error
+
+  /print/queue:
+    get:
+      tags: [Print]
+      summary: Pending print jobs with payloads
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queue: { type: array, items: { type: object } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /print/job/{id}:
+    get:
+      tags: [Print]
+      summary: Fetch a single print job
+      parameters: [{ $ref: "#/components/parameters/PathId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { job: { type: object } } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /print/label/{id}:
+    get:
+      tags: [Print]
+      summary: Standalone HTML label page (auto-fires window.print())
+      description: >
+        Opened via `window.open()` from the SPA, which cannot attach an
+        `Authorization` header — accepts the token as a `?token=` query
+        param as a fallback (see README **Authentication** section for the
+        known limitation this carries).
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - name: size
+          in: query
+          schema: { type: string, enum: [large, small], default: large }
+        - name: rotate
+          in: query
+          schema: { type: string, enum: ["1"] }
+        - name: token
+          in: query
+          schema: { type: string }
+          description: Bearer token fallback for window.open() navigations
+      responses:
+        "200":
+          description: HTML label page
+          content:
+            text/html:
+              schema: { type: string }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Not found
+
+  /print/labels:
+    get:
+      tags: [Print]
+      summary: Bulk label page — all labels separated by page-break-after
+      parameters:
+        - name: ids
+          in: query
+          required: true
+          schema: { type: string }
+          description: Comma-separated print job ids
+        - name: size
+          in: query
+          schema: { type: string, enum: [large, small] }
+        - name: token
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: HTML label page
+          content:
+            text/html:
+              schema: { type: string }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /print/send/{id}:
+    post:
+      tags: [Print]
+      summary: Dispatch one label
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - name: size
+          in: query
+          schema: { type: string, enum: [large, small] }
+        - name: rotate
+          in: query
+          schema: { type: string, enum: ["1"] }
+      responses:
+        "200":
+          description: Dispatched
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      mode: { type: string, example: browser }
+                      url: { type: string }
+                  - type: object
+                    properties:
+                      mode: { type: string, example: printnode }
+                      printnode_job_id: { type: integer }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /print/send-all:
+    post:
+      tags: [Print]
+      summary: Bulk send / open one print window for all queued labels
+      parameters:
+        - name: size
+          in: query
+          schema: { type: string, enum: [large, small] }
+        - name: rotate
+          in: query
+          schema: { type: string, enum: ["1"] }
+      responses:
+        "200":
+          description: Dispatched
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode: { type: string }
+                  url: { type: string }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /print/mark-sent/{id}:
+    post:
+      tags: [Print]
+      summary: Mark a single print job as sent
+      parameters: [{ $ref: "#/components/parameters/PathId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  already: { type: boolean }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /print/mark-sent-batch:
+    post:
+      tags: [Print]
+      summary: Mark multiple print jobs as sent
+      description: Called by postMessage from the browser-print window after afterprint fires.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids: { type: array, items: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean } } }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        HS256 JWT obtained from `POST /auth/dev-login`. Sent as
+        `Authorization: Bearer <token>`. A subset of GET routes that are
+        opened via `window.open()` (DYMO label pages) also accept the
+        token as a `?token=` query parameter as a fallback.
+
+  parameters:
+    PathId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+
+  responses:
+    Unauthorized:
+      description: Missing, invalid, expired, or malformed-claims token
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not found (or belongs to a different organisation)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+
+    AuthUser:
+      type: object
+      properties:
+        id: { type: integer }
+        email: { type: string, format: email }
+        name: { type: string, nullable: true }
+        role: { type: string, example: admin }
+        organisation_id: { type: integer }
+
+    DeviceStatus:
+      type: string
+      enum:
+        - RECEIVED
+        - SORTING
+        - ACTIVE_INVENTORY
+        - IN_HOUSE_REPAIR
+        - READY_FOR_EXPORT
+        - IN_EXPORT_CONSIGNMENT
+        - EXPORTED_UNDER_OPR
+        - RETURNED_UNDER_OPR
+        - SOLD
+        - REJECTED
+      description: >
+        Allowed transitions (this pass only): RECEIVED→SORTING,
+        SORTING→{ACTIVE_INVENTORY,IN_HOUSE_REPAIR,READY_FOR_EXPORT},
+        IN_HOUSE_REPAIR→ACTIVE_INVENTORY, RECEIVED→REJECTED. All other
+        statuses/transitions exist in the enum for forward-compatibility
+        but have no transitions wired to them yet (out of scope).
+
+    Manifest:
+      type: object
+      properties:
+        id: { type: integer }
+        organisation_id: { type: integer }
+        reference: { type: string }
+        supplier: { type: string }
+        notes: { type: string, nullable: true }
+        status: { type: string, enum: [open, closed] }
+        created_by_user_id: { type: integer }
+        created_at: { type: string, format: date-time }
+        closed_at: { type: string, format: date-time, nullable: true }
+        expected_count: { type: integer }
+        received_count: { type: integer }
+        unreconciled_count: { type: integer }
+
+    Device:
+      type: object
+      description: A row from received_devices.
+      properties:
+        id: { type: integer }
+        organisation_id: { type: integer }
+        uuid: { type: string, description: 12-char short code }
+        imei: { type: string }
+        sku: { type: string, nullable: true }
+        brand: { type: string, nullable: true }
+        model: { type: string, nullable: true }
+        capacity: { type: string, nullable: true }
+        color: { type: string, nullable: true }
+        grade: { type: string, nullable: true }
+        source: { type: string, enum: [manifest, unreconciled] }
+        manifest_id: { type: integer, nullable: true }
+        expected_device_id: { type: integer, nullable: true }
+        status: { $ref: "#/components/schemas/DeviceStatus" }
+        label_printed_at: { type: string, format: date-time, nullable: true }
+        notes: { type: string, nullable: true }
+        created_by_user_id: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        buy_price: { type: number, nullable: true }
+        currency: { type: string, example: GBP }
+        vat_type: { type: string, enum: [MARGIN, STANDARD, ZERO], nullable: true }
+        supplier_id: { type: integer, nullable: true }
+
+    DeviceEvent:
+      type: object
+      description: >
+        A row from device_events — the append-only audit log. Invariant:
+        a device's `status` always equals the `to_status` of its own most
+        recent event.
+      properties:
+        id: { type: integer }
+        organisation_id: { type: integer }
+        device_id: { type: integer }
+        event_type: { type: string, example: STATUS_CHANGE, description: "RECEIVE | STATUS_CHANGE | REJECT | GRADE_CHANGE | DEVICE_DELETED" }
+        from_status: { $ref: "#/components/schemas/DeviceStatus" }
+        to_status: { $ref: "#/components/schemas/DeviceStatus" }
+        user_id: { type: integer, nullable: true }
+        reference: { type: string, nullable: true }
+        metadata: { type: string, nullable: true, description: JSON-encoded string }
+        created_at: { type: string, format: date-time }
+
+    ScanConfirmRequest:
+      type: object
+      properties:
+        expected_device_id: { type: integer, nullable: true }
+        sku: { type: string }
+        brand: { type: string }
+        model: { type: string }
+        capacity: { type: string }
+        color: { type: string }
+        grade: { type: string }
+        notes: { type: string, nullable: true }
+        auto_print: { type: boolean }
+        buy_price: { type: number, nullable: true }
+        currency: { type: string, nullable: true, default: GBP }
+        vat_type: { type: string, enum: [MARGIN, STANDARD, ZERO], nullable: true }
+        supplier_id: { type: integer, nullable: true }
+
+    WebhookSummary:
+      type: object
+      description: Never includes the signing secret (only returned once, at creation).
+      properties:
+        id: { type: integer }
+        url: { type: string, format: uri }
+        enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    WebhookPayload:
+      type: object
+      description: >
+        Body POSTed to each enabled webhook URL on a successful device
+        transition. Signed with X-Signature: sha256=<hex> — an
+        HMAC-SHA256 of this exact raw JSON body, keyed with the webhook's
+        secret.
+      properties:
+        event: { type: string, example: device.status_changed }
+        organisation_id: { type: integer }
+        device_id: { type: integer }
+        imei: { type: string }
+        uuid: { type: string }
+        from_status: { $ref: "#/components/schemas/DeviceStatus" }
+        to_status: { $ref: "#/components/schemas/DeviceStatus" }
+        user_id: { type: integer, nullable: true }
+        occurred_at: { type: string, format: date-time }
