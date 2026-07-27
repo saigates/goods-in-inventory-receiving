@@ -7,8 +7,10 @@ A modern, scanner-first web application for the **Goods In** (inbound receiving)
 - **Goal**: Turn the chaotic process of receiving a pallet of phones into a single, frictionless scan-and-print loop — from supplier ASN through to printed internal label.
 - **Stack**: Hono (Cloudflare Pages) · TypeScript · Cloudflare D1 (SQLite) · Tailwind (CDN) · vanilla JS SPA · QRCode.js
 
-## Live URL
-- **Sandbox preview**: https://3000-i4zj15jax42ejggi6n8yt-b32ec7bb.sandbox.novita.ai
+## Live URLs
+- **Production (Genspark-hosted Cloudflare)**: https://d6aea290-bd61-4f82-aa8d-94378b9f2fec.vip.gensparksite.com
+- **Master Checklist tracker**: https://d6aea290-bd61-4f82-aa8d-94378b9f2fec.vip.gensparksite.com/tracker/
+- **Sandbox preview (dev)**: https://3000-i4zj15jax42ejggi6n8yt-b32ec7bb.sandbox.novita.ai
 - **API health**: `/api/health` (the only unauthenticated endpoint besides `POST /api/auth/dev-login`)
 
 ## Authentication & Multi-Tenancy
@@ -262,13 +264,30 @@ pm2 start ecosystem.config.cjs   # serves on http://localhost:3000
 ```
 Then get a token: `curl -X POST http://localhost:3000/api/auth/dev-login -d '{}' -H 'Content-Type: application/json'` and use it as `Authorization: Bearer <token>` on every other `/api/*` call (the SPA does this automatically once you log in through the UI).
 
-### Production deploy
+### Production deploy (Genspark-hosted Cloudflare — current path)
+Deployed 2026-07-27 via `gsk hosted deploy` (Workers for Platform on a Genspark-managed
+Cloudflare account, approval-gated). Managed resources: worker + D1
+`d6aea290-bd61-4f82-aa8d-94378b9f2fec-db` (all 9 migrations applied; SKU seed loaded);
+`JWT_SECRET` set as a write-only worker secret (`gsk hosted secret_put`).
+
+**Remote-D1 caveat (fixed in `f6e69a3`):** Cloudflare's remote D1 rejects explicit
+`BEGIN TRANSACTION` / `COMMIT` in migration files (error 7500) — wrangler applies each
+migration file as one batch, which is D1's supported atomicity. Do not add explicit
+transaction wrappers to new migrations.
+
+Redeploy: `npm run build && gsk hosted deploy` (user approves in the UI), then re-set
+secrets if the redeploy dropped bindings. D1 data ops: `gsk hosted d1_query` /
+`d1_execute`.
+
+<details><summary>Alternative: deploy to your own Cloudflare account (BYOK)</summary>
+
 ```bash
 npx wrangler d1 create webapp-production         # then paste the id into wrangler.jsonc
 npm run db:migrate:prod
 npx wrangler pages secret put JWT_SECRET         # required — pick a strong random value, never commit it
 npm run deploy
 ```
+</details>
 
 ## Testing
 

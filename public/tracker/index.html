@@ -37,8 +37,8 @@ const DATA = {
   meta: {
     project: 'Goods In — Inventory Receiving',
     lastUpdated: '2026-07-27',
-    commit: 'f434a14',
-    commitNote: 'latest app commit at time of writing (Part A close: /scan/manual valuation parity)',
+    commit: 'f6e69a3',
+    commitNote: 'latest app commit at time of writing (production deploy: migrations fixed for remote D1)',
     figuresSource: 'Test counts read from `npx vitest run` output (94 passed / 4 files) and browser-check script output (22 + 13 PASS lines) at commit f434a14; commit history from `git log`. Nothing estimated.',
   },
 
@@ -198,6 +198,8 @@ DATA.executionLog = [
   ['2026-07-27', '664c418', 'FOUND & FIXED real defect: /scan/force-add valuation bypass (was required:false — a device could be force-added with no buy price or VAT type). Server parity + UI fields + 21 tests', 'Unit-tested; verified-can-fail (flip to required:false → 4 failures; revert sha1-identical)'],
   ['2026-07-27', '76f2e22', 'Browser-UI proof: login E2E + force-add enforcement through the real UI — 22 Playwright checks incl. server-422-through-UI (UKL) and zero-request client blocks', 'Browser-verified (Playwright/Chromium); dual-layer sabotage → immediate fails; DB cleaned'],
   ['2026-07-27', 'f434a14', '/scan/manual valuation parity (last lax intake branch): server required + UI fields + 19 Vitest tests + 13 browser checks; general rule adopted — every intake path required:true', 'Unit + browser-verified; verified-can-fail; live curl 422/422/200'],
+  ['2026-07-27', '3ade703', 'Master Checklist tracker: this page — static, data-driven, served at /tracker/', 'Browser-verified (21 Playwright checks, zero JS errors)'],
+  ['2026-07-27', 'f6e69a3', 'Production deploy (Genspark-hosted Cloudflare): migrations fixed for remote D1 (explicit transaction wrappers stripped — CF rejects them, error 7500), all 9 applied, JWT_SECRET secret set, SKU seed loaded', 'Live smoke-tested: manual/force-add 422 without valuation ×5, happy path persisted 88.50 GBP MARGIN, test row cleaned (prod DB left at 0 devices / 14 SKUs)'],
 ];
 
 DATA.testCoverage = {
@@ -232,7 +234,7 @@ DATA.backlog = [
 
 DATA.outstanding = [
   'Part A closed this pass: /scan/manual was the last intake branch on required:false — all three device-creation paths now enforce identical server-side valuation rules (general rule: future intake paths inherit required:true by default).',
-  'Deployment decision needed: app + this tracker are not yet on Cloudflare Pages (sandbox preview only). Owner to choose Genspark-hosted vs own-Cloudflare-account (BYOK) deploy path.',
+  'DEPLOYED (this pass): owner chose Genspark-hosted Cloudflare — app + tracker live at https://d6aea290-bd61-4f82-aa8d-94378b9f2fec.vip.gensparksite.com with managed D1 (all 9 migrations applied — required stripping explicit BEGIN TRANSACTION wrappers that remote D1 rejects), production JWT_SECRET set as write-only secret, SKU seed loaded. Smoke-tested live: manual & force-add both 422 without valuation; happy path persisted 88.50 GBP MARGIN then cleaned.',
   'OPR foundation (OPR 1) is the next major track — 0/21 items across the four OPR sub-tracks; reference authorisation values are captured above, ready to seed a configurable Authorisation record.',
   'Known-but-accepted: dev-login auth story and token-in-URL for print windows — both flagged for pre-production hardening, not blockers for internal use.',
 ];
