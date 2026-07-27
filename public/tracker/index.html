@@ -37,9 +37,9 @@ const DATA = {
   meta: {
     project: 'Goods In — Inventory Receiving',
     lastUpdated: '2026-07-27',
-    commit: '2b21ebf',
-    commitNote: 'latest app commit at time of writing (OPR 1 Foundation, API-level)',
-    figuresSource: 'Test counts read from `npx vitest run` output (119 passed / 5 files) and browser-check script output (22 + 13 PASS lines); commit history from `git log`. Nothing estimated.',
+    commit: '5d1095d',
+    commitNote: 'latest app commit at time of writing (OPR 2 Export flow, API-level)',
+    figuresSource: 'Test counts read from `npx vitest run` output (147 passed / 6 files) and browser-check script output (22 + 13 PASS lines); commit history from `git log`. Nothing estimated.',
   },
 
   // Formula: 1 point per tracked work item, equal weight. Denominator
@@ -47,9 +47,9 @@ const DATA = {
   // grading placeholder (1), so the percentage cannot inflate by simply not
   // defining future work. Percentage is floored, not rounded up.
   progress: {
-    done: 36, total: 55,
-    formula: '36 done ÷ 55 tracked items = 65.4% → shown as 65% (floored). Denominator = 33 items across the 6 built phases + 21 defined OPR items + 1 grading placeholder. One item = one row in a phase checklist below; equal weight; an item counts as done only when verified at the level stated in the execution log. OPR 1’s six items count as done at the API/entity level — they have no UI yet (honestly labelled below).',
-    remainingNote: 'Remaining 19 items: 15 OPR (export/import/automation) + 1 grading + 3 in-progress gaps (lifecycle transitions, bulk endpoints, automated CSV/webhook coverage).',
+    done: 42, total: 55,
+    formula: '42 done ÷ 55 tracked items = 76.3% → shown as 76% (floored). Denominator = 33 items across the 6 built phases + 21 defined OPR items + 1 grading placeholder. One item = one row in a phase checklist below; equal weight; an item counts as done only when verified at the level stated in the execution log. OPR 1 + OPR 2’s twelve items count as done at the API level — they have no UI yet (honestly labelled below).',
+    remainingNote: 'Remaining 13 items: 9 OPR (import/discharge + automation) + 1 grading + 3 in-progress gaps (bulk endpoints, automated CSV/webhook coverage, OPR UI). Export lifecycle transitions are now wired (OPR 2); return/sale transitions await OPR 3.',
   },
 
   phases: [
@@ -101,8 +101,8 @@ const DATA = {
   ],
 
   oprIntro: {
-    heading: 'OPR (Outward Processing Relief) — Foundation built (API-level), workflows NOT STARTED',
-    text: 'OPR is the HMRC customs regime for temporarily exporting devices abroad for repair and re-importing them with duty/VAT relief assessed on the repair cost only. OPR 1 (Foundation) is now implemented and unit-tested at the API/entity level — authorisation records, shipment drafts with validated procedure codes / GBP-only currency / declaration charset, and frozen device-line snapshots. It has NO UI yet: everything is exercised via the API and 25 Vitest tests. OPR 2–4 (the actual export/import workflows, document generation, discharge tracking, automation) remain 0/N — no green/amber/red validation engine, no invoice or C&E1154 generation, no finalisation/status transitions. The Saigates authorisation values live as a configurable seeded data row (seed.sql → opr_authorisations), not inline in code — exactly as this tracker required.',
+    heading: 'OPR (Outward Processing Relief) — Foundation + Export flow built (API-level), import/discharge NOT STARTED',
+    text: 'OPR is the HMRC customs regime for temporarily exporting devices abroad for repair and re-importing them with duty/VAT relief assessed on the repair cost only. OPR 1 (Foundation) and OPR 2 (Export flow) are now implemented and unit-tested at the API level — authorisation records, shipment drafts, frozen device-line snapshots, a scan-by-IMEI consignment builder that keeps device status in lockstep with lines, a coded green/amber/red validation engine, a print-ready A4 commercial invoice + IMEI scan-out list sharing one pence-exact total, a carrier pre-alert email DRAFT (mailbox/cut-off configured on the authorisation record — nothing is sent), and red-blocked finalisation that locks lines, moves devices to Exported-Under-OPR and captures MRN/DUCR/EAD. There is NO OPR UI yet: everything is exercised via the API and 53 Vitest tests. OPR 3–4 (import/return consignments, C&E1154 generation, discharge tracking, email automation) remain 0/N. The Saigates authorisation values live as a configurable seeded data row (seed.sql → opr_authorisations), not inline in code — exactly as this tracker required.',
   },
   oprTracks: [
     { name: 'OPR 1 — Foundation: Shipment / Consignment + Authorisation entities (API-level, no UI)', done: 6, total: 6, status: 'done', items: [
@@ -113,13 +113,13 @@ const DATA = {
       'Supervising office (name + code), commodity scope, rate of yield, discharge period — all on the seeded Saigates record',
       'Linkage: shipment → OP authorisation (mandatory, org-scoped) → contained devices (unique per shipment)',
     ]},
-    { name: 'OPR 2 — Export flow', done: 0, total: 6, items: [
-      'Export-consignment builder (scan devices into a shipment)',
-      'Validation engine → coded green/amber/red results: GBP-only currency, authorisation valid on ship date, procedure code valid for OPR export (2100), commodity within authorisation scope, IMEIs present/valid/unique, declaration text charset/length, unit values present, document totals internally consistent',
-      'Print-ready A4 commercial invoice generator',
-      'IMEI/value scan-out list (total must equal invoice total)',
-      'Pre-alert email draft to carrier customs mailbox by cut-off',
-      'Finalisation: lock lines, devices → Exported-Under-OPR, capture MRN / DUCR / EAD as proof of export',
+    { name: 'OPR 2 — Export flow (API-level, no UI)', done: 6, total: 6, status: 'done', items: [
+      'Export-consignment builder: POST /shipments/:id/scan adds devices by IMEI; only READY_FOR_EXPORT devices accepted; device status ↔ IN_EXPORT_CONSIGNMENT moves in lockstep with the line (event-logged); generic transition endpoint refuses consignment-derived statuses in both directions',
+      'Validation engine → coded green/amber/red results (10 checks): GBP-only currency (shipment + every frozen line), authorisation valid on ship date, procedure code valid for OPR export, commodity within authorisation scope, IMEIs present/Luhn-valid/unique, declaration text charset/length, unit values present/positive/pence-exact, document totals internally consistent, logistics completeness (amber)',
+      'Print-ready A4 commercial invoice generator (HTML → browser print): CDS authorisation number (never the CHIEF one), procedure code, commodity code, per-IMEI lines from the FROZEN snapshots, OPR no-sale declaration',
+      'IMEI/value scan-out list — total equals invoice total by construction (same pence-exact sum); test proves 150 + 249.99 + 88.5 = 488.49 on both documents',
+      'Pre-alert email DRAFT to the carrier customs mailbox — mailbox + cut-off are CONFIGURABLE DATA on the authorisation record (prealert_email/prealert_cutoff, seeded for FedEx); unconfigured mailbox is flagged, never invented; nothing is auto-sent (that is OPR 4)',
+      'Finalisation: red validation blocks with zero side-effects (amber passes); locks lines/PATCH; every device → EXPORTED_UNDER_OPR through the real state machine (event-logged); captures MRN / DUCR / EAD; /export-proof is the only mutation FINALISED accepts',
     ]},
     { name: 'OPR 3 — Import / Discharge flow', done: 0, total: 6, items: [
       'Return-consignment builder selecting a subset of exported devices (partial returns, e.g. 90 of 162), inheriting the original export MRN',
@@ -201,14 +201,15 @@ DATA.executionLog = [
   ['2026-07-27', '3ade703', 'Master Checklist tracker: this page — static, data-driven, served at /tracker/', 'Browser-verified (21 Playwright checks, zero JS errors)'],
   ['2026-07-27', 'f6e69a3', 'Production deploy (Genspark-hosted Cloudflare): migrations fixed for remote D1 (explicit transaction wrappers stripped — CF rejects them, error 7500), all 9 applied, JWT_SECRET secret set, SKU seed loaded', 'Live smoke-tested: manual/force-add 422 without valuation ×5, happy path persisted 88.50 GBP MARGIN, test row cleaned (prod DB left at 0 devices / 14 SKUs)'],
   ['2026-07-27', '2b21ebf', 'OPR 1 Foundation (API-level, no UI): opr_authorisations + shipments + frozen shipment_lines snapshots; GBP-only (UKL rejected with CHIEF-era message), procedure codes validated incl. forbidden 2100+B51 / import-only 6121, declaration charset, EORI + date checks, org-scoped authorisation linkage; Saigates authorisation seeded as data (seed.sql), never inline in code', 'Unit-tested: 25 Vitest tests incl. snapshot-freeze proof + zero-side-effect 422s; verified-can-fail ×3 (UKL, 2100+B51, line buy_price guards each sabotaged → failed → restored sha1-identical); live curl smoke on all guards; smoke rows cleaned'],
+  ['2026-07-27', '5d1095d', 'OPR 2 Export flow (API-level, no UI): scan-by-IMEI consignment builder gated on READY_FOR_EXPORT with device status ↔ line lockstep (event-logged, generic transition endpoint refuses consignment statuses both ways); 10-check green/amber/red validation engine; A4 commercial invoice + scan-out list sharing one pence-exact total; pre-alert DRAFT from authorisation-configured mailbox/cut-off; red-blocked finalisation → EXPORTED_UNDER_OPR + MRN/DUCR/EAD capture; /export-proof as the only post-finalise mutation. Also fixed a real bug: Hono c.executionCtx is a throwing getter — webhook dispatch 500ed under test envs', 'Unit-tested: 28 new Vitest tests (147/147 total, 6 files) incl. amber-passes-red-blocks finalisation proof, zero-side-effect rejections, lockstep event assertions; verified-can-fail ×3 (red-block gate, READY_FOR_EXPORT gate, totals-consistency check each sabotaged → failed → restored sha1-identical); local end-to-end curl smoke (builder 409 → stage → scan → green → documents → finalise → locked → proof); smoke rows cleaned'],
 ];
 
 DATA.testCoverage = {
   cells: [
-    ['119/119', 'Vitest tests passing', '5 spec files · real workerd/Miniflare + real D1 · all 10 migrations applied per file · not mocks'],
+    ['147/147', 'Vitest tests passing', '6 spec files · real workerd/Miniflare + real D1 · all 11 migrations applied per file · not mocks'],
     ['35/35', 'Browser-UI checks passing', 'Playwright + Chromium · force-add 22 + manual 13 · server-through-UI proof (UKL 422 rendered from server)'],
     ['EXIT 0', 'TypeScript clean', 'app scope (tsconfig.json) + test scope (test/tsconfig.json) typecheck independently'],
-    ['8/8', 'Guards verified-can-fail', 'lifecycle invariant, force-add server, manual server, force-add UI (dual-layer), manual UI pattern + OPR: UKL guard, 2100+B51 guard, line buy_price guard — each sabotaged, failed, restored sha1-identical'],
+    ['11/11', 'Guards verified-can-fail', 'lifecycle invariant, force-add server, manual server, force-add UI (dual-layer), manual UI pattern + OPR: UKL, 2100+B51, line buy_price, red-block finalisation gate, READY_FOR_EXPORT builder gate, totals-consistency check — each sabotaged, failed, restored sha1-identical'],
   ],
   bullets: [
     'Audit-trail invariant (device.status === latest event.to_status) asserted automatically after single transitions, chains, and rejected no-ops.',
@@ -222,7 +223,8 @@ DATA.testCoverage = {
 DATA.backlog = [
   ['Real credential login / IdP (current auth is email-only dev-login)', 'Deferred', 'Before production go-live'],
   ['?token= query-param hardening on print-label URLs (can leak into logs/history)', 'Deferred', 'Before production with a real IdP'],
-  ['Export / return / sale lifecycle transitions wired to real flows', 'Deferred', 'When OPR export flow is built (OPR 2)'],
+  ['Export lifecycle transitions (READY_FOR_EXPORT ↔ IN_EXPORT_CONSIGNMENT → EXPORTED_UNDER_OPR)', 'Done (OPR 2)', 'Wired to the consignment builder/finalisation — OPR-workflow-only, generic endpoint refuses them'],
+  ['Return / sale lifecycle transitions (→ RETURNED_UNDER_OPR, → SOLD)', 'Deferred', 'When OPR import/discharge flow is built (OPR 3)'],
   ['Automated tests: CSV export, webhook HMAC delivery, dedicated IMEI/Luhn suite', 'Open', 'Next testing pass'],
   ['Bulk endpoints + webhook hardening for downstream consumers', 'Deferred', 'When OPR / downstream integration starts (OPR 4)'],
   ['Supplier CSV import (only device CSV export exists)', 'Deferred', 'When supplier master data grows beyond hand-entry'],
@@ -236,7 +238,8 @@ DATA.backlog = [
 DATA.outstanding = [
   'Part A closed this pass: /scan/manual was the last intake branch on required:false — all three device-creation paths now enforce identical server-side valuation rules (general rule: future intake paths inherit required:true by default).',
   'DEPLOYED (this pass): owner chose Genspark-hosted Cloudflare — app + tracker live at https://d6aea290-bd61-4f82-aa8d-94378b9f2fec.vip.gensparksite.com with managed D1 (all 9 migrations applied — required stripping explicit BEGIN TRANSACTION wrappers that remote D1 rejects), production JWT_SECRET set as write-only secret, SKU seed loaded. Smoke-tested live: manual & force-add both 422 without valuation; happy path persisted 88.50 GBP MARGIN then cleaned.',
-  'OPR 1 (Foundation) closed this pass at the API/entity level — 6/6 items, 25 tests, Saigates authorisation seeded as configurable data. It has NO UI yet. Next major track: OPR 2 (export flow — consignment builder UI, green/amber/red validation engine, invoice, scan-out list, pre-alert draft, finalisation with device status transitions).',
+  'OPR 1 (Foundation) closed at the API/entity level — 6/6 items, 25 tests, Saigates authorisation seeded as configurable data.',
+  'OPR 2 (Export flow) closed this pass at the API level — 6/6 items, 28 tests: consignment builder w/ status lockstep, 10-check green/amber/red engine, invoice + scan-out (one pence-exact total), pre-alert draft from authorisation config, red-blocked finalisation w/ MRN/DUCR/EAD. Still NO OPR UI — all exercised via API + tests. Next major track: OPR 3 (import/discharge — return consignments, C&E1154, discharge tracker).',
   'Known-but-accepted: dev-login auth story and token-in-URL for print windows — both flagged for pre-production hardening, not blockers for internal use.',
 ];
 </script>
