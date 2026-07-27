@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Goods In — Master Checklist</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+<style>
+  body { background:#0b1220; color:#e2e8f0; font-family: ui-sans-serif, system-ui, sans-serif; }
+  .card { background:rgba(15,23,42,.7); border:1px solid #1e293b; border-radius:1rem; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .badge { display:inline-flex; align-items:center; gap:.3rem; padding:.15rem .55rem; border-radius:999px; font-size:.68rem; font-weight:600; letter-spacing:.02em; }
+  .b-done { background:rgba(34,197,94,.12); color:#4ade80; border:1px solid rgba(34,197,94,.3); }
+  .b-prog { background:rgba(245,158,11,.12); color:#fbbf24; border:1px solid rgba(245,158,11,.3); }
+  .b-not  { background:rgba(100,116,139,.12); color:#94a3b8; border:1px solid rgba(100,116,139,.3); }
+  .b-fix  { background:rgba(239,68,68,.12); color:#f87171; border:1px solid rgba(239,68,68,.3); }
+  .b-ref  { background:rgba(6,182,212,.10); color:#67e8f9; border:1px solid rgba(6,182,212,.3); }
+  table { width:100%; border-collapse:collapse; font-size:.8rem; }
+  th { text-align:left; color:#64748b; font-size:.68rem; text-transform:uppercase; letter-spacing:.06em; padding:.5rem .6rem; border-bottom:1px solid #1e293b; }
+  td { padding:.5rem .6rem; border-bottom:1px solid rgba(30,41,59,.6); vertical-align:top; }
+  .bar { height:10px; border-radius:999px; background:#1e293b; overflow:hidden; }
+  .bar > div { height:100%; background:linear-gradient(90deg,#22d3ee,#6366f1); }
+  h2 { font-size:1.05rem; font-weight:700; }
+  .note { font-size:.72rem; color:#64748b; }
+</style>
+</head>
+<body>
+<main id="root" class="max-w-6xl mx-auto px-5 py-8 space-y-6"></main>
+<script>
+// ─────────────────────────────────────────────────────────────────────────
+// ALL tracker content lives in this DATA object. Update it each pass —
+// nothing below it is content, only rendering. Figures must be READ from
+// the repo (vitest output, git log), never estimated.
+// ─────────────────────────────────────────────────────────────────────────
+const DATA = {
+  meta: {
+    project: 'Goods In — Inventory Receiving',
+    lastUpdated: '2026-07-27',
+    commit: 'f434a14',
+    commitNote: 'latest app commit at time of writing (Part A close: /scan/manual valuation parity)',
+    figuresSource: 'Test counts read from `npx vitest run` output (94 passed / 4 files) and browser-check script output (22 + 13 PASS lines) at commit f434a14; commit history from `git log`. Nothing estimated.',
+  },
+
+  // Formula: 1 point per tracked work item, equal weight. Denominator
+  // includes the FULL defined-but-not-started OPR scope (21 items) and the
+  // grading placeholder (1), so the percentage cannot inflate by simply not
+  // defining future work. Percentage is floored, not rounded up.
+  progress: {
+    done: 30, total: 55,
+    formula: '30 done ÷ 55 tracked items = 54.5% → shown as 54% (floored). Denominator = 33 items across the 6 built phases + 21 defined OPR items (all not-started) + 1 grading placeholder. One item = one row in a phase checklist below; equal weight; an item counts as done only when verified at the level stated in the execution log.',
+    remainingNote: 'Remaining 25 items: 21 OPR (customs) + 1 grading + 3 in-progress gaps (lifecycle transitions, bulk endpoints, automated CSV/webhook coverage).',
+  },
+
+  phases: [
+    { name: 'Phase 1 — Goods-In Receiving Core', done: 10, total: 10, status: 'done', items: [
+      ['Manifest upload (CSV/XLS/XLSX) + column-mapping UI', 'done'],
+      ['Pending receipt queue + received/expected progress', 'done'],
+      ['HID scanner loop: match / duplicate / unreconciled / rejected outcomes', 'done'],
+      ['Confirm-SKU modal with catalogue as source of truth', 'done'],
+      ['Force-add / reject for off-manifest devices', 'done'],
+      ['Quick receive (manual, no manifest)', 'done'],
+      ['DYMO labels: 57×32 + 32×57, rotate-90, dual QR', 'done'],
+      ['Three printer modes (Browser / PrintNode / Manual)', 'done'],
+      ['Inventory view: search, source badges, delete with cascade', 'done'],
+      ['SKU catalogue: CRUD + bulk upload, duplicate flagging', 'done'],
+    ]},
+    { name: 'Phase 2 — Auth & Multi-Tenancy', done: 4, total: 4, status: 'done', note: 'dev-login only (email, no password) — real IdP is a backlog item, not counted here', items: [
+      ['HS256 JWT middleware on every /api/* route (health + dev-login exempt)', 'done'],
+      ['dev-login + /auth/me; SPA token store + 401 auto-logout', 'done'],
+      ['organisation_id scoping on every read, org+user attribution on every write', 'done'],
+      ['?token= fallback restricted to print-label window.open URLs', 'done'],
+    ]},
+    { name: 'Phase 3 — Device Lifecycle & Audit Trail', done: 3, total: 4, status: 'progress', items: [
+      ['Status enum + transitionDevice() state machine with allowed-transition map', 'done'],
+      ['device_events append-only audit trail (RECEIVE / FORCE_ADD / MANUAL_RECEIVE / STATUS_CHANGE / REJECT / SCAN)', 'done'],
+      ['Audit invariant (device.status === latest event.to_status) as automated tests', 'done'],
+      ['Export / return / sale transitions wired to real flows (statuses exist in enum only)', 'not'],
+    ]},
+    { name: 'Phase 4 — Valuation & VAT at Goods-In', done: 5, total: 5, status: 'done', note: 'general rule adopted: EVERY intake path enforces required buy_price + vat_type + valid ISO 4217 currency, server-side', items: [
+      ['Schema: buy_price / currency / vat_type / supplier_id on received_devices', 'done'],
+      ['Server validators: ISO 4217 allow-list, vat_type enum, buy_price bounds', 'done'],
+      ['/scan/confirm requires valuation (422 on missing/invalid)', 'done'],
+      ['/scan/force-add requires valuation — was a REAL bypass (required:false), found & fixed', 'fixed'],
+      ['/scan/manual requires valuation — last lax branch, brought to parity', 'fixed'],
+    ]},
+    { name: 'Phase 5 — API Surface & Integrations', done: 3, total: 4, status: 'progress', items: [
+      ['Devices API: list/filter/status-transition + CSV export', 'done'],
+      ['Webhooks: register + HMAC-SHA256 X-Signature delivery on status change', 'done'],
+      ['OpenAPI 3 spec (openapi.yaml) covering auth/scan/devices/webhooks', 'done'],
+      ['Bulk endpoints for downstream consumers', 'not'],
+    ]},
+    { name: 'Phase 6 — Testing & Verification', done: 5, total: 6, status: 'progress', items: [
+      ['Vitest inside real workerd/Miniflare + real D1, all 9 migrations applied (not mocks)', 'done'],
+      ['Lifecycle suite: 24 tests incl. audit-trail invariant, verified-can-fail', 'done'],
+      ['Currency suite: 30 tests incl. documented case-insensitivity decision', 'done'],
+      ['Intake valuation suites: force-add (21) + manual (19), zero-side-effect assertions, verified-can-fail', 'done'],
+      ['Browser-UI checks (Playwright/Chromium): login E2E + force-add (22) + manual (13), server-through-UI proof', 'done'],
+      ['Automated coverage for CSV export, webhook HMAC, dedicated IMEI/Luhn suite (currently manual/live-verified only)', 'not'],
+    ]},
+  ],
+
+  oprIntro: {
+    heading: 'OPR (Outward Processing Relief) — defined scope, NOT STARTED',
+    text: 'OPR is the HMRC customs regime for temporarily exporting devices abroad for repair and re-importing them with duty/VAT relief assessed on the repair cost only. The four sub-tracks below are the reference scope for the remaining customs work. Zero implementation exists — every count is honestly 0/N. The reference values further down describe the OP authorisation this system will operate under; when built, they must live in a configurable Authorisation record, not inline in code.',
+  },
+  oprTracks: [
+    { name: 'OPR 1 — Foundation: Shipment / Consignment + Authorisation entities', done: 0, total: 6, items: [
+      'Shipment/Consignment entity above devices: direction (export/import), type (OPR repair), status, procedure code + additional procedure code',
+      'Consignee/vendor, carrier + carrier account, incoterm, currency (GBP-enforced), ship date',
+      'Device line snapshots (value/attributes frozen at time of shipment)',
+      'Authorisation entity: CDS-format + legacy CHIEF-format numbers, EORI, validity dates',
+      'Supervising office (name + code), commodity scope, rate of yield, discharge period',
+      'Linkage: shipment → OP authorisation → contained devices',
+    ]},
+    { name: 'OPR 2 — Export flow', done: 0, total: 6, items: [
+      'Export-consignment builder (scan devices into a shipment)',
+      'Validation engine → coded green/amber/red results: GBP-only currency, authorisation valid on ship date, procedure code valid for OPR export (2100), commodity within authorisation scope, IMEIs present/valid/unique, declaration text charset/length, unit values present, document totals internally consistent',
+      'Print-ready A4 commercial invoice generator',
+      'IMEI/value scan-out list (total must equal invoice total)',
+      'Pre-alert email draft to carrier customs mailbox by cut-off',
+      'Finalisation: lock lines, devices → Exported-Under-OPR, capture MRN / DUCR / EAD as proof of export',
+    ]},
+    { name: 'OPR 3 — Import / Discharge flow', done: 0, total: 6, items: [
+      'Return-consignment builder selecting a subset of exported devices (partial returns, e.g. 90 of 162), inheriting the original export MRN',
+      'C&E1154 generator: quantity from consignment, repair cost → GBP at customs rate, exported-goods value = sum of returning devices only, duty rate applied, relief + net duty computed',
+      'Partial-return guardrail: exported-goods quantity must equal consignment quantity',
+      'CHIEF-format number in the C&E1154 authorisation field; CDS number in the cross-referenced statement (must never be confused)',
+      'Re-import clearance-instruction draft: procedure code 6121, quoting export MRN, duty/VAT on repair cost only',
+      'Discharge tracker from device events: exported vs returned vs outstanding, deadline = export date + discharge period, alerts as window closes; on receipt devices → Active Inventory',
+    ]},
+    { name: 'OPR 4 — Automation & Integration (later)', done: 0, total: 3, items: [
+      'Send (not just draft) pre-alert email via Gmail integration with generated documents attached',
+      'Send clearance-instruction email via Gmail integration',
+      'API hardening for downstream consumers: webhooks on status change, bulk endpoints',
+    ]},
+  ],
+  grading: { name: 'Grading module (next stage after Goods In)', done: 0, total: 1 },
+
+  oprReference: {
+    heading: 'OPR reference values (read-only configuration — the OP authorisation this system will operate under)',
+    groups: [
+      { title: 'Authorisation holder & identifiers', rows: [
+        ['Holder', 'Saigates Limited'],
+        ['EORI', 'GB369979995000'],
+        ['CDS OP Authorisation Number (CDS declarations, pre-alert emails, commercial-invoice declaration statement)', 'GBOPO36997999500020260226105539'],
+        ['OPR Authorisation Number — legacy CHIEF format (C&E1154 "OPR authorisation number" field only, pre-formatted OP/__/__/__)', 'OP/0922/601/31'],
+        ['Authorisation validity', '01/03/2026 – 28/02/2031'],
+      ]},
+      { title: 'Supervising office', rows: [
+        ['Name', 'HMRC S1756, IP-OP Customs Liverpool'],
+        ['Office code', 'GBNCL001'],
+        ['Address', 'Central Mail Unit, Newcastle, NE98 1ZZ'],
+      ]},
+      { title: 'Procedure codes', rows: [
+        ['Export (temporary export for repair, paid repair)', 'Procedure Code 2100'],
+        ['Re-import after OP (paid repair)', 'Procedure Code 6121'],
+        ['Free-of-charge warranty alternative (configurable, not the default flow)', 'export 2200 with APC B51 · re-import APC B02'],
+      ]},
+      { title: 'Goods & authorisation parameters', rows: [
+        ['Authorised goods', 'Smartphones'],
+        ['Commodity heading / code', '8517 (processed product code 8517130000)'],
+        ['Rate of yield', '1:1'],
+        ['Discharge period', '6 months from date of export'],
+        ['Goods identification method', 'IMEI / manufacturer\u2019s serial number'],
+      ]},
+      { title: 'Carrier / customs contact (operational reference)', rows: [
+        ['Carrier', 'FedEx · declarant on prior movements: FedEx Express UK Limited (EORI GB271251133000)'],
+        ['Pre-alert mailbox', 'controlprealert@fedex.com · cut-off 4pm on collection/drop-off day'],
+        ['Return duty form', 'C&E1154 (OPR duty calculation — duty/VAT assessed on repair cost only)'],
+      ]},
+    ],
+    constraints: [
+      'The CDS number (GBOPO…) and the CHIEF number (OP/0922/601/31) are two representations of the SAME authorisation and must not be confused — CDS format on declarations / invoice / pre-alert; CHIEF format only in the C&E1154 authorisation field.',
+      'Currency on all OPR documents must be GBP (ISO 4217). The informal "UKL" is invalid — the goods-in validator already rejects it, and the OPR validation engine must too.',
+      'Carrier declaration-statement fields accept only letters, numbers, and spaces — no hyphens, punctuation, or line breaks.',
+      'The 2100 + B51 combination is NOT permitted by HMRC; the valid warranty pairing is 2200 + B51.',
+    ],
+  },
+};
+</script>
+<script>
+// DATA part 2 (kept separate for easy per-pass edits): execution log,
+// test-coverage snapshot, backlog, outstanding actions.
+DATA.executionLog = [
+  ['2026-06-12', '1068318', 'Initial Goods In app: manifest upload, scan loop, confirm modal, inventory, print queue', 'Smoke-tested (manual browser)'],
+  ['2026-06-12', 'a7a9d6d…6beb746', 'DYMO label work across 7 commits: 57×32 + 32×57 formats, QR fixes, rotate-90°, real LabelWriter support, preflight', 'Manually verified against a live DYMO print'],
+  ['2026-06-14', '040a1fd', 'Strict grades (A|B|C|UG), grade override + audit, manual receive, catalogue upload', 'Smoke-tested (manual browser)'],
+  ['2026-06-16', 'da3f307…00f15ba', 'scan_events on confirm/force-add; manifest delete cascade + FK fixes; column-mapping UI', 'Smoke-tested + curl'],
+  ['2026-06-17', 'e034f0e', 'Catalogue as source of truth for scan + manifest', 'Smoke-tested (manual browser)'],
+  ['2026-07-27', 'e864f02', 'JWT auth + multi-tenancy foundation (middleware, dev-login, org scoping)', 'curl-verified (401s, tenancy scoping)'],
+  ['2026-07-27', 'ba8350b', 'Device status enum + transitionDevice() state machine', 'Typecheck+build at the time; unit-tested later (e99f8bb)'],
+  ['2026-07-27', '7d3702e', 'Org-scoping of existing routes + centralised server-side validation (IMEI/Luhn, currency, VAT)', 'curl-verified'],
+  ['2026-07-27', '2449018', 'device_events audit wiring, valuation/VAT persistence, devices + webhooks API', 'curl-verified incl. independent HMAC recompute with wrong-secret negative control'],
+  ['2026-07-27', '72cdb21', 'JWT auth + valuation/VAT fields wired into the SPA (login view, confirm modal)', 'Browser smoke (manual)'],
+  ['2026-07-27', '93e6250', 'README overhaul + OpenAPI 3 spec', 'Docs only'],
+  ['2026-07-27', 'e99f8bb', 'Vitest inside real workerd + D1 (all migrations): 54 tests — lifecycle/audit-invariant + currency suites', 'Unit-tested; verified-can-fail (injected bug → 11 failures, revert byte-identical)'],
+  ['2026-07-27', '664c418', 'FOUND & FIXED real defect: /scan/force-add valuation bypass (was required:false — a device could be force-added with no buy price or VAT type). Server parity + UI fields + 21 tests', 'Unit-tested; verified-can-fail (flip to required:false → 4 failures; revert sha1-identical)'],
+  ['2026-07-27', '76f2e22', 'Browser-UI proof: login E2E + force-add enforcement through the real UI — 22 Playwright checks incl. server-422-through-UI (UKL) and zero-request client blocks', 'Browser-verified (Playwright/Chromium); dual-layer sabotage → immediate fails; DB cleaned'],
+  ['2026-07-27', 'f434a14', '/scan/manual valuation parity (last lax intake branch): server required + UI fields + 19 Vitest tests + 13 browser checks; general rule adopted — every intake path required:true', 'Unit + browser-verified; verified-can-fail; live curl 422/422/200'],
+];
+
+DATA.testCoverage = {
+  cells: [
+    ['94/94', 'Vitest tests passing', '4 spec files · real workerd/Miniflare + real D1 · all 9 migrations applied per file · not mocks'],
+    ['35/35', 'Browser-UI checks passing', 'Playwright + Chromium · force-add 22 + manual 13 · server-through-UI proof (UKL 422 rendered from server)'],
+    ['EXIT 0', 'TypeScript clean', 'app scope (tsconfig.json) + test scope (test/tsconfig.json) typecheck independently'],
+    ['5/5', 'Suites verified-can-fail', 'lifecycle invariant, force-add server, manual server, force-add UI (dual-layer), manual UI pattern — each sabotaged, failed, restored sha1-identical'],
+  ],
+  bullets: [
+    'Audit-trail invariant (device.status === latest event.to_status) asserted automatically after single transitions, chains, and rejected no-ops.',
+    'Every 422 rejection in the intake suites also asserts ZERO side-effects: no device row, no audit event, no scan_event, no print job.',
+    'Case-insensitive currency ("gbp"/"eur" accepted, normalised uppercase) is a documented, owner-confirmed decision locked in as explicit tests.',
+    'All UI/live test rows (and one sabotage-leaked valuation-less row) were cleaned from local D1 after each run — DB back to its 2 pre-existing devices.',
+  ],
+  manualOnly: 'Manual/live-verified only (NOT yet automated): CSV export shape; webhook X-Signature HMAC (recomputed independently once, with a wrong-secret negative control); no dedicated IMEI/Luhn unit suite (Luhn is exercised indirectly by the intake suites).',
+};
+
+DATA.backlog = [
+  ['Real credential login / IdP (current auth is email-only dev-login)', 'Deferred', 'Before production go-live'],
+  ['?token= query-param hardening on print-label URLs (can leak into logs/history)', 'Deferred', 'Before production with a real IdP'],
+  ['Export / return / sale lifecycle transitions wired to real flows', 'Deferred', 'When OPR export flow is built (OPR 2)'],
+  ['Automated tests: CSV export, webhook HMAC delivery, dedicated IMEI/Luhn suite', 'Open', 'Next testing pass'],
+  ['Bulk endpoints + webhook hardening for downstream consumers', 'Deferred', 'When OPR / downstream integration starts (OPR 4)'],
+  ['Supplier CSV import (only device CSV export exists)', 'Deferred', 'When supplier master data grows beyond hand-entry'],
+  ['Multi-warehouse / multi-location', 'Deferred', 'Second physical site'],
+  ['Real-time multi-user updates (SSE/websocket on scan_events)', 'Deferred', 'More than one concurrent receiving station'],
+  ['User-management UI (users/orgs currently seeded directly in D1)', 'Deferred', 'Second organisation or non-admin operator onboarded'],
+  ['QZ Tray local bridge (alternative to PrintNode)', 'Deferred', 'A site that refuses cloud printing'],
+  ['Grading module', 'Not started', 'After Goods-In accepted in production use'],
+];
+
+DATA.outstanding = [
+  'Part A closed this pass: /scan/manual was the last intake branch on required:false — all three device-creation paths now enforce identical server-side valuation rules (general rule: future intake paths inherit required:true by default).',
+  'Deployment decision needed: app + this tracker are not yet on Cloudflare Pages (sandbox preview only). Owner to choose Genspark-hosted vs own-Cloudflare-account (BYOK) deploy path.',
+  'OPR foundation (OPR 1) is the next major track — 0/21 items across the four OPR sub-tracks; reference authorisation values are captured above, ready to seed a configurable Authorisation record.',
+  'Known-but-accepted: dev-login auth story and token-in-URL for print windows — both flagged for pre-production hardening, not blockers for internal use.',
+];
+</script>
+<script>
+// ── Rendering only below this line ──
+const el = (tag, cls, html) => { const n = document.createElement(tag); if (cls) n.className = cls; if (html != null) n.innerHTML = html; return n; };
+const root = document.getElementById('root');
+
+// Header + progress
+{
+  const pct = Math.floor(DATA.progress.done / DATA.progress.total * 100);
+  const c = el('section', 'card p-6');
+  c.appendChild(el('div', 'flex items-center justify-between flex-wrap gap-3',
+    `<div>
+       <h1 class="text-2xl font-bold"><i class="fas fa-list-check mr-2 text-cyan-400"></i>${DATA.meta.project} — Master Checklist</h1>
+       <p class="note mt-1">Last updated ${DATA.meta.lastUpdated} · commit <span class="mono text-slate-300">${DATA.meta.commit}</span> (${DATA.meta.commitNote})</p>
+     </div>
+     <div class="text-right">
+       <div class="text-4xl font-extrabold text-cyan-300">${pct}%</div>
+       <div class="note">${DATA.progress.done} of ${DATA.progress.total} tracked items done</div>
+     </div>`));
+  const bar = el('div', 'bar mt-4'); bar.appendChild(el('div', '', '')); bar.firstChild.style.width = pct + '%';
+  c.appendChild(bar);
+  c.appendChild(el('p', 'note mt-3', `<strong class="text-slate-400">How this number is derived:</strong> ${DATA.progress.formula}`));
+  c.appendChild(el('p', 'note mt-1', DATA.progress.remainingNote));
+  root.appendChild(c);
+}
+
+// Phases (built)
+{
+  const c = el('section', 'card p-6');
+  c.appendChild(el('h2', '', '<i class="fas fa-layer-group mr-2 text-indigo-400"></i>Phases — built application'));
+  DATA.phases.forEach(p => {
+    const st = p.status === 'done' ? '<span class="badge b-done"><i class="fas fa-check"></i>done</span>'
+             : '<span class="badge b-prog"><i class="fas fa-hourglass-half"></i>in progress</span>';
+    const box = el('div', 'mt-4 border border-slate-800 rounded-xl p-4');
+    box.appendChild(el('div', 'flex items-center justify-between flex-wrap gap-2',
+      `<div class="font-semibold text-sm">${p.name} <span class="text-slate-500 mono">${p.done}/${p.total}</span></div><div>${st}</div>`));
+    if (p.note) box.appendChild(el('p', 'note mt-1', p.note));
+    const ul = el('ul', 'mt-2 space-y-1 text-[13px]');
+    p.items.forEach(([txt, s]) => {
+      const ic = s === 'done' ? '<i class="fas fa-check text-green-400 mr-2"></i>'
+               : s === 'fixed' ? '<i class="fas fa-bug text-red-400 mr-2"></i>'
+               : '<i class="far fa-circle text-slate-600 mr-2"></i>';
+      const tag = s === 'fixed' ? ' <span class="badge b-fix">defect found &amp; fixed</span>' : '';
+      ul.appendChild(el('li', s === 'not' ? 'text-slate-500' : 'text-slate-300', ic + txt + tag));
+    });
+    box.appendChild(ul);
+    c.appendChild(box);
+  });
+  root.appendChild(c);
+}
+
+// OPR track
+{
+  const c = el('section', 'card p-6 border-cyan-900/40');
+  c.appendChild(el('h2', '', `<i class="fas fa-ship mr-2 text-cyan-400"></i>${DATA.oprIntro.heading} <span class="badge b-not ml-2">0/21</span>`));
+  c.appendChild(el('p', 'text-[13px] text-slate-400 mt-2', DATA.oprIntro.text));
+  DATA.oprTracks.forEach(t => {
+    const box = el('div', 'mt-4 border border-slate-800 rounded-xl p-4');
+    box.appendChild(el('div', 'flex items-center justify-between flex-wrap gap-2',
+      `<div class="font-semibold text-sm">${t.name} <span class="text-slate-500 mono">${t.done}/${t.total}</span></div>
+       <span class="badge b-not"><i class="far fa-circle"></i>not started</span>`));
+    const ul = el('ul', 'mt-2 space-y-1 text-[13px] text-slate-500');
+    t.items.forEach(txt => ul.appendChild(el('li', '', '<i class="far fa-circle text-slate-700 mr-2"></i>' + txt)));
+    box.appendChild(ul);
+    c.appendChild(box);
+  });
+  const g = el('div', 'mt-4 border border-slate-800 rounded-xl p-4 flex items-center justify-between');
+  g.innerHTML = `<div class="font-semibold text-sm">${DATA.grading.name} <span class="text-slate-500 mono">${DATA.grading.done}/${DATA.grading.total}</span></div>
+                 <span class="badge b-not"><i class="far fa-circle"></i>not started</span>`;
+  c.appendChild(g);
+  root.appendChild(c);
+}
+
+// OPR reference values
+{
+  const r = DATA.oprReference;
+  const c = el('section', 'card p-6');
+  c.appendChild(el('h2', '', `<i class="fas fa-file-shield mr-2 text-cyan-400"></i>${r.heading} <span class="badge b-ref ml-2">reference / configuration</span>`));
+  c.appendChild(el('p', 'note mt-1', 'Displayed for scope accuracy only — no executable customs logic exists yet. When OPR is built, these values must live in a configurable Authorisation record, not inline in code.'));
+  const grid = el('div', 'grid md:grid-cols-2 gap-4 mt-4');
+  r.groups.forEach(gr => {
+    const box = el('div', 'border border-slate-800 rounded-xl p-4');
+    box.appendChild(el('div', 'text-xs font-bold uppercase tracking-wider text-slate-400 mb-2', gr.title));
+    gr.rows.forEach(([k, v]) => {
+      box.appendChild(el('div', 'mb-2', `<div class="note">${k}</div><div class="text-[13px] mono text-slate-200">${v}</div>`));
+    });
+    grid.appendChild(box);
+  });
+  c.appendChild(grid);
+  const cons = el('div', 'mt-4 border border-amber-500/20 bg-amber-500/5 rounded-xl p-4');
+  cons.appendChild(el('div', 'text-xs font-bold uppercase tracking-wider text-amber-300 mb-2', '<i class="fas fa-triangle-exclamation mr-1"></i>Critical distinctions (learned constraints)'));
+  const ul = el('ul', 'space-y-1 text-[13px] text-slate-300');
+  r.constraints.forEach(t => ul.appendChild(el('li', '', '<i class="fas fa-angle-right text-amber-400 mr-2"></i>' + t)));
+  cons.appendChild(ul);
+  c.appendChild(cons);
+  root.appendChild(c);
+}
+
+// Execution log
+{
+  const c = el('section', 'card p-6');
+  c.appendChild(el('h2', '', '<i class="fas fa-clock-rotate-left mr-2 text-indigo-400"></i>Execution log — one row per completed pass'));
+  const t = el('table', 'mt-3');
+  t.innerHTML = '<thead><tr><th>Date</th><th>Commit(s)</th><th>Scope</th><th>Verification level</th></tr></thead>';
+  const tb = el('tbody');
+  DATA.executionLog.forEach(([d, h, scope, ver]) => {
+    tb.appendChild(el('tr', '', `<td class="mono text-slate-400 whitespace-nowrap">${d}</td><td class="mono text-cyan-300 whitespace-nowrap">${h}</td><td class="text-slate-300">${scope}</td><td class="text-slate-400">${ver}</td>`));
+  });
+  t.appendChild(tb);
+  c.appendChild(t);
+  c.appendChild(el('p', 'note mt-3', '<strong class="text-slate-400">Verification key:</strong> Smoke-tested = exercised by hand in the running app · curl-verified = scripted live requests against a running instance · Unit-tested = Vitest inside real workerd + real D1 · Browser-verified = Playwright driving the real SPA in Chromium · verified-can-fail = the protection was deliberately broken, the tests failed, and the revert was confirmed byte/sha1-identical.'));
+  root.appendChild(c);
+}
+
+// Test coverage snapshot
+{
+  const c = el('section', 'card p-6');
+  c.appendChild(el('h2', '', '<i class="fas fa-vial-circle-check mr-2 text-green-400"></i>Test-coverage snapshot'));
+  const grid = el('div', 'grid sm:grid-cols-2 lg:grid-cols-4 gap-4 mt-4');
+  DATA.testCoverage.cells.forEach(([big, label, sub]) => {
+    grid.appendChild(el('div', 'border border-slate-800 rounded-xl p-4 text-center',
+      `<div class="text-2xl font-extrabold text-green-300 mono">${big}</div><div class="text-sm font-semibold mt-1">${label}</div><div class="note mt-1">${sub}</div>`));
+  });
+  c.appendChild(grid);
+  const ul = el('ul', 'mt-4 space-y-1 text-[13px] text-slate-300');
+  DATA.testCoverage.bullets.forEach(b => ul.appendChild(el('li', '', '<i class="fas fa-check text-green-400 mr-2"></i>' + b)));
+  c.appendChild(ul);
+  c.appendChild(el('div', 'mt-3 border border-amber-500/20 bg-amber-500/5 rounded-xl p-3 text-[13px] text-amber-200',
+    '<i class="fas fa-hand mr-2"></i>' + DATA.testCoverage.manualOnly));
+  root.appendChild(c);
+}
+
+// Backlog
+{
+  const c = el('section', 'card p-6');
+  c.appendChild(el('h2', '', '<i class="fas fa-box-archive mr-2 text-slate-400"></i>Backlog / deferred'));
+  const t = el('table', 'mt-3');
+  t.innerHTML = '<thead><tr><th>Item</th><th>Status</th><th>Trigger</th></tr></thead>';
+  const tb = el('tbody');
+  DATA.backlog.forEach(([item, status, trigger]) => {
+    const b = status === 'Open' ? 'b-prog' : 'b-not';
+    tb.appendChild(el('tr', '', `<td class="text-slate-300">${item}</td><td><span class="badge ${b}">${status}</span></td><td class="text-slate-400">${trigger}</td>`));
+  });
+  t.appendChild(tb);
+  c.appendChild(t);
+  root.appendChild(c);
+}
+
+// Outstanding / next actions
+{
+  const c = el('section', 'card p-6');
+  c.appendChild(el('h2', '', '<i class="fas fa-flag mr-2 text-amber-400"></i>Outstanding / next actions'));
+  const ul = el('ul', 'mt-3 space-y-2 text-[13px] text-slate-300');
+  DATA.outstanding.forEach(t => ul.appendChild(el('li', '', '<i class="fas fa-angle-right text-amber-400 mr-2"></i>' + t)));
+  c.appendChild(ul);
+  root.appendChild(c);
+}
+
+// Honesty footer
+root.appendChild(el('p', 'note text-center pb-6',
+  `<i class="fas fa-scale-balanced mr-1"></i>Accuracy over optimism: this tracker records verified state only. ${DATA.meta.figuresSource}`));
+</script>
+</body>
+</html>
