@@ -57,6 +57,7 @@ export async function resolveCatalogSku(
     color: string | null | undefined
     grade: Grade
   },
+  organisationId: number,
 ): Promise<CatalogLookup> {
   const model = norm(input.model)
   const capacityCanon = normalizeCapacity(input.capacity)
@@ -72,13 +73,14 @@ export async function resolveCatalogSku(
     .prepare(
       `SELECT id, sku, brand, model, capacity, color, grade
          FROM sku_catalog
-        WHERE UPPER(model) = ?
+        WHERE organisation_id = ?
+          AND UPPER(model) = ?
           AND UPPER(COALESCE(capacity, '')) = ?
           AND UPPER(COALESCE(color, ''))    = ?
           AND grade = ?
         LIMIT 5`,
     )
-    .bind(model, capacityCanon ?? '', color, grade)
+    .bind(organisationId, model, capacityCanon ?? '', color, grade)
     .all<CatalogRow>()
 
   if (exact.results.length === 1) {
@@ -97,12 +99,13 @@ export async function resolveCatalogSku(
     .prepare(
       `SELECT id, sku, brand, model, capacity, color, grade
          FROM sku_catalog
-        WHERE UPPER(model) = ?
+        WHERE organisation_id = ?
+          AND UPPER(model) = ?
           AND UPPER(COALESCE(capacity, '')) = ?
           AND grade = ?
         LIMIT 50`,
     )
-    .bind(model, capacityCanon ?? '', grade)
+    .bind(organisationId, model, capacityCanon ?? '', grade)
     .all<CatalogRow>()
 
   if (color) {
@@ -131,11 +134,11 @@ export async function resolveCatalogSku(
       .prepare(
         `SELECT id, sku, brand, model, capacity, color, grade
            FROM sku_catalog
-          WHERE UPPER(model) = ?
+          WHERE organisation_id = ? AND UPPER(model) = ?
           ORDER BY capacity, color, grade
           LIMIT 50`,
       )
-      .bind(model)
+      .bind(organisationId, model)
       .all<CatalogRow>()
     candidates = sameModel.results
   }
@@ -161,10 +164,11 @@ export async function bulkResolveCatalog(
     color: string | null | undefined
     grade: Grade
   }>,
+  organisationId: number,
 ): Promise<Array<string | null>> {
   const out: Array<string | null> = []
   for (const r of rows) {
-    const res = await resolveCatalogSku(db, r)
+    const res = await resolveCatalogSku(db, r, organisationId)
     out.push(res.status === 'match' ? res.row.sku : null)
   }
   return out

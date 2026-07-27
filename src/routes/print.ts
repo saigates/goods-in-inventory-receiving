@@ -1,7 +1,8 @@
 import { Hono } from 'hono'
-import type { Bindings } from '../types'
+import type { Bindings, AuthUser } from '../types'
+import { currentUser } from '../lib/auth'
 
-const app = new Hono<{ Bindings: Bindings }>()
+const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
 type Settings = {
   print_mode: 'browser' | 'printnode' | 'manual'
@@ -10,11 +11,18 @@ type Settings = {
   printnode_printer_id_small: number | null
 }
 
-async function loadSettings(c: any): Promise<Settings> {
-  const row = await c.env.DB.prepare(
-    'SELECT print_mode, printnode_api_key, printnode_printer_id_large, printnode_printer_id_small FROM app_settings WHERE id = 1'
-  ).first<Settings>()
-  return row || { print_mode: 'browser', printnode_api_key: null, printnode_printer_id_large: null, printnode_printer_id_small: null }
+// app_settings is keyed by organisation_id (Priority 1: each tenant gets
+// its own print configuration / PrintNode account).
+async function loadSettings(db: D1Database, organisationId: number): Promise<Settings> {
+  const row = await db.prepare(
+    'SELECT print_mode, printnode_api_key, printnode_printer_id_large, printnode_printer_id_small FROM app_settings WHERE organisation_id = ?'
+  ).bind(organisationId).first<Settings>()
+  if (row) return row
+  // First time this org touches print settings — create the default row.
+  await db.prepare(
+    'INSERT OR IGNORE INTO app_settings (organisation_id, print_mode) VALUES (?, ?)'
+  ).bind(organisationId, 'browser').run()
+  return { print_mode: 'browser', printnode_api_key: null, printnode_printer_id_large: null, printnode_printer_id_small: null }
 }
 
 // Build a printable HTML for a single label (used by browser-print mode).
@@ -174,7 +182,8 @@ ${isSmall ? `
 
 // ───────── Settings ─────────
 app.get('/settings', async (c) => {
-  const s = await loadSettings(c)
+  const user = currentUser(c)
+  const s = await loadSettings(c.env.DB, user.organisation_id)
   // Don't return the raw API key — return whether it's set
   return c.json({
     print_mode: s.print_mode,
@@ -185,6 +194,7 @@ app.get('/settings', async (c) => {
 })
 
 app.post('/settings', async (c) => {
+  const user = currentUser(c)
   const body = await c.req.json<{
     print_mode?: 'browser' | 'printnode' | 'manual'
     printnode_api_key?: string | null  // null = clear, undefined = unchanged
@@ -192,7 +202,7 @@ app.post('/settings', async (c) => {
     printnode_printer_id_small?: number | null
   }>()
 
-  const cur = await loadSettings(c)
+  const cur = await loadSettings(c.env.DB, user.organisation_id)
   const next: Settings = {
     print_mode: body.print_mode ?? cur.print_mode,
     printnode_api_key:
@@ -206,12 +216,13 @@ app.post('/settings', async (c) => {
   await c.env.DB.prepare(`
     UPDATE app_settings
     SET print_mode = ?, printnode_api_key = ?, printnode_printer_id_large = ?, printnode_printer_id_small = ?, updated_at = CURRENT_TIMESTAMP
-    WHERE id = 1
+    WHERE organisation_id = ?
   `).bind(
     next.print_mode,
     next.printnode_api_key,
     next.printnode_printer_id_large,
-    next.printnode_printer_id_small
+    next.printnode_printer_id_small,
+    user.organisation_id,
   ).run()
 
   return c.json({ ok: true })
@@ -220,7 +231,8 @@ app.post('/settings', async (c) => {
 // List PrintNode printers (proxy that calls the PrintNode API so we don't
 // leak the API key into the browser). Useful for the settings dropdown.
 app.get('/printnode/printers', async (c) => {
-  const s = await loadSettings(c)
+  const user = currentUser(c)
+  const s = await loadSettings(c.env.DB, user.organisation_id)
   if (!s.printnode_api_key) return c.json({ error: 'PrintNode API key not configured' }, 400)
   const r = await fetch('https://api.printnode.com/printers', {
     headers: {
@@ -234,26 +246,28 @@ app.get('/printnode/printers', async (c) => {
 
 // ───────── Queue ─────────
 app.get('/queue', async (c) => {
+  const user = currentUser(c)
   const { results } = await c.env.DB.prepare(`
     SELECT pj.*, rd.uuid, rd.imei, rd.sku, rd.brand, rd.model, rd.capacity, rd.color, rd.grade
     FROM print_jobs pj
     JOIN received_devices rd ON rd.id = pj.received_device_id
-    WHERE pj.status = 'queued'
+    WHERE pj.status = 'queued' AND pj.organisation_id = ?
     ORDER BY pj.id ASC
     LIMIT 100
-  `).all()
+  `).bind(user.organisation_id).all()
   return c.json({ queue: results })
 })
 
 // Fetch a single job (used by browser-print mode to retrieve payload)
 app.get('/job/:id', async (c) => {
+  const user = currentUser(c)
   const id = Number(c.req.param('id'))
   const job = await c.env.DB.prepare(`
     SELECT pj.*, rd.uuid, rd.imei, rd.sku, rd.brand, rd.model, rd.capacity, rd.color, rd.grade
     FROM print_jobs pj
     JOIN received_devices rd ON rd.id = pj.received_device_id
-    WHERE pj.id = ?
-  `).bind(id).first()
+    WHERE pj.id = ? AND pj.organisation_id = ?
+  `).bind(id, user.organisation_id).first()
   if (!job) return c.json({ error: 'Not found' }, 404)
   return c.json({ job })
 })
@@ -261,6 +275,7 @@ app.get('/job/:id', async (c) => {
 // Stand-alone HTML page for a label (browser-print path).
 // The page renders the label, calls window.print() automatically, and closes.
 app.get('/label/:id', async (c) => {
+  const user = currentUser(c)
   const id = Number(c.req.param('id'))
   const size = (c.req.query('size') as 'large' | 'small') || 'large'
   const rotate = c.req.query('rotate') === '1'
@@ -268,8 +283,8 @@ app.get('/label/:id', async (c) => {
     SELECT pj.payload_json, rd.uuid, rd.imei, rd.sku, rd.brand, rd.model, rd.capacity, rd.color, rd.grade
     FROM print_jobs pj
     JOIN received_devices rd ON rd.id = pj.received_device_id
-    WHERE pj.id = ?
-  `).bind(id).first<any>()
+    WHERE pj.id = ? AND pj.organisation_id = ?
+  `).bind(id, user.organisation_id).first<any>()
   if (!row) return c.text('Not found', 404)
   const payload = {
     uuid: row.uuid, imei: row.imei, sku: row.sku,
@@ -282,8 +297,9 @@ app.get('/label/:id', async (c) => {
 // Mark a job as sent (called by the browser-print path after it's dispatched
 // the label to window.print, or by the operator when using manual mode).
 app.post('/mark-sent/:id', async (c) => {
+  const user = currentUser(c)
   const id = Number(c.req.param('id'))
-  const job = await c.env.DB.prepare('SELECT * FROM print_jobs WHERE id = ?').bind(id).first<{
+  const job = await c.env.DB.prepare('SELECT * FROM print_jobs WHERE id = ? AND organisation_id = ?').bind(id, user.organisation_id).first<{
     id: number; received_device_id: number; status: string
   }>()
   if (!job) return c.json({ error: 'Not found' }, 404)
@@ -300,19 +316,73 @@ app.post('/mark-sent/:id', async (c) => {
 //                           and the frontend opens that URL in a print window.
 //   - 'printnode': server calls PrintNode API directly and the job is sent
 //                  to a real DYMO LabelWriter on the warehouse PC.
+// Shared PrintNode dispatch used by both /send/:id and /send-all so the
+// latter doesn't have to self-fetch its own authenticated endpoint (a
+// Worker can't attach the caller's Authorization header to a same-origin
+// fetch of itself without re-deriving it, which is fragile).
+async function sendToPrintNode(
+  db: D1Database,
+  s: Settings,
+  job: { id: number; received_device_id: number; sku: string; imei: string },
+  size: 'large' | 'small',
+  labelUrlBase: string,
+  authToken: string,
+): Promise<{ ok: true; printnode_job_id: unknown } | { ok: false; error: string; status: number }> {
+  if (!s.printnode_api_key) return { ok: false, error: 'PrintNode API key not configured', status: 400 }
+  const printerId = size === 'small' ? s.printnode_printer_id_small : s.printnode_printer_id_large
+  if (!printerId) return { ok: false, error: `PrintNode printer for size '${size}' not configured`, status: 400 }
+
+  // Render the label HTML and send to PrintNode as pdf_uri pointing at our
+  // endpoint. PrintNode's headless renderer fetches this URL itself — it
+  // can't send our normal Authorization header, so we pass the same bearer
+  // token as a `?token=` query param (see extractToken() fallback in
+  // src/lib/auth.ts, scoped to exactly this use case).
+  const labelUrl = new URL(labelUrlBase)
+  labelUrl.pathname = `/api/print/label/${job.id}`
+  labelUrl.search = `?size=${size}&token=${encodeURIComponent(authToken)}`
+
+  const pnResp = await fetch('https://api.printnode.com/printjobs', {
+    method: 'POST',
+    headers: {
+      Authorization: 'Basic ' + btoa(s.printnode_api_key + ':'),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      printerId,
+      title: `Goods In · ${job.sku} · ${job.imei}`,
+      contentType: 'pdf_uri',
+      content: labelUrl.toString(),
+      source: 'goods-in-app',
+    }),
+  })
+
+  if (!pnResp.ok) {
+    const errText = await pnResp.text()
+    return { ok: false, error: `PrintNode rejected job: ${pnResp.status} ${errText}`, status: 502 }
+  }
+  const pnJobId = await pnResp.json()
+
+  await db.batch([
+    db.prepare("UPDATE print_jobs SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?").bind(job.id),
+    db.prepare("UPDATE received_devices SET label_printed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(job.received_device_id),
+  ])
+  return { ok: true, printnode_job_id: pnJobId }
+}
+
 app.post('/send/:id', async (c) => {
+  const user = currentUser(c)
   const id = Number(c.req.param('id'))
   const size = (c.req.query('size') as 'large' | 'small') || 'large'
   const rotate = c.req.query('rotate') === '1'
-  const s = await loadSettings(c)
+  const s = await loadSettings(c.env.DB, user.organisation_id)
 
   const job = await c.env.DB.prepare(`
     SELECT pj.id, pj.received_device_id, pj.status, pj.payload_json,
            rd.uuid, rd.imei, rd.sku, rd.brand, rd.model, rd.capacity, rd.color, rd.grade
     FROM print_jobs pj
     JOIN received_devices rd ON rd.id = pj.received_device_id
-    WHERE pj.id = ?
-  `).bind(id).first<any>()
+    WHERE pj.id = ? AND pj.organisation_id = ?
+  `).bind(id, user.organisation_id).first<any>()
   if (!job) return c.json({ error: 'Not found' }, 404)
 
   if (s.print_mode === 'browser' || s.print_mode === 'manual') {
@@ -321,44 +391,11 @@ app.post('/send/:id', async (c) => {
   }
 
   if (s.print_mode === 'printnode') {
-    if (!s.printnode_api_key) return c.json({ error: 'PrintNode API key not configured' }, 400)
-    const printerId = size === 'small' ? s.printnode_printer_id_small : s.printnode_printer_id_large
-    if (!printerId) return c.json({ error: `PrintNode printer for size '${size}' not configured` }, 400)
-
-    // Render the label HTML and send to PrintNode as raw_uri pointing at our endpoint.
-    // PrintNode supports content types: pdf_uri, pdf_base64, raw_uri, raw_base64.
-    // Our endpoint returns HTML that PrintNode renders via headless Chrome.
-    // (Alternatively you can pre-render a PDF — see README.)
-    const labelUrl = new URL(c.req.url)
-    labelUrl.pathname = `/api/print/label/${id}`
-    labelUrl.search = `?size=${size}`
-
-    const pnResp = await fetch('https://api.printnode.com/printjobs', {
-      method: 'POST',
-      headers: {
-        Authorization: 'Basic ' + btoa(s.printnode_api_key + ':'),
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        printerId,
-        title: `Goods In · ${job.sku} · ${job.imei}`,
-        contentType: 'pdf_uri',
-        content: labelUrl.toString(),
-        source: 'goods-in-app',
-      }),
-    })
-
-    if (!pnResp.ok) {
-      const errText = await pnResp.text()
-      return c.json({ error: `PrintNode rejected job: ${pnResp.status} ${errText}` }, 502)
-    }
-    const pnJobId = await pnResp.json()
-
-    await c.env.DB.batch([
-      c.env.DB.prepare("UPDATE print_jobs SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?").bind(id),
-      c.env.DB.prepare("UPDATE received_devices SET label_printed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(job.received_device_id),
-    ])
-    return c.json({ ok: true, mode: 'printnode', printnode_job_id: pnJobId })
+    const authHeader = c.req.header('Authorization') || ''
+    const authToken = authHeader.replace(/^Bearer\s+/i, '')
+    const result = await sendToPrintNode(c.env.DB, s, job, size, c.req.url, authToken)
+    if (!result.ok) return c.json({ error: result.error }, result.status as any)
+    return c.json({ ok: true, mode: 'printnode', printnode_job_id: result.printnode_job_id })
   }
 
   return c.json({ error: `Unknown print_mode: ${s.print_mode}` }, 500)
@@ -367,12 +404,13 @@ app.post('/send/:id', async (c) => {
 // Bulk send. For browser-print mode, the frontend will open ONE print window
 // containing all queued labels stacked — much faster than spawning N windows.
 app.post('/send-all', async (c) => {
+  const user = currentUser(c)
   const size = (c.req.query('size') as 'large' | 'small') || 'large'
   const rotate = c.req.query('rotate') === '1'
-  const s = await loadSettings(c)
+  const s = await loadSettings(c.env.DB, user.organisation_id)
   const { results } = await c.env.DB.prepare(
-    "SELECT id, received_device_id FROM print_jobs WHERE status = 'queued' ORDER BY id ASC"
-  ).all<{ id: number; received_device_id: number }>()
+    "SELECT pj.id, pj.received_device_id, rd.sku, rd.imei FROM print_jobs pj JOIN received_devices rd ON rd.id = pj.received_device_id WHERE pj.status = 'queued' AND pj.organisation_id = ? ORDER BY pj.id ASC"
+  ).bind(user.organisation_id).all<{ id: number; received_device_id: number; sku: string; imei: string }>()
 
   if (results.length === 0) return c.json({ ok: true, sent: 0 })
 
@@ -389,13 +427,12 @@ app.post('/send-all', async (c) => {
   if (s.print_mode === 'printnode') {
     // For simplicity, kick off jobs sequentially. They are sent to PrintNode
     // independently so the warehouse printer queues them in order.
+    const authHeader = c.req.header('Authorization') || ''
+    const authToken = authHeader.replace(/^Bearer\s+/i, '')
     let sent = 0
-    for (const r of results) {
-      const resp = await fetch(new URL(`/api/print/send/${r.id}`, c.req.url).toString(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-      })
-      if (resp.ok) sent++
+    for (const job of results) {
+      const result = await sendToPrintNode(c.env.DB, s, job, size, c.req.url, authToken)
+      if (result.ok) sent++
     }
     return c.json({ ok: true, mode: 'printnode', sent })
   }
@@ -405,6 +442,7 @@ app.post('/send-all', async (c) => {
 
 // Bulk label HTML — all jobs in a single printable page (browser-print mode).
 app.get('/labels', async (c) => {
+  const user = currentUser(c)
   const idsParam = c.req.query('ids') || ''
   const size = (c.req.query('size') as 'large' | 'small') || 'large'
   const rotate = c.req.query('rotate') === '1'
@@ -417,8 +455,8 @@ app.get('/labels', async (c) => {
     const row = await c.env.DB.prepare(`
       SELECT pj.id, rd.uuid, rd.imei, rd.sku, rd.brand, rd.model, rd.capacity, rd.color, rd.grade
       FROM print_jobs pj JOIN received_devices rd ON rd.id = pj.received_device_id
-      WHERE pj.id = ?
-    `).bind(id).first()
+      WHERE pj.id = ? AND pj.organisation_id = ?
+    `).bind(id, user.organisation_id).first()
     if (row) rows.push(row)
   }
 
@@ -588,13 +626,14 @@ ${labels}
 
 // Mark a batch of jobs as sent (called by browser-print after window.print)
 app.post('/mark-sent-batch', async (c) => {
+  const user = currentUser(c)
   const body = await c.req.json<{ ids: number[] }>()
   const ids = (body.ids || []).map(Number).filter(Boolean)
   if (!ids.length) return c.json({ ok: true, sent: 0 })
 
   const stmts = []
   for (const id of ids) {
-    const job = await c.env.DB.prepare('SELECT received_device_id, status FROM print_jobs WHERE id = ?').bind(id).first<{ received_device_id: number; status: string }>()
+    const job = await c.env.DB.prepare('SELECT received_device_id, status FROM print_jobs WHERE id = ? AND organisation_id = ?').bind(id, user.organisation_id).first<{ received_device_id: number; status: string }>()
     if (!job || job.status === 'sent') continue
     stmts.push(c.env.DB.prepare("UPDATE print_jobs SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?").bind(id))
     stmts.push(c.env.DB.prepare("UPDATE received_devices SET label_printed_at = CURRENT_TIMESTAMP WHERE id = ?").bind(job.received_device_id))

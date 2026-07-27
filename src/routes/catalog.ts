@@ -1,18 +1,21 @@
 import { Hono } from 'hono'
-import type { Bindings } from '../types'
-import { buildSku, brandFromOem, colorShortCode } from '../lib/sku'
+import type { Bindings, AuthUser } from '../types'
+import { buildSku, brandFromOem } from '../lib/sku'
 import { normalizeGrade, VALID_GRADES } from '../lib/grade'
-import { normalizeCapacity } from '../lib/catalog'
+import { normalizeCapacity, resolveCatalogSku } from '../lib/catalog'
+import { currentUser } from '../lib/auth'
+import { cleanString } from '../lib/validate'
 
-const app = new Hono<{ Bindings: Bindings }>()
+const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
-// List catalogue entries (optionally filtered by free-text q)
+// List catalogue entries (optionally filtered by free-text q), org-scoped
 app.get('/', async (c) => {
+  const user = currentUser(c)
   const q = c.req.query('q')?.trim()
-  let sql = 'SELECT * FROM sku_catalog'
-  const binds: unknown[] = []
+  let sql = 'SELECT * FROM sku_catalog WHERE organisation_id = ?'
+  const binds: unknown[] = [user.organisation_id]
   if (q) {
-    sql += ' WHERE sku LIKE ? OR brand LIKE ? OR model LIKE ?'
+    sql += ' AND (sku LIKE ? OR brand LIKE ? OR model LIKE ?)'
     const w = `%${q}%`
     binds.push(w, w, w)
   }
@@ -38,6 +41,8 @@ app.get('/', async (c) => {
 // The whole upload is dry-run-able with ?dry_run=1 — useful for the UI
 // preview step before the user commits.
 app.post('/upload', async (c) => {
+  const user = currentUser(c)
+  const orgId = user.organisation_id
   const dryRun = c.req.query('dry_run') === '1'
   const body = await c.req.json<{
     rows: Array<{
@@ -48,7 +53,7 @@ app.post('/upload', async (c) => {
       sku?: string | null
       grade?: string | null
     }>
-  }>()
+  }>().catch(() => ({} as any))
 
   const rows = Array.isArray(body.rows) ? body.rows : []
   if (rows.length === 0) return c.json({ error: 'rows[] required' }, 400)
@@ -83,20 +88,20 @@ app.post('/upload', async (c) => {
   }
 
   // Pre-load existing SKUs into a map so we can check without N+1 queries.
-  // For a prototype catalogue (< ~10k rows) this is fine.
+  // For a prototype catalogue (< ~10k rows) this is fine. Org-scoped.
   const { results: existingRows } = await c.env.DB.prepare(
-    'SELECT sku, brand, model, capacity, color, grade FROM sku_catalog'
-  ).all<{ sku: string; brand: string; model: string; capacity: string | null; color: string | null; grade: string | null }>()
+    'SELECT sku, brand, model, capacity, color, grade FROM sku_catalog WHERE organisation_id = ?'
+  ).bind(orgId).all<{ sku: string; brand: string; model: string; capacity: string | null; color: string | null; grade: string | null }>()
   const existingMap = new Map(existingRows.map(r => [r.sku, r]))
 
   const report: Report[] = []
 
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i] || {}
-    const brand = (r.brand || '').trim()
-    const model = (r.model || '').trim()
+    const brand = cleanString(r.brand, 128) || ''
+    const model = cleanString(r.model, 128) || ''
     const capacity = normalizeCapacity(r.capacity)
-    const color = r.color ? String(r.color).trim() : null
+    const color = cleanString(r.color, 64)
     // Grade is now first-class on catalog. Anything missing/invalid → UG so
     // the row is still usable; this matches receive-side normalisation.
     const rawGrade = (r.grade ?? '').toString().trim()
@@ -112,7 +117,7 @@ app.post('/upload', async (c) => {
       continue
     }
 
-    const sku = (r.sku && r.sku.trim()) || deriveSku(brand, model, capacity, color, grade)
+    const sku = cleanString(r.sku, 128) || deriveSku(brand, model, capacity, color, grade)
 
     // Check existing (DB + any rows we've inserted/seen earlier in this upload).
     const prior = existingMap.get(sku)
@@ -138,8 +143,8 @@ app.post('/upload', async (c) => {
     // Good to insert
     if (!dryRun) {
       await c.env.DB.prepare(
-        `INSERT INTO sku_catalog (sku, brand, model, capacity, color, grade) VALUES (?, ?, ?, ?, ?, ?)`
-      ).bind(sku, brand, model, capacity, color, grade).run()
+        `INSERT INTO sku_catalog (organisation_id, sku, brand, model, capacity, color, grade) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).bind(orgId, sku, brand, model, capacity, color, grade).run()
     }
     report.push({ row_index: i, outcome: 'inserted', sku, brand, model, capacity, color, grade })
     // Mark as known so the next row in this upload sees it (in-upload duplicate detection)
@@ -161,21 +166,21 @@ app.post('/upload', async (c) => {
 // operator edits model/capacity/color/grade so it can re-resolve to a
 // catalog SKU on every change, without having to re-scan the IMEI.
 // Body: { model, capacity, color, grade }
-import { resolveCatalogSku } from '../lib/catalog'
 app.post('/lookup', async (c) => {
+  const user = currentUser(c)
   const body = await c.req.json<{
     model?: string | null
     capacity?: string | null
     color?: string | null
     grade?: string | null
-  }>()
+  }>().catch(() => ({} as any))
   const grade = normalizeGrade(body.grade)
   const result = await resolveCatalogSku(c.env.DB, {
     model: body.model,
     capacity: body.capacity,
     color: body.color,
     grade,
-  })
+  }, user.organisation_id)
   return c.json(result)
 })
 
@@ -183,6 +188,8 @@ app.post('/lookup', async (c) => {
 // matching SKU exists. Body: { brand, model, capacity, color, grade, sku? }
 // Returns the inserted row (or the conflicting row if a SKU collision exists).
 app.post('/', async (c) => {
+  const user = currentUser(c)
+  const orgId = user.organisation_id
   const body = await c.req.json<{
     brand?: string | null
     model?: string | null
@@ -190,11 +197,11 @@ app.post('/', async (c) => {
     color?: string | null
     grade?: string | null
     sku?: string | null
-  }>()
-  const brand = (body.brand || '').trim()
-  const model = (body.model || '').trim()
+  }>().catch(() => ({} as any))
+  const brand = cleanString(body.brand, 128) || ''
+  const model = cleanString(body.model, 128) || ''
   const capacity = normalizeCapacity(body.capacity)
-  const color = body.color ? String(body.color).trim() : null
+  const color = cleanString(body.color, 64)
   const grade = normalizeGrade(body.grade)
 
   if (!brand || !model) {
@@ -202,7 +209,7 @@ app.post('/', async (c) => {
   }
   // Refuse if a row already matches (model+capacity+color+grade) — operator
   // should pick that one rather than create a duplicate.
-  const existingMatch = await resolveCatalogSku(c.env.DB, { model, capacity, color, grade })
+  const existingMatch = await resolveCatalogSku(c.env.DB, { model, capacity, color, grade }, orgId)
   if (existingMatch.status === 'match') {
     return c.json({
       error: 'A catalog SKU already exists for this combination',
@@ -211,15 +218,15 @@ app.post('/', async (c) => {
   }
 
   // Derive SKU if not provided
-  const sku = body.sku?.trim() || (() => {
+  const sku = cleanString(body.sku, 128) || (() => {
     const built = buildSku({ oem: brand, description: model, color, capacity })
     return `${built.sku}-${grade}`
   })()
 
-  // Refuse if SKU collides with a different row
+  // Refuse if SKU collides with a different row (within this org)
   const collision = await c.env.DB.prepare(
-    'SELECT id, sku, brand, model, capacity, color, grade FROM sku_catalog WHERE sku = ?'
-  ).bind(sku).first()
+    'SELECT id, sku, brand, model, capacity, color, grade FROM sku_catalog WHERE sku = ? AND organisation_id = ?'
+  ).bind(sku, orgId).first()
   if (collision) {
     return c.json({
       error: `SKU '${sku}' already exists with different fields`,
@@ -228,8 +235,8 @@ app.post('/', async (c) => {
   }
 
   const ins = await c.env.DB.prepare(
-    'INSERT INTO sku_catalog (sku, brand, model, capacity, color, grade) VALUES (?, ?, ?, ?, ?, ?)'
-  ).bind(sku, brand, model, capacity, color, grade).run()
+    'INSERT INTO sku_catalog (organisation_id, sku, brand, model, capacity, color, grade) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).bind(orgId, sku, brand, model, capacity, color, grade).run()
   const row = await c.env.DB.prepare('SELECT * FROM sku_catalog WHERE id = ?')
     .bind(ins.meta.last_row_id).first()
   return c.json({ ok: true, row })
@@ -238,9 +245,11 @@ app.post('/', async (c) => {
 // Delete a single catalogue entry by id. Does NOT affect received_devices that
 // reference this SKU — those keep their copy of the SKU string.
 app.delete('/:id', async (c) => {
+  const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
-  await c.env.DB.prepare('DELETE FROM sku_catalog WHERE id = ?').bind(id).run()
+  await c.env.DB.prepare('DELETE FROM sku_catalog WHERE id = ? AND organisation_id = ?')
+    .bind(id, user.organisation_id).run()
   return c.json({ ok: true })
 })
 
