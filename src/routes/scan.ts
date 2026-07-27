@@ -24,9 +24,13 @@ const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 //
 // buy_price and vat_type are REQUIRED at the point of confirming a device
 // per the brief ("confirming a device requires a valid buy price and VAT
-// type"); force-add/manual keep them optional since those paths predate
-// this requirement and aren't the primary SKU-confirm flow, but if
-// supplied they are still validated with the same rigor.
+// type"). /force-add now enforces the SAME requirement — it is the
+// exception branch for off-manifest devices and therefore the likeliest
+// place for a required-field bypass to hide, so it gets the same
+// server-side rules as the manifest-matched confirm path. /manual keeps
+// them optional for now (predates the requirement; not in scope of the
+// force-add parity brief — flagged as an open question), but supplied
+// values are still validated with the same rigor.
 function parseValuation(
   body: { buy_price?: unknown; currency?: unknown; vat_type?: unknown },
   opts: { required: boolean },
@@ -350,7 +354,9 @@ app.post('/force-add', async (c) => {
   if (!imeiCheck.ok) return c.json({ error: imeiCheck.reason }, 400)
   const imei = imeiCheck.imei
 
-  const valuation = parseValuation(body, { required: false })
+  // Valuation/VAT are required on force-add exactly like /confirm — the
+  // off-manifest exception branch must not be a bypass for required fields.
+  const valuation = parseValuation(body, { required: true })
   if (!valuation.ok) return c.json({ error: valuation.error }, 422)
 
   const dup = await c.env.DB.prepare('SELECT id, uuid, sku FROM received_devices WHERE imei = ? AND organisation_id = ?')
@@ -396,7 +402,7 @@ app.post('/force-add', async (c) => {
   await logDeviceEvent(c.env.DB, {
     organisationId: orgId, deviceId: receivedId, eventType: 'FORCE_ADD', userId: user.id,
     toStatus: 'RECEIVED', reference: body.manifest_id ? String(body.manifest_id) : null,
-    metadata: { sku: built.sku, grade, source: 'unreconciled' },
+    metadata: { sku: built.sku, grade, source: 'unreconciled', buy_price: valuation.buy_price, currency: valuation.currency, vat_type: valuation.vat_type },
   })
 
   // Queue print job

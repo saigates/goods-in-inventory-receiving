@@ -1508,7 +1508,8 @@
   // ───────── Unreconciled modal ─────────
   function UnreconciledModal() {
     const { imei } = state.pendingUnrec;
-    const ctx = state._unrecCtx ||= { oem: 'SMSG', description: '', grade: 'UG', color: 'Phantom Black', notes: '' };
+    const ctx = state._unrecCtx ||= { oem: 'SMSG', description: '', grade: 'UG', color: 'Phantom Black', notes: '',
+      buy_price: '', currency: 'GBP', vat_type: '' };
     const close = () => { state.pendingUnrec = null; state._unrecCtx = null; render(); };
     const reject = async () => {
       await api.post('/scan/reject', { manifest_id: state.activeManifestId, imei, reason: 'Not on manifest — rejected by operator' });
@@ -1517,8 +1518,16 @@
       await refreshActiveManifest(); render();
     };
     const forceAdd = async () => {
+      // Optimistic client-side checks only — the server enforces the same
+      // valuation rules on /scan/force-add as on /scan/confirm (422 with a
+      // specific message); this just saves an obviously-wasted round trip.
+      if (ctx.buy_price === '' || ctx.buy_price == null) { toast('Buy price is required', 'warn'); return; }
+      if (!ctx.vat_type) { toast('VAT type is required', 'warn'); return; }
       try {
-        const r = await api.post('/scan/force-add', { manifest_id: state.activeManifestId, imei, ...ctx });
+        const r = await api.post('/scan/force-add', {
+          manifest_id: state.activeManifestId, imei, ...ctx,
+          currency: ctx.currency || 'GBP',
+        });
         toast(`Force-added <span class="mono">${imei}</span> · ${r.received.sku}<br><span class="text-xs text-amber-300">Pending manager review</span>`, 'warn', 3500);
         state.pendingUnrec = null; state._unrecCtx = null;
         await refreshActiveManifest(); render();
@@ -1555,6 +1564,40 @@
             gradeSelect(ctx.grade || 'UG', (v) => update('grade', v))
           ),
         ),
+        // Valuation & VAT — required on force-add exactly like the manifest
+        // confirm path; the exception branch is not a required-field bypass.
+        h('div', { class: 'card p-3 bg-slate-900/40 mt-3', id: 'unrec-valuation' },
+          h('div', { class: 'text-[10px] uppercase tracking-wider text-slate-500 mb-2' },
+            h('i', { class: 'fas fa-sterling-sign mr-1' }), 'Valuation & VAT (required)'),
+          h('div', { class: 'grid grid-cols-3 gap-3' },
+            h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Buy price *'),
+              h('input', {
+                class: 'input mono', id: 'unrec-buy-price', type: 'number', step: '0.01', min: '0',
+                value: ctx.buy_price, placeholder: '0.00',
+                oninput: (e) => { ctx.buy_price = e.target.value; state._unrecCtx = ctx; },
+              })
+            ),
+            h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Currency'),
+              h('input', {
+                class: 'input mono uppercase', id: 'unrec-currency', maxlength: 3, value: ctx.currency || 'GBP',
+                oninput: (e) => { ctx.currency = e.target.value.toUpperCase(); state._unrecCtx = ctx; },
+              })
+            ),
+            h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'VAT type *'),
+              h('select', {
+                class: 'input', id: 'unrec-vat-type',
+                onchange: (e) => { ctx.vat_type = e.target.value; state._unrecCtx = ctx; },
+              },
+                h('option', { value: '', selected: !ctx.vat_type ? 'selected' : null }, '— select —'),
+                ['MARGIN', 'STANDARD', 'ZERO'].map(v =>
+                  h('option', { value: v, selected: v === ctx.vat_type ? 'selected' : null }, v))
+              )
+            ),
+          ),
+        ),
         h('div', { class: 'mt-3' },
           h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Notes for manager'),
           h('textarea', { class: 'input', rows: 2, value: ctx.notes, oninput: (e) => update('notes', e.target.value) })
@@ -1562,7 +1605,7 @@
         h('div', { class: 'mt-5 flex justify-end gap-2' },
           h('button', { class: 'btn btn-danger', onclick: reject }, h('i', { class: 'fas fa-ban' }), 'Reject Device'),
           h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
-          h('button', { class: 'btn btn-primary', onclick: forceAdd },
+          h('button', { class: 'btn btn-primary', id: 'unrec-force-add-btn', onclick: forceAdd },
             h('i', { class: 'fas fa-plus' }), 'Force-add to Unreconciled')
         )
       )
