@@ -44,6 +44,9 @@
 
   // ───────── State ─────────
   const state = {
+    authUser: null,       // { id, email, name, role, organisation_id } once logged in
+    authBusy: false,
+    authError: null,
     view: 'receive',     // dashboard | manifests | receive | inventory | catalog | print
     manifests: [],
     activeManifestId: null,
@@ -126,11 +129,42 @@
     } catch(e) {}
   }
 
+  // ───────── Auth token store ─────────
+  // JWT minted by POST /api/auth/dev-login. Persisted in localStorage so a
+  // page refresh doesn't force a re-login. Every /api/* call below attaches
+  // it as `Authorization: Bearer <token>`; a 401 response clears it and
+  // drops the app back to the login screen.
+  const AUTH_TOKEN_KEY = 'goodsin.auth_token.v1';
+  let authToken = localStorage.getItem(AUTH_TOKEN_KEY) || null;
+  function setAuthToken(token) {
+    authToken = token || null;
+    if (authToken) localStorage.setItem(AUTH_TOKEN_KEY, authToken);
+    else localStorage.removeItem(AUTH_TOKEN_KEY);
+  }
+
+  const http = axios.create({ baseURL: API });
+  http.interceptors.request.use((cfg) => {
+    if (authToken) cfg.headers.Authorization = `Bearer ${authToken}`;
+    return cfg;
+  });
+  http.interceptors.response.use(
+    (r) => r,
+    (err) => {
+      if (err.response?.status === 401) {
+        // Token missing/invalid/expired — force back to the login screen.
+        setAuthToken(null);
+        state.authUser = null;
+        render();
+      }
+      return Promise.reject(err);
+    }
+  );
+
   // ───────── API helpers ─────────
   const api = {
-    get: (p) => axios.get(API + p).then(r => r.data),
-    post: (p, d) => axios.post(API + p, d).then(r => r.data),
-    del: (p) => axios.delete(API + p).then(r => r.data),
+    get: (p) => http.get(p).then(r => r.data),
+    post: (p, d) => http.post(p, d).then(r => r.data),
+    del: (p) => http.delete(p).then(r => r.data),
   };
 
   async function refreshManifests() {
@@ -182,11 +216,74 @@
   function render() {
     const root = $('#app');
     root.innerHTML = '';
+    if (!state.authUser) {
+      root.appendChild(LoginView());
+      return;
+    }
     root.appendChild(Shell());
     // Restore focus to scan input if on receive view
     if (state.view === 'receive') {
       setTimeout(() => $('#scan-input')?.focus(), 30);
     }
+  }
+
+  // ───────── Login ─────────
+  // Minimal dev/demo login: exchanges a seeded user's email for a JWT via
+  // POST /api/auth/dev-login (see src/routes/auth.ts — there is no password
+  // yet since this app has no real IdP). The token is stored via
+  // setAuthToken() and every subsequent api.* call attaches it.
+  function LoginView() {
+    const doLogin = async (email) => {
+      state.authError = null;
+      state.authBusy = true;
+      render();
+      try {
+        const r = await api.post('/auth/dev-login', email ? { email } : {});
+        setAuthToken(r.token);
+        state.authUser = r.user;
+        state.authBusy = false;
+        await boot();
+      } catch (err) {
+        state.authBusy = false;
+        state.authError = err.response?.data?.error || err.message;
+        render();
+      }
+    };
+    let emailValue = '';
+    return h('div', { class: 'min-h-screen flex items-center justify-center px-4' },
+      h('div', { class: 'card p-8 w-full max-w-sm' },
+        h('div', { class: 'flex items-center gap-3 mb-6' },
+          h('div', { class: 'w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-400 to-indigo-500 flex items-center justify-center shadow-lg shadow-cyan-500/20' },
+            h('i', { class: 'fas fa-box-open text-slate-900' })
+          ),
+          h('div', {},
+            h('div', { class: 'text-sm font-bold tracking-wide' }, 'GOODS IN'),
+            h('div', { class: 'text-[10px] text-slate-500 -mt-0.5' }, 'Sign in to continue')
+          )
+        ),
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Email'),
+        h('input', {
+          class: 'input mb-3', type: 'email', placeholder: 'admin@goodsin.local',
+          oninput: (e) => { emailValue = e.target.value; },
+          onkeydown: (e) => { if (e.key === 'Enter') doLogin(emailValue.trim()); },
+        }),
+        state.authError ? h('div', { class: 'mb-3 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-200' },
+          h('i', { class: 'fas fa-triangle-exclamation mr-2' }), state.authError) : null,
+        h('button', {
+          class: 'btn btn-primary w-full justify-center' + (state.authBusy ? ' opacity-60 cursor-not-allowed' : ''),
+          disabled: state.authBusy ? 'disabled' : null,
+          onclick: () => doLogin(emailValue.trim()),
+        }, state.authBusy ? h('i', { class: 'fas fa-spinner fa-spin' }) : h('i', { class: 'fas fa-right-to-bracket' }), state.authBusy ? 'Signing in…' : 'Sign in'),
+        h('div', { class: 'text-[11px] text-slate-500 mt-4 text-center' },
+          'Leave blank and press Sign in to use the seeded admin account.')
+      )
+    );
+  }
+
+  function logout() {
+    setAuthToken(null);
+    state.authUser = null;
+    render();
   }
 
   function Shell() {
@@ -267,7 +364,12 @@
             class: 'btn btn-ghost text-xs',
             title: 'Toggle scanner sound',
             onclick: () => { state.soundOn = !state.soundOn; render(); },
-          }, h('i', { class: `fas fa-${state.soundOn ? 'volume-high' : 'volume-xmark'}` }))
+          }, h('i', { class: `fas fa-${state.soundOn ? 'volume-high' : 'volume-xmark'}` })),
+          state.authUser ? h('div', { class: 'flex items-center gap-2 pl-2 border-l border-slate-800' },
+            h('div', { class: 'text-xs text-slate-400 hidden md:block' }, state.authUser.name || state.authUser.email),
+            h('button', { class: 'btn btn-ghost text-xs', title: 'Sign out', onclick: logout },
+              h('i', { class: 'fas fa-right-from-bracket' }))
+          ) : null
         )
       )
     );
@@ -1088,6 +1190,11 @@
         color: matchRow?.color || expected.color || '',
         grade: matchRow?.grade || expected.grade || 'UG',
         notes: '',
+        // Valuation/VAT (Priority 4) — required server-side on /scan/confirm.
+        buy_price: '',
+        currency: 'GBP',
+        vat_type: '',
+        supplier_id: '',
         // Live lookup state — re-resolved as operator edits fields below
         live: cm,            // { status, row?, candidates?, reason? }
         liveBusy: false,
@@ -1174,12 +1281,19 @@
 
     const confirmIt = async () => {
       if (!ctx.sku) { toast('No catalogue SKU — pick a candidate or add to catalogue first', 'warn'); return; }
+      // Optimistic client-side checks only — the server (Priority 4/5) is the
+      // authoritative validator and will 422 with a specific message if these
+      // are missing or malformed; this just saves an obviously-wasted round trip.
+      if (ctx.buy_price === '' || ctx.buy_price == null) { toast('Buy price is required', 'warn'); return; }
+      if (!ctx.vat_type) { toast('VAT type is required', 'warn'); return; }
       try {
         const r = await api.post('/scan/confirm', {
           expected_device_id: expected.id,
           sku: ctx.sku, brand: ctx.brand, model: ctx.model,
           capacity: ctx.capacity, color: ctx.color, grade: ctx.grade,
           notes: ctx.notes, auto_print: state.autoPrint,
+          buy_price: ctx.buy_price, currency: ctx.currency || 'GBP', vat_type: ctx.vat_type,
+          supplier_id: ctx.supplier_id ? Number(ctx.supplier_id) : undefined,
         });
         toast(`Received <span class="mono">${r.received.imei}</span> · ${r.received.sku}${state.autoPrint ? ' · 🖨️ label queued' : ''}`, 'ok');
         beep('ok');
@@ -1314,6 +1428,46 @@
             h('input', { type: 'checkbox', class: 'accent-cyan-500', checked: state.autoPrint ? 'checked' : null,
               onchange: (e) => { state.autoPrint = e.target.checked; } }),
             'Auto-queue print label'
+          ),
+        ),
+        // Valuation / VAT (Priority 4) — required server-side on confirm.
+        h('div', { class: 'mt-3 card p-3 bg-slate-900/40' },
+          h('div', { class: 'text-[10px] uppercase tracking-wider text-slate-500 mb-2' }, 'Valuation & VAT'),
+          h('div', { class: 'grid grid-cols-3 gap-3' },
+            h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Buy price *'),
+              h('input', {
+                class: 'input mono', type: 'number', step: '0.01', min: '0',
+                value: ctx.buy_price, placeholder: '0.00',
+                oninput: (e) => { ctx.buy_price = e.target.value; state._confirmCtx = ctx; },
+              })
+            ),
+            h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Currency'),
+              h('input', {
+                class: 'input mono uppercase', maxlength: 3, value: ctx.currency || 'GBP',
+                oninput: (e) => { ctx.currency = e.target.value.toUpperCase(); state._confirmCtx = ctx; },
+              })
+            ),
+            h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'VAT type *'),
+              h('select', {
+                class: 'input',
+                onchange: (e) => { ctx.vat_type = e.target.value; state._confirmCtx = ctx; },
+              },
+                h('option', { value: '', selected: !ctx.vat_type ? 'selected' : null }, '— select —'),
+                ['MARGIN', 'STANDARD', 'ZERO'].map(v =>
+                  h('option', { value: v, selected: v === ctx.vat_type ? 'selected' : null }, v))
+              )
+            ),
+          ),
+          h('div', { class: 'mt-2' },
+            h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Supplier ID (optional)'),
+            h('input', {
+              class: 'input mono', type: 'number', min: '1', value: ctx.supplier_id,
+              placeholder: 'Leave blank if unknown',
+              oninput: (e) => { ctx.supplier_id = e.target.value; state._confirmCtx = ctx; },
+            })
           ),
         ),
         // Optional notes
@@ -2487,11 +2641,19 @@
           )
     );
   }
+  // Browser-mode label URLs (GET /api/print/label/:id, /api/print/labels)
+  // are opened via window.open(), which is a plain browser navigation and
+  // can't carry our Authorization header. The backend's extractToken()
+  // falls back to a `?token=` query param for exactly this case.
+  function withAuthToken(url) {
+    if (!authToken) return url;
+    return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(authToken);
+  }
   async function sendPrint(id) {
     try {
       const r = await api.post(`/print/send/${id}?size=${state.labelSize}${state.labelRotate ? '&rotate=1' : ''}`);
       if (r.mode === 'browser') {
-        const win = window.open(r.url, '_blank', 'width=720,height=520');
+        const win = window.open(withAuthToken(r.url), '_blank', 'width=720,height=520');
         if (!win) {
           toast('Pop-up blocked — please allow pop-ups for this site', 'err', 4000);
           return;
@@ -2512,7 +2674,7 @@
     try {
       const r = await api.post(`/print/send-all?size=${state.labelSize}${state.labelRotate ? '&rotate=1' : ''}`);
       if (r.mode === 'browser') {
-        const win = window.open(r.url, '_blank', 'width=720,height=520');
+        const win = window.open(withAuthToken(r.url), '_blank', 'width=720,height=520');
         if (!win) {
           toast('Pop-up blocked — please allow pop-ups for this site', 'err', 4000);
           return;
@@ -2563,6 +2725,25 @@
   });
 
   async function boot() {
+    // No stored token at all — show the login screen immediately, no need
+    // to round-trip to the server first.
+    if (!authToken) {
+      state.authUser = null;
+      render();
+      return;
+    }
+    // We have a stored token — validate it via GET /api/auth/me before
+    // loading any app data. A 401 here is handled by the axios response
+    // interceptor above (clears the token and re-renders the login view).
+    if (!state.authUser) {
+      try {
+        const r = await api.get('/auth/me');
+        state.authUser = r.user;
+      } catch (e) {
+        // Interceptor already cleared the token + re-rendered login on 401.
+        return;
+      }
+    }
     try {
       await refreshManifests();
       await refreshStats();
