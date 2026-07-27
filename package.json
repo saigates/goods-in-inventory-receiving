@@ -8,6 +8,8 @@
     "preview": "wrangler pages dev dist --d1=webapp-production --local",
     "deploy": "npm run build && wrangler pages deploy dist",
     "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "db:migrate:local": "wrangler d1 migrations apply webapp-production --local",
     "db:migrate:prod": "wrangler d1 migrations apply webapp-production",
     "db:seed": "wrangler d1 execute webapp-production --local --file=./seed.sql",
@@ -18,11 +20,13 @@
     "hono": "^4.12.23"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.18.8",
     "@cloudflare/workers-types": "^4.20250705.0",
     "@hono/vite-build": "^1.2.0",
     "@hono/vite-dev-server": "^0.25.2",
     "typescript": "^5.0.0",
     "vite": "^6.3.5",
+    "vitest": "^4.1.10",
     "wrangler": "^4.4.0"
   }
 }

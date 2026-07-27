@@ -272,12 +272,22 @@ npm run deploy
 
 ## Testing
 
-**Manual/live verification so far**: every behaviour described above (auth 401s, org-scoping, IMEI/Luhn validation, ISO 4217 currency rejection, `transitionDevice()` valid/invalid transitions, `device_events` invariant, CSV export shape, and the webhook `X-Signature` HMAC — independently recomputed and matched against a live payload) has been exercised via live `curl`/scripted requests against a running instance, not just read from source.
+**Automated suite**: [Vitest](https://vitest.dev/) via [`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/), which runs tests inside the real `workerd`/Miniflare runtime against a real D1 binding (all 9 migrations in `migrations/` applied before each test file — see `vitest.config.ts` and `test/apply-migrations.ts`), not mocks.
 
-**Automated test suite: not written yet** — this is the next planned step. Priority order once started: (1) `transitionDevice()` — valid transitions succeed, invalid ones reject with `409`, the `device_events` invariant holds after each; (2) `isValidCurrency()` / `validateImei()` in `src/lib/validate.ts` — known-good and known-bad codes (e.g. `GBP` accepted, `UKL` rejected) and IMEI edge cases (14/15/16-digit, Luhn pass/fail). No test framework is wired into `package.json` yet.
+```bash
+npm test              # vitest run — runs once and exits
+npm run test:watch    # vitest — watch mode
+```
+
+Current coverage (54 tests across 2 suites):
+- **`test/deviceLifecycle.spec.ts`** (24 tests) — `transitionDevice()`: every entry in `ALLOWED_TRANSITIONS` succeeds; a representative set of disallowed transitions (explicitly including `RECEIVED → SOLD`) reject with `InvalidTransitionError`; unknown-status and unknown-device-id error paths; org-scoping (a device in another organisation is treated as not-found, never a cross-tenant leak); each transition writes **exactly one** `device_events` row with the correct `from_status`/`to_status`/`user_id`/`organisation_id`; and — the audit-trail invariant from Priority 3 — `device.status === (most recent device_events row).to_status`, asserted automatically after single transitions, chains of transitions, and rejected-attempt no-ops, so a future refactor can't silently break it without a test failing (verified by deliberately injecting a bug that skips the status UPDATE — the invariant tests caught it immediately, then the fix was confirmed reverted byte-identical via `git diff`).
+- **`test/validate.spec.ts`** (30 tests) — `isValidCurrency()`: every code in `ISO_4217_CODES` accepted; `"UKL"`, empty string, whitespace-only, and assorted junk (`"XXX"`, `"GB"`, `"GBPX"`, non-string input, etc.) all rejected. Note: the validator normalizes to uppercase *before* checking (`.trim().toUpperCase()`), so a lowercase **valid** code like `"gbp"` currently passes — this is documented and locked in as its own explicit test (not silently asserted as a rejection), while lowercase **junk** (`"ukl"`, `"xyz"`) is still correctly rejected in any case. Also covers `normalizeCurrency()`'s fallback behaviour.
+
+**Manual/live verification (not yet automated)**: auth 401s, IMEI/Luhn validation, CSV export shape, and the webhook `X-Signature` HMAC (independently recomputed in a separate process and matched against a live payload, with a wrong-secret negative control) have been exercised via live `curl`/scripted requests against a running instance, but do not yet have Vitest coverage. Browser-UI flows (login click-through, force-add valuation-field enforcement) have not yet been checked in a real interactive session — see **Not Yet Implemented** below.
 
 ## Not Yet Implemented / Next Steps
-- Automated test suite (state-machine transitions, currency/IMEI validators) — see **Testing** above.
+- Browser-UI checks: force-add valuation-field bypass prevention (highest priority — off-manifest devices are where a required-field bypass could hide) and login flow click-through — see **Testing** above.
+- Automated coverage for CSV export, webhook HMAC delivery, and IMEI/Luhn validation (currently manual/live-verified only — see **Testing** above).
 - Grading workflow (next stage after Goods In).
 - QZ Tray local-WebSocket bridge (alternative to PrintNode for sites that don't want cloud printing).
 - Real credential-based login / Cloudflare Access (current auth is a dev/demo email-only `dev-login` — see **Authentication** above).
