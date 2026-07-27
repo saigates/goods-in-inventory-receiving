@@ -152,3 +152,72 @@ export type Webhook = {
   enabled: number
   created_at: string
 }
+
+// ───────── OPR foundation (OPR 1) ─────────
+
+export type OprAuthorisation = {
+  id: number
+  organisation_id: number
+  holder_name: string
+  eori: string
+  cds_number: string      // CDS-format — for CDS declarations
+  chief_number: string | null // legacy CHIEF-format — for C&E1154 paper forms
+  valid_from: string
+  valid_to: string
+  supervising_office_name: string | null
+  supervising_office_code: string | null
+  commodity_scope: string | null
+  commodity_codes: string | null
+  rate_of_yield: string
+  discharge_period_months: number
+  notes: string | null
+  created_at: string
+  updated_at: string | null
+}
+
+export type ShipmentDirection = 'export' | 'import'
+export type ShipmentStatus = 'DRAFT' | 'FINALISED' | 'CANCELLED'
+
+export type Shipment = {
+  id: number
+  organisation_id: number
+  reference: string
+  direction: ShipmentDirection
+  shipment_type: 'OPR_REPAIR'
+  status: ShipmentStatus
+  authorisation_id: number
+  procedure_code: string
+  additional_procedure_code: string | null
+  consignee_name: string | null
+  consignee_address: string | null
+  carrier: string | null
+  carrier_account: string | null
+  incoterm: string | null
+  currency: 'GBP'
+  ship_date: string | null
+  related_export_shipment_id: number | null
+  export_mrn: string | null
+  notes: string | null
+  created_by_user_id: number | null
+  created_at: string
+  updated_at: string | null
+}
+
+export type ShipmentLine = {
+  id: number
+  organisation_id: number
+  shipment_id: number
+  received_device_id: number
+  // Snapshot columns — frozen at add time
+  imei: string
+  sku: string | null
+  brand: string | null
+  model: string | null
+  capacity: string | null
+  color: string | null
+  grade: string | null
+  unit_value: number
+  currency: string
+  added_by_user_id: number | null
+  created_at: string
+}

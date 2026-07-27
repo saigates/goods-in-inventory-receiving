@@ -11,6 +11,7 @@ import printRoute from './routes/print'
 import catalogRoute from './routes/catalog'
 import devicesRoute from './routes/devices'
 import webhooksRoute from './routes/webhooks'
+import oprRoute from './routes/opr'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -41,6 +42,7 @@ app.route('/api/print', printRoute)
 app.route('/api/catalog', catalogRoute)
 app.route('/api/devices', devicesRoute)
 app.route('/api/webhooks', webhooksRoute)
+app.route('/api/opr', oprRoute)
 
 // SPA shell — all UI rendered client-side from /static/app.js
 app.get('/', (c) => {

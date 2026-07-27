@@ -14,3 +14,20 @@ INSERT OR IGNORE INTO sku_catalog (sku, brand, model, capacity, color) VALUES
   ('SMSG-ZFLIP5-256-GRA','Samsung','Galaxy Z Flip5',     '256G', 'Graphite'),
   ('SMSG-ZFLIP5-512-GRA','Samsung','Galaxy Z Flip5',     '512G', 'Graphite'),
   ('SMSG-ZFOLD5-256-PBK','Samsung','Galaxy Z Fold5',     '256G', 'Phantom Black');
+
+-- ───────── OPR authorisation (OPR 1) ─────────
+-- The Saigates OPR authorisation as configurable DATA (never inline in
+-- code). Both number formats stored deliberately: cds_number goes on CDS
+-- declarations; chief_number goes in the C&E1154 paper form's
+-- authorisation field. They must never be confused.
+INSERT OR IGNORE INTO opr_authorisations
+  (id, organisation_id, holder_name, eori, cds_number, chief_number,
+   valid_from, valid_to, supervising_office_name, supervising_office_code,
+   commodity_scope, commodity_codes, rate_of_yield, discharge_period_months, notes)
+VALUES
+  (1, 1, 'Saigates Limited', 'GB369979995000',
+   'GBOPO36997999500020260226105539', 'OP/0922/601/31',
+   '2026-03-01', '2031-02-28',
+   'HMRC S1756 IP-OP Customs Liverpool', 'GBNCL001',
+   'Smartphones', '8517130000', '1:1', 6,
+   'Correspondence: Central Mail Unit Newcastle NE98 1ZZ. Goods identified by IMEI. Export 2100 (standard) / 2200+B51 or B02 (warranty; 2100+B51 NOT permitted). Re-import 6121. Carrier FedEx (declarant FedEx Express UK Limited, EORI GB271251133000); pre-alert controlprealert@fedex.com, cut-off 4pm.');
