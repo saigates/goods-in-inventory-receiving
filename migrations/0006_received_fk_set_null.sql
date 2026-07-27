@@ -14,7 +14,9 @@
 --
 -- SQLite needs the recreate-and-copy dance to change FK clauses.
 
-BEGIN TRANSACTION;
+-- (explicit transaction wrapper removed: remote D1 rejects it [CF 7500];
+-- wrangler applies each migration file as a single batch, which is the
+-- supported atomicity mechanism on D1.)
 
 CREATE TABLE received_devices_new (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,4 +57,4 @@ CREATE INDEX IF NOT EXISTS idx_received_imei     ON received_devices(imei);
 CREATE INDEX IF NOT EXISTS idx_received_sku      ON received_devices(sku);
 CREATE INDEX IF NOT EXISTS idx_received_manifest ON received_devices(manifest_id);
 
-COMMIT;
+-- (transaction-end statement removed — see note where the wrapper began.)

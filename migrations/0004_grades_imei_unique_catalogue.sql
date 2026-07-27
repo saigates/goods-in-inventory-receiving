@@ -12,7 +12,9 @@
 -- Schema migration is done via the standard SQLite recreate-and-copy dance
 -- because SQLite can't ALTER TABLE ADD CONSTRAINT.
 
-BEGIN TRANSACTION;
+-- (explicit transaction wrapper removed: remote D1 rejects it [CF 7500];
+-- wrangler applies each migration file as a single batch, which is the
+-- supported atomicity mechanism on D1.)
 
 -- 1. Normalise existing grades on expected_devices to A|B|C|UG.
 --    Anything else (B+, A-, NULL, empty, junk) → UG.
@@ -85,4 +87,4 @@ CREATE TABLE IF NOT EXISTS grade_audit (
 CREATE INDEX IF NOT EXISTS idx_grade_audit_device ON grade_audit(received_device_id);
 CREATE INDEX IF NOT EXISTS idx_grade_audit_bulk   ON grade_audit(bulk_id);
 
-COMMIT;
+-- (transaction-end statement removed — see note where the wrapper began.)

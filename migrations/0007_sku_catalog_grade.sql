@@ -12,7 +12,9 @@
 -- backfill grade from the last segment of the SKU after the final hyphen
 -- when it's one of A | B | C | UG.
 
-BEGIN TRANSACTION;
+-- (explicit transaction wrapper removed: remote D1 rejects it [CF 7500];
+-- wrangler applies each migration file as a single batch, which is the
+-- supported atomicity mechanism on D1.)
 
 -- 1. Add grade column (nullable for safety on backfill)
 ALTER TABLE sku_catalog ADD COLUMN grade TEXT;
@@ -51,4 +53,4 @@ WHERE capacity IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sku_catalog_lookup
   ON sku_catalog(model, capacity, color, grade);
 
-COMMIT;
+-- (transaction-end statement removed — see note where the wrapper began.)

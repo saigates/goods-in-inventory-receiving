@@ -30,7 +30,9 @@
 -- migrations); everything else uses simple ADD COLUMN with a constant
 -- DEFAULT so existing rows backfill cleanly.
 
-BEGIN TRANSACTION;
+-- (explicit transaction wrapper removed: remote D1 rejects it [CF 7500];
+-- wrangler applies each migration file as a single batch, which is the
+-- supported atomicity mechanism on D1.)
 
 -- ───────── 1. Organisations & Users ─────────
 
@@ -222,4 +224,4 @@ FROM scan_events se
 JOIN received_devices rd ON rd.imei = se.imei
 WHERE se.outcome IN ('matched', 'duplicate');
 
-COMMIT;
+-- (transaction-end statement removed — see note where the wrapper began.)
