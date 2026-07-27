@@ -203,6 +203,12 @@ export type Shipment = {
   ead_mrn: string | null          // EAD MRN — proof of export (0011)
   finalised_at: string | null
   finalised_by_user_id: number | null
+  // ── OPR 3 (0012): C&E1154 inputs + re-import proof (import shipments) ──
+  repair_cost: number | null            // repairer invoice amount, as invoiced
+  repair_cost_currency: string | null   // ISO 4217 of that invoice
+  customs_exchange_rate: number | null  // HMRC monthly rate (foreign units per £1)
+  duty_rate_pct: number | null          // duty rate for the commodity (0 valid)
+  import_mrn: string | null             // MRN of the 6121 import declaration
   notes: string | null
   created_by_user_id: number | null
   created_at: string

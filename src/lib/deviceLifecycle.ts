@@ -19,11 +19,14 @@ export { DEVICE_STATUSES }
 //   READY_FOR_EXPORT → IN_EXPORT_CONSIGNMENT   (device scanned onto a draft consignment)
 //   IN_EXPORT_CONSIGNMENT → READY_FOR_EXPORT   (line removed while still DRAFT)
 //   IN_EXPORT_CONSIGNMENT → EXPORTED_UNDER_OPR (consignment finalised)
-// These three are OPR-WORKFLOW-ONLY: the generic /api/devices/:id/transition
+// The OPR 3 import/discharge flow wires:
+//   EXPORTED_UNDER_OPR → RETURNED_UNDER_OPR    (import consignment received)
+//   RETURNED_UNDER_OPR → ACTIVE_INVENTORY      (returned goods back into stock)
+// All of these are OPR-WORKFLOW-ONLY: the generic /api/devices/:id/transition
 // endpoint refuses them (see OPR_WORKFLOW_ONLY_STATUSES below) because they
 // must stay in lockstep with shipment_lines — only src/routes/opr.ts may
-// drive them. Return/sale transitions (→ RETURNED_UNDER_OPR, → SOLD) remain
-// NOT enabled: they belong to the OPR 3 import/discharge flow.
+// drive them. Sale transitions (→ SOLD) remain NOT enabled: selling is a
+// downstream sales flow, not part of the OPR tracks.
 export const ALLOWED_TRANSITIONS: Record<DeviceStatus, DeviceStatus[]> = {
   RECEIVED: ['SORTING', 'REJECTED'],
   SORTING: ['ACTIVE_INVENTORY', 'IN_HOUSE_REPAIR', 'READY_FOR_EXPORT'],
@@ -31,20 +34,22 @@ export const ALLOWED_TRANSITIONS: Record<DeviceStatus, DeviceStatus[]> = {
   IN_HOUSE_REPAIR: ['ACTIVE_INVENTORY'],
   READY_FOR_EXPORT: ['IN_EXPORT_CONSIGNMENT'],
   IN_EXPORT_CONSIGNMENT: ['READY_FOR_EXPORT', 'EXPORTED_UNDER_OPR'],
-  EXPORTED_UNDER_OPR: [],
-  RETURNED_UNDER_OPR: [],
+  EXPORTED_UNDER_OPR: ['RETURNED_UNDER_OPR'],
+  RETURNED_UNDER_OPR: ['ACTIVE_INVENTORY'],
   SOLD: [],
   REJECTED: [],
 }
 
 // Statuses whose membership is DERIVED from consignment state (a device is
 // IN_EXPORT_CONSIGNMENT iff it has a line on a DRAFT export shipment;
-// EXPORTED_UNDER_OPR iff that shipment finalised). Letting the generic
-// transition endpoint set or leave these statuses would desynchronise the
-// device ledger from shipment_lines, so it refuses both directions.
+// EXPORTED_UNDER_OPR iff that shipment finalised; RETURNED_UNDER_OPR iff a
+// related import consignment was received). Letting the generic transition
+// endpoint set or leave these statuses would desynchronise the device
+// ledger from shipment_lines, so it refuses both directions.
 export const OPR_WORKFLOW_ONLY_STATUSES: readonly DeviceStatus[] = [
   'IN_EXPORT_CONSIGNMENT',
   'EXPORTED_UNDER_OPR',
+  'RETURNED_UNDER_OPR',
 ] as const
 
 export class InvalidTransitionError extends Error {

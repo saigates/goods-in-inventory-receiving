@@ -195,20 +195,29 @@ describe('consignment builder — status lockstep', () => {
     expect(re.status).toBe(201)
   })
 
-  it('import shipments refuse the consignment builder (OPR 3 flow)', async () => {
+  // Originally (OPR 2 era) this asserted imports refuse the builder
+  // outright ("OPR 3 flow"). OPR 3 wired the return builder, so the
+  // invariant is now: an EXPORT-STAGED device still cannot join an import
+  // consignment — returns only take EXPORTED_UNDER_OPR devices from the
+  // related export (covered in depth in test/oprImport.spec.ts).
+  it('import shipments do not accept export-staged devices (return builder takes EXPORTED_UNDER_OPR only)', async () => {
     const res = await api('/api/opr/shipments', {
       method: 'POST',
       body: JSON.stringify({ reference: `IMP TEST ${shipmentSeq++}`, direction: 'import', authorisation_id: authId, procedure_code: '6121' }),
     })
     expect(res.status).toBe(201)
     const importShipment = ((await res.json()) as { shipment: { id: number } }).shipment
-    const device = await makeDevice()
+    const device = await makeDevice() // READY_FOR_EXPORT
 
+    // No related export linked yet → the builder refuses before looking
+    // at the device.
     const scan = await api(`/api/opr/shipments/${importShipment.id}/scan`, {
       method: 'POST', body: JSON.stringify({ imei: device.imei }),
     })
-    expect(scan.status).toBe(409)
-    expect(((await scan.json()) as { error: string }).error).toMatch(/OPR 3/)
+    expect(scan.status).toBe(422)
+    expect(((await scan.json()) as { error: string }).error).toMatch(/related_export_shipment_id/)
+    // Device untouched (zero side-effects).
+    expect(await deviceStatus(device.id)).toBe('READY_FOR_EXPORT')
   })
 
   it('generic transition endpoint refuses consignment-derived statuses in BOTH directions', async () => {
