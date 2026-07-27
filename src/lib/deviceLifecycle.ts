@@ -15,23 +15,37 @@ import { DEVICE_STATUSES } from '../types'
 
 export { DEVICE_STATUSES }
 
-// Allowed transitions per the brief. Export/return transitions
-// (READY_FOR_EXPORT → IN_EXPORT_CONSIGNMENT → EXPORTED_UNDER_OPR →
-// RETURNED_UNDER_OPR, and → SOLD) are intentionally NOT enabled yet — they
-// are defined in DEVICE_STATUSES so the column/enum is future-proof, but
-// their workflows are out of scope for this pass.
+// Allowed transitions per the brief. The OPR 2 export flow wires:
+//   READY_FOR_EXPORT → IN_EXPORT_CONSIGNMENT   (device scanned onto a draft consignment)
+//   IN_EXPORT_CONSIGNMENT → READY_FOR_EXPORT   (line removed while still DRAFT)
+//   IN_EXPORT_CONSIGNMENT → EXPORTED_UNDER_OPR (consignment finalised)
+// These three are OPR-WORKFLOW-ONLY: the generic /api/devices/:id/transition
+// endpoint refuses them (see OPR_WORKFLOW_ONLY_STATUSES below) because they
+// must stay in lockstep with shipment_lines — only src/routes/opr.ts may
+// drive them. Return/sale transitions (→ RETURNED_UNDER_OPR, → SOLD) remain
+// NOT enabled: they belong to the OPR 3 import/discharge flow.
 export const ALLOWED_TRANSITIONS: Record<DeviceStatus, DeviceStatus[]> = {
   RECEIVED: ['SORTING', 'REJECTED'],
   SORTING: ['ACTIVE_INVENTORY', 'IN_HOUSE_REPAIR', 'READY_FOR_EXPORT'],
   ACTIVE_INVENTORY: [],
   IN_HOUSE_REPAIR: ['ACTIVE_INVENTORY'],
-  READY_FOR_EXPORT: [],
-  IN_EXPORT_CONSIGNMENT: [],
+  READY_FOR_EXPORT: ['IN_EXPORT_CONSIGNMENT'],
+  IN_EXPORT_CONSIGNMENT: ['READY_FOR_EXPORT', 'EXPORTED_UNDER_OPR'],
   EXPORTED_UNDER_OPR: [],
   RETURNED_UNDER_OPR: [],
   SOLD: [],
   REJECTED: [],
 }
+
+// Statuses whose membership is DERIVED from consignment state (a device is
+// IN_EXPORT_CONSIGNMENT iff it has a line on a DRAFT export shipment;
+// EXPORTED_UNDER_OPR iff that shipment finalised). Letting the generic
+// transition endpoint set or leave these statuses would desynchronise the
+// device ledger from shipment_lines, so it refuses both directions.
+export const OPR_WORKFLOW_ONLY_STATUSES: readonly DeviceStatus[] = [
+  'IN_EXPORT_CONSIGNMENT',
+  'EXPORTED_UNDER_OPR',
+] as const
 
 export class InvalidTransitionError extends Error {
   code = 'invalid_transition' as const

@@ -171,6 +171,8 @@ export type OprAuthorisation = {
   rate_of_yield: string
   discharge_period_months: number
   notes: string | null
+  prealert_email: string | null   // carrier customs pre-alert mailbox (0011)
+  prealert_cutoff: string | null  // e.g. '16:00' — same-day pre-alert cut-off (0011)
   created_at: string
   updated_at: string | null
 }
@@ -197,6 +199,10 @@ export type Shipment = {
   ship_date: string | null
   related_export_shipment_id: number | null
   export_mrn: string | null
+  ducr: string | null             // Declaration UCR — proof of export (0011)
+  ead_mrn: string | null          // EAD MRN — proof of export (0011)
+  finalised_at: string | null
+  finalised_by_user_id: number | null
   notes: string | null
   created_by_user_id: number | null
   created_at: string

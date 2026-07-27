@@ -23,11 +23,20 @@ INSERT OR IGNORE INTO sku_catalog (sku, brand, model, capacity, color) VALUES
 INSERT OR IGNORE INTO opr_authorisations
   (id, organisation_id, holder_name, eori, cds_number, chief_number,
    valid_from, valid_to, supervising_office_name, supervising_office_code,
-   commodity_scope, commodity_codes, rate_of_yield, discharge_period_months, notes)
+   commodity_scope, commodity_codes, rate_of_yield, discharge_period_months, notes,
+   prealert_email, prealert_cutoff)
 VALUES
   (1, 1, 'Saigates Limited', 'GB369979995000',
    'GBOPO36997999500020260226105539', 'OP/0922/601/31',
    '2026-03-01', '2031-02-28',
    'HMRC S1756 IP-OP Customs Liverpool', 'GBNCL001',
    'Smartphones', '8517130000', '1:1', 6,
-   'Correspondence: Central Mail Unit Newcastle NE98 1ZZ. Goods identified by IMEI. Export 2100 (standard) / 2200+B51 or B02 (warranty; 2100+B51 NOT permitted). Re-import 6121. Carrier FedEx (declarant FedEx Express UK Limited, EORI GB271251133000); pre-alert controlprealert@fedex.com, cut-off 4pm.');
+   'Correspondence: Central Mail Unit Newcastle NE98 1ZZ. Goods identified by IMEI. Export 2100 (standard) / 2200+B51 or B02 (warranty; 2100+B51 NOT permitted). Re-import 6121. Carrier FedEx (declarant FedEx Express UK Limited, EORI GB271251133000); pre-alert controlprealert@fedex.com, cut-off 4pm.',
+   'controlprealert@fedex.com', '16:00');
+
+-- Rows seeded before migration 0011 predate the structured pre-alert
+-- columns (INSERT OR IGNORE will not touch them) — backfill from the
+-- values documented in the notes.
+UPDATE opr_authorisations
+   SET prealert_email = 'controlprealert@fedex.com', prealert_cutoff = '16:00'
+ WHERE id = 1 AND prealert_email IS NULL;

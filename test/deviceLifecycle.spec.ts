@@ -103,7 +103,7 @@ describe('transitionDevice — disallowed transitions are rejected', () => {
   const disallowed: [DeviceStatus, DeviceStatus][] = [
     ['RECEIVED', 'SOLD'], // explicitly named in the brief
     ['RECEIVED', 'ACTIVE_INVENTORY'], // skipping SORTING
-    ['SORTING', 'EXPORTED_UNDER_OPR'], // export workflow out of scope
+    ['SORTING', 'EXPORTED_UNDER_OPR'], // must go via IN_EXPORT_CONSIGNMENT (OPR finalisation)
     ['ACTIVE_INVENTORY', 'IN_HOUSE_REPAIR'], // ACTIVE_INVENTORY has no outgoing transitions
     ['REJECTED', 'RECEIVED'], // terminal status, no way back
     ['RECEIVED', 'RECEIVED'], // same-status no-op is not a valid transition

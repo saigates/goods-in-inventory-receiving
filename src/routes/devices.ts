@@ -9,7 +9,7 @@
 import { Hono } from 'hono'
 import type { Bindings, AuthUser, DeviceStatus } from '../types'
 import { currentUser } from '../lib/auth'
-import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, ALLOWED_TRANSITIONS } from '../lib/deviceLifecycle'
+import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES } from '../lib/deviceLifecycle'
 import { dispatchDeviceStatusWebhooks } from '../lib/webhook'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
@@ -153,6 +153,21 @@ app.post('/:id/transition', async (c) => {
     return c.json({ error: `to_status must be one of: ${DEVICE_STATUSES.join(', ')}` }, 400)
   }
 
+  // Consignment-derived statuses may only be driven by the OPR workflow
+  // endpoints — moving a device in/out of them here would desynchronise
+  // shipment_lines from the device ledger.
+  if (OPR_WORKFLOW_ONLY_STATUSES.includes(toStatus)) {
+    return c.json({ error: `${toStatus} is managed by the OPR consignment workflow — use /api/opr/shipments/:id/lines (add/remove) and /finalise instead of a direct transition` }, 409)
+  }
+  {
+    const device = await c.env.DB.prepare(
+      'SELECT status FROM received_devices WHERE id = ? AND organisation_id = ?'
+    ).bind(id, user.organisation_id).first<{ status: DeviceStatus }>()
+    if (device && OPR_WORKFLOW_ONLY_STATUSES.includes(device.status)) {
+      return c.json({ error: `Device is ${device.status}, which is managed by the OPR consignment workflow — it cannot be transitioned via this endpoint` }, 409)
+    }
+  }
+
   try {
     const { device, event } = await transitionDevice(c.env.DB, id, toStatus, {
       user,
@@ -175,8 +190,13 @@ app.post('/:id/transition', async (c) => {
       user_id: user.id,
       occurred_at: new Date().toISOString(),
     })
-    if (typeof (c.executionCtx as any)?.waitUntil === 'function') {
-      ;(c.executionCtx as any).waitUntil(notify)
+    // NOTE: c.executionCtx is a THROWING getter in Hono when no
+    // ExecutionContext exists (e.g. app.request() in tests) — it cannot be
+    // probed with optional chaining alone.
+    let execCtx: { waitUntil?: (p: Promise<unknown>) => void } | undefined
+    try { execCtx = c.executionCtx as any } catch { execCtx = undefined }
+    if (typeof execCtx?.waitUntil === 'function') {
+      execCtx.waitUntil(notify)
     } else {
       await notify
     }

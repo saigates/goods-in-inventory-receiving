@@ -55,6 +55,15 @@ async function makeDevice(overrides: Record<string, unknown> = {}) {
   })
   expect(res.status).toBe(200)
   const data = await res.json() as { received: { id: number; imei: string } }
+  // OPR 2 rule: only READY_FOR_EXPORT devices can join an export
+  // consignment, so stage the device through the real state machine
+  // (RECEIVED → SORTING → READY_FOR_EXPORT) via the API.
+  for (const to of ['SORTING', 'READY_FOR_EXPORT']) {
+    const t = await api(`/api/devices/${data.received.id}/transition`, {
+      method: 'POST', body: JSON.stringify({ to_status: to }),
+    })
+    expect(t.status).toBe(200)
+  }
   return data.received
 }
 
