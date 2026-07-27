@@ -22,15 +22,12 @@ const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 // /confirm, /force-add and /manual (Priority 4). Returns either the
 // normalised values or a 422-shaped error the caller can return directly.
 //
-// buy_price and vat_type are REQUIRED at the point of confirming a device
-// per the brief ("confirming a device requires a valid buy price and VAT
-// type"). /force-add now enforces the SAME requirement — it is the
-// exception branch for off-manifest devices and therefore the likeliest
-// place for a required-field bypass to hide, so it gets the same
-// server-side rules as the manifest-matched confirm path. /manual keeps
-// them optional for now (predates the requirement; not in scope of the
-// force-add parity brief — flagged as an open question), but supplied
-// values are still validated with the same rigor.
+// buy_price and vat_type are REQUIRED on EVERY path that creates a device
+// (/confirm, /force-add, /manual) — general rule, earned through evidence:
+// force-add shipped with `required: false` and was a real valuation bypass
+// until caught. Any future intake path inherits `required: true` by
+// default; opting OUT must be a deliberate, reviewed decision. currency
+// must always be a valid ISO 4217 code (default GBP).
 function parseValuation(
   body: { buy_price?: unknown; currency?: unknown; vat_type?: unknown },
   opts: { required: boolean },
@@ -443,7 +440,9 @@ app.post('/manual', async (c) => {
   if (!imeiCheck.ok) return c.json({ error: imeiCheck.reason }, 400)
   const imei = imeiCheck.imei
 
-  const valuation = parseValuation(body, { required: false })
+  // Valuation/VAT required here too — manual is an intake path like any
+  // other; "quick receive" must not mean "valuation-less receive".
+  const valuation = parseValuation(body, { required: true })
   if (!valuation.ok) return c.json({ error: valuation.error }, 422)
 
   // Duplicate check — same friendly path as scan/confirm.
@@ -517,7 +516,7 @@ app.post('/manual', async (c) => {
 
   await logDeviceEvent(c.env.DB, {
     organisationId: orgId, deviceId: receivedId, eventType: 'MANUAL_RECEIVE', userId: user.id,
-    toStatus: 'RECEIVED', metadata: { sku, grade, source: 'manual' },
+    toStatus: 'RECEIVED', metadata: { sku, grade, source: 'manual', buy_price: valuation.buy_price, currency: valuation.currency, vat_type: valuation.vat_type },
   })
 
   // Queue print job by default

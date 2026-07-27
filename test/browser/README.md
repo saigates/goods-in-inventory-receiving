@@ -47,3 +47,14 @@ from git (sha1-verified identical) and the leaked sabotage row cleaned from
 the local D1 (`received_devices` + `device_events` + `scan_events` +
 `print_jobs`). Each green run's test device is likewise cleaned up so the
 local DB isn't polluted with test rows.
+
+## manual-ui.browser.mjs (13 checks)
+Same pattern applied to the **Quick receive (manual)** path — the last intake
+branch brought up to valuation parity: modal shows the required Valuation &
+VAT section; missing buy_price / vat_type blocked client-side with zero
+network requests; `UKL` typed into the currency field genuinely reaches the
+server and the toast carries its 422 ISO 4217 message; no device row after
+blocked attempts; valid values persist exactly (`77.50 / GBP / STANDARD`,
+`source=manual`). The script prints `CLEANUP_IMEI=<imei>` at the end — delete
+that row (+ its device_events / scan_events / print_jobs) from local D1 after
+a green run.

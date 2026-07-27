@@ -1970,6 +1970,7 @@
       color: 'Phantom Black',
       grade: 'UG',
       notes: '',
+      buy_price: '', currency: 'GBP', vat_type: '',
     };
     const close = () => {
       state.manualReceiveOpen = false;
@@ -1996,12 +1997,17 @@
     const submit = async () => {
       const imei = ctx.imei.trim();
       if (!/^\d{14,17}$/.test(imei)) { toast('IMEI must be 14-17 digits', 'warn'); return; }
+      // Optimistic client-side checks only — the server enforces the same
+      // valuation rules on /scan/manual as on /confirm and /force-add.
+      if (ctx.buy_price === '' || ctx.buy_price == null) { toast('Buy price is required', 'warn'); return; }
+      if (!ctx.vat_type) { toast('VAT type is required', 'warn'); return; }
       try {
         const body = {
           imei,
           grade: ctx.grade,
           notes: ctx.notes || null,
           auto_print: state.autoPrint,
+          buy_price: ctx.buy_price, currency: ctx.currency || 'GBP', vat_type: ctx.vat_type,
         };
         if (ctx.sku_pick) {
           // Use catalogue SKU as-is. Server will enrich brand/model/etc.
@@ -2105,6 +2111,41 @@
           ),
         ),
 
+        // Valuation & VAT — required on manual receive exactly like the
+        // confirm and force-add paths; quick receive is not a bypass.
+        h('div', { class: 'card p-3 bg-slate-900/40 mt-3', id: 'manual-valuation' },
+          h('div', { class: 'text-[10px] uppercase tracking-wider text-slate-500 mb-2' },
+            h('i', { class: 'fas fa-sterling-sign mr-1' }), 'Valuation & VAT (required)'),
+          h('div', { class: 'grid grid-cols-3 gap-3' },
+            h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Buy price *'),
+              h('input', {
+                class: 'input mono', id: 'manual-buy-price', type: 'number', step: '0.01', min: '0',
+                value: ctx.buy_price, placeholder: '0.00',
+                oninput: (e) => { ctx.buy_price = e.target.value; state._manualCtx = ctx; },
+              })
+            ),
+            h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Currency'),
+              h('input', {
+                class: 'input mono uppercase', id: 'manual-currency', maxlength: 3, value: ctx.currency || 'GBP',
+                oninput: (e) => { ctx.currency = e.target.value.toUpperCase(); state._manualCtx = ctx; },
+              })
+            ),
+            h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'VAT type *'),
+              h('select', {
+                class: 'input', id: 'manual-vat-type',
+                onchange: (e) => { ctx.vat_type = e.target.value; state._manualCtx = ctx; },
+              },
+                h('option', { value: '', selected: !ctx.vat_type ? 'selected' : null }, '— select —'),
+                ['MARGIN', 'STANDARD', 'ZERO'].map(v =>
+                  h('option', { value: v, selected: v === ctx.vat_type ? 'selected' : null }, v))
+              )
+            ),
+          ),
+        ),
+
         h('div', { class: 'mt-3' },
           h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Notes (optional)'),
           h('textarea', { class: 'input', rows: 2, value: ctx.notes, oninput: (e) => update('notes', e.target.value) })
@@ -2112,7 +2153,7 @@
 
         h('div', { class: 'mt-5 flex justify-end gap-2' },
           h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
-          h('button', { class: 'btn btn-primary', onclick: submit },
+          h('button', { class: 'btn btn-primary', id: 'manual-receive-btn', onclick: submit },
             h('i', { class: 'fas fa-check' }), 'Receive & Print')
         )
       )

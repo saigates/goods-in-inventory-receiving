@@ -397,8 +397,10 @@ paths:
       tags: [Scan]
       summary: Manually add a device outside the scan flow
       description: >
-        Valuation fields are optional here (unlike `/scan/confirm` and
-        `/scan/force-add`) but still server-validated if supplied.
+        Same valuation requirements as `/scan/confirm` and `/scan/force-add`:
+        `buy_price` and `vat_type` are required, `currency` must be a valid
+        ISO 4217 code (default GBP). Every path that creates a device
+        enforces these rules server-side — no intake branch is a bypass.
       requestBody:
         required: true
         content:
@@ -416,6 +418,11 @@ paths:
                   received: { $ref: "#/components/schemas/Device" }
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "422":
+          description: Missing or invalid valuation fields (buy_price / vat_type required; currency must be valid ISO 4217)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /scan/reject:
     post:
