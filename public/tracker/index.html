@@ -37,9 +37,9 @@ const DATA = {
   meta: {
     project: 'Goods In — Inventory Receiving',
     lastUpdated: '2026-07-27',
-    commit: 'f6e69a3',
-    commitNote: 'latest app commit at time of writing (production deploy: migrations fixed for remote D1)',
-    figuresSource: 'Test counts read from `npx vitest run` output (94 passed / 4 files) and browser-check script output (22 + 13 PASS lines) at commit f434a14; commit history from `git log`. Nothing estimated.',
+    commit: '2b21ebf',
+    commitNote: 'latest app commit at time of writing (OPR 1 Foundation, API-level)',
+    figuresSource: 'Test counts read from `npx vitest run` output (119 passed / 5 files) and browser-check script output (22 + 13 PASS lines); commit history from `git log`. Nothing estimated.',
   },
 
   // Formula: 1 point per tracked work item, equal weight. Denominator
@@ -47,9 +47,9 @@ const DATA = {
   // grading placeholder (1), so the percentage cannot inflate by simply not
   // defining future work. Percentage is floored, not rounded up.
   progress: {
-    done: 30, total: 55,
-    formula: '30 done ÷ 55 tracked items = 54.5% → shown as 54% (floored). Denominator = 33 items across the 6 built phases + 21 defined OPR items (all not-started) + 1 grading placeholder. One item = one row in a phase checklist below; equal weight; an item counts as done only when verified at the level stated in the execution log.',
-    remainingNote: 'Remaining 25 items: 21 OPR (customs) + 1 grading + 3 in-progress gaps (lifecycle transitions, bulk endpoints, automated CSV/webhook coverage).',
+    done: 36, total: 55,
+    formula: '36 done ÷ 55 tracked items = 65.4% → shown as 65% (floored). Denominator = 33 items across the 6 built phases + 21 defined OPR items + 1 grading placeholder. One item = one row in a phase checklist below; equal weight; an item counts as done only when verified at the level stated in the execution log. OPR 1’s six items count as done at the API/entity level — they have no UI yet (honestly labelled below).',
+    remainingNote: 'Remaining 19 items: 15 OPR (export/import/automation) + 1 grading + 3 in-progress gaps (lifecycle transitions, bulk endpoints, automated CSV/webhook coverage).',
   },
 
   phases: [
@@ -101,17 +101,17 @@ const DATA = {
   ],
 
   oprIntro: {
-    heading: 'OPR (Outward Processing Relief) — defined scope, NOT STARTED',
-    text: 'OPR is the HMRC customs regime for temporarily exporting devices abroad for repair and re-importing them with duty/VAT relief assessed on the repair cost only. The four sub-tracks below are the reference scope for the remaining customs work. Zero implementation exists — every count is honestly 0/N. The reference values further down describe the OP authorisation this system will operate under; when built, they must live in a configurable Authorisation record, not inline in code.',
+    heading: 'OPR (Outward Processing Relief) — Foundation built (API-level), workflows NOT STARTED',
+    text: 'OPR is the HMRC customs regime for temporarily exporting devices abroad for repair and re-importing them with duty/VAT relief assessed on the repair cost only. OPR 1 (Foundation) is now implemented and unit-tested at the API/entity level — authorisation records, shipment drafts with validated procedure codes / GBP-only currency / declaration charset, and frozen device-line snapshots. It has NO UI yet: everything is exercised via the API and 25 Vitest tests. OPR 2–4 (the actual export/import workflows, document generation, discharge tracking, automation) remain 0/N — no green/amber/red validation engine, no invoice or C&E1154 generation, no finalisation/status transitions. The Saigates authorisation values live as a configurable seeded data row (seed.sql → opr_authorisations), not inline in code — exactly as this tracker required.',
   },
   oprTracks: [
-    { name: 'OPR 1 — Foundation: Shipment / Consignment + Authorisation entities', done: 0, total: 6, items: [
-      'Shipment/Consignment entity above devices: direction (export/import), type (OPR repair), status, procedure code + additional procedure code',
-      'Consignee/vendor, carrier + carrier account, incoterm, currency (GBP-enforced), ship date',
-      'Device line snapshots (value/attributes frozen at time of shipment)',
-      'Authorisation entity: CDS-format + legacy CHIEF-format numbers, EORI, validity dates',
-      'Supervising office (name + code), commodity scope, rate of yield, discharge period',
-      'Linkage: shipment → OP authorisation → contained devices',
+    { name: 'OPR 1 — Foundation: Shipment / Consignment + Authorisation entities (API-level, no UI)', done: 6, total: 6, status: 'done', items: [
+      'Shipment/Consignment entity above devices: direction (export/import), type (OPR repair), status, procedure code + additional procedure code — validated incl. forbidden 2100+B51; 6121 import-only',
+      'Consignee/vendor, carrier + carrier account, incoterm, currency (GBP-enforced — UKL explicitly rejected with the CHIEF-era explanation), ship date',
+      'Device line snapshots (value/attributes frozen at time of shipment — test proves later device edits do not leak into the line; devices without buy_price rejected)',
+      'Authorisation entity: CDS-format + legacy CHIEF-format numbers stored as distinct fields, EORI validated, validity dates ordered',
+      'Supervising office (name + code), commodity scope, rate of yield, discharge period — all on the seeded Saigates record',
+      'Linkage: shipment → OP authorisation (mandatory, org-scoped) → contained devices (unique per shipment)',
     ]},
     { name: 'OPR 2 — Export flow', done: 0, total: 6, items: [
       'Export-consignment builder (scan devices into a shipment)',
@@ -200,14 +200,15 @@ DATA.executionLog = [
   ['2026-07-27', 'f434a14', '/scan/manual valuation parity (last lax intake branch): server required + UI fields + 19 Vitest tests + 13 browser checks; general rule adopted — every intake path required:true', 'Unit + browser-verified; verified-can-fail; live curl 422/422/200'],
   ['2026-07-27', '3ade703', 'Master Checklist tracker: this page — static, data-driven, served at /tracker/', 'Browser-verified (21 Playwright checks, zero JS errors)'],
   ['2026-07-27', 'f6e69a3', 'Production deploy (Genspark-hosted Cloudflare): migrations fixed for remote D1 (explicit transaction wrappers stripped — CF rejects them, error 7500), all 9 applied, JWT_SECRET secret set, SKU seed loaded', 'Live smoke-tested: manual/force-add 422 without valuation ×5, happy path persisted 88.50 GBP MARGIN, test row cleaned (prod DB left at 0 devices / 14 SKUs)'],
+  ['2026-07-27', '2b21ebf', 'OPR 1 Foundation (API-level, no UI): opr_authorisations + shipments + frozen shipment_lines snapshots; GBP-only (UKL rejected with CHIEF-era message), procedure codes validated incl. forbidden 2100+B51 / import-only 6121, declaration charset, EORI + date checks, org-scoped authorisation linkage; Saigates authorisation seeded as data (seed.sql), never inline in code', 'Unit-tested: 25 Vitest tests incl. snapshot-freeze proof + zero-side-effect 422s; verified-can-fail ×3 (UKL, 2100+B51, line buy_price guards each sabotaged → failed → restored sha1-identical); live curl smoke on all guards; smoke rows cleaned'],
 ];
 
 DATA.testCoverage = {
   cells: [
-    ['94/94', 'Vitest tests passing', '4 spec files · real workerd/Miniflare + real D1 · all 9 migrations applied per file · not mocks'],
+    ['119/119', 'Vitest tests passing', '5 spec files · real workerd/Miniflare + real D1 · all 10 migrations applied per file · not mocks'],
     ['35/35', 'Browser-UI checks passing', 'Playwright + Chromium · force-add 22 + manual 13 · server-through-UI proof (UKL 422 rendered from server)'],
     ['EXIT 0', 'TypeScript clean', 'app scope (tsconfig.json) + test scope (test/tsconfig.json) typecheck independently'],
-    ['5/5', 'Suites verified-can-fail', 'lifecycle invariant, force-add server, manual server, force-add UI (dual-layer), manual UI pattern — each sabotaged, failed, restored sha1-identical'],
+    ['8/8', 'Guards verified-can-fail', 'lifecycle invariant, force-add server, manual server, force-add UI (dual-layer), manual UI pattern + OPR: UKL guard, 2100+B51 guard, line buy_price guard — each sabotaged, failed, restored sha1-identical'],
   ],
   bullets: [
     'Audit-trail invariant (device.status === latest event.to_status) asserted automatically after single transitions, chains, and rejected no-ops.',
@@ -235,7 +236,7 @@ DATA.backlog = [
 DATA.outstanding = [
   'Part A closed this pass: /scan/manual was the last intake branch on required:false — all three device-creation paths now enforce identical server-side valuation rules (general rule: future intake paths inherit required:true by default).',
   'DEPLOYED (this pass): owner chose Genspark-hosted Cloudflare — app + tracker live at https://d6aea290-bd61-4f82-aa8d-94378b9f2fec.vip.gensparksite.com with managed D1 (all 9 migrations applied — required stripping explicit BEGIN TRANSACTION wrappers that remote D1 rejects), production JWT_SECRET set as write-only secret, SKU seed loaded. Smoke-tested live: manual & force-add both 422 without valuation; happy path persisted 88.50 GBP MARGIN then cleaned.',
-  'OPR foundation (OPR 1) is the next major track — 0/21 items across the four OPR sub-tracks; reference authorisation values are captured above, ready to seed a configurable Authorisation record.',
+  'OPR 1 (Foundation) closed this pass at the API/entity level — 6/6 items, 25 tests, Saigates authorisation seeded as configurable data. It has NO UI yet. Next major track: OPR 2 (export flow — consignment builder UI, green/amber/red validation engine, invoice, scan-out list, pre-alert draft, finalisation with device status transitions).',
   'Known-but-accepted: dev-login auth story and token-in-URL for print windows — both flagged for pre-production hardening, not blockers for internal use.',
 ];
 </script>
@@ -292,15 +293,18 @@ const root = document.getElementById('root');
 // OPR track
 {
   const c = el('section', 'card p-6 border-cyan-900/40');
-  c.appendChild(el('h2', '', `<i class="fas fa-ship mr-2 text-cyan-400"></i>${DATA.oprIntro.heading} <span class="badge b-not ml-2">0/21</span>`));
+  const oprDone = DATA.oprTracks.reduce((s, t) => s + t.done, 0);
+  const oprTotal = DATA.oprTracks.reduce((s, t) => s + t.total, 0);
+  c.appendChild(el('h2', '', `<i class="fas fa-ship mr-2 text-cyan-400"></i>${DATA.oprIntro.heading} <span class="badge ${oprDone ? 'b-prog' : 'b-not'} ml-2">${oprDone}/${oprTotal}</span>`));
   c.appendChild(el('p', 'text-[13px] text-slate-400 mt-2', DATA.oprIntro.text));
   DATA.oprTracks.forEach(t => {
+    const isDone = t.status === 'done';
     const box = el('div', 'mt-4 border border-slate-800 rounded-xl p-4');
     box.appendChild(el('div', 'flex items-center justify-between flex-wrap gap-2',
       `<div class="font-semibold text-sm">${t.name} <span class="text-slate-500 mono">${t.done}/${t.total}</span></div>
-       <span class="badge b-not"><i class="far fa-circle"></i>not started</span>`));
-    const ul = el('ul', 'mt-2 space-y-1 text-[13px] text-slate-500');
-    t.items.forEach(txt => ul.appendChild(el('li', '', '<i class="far fa-circle text-slate-700 mr-2"></i>' + txt)));
+       ${isDone ? '<span class="badge b-done"><i class="fas fa-check"></i>done (API-level)</span>' : '<span class="badge b-not"><i class="far fa-circle"></i>not started</span>'}`));
+    const ul = el('ul', `mt-2 space-y-1 text-[13px] ${isDone ? 'text-slate-400' : 'text-slate-500'}`);
+    t.items.forEach(txt => ul.appendChild(el('li', '', (isDone ? '<i class="fas fa-check text-emerald-500 mr-2"></i>' : '<i class="far fa-circle text-slate-700 mr-2"></i>') + txt)));
     box.appendChild(ul);
     c.appendChild(box);
   });
