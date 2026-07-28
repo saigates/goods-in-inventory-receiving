@@ -11,16 +11,21 @@ A modern, scanner-first web application for the **Goods In** (inbound receiving)
 - **Production (Genspark-hosted Cloudflare)**: https://d6aea290-bd61-4f82-aa8d-94378b9f2fec.vip.gensparksite.com
 - **Master Checklist tracker**: https://d6aea290-bd61-4f82-aa8d-94378b9f2fec.vip.gensparksite.com/tracker/
 - **Sandbox preview (dev)**: https://3000-i4zj15jax42ejggi6n8yt-b32ec7bb.sandbox.novita.ai
-- **API health**: `/api/health` (the only unauthenticated endpoint besides `POST /api/auth/dev-login`)
+- **API health**: `/api/health` (the only unauthenticated endpoint besides `POST /api/auth/login` and the dev-login tombstone)
 
 ## Authentication & Multi-Tenancy
 
-Every route under `/api/*` requires a valid JWT **except** `GET /api/health` and `POST /api/auth/dev-login`. Unauthenticated or invalid-token requests get a `401`.
+Every route under `/api/*` requires a valid JWT **except** `GET /api/health`, `POST /api/auth/login`, and `POST /api/auth/dev-login` (which is exempt only so its **410 Gone** tombstone is visible instead of being masked as a 401 — it can no longer mint a token). Unauthenticated or invalid-token requests get a `401`.
 
-- **Login**: `POST /api/auth/dev-login` with body `{"email"?: string}` (defaults to the seeded admin) looks up a seeded user and returns `{token, user}`. There is no password yet — this app has no real IdP wired up. Swapping this for real credential checking or Cloudflare Access later only touches `src/routes/auth.ts` / `src/lib/auth.ts`; every other route just consumes `c.var.user` and doesn't care how it was populated.
+- **Login (credentialed, 2026-07-28 — replaces the email-only dev-login)**: `POST /api/auth/login` with `{"email", "password"}` returns `{token, user}`. Two real per-person accounts exist under **Saigates Limited** (org id 1): `owner@saigates.com` (admin) and `ops@saigates.com` (operator). These are genuinely separate credentials — each person's writes are attributed to their own user id, giving two independent audit trails. Unknown email and wrong password return the **identical** `401 {"error":"Invalid email or password"}` (no user enumeration).
+- **Password storage**: PBKDF2-SHA256 via WebCrypto (100,000 iterations — the Cloudflare Workers cap — 16-byte random salt, 32-byte key), stored as `pbkdf2$<iters>$<salt-hex>$<hash-hex>` in `users.password_hash`, compared constant-time. **Plaintext passwords are never stored anywhere** — not in rows, not in logs, not in the repo (the migration seeds `password_hash = NULL`, which can never authenticate; a Vitest sweep asserts the hash shape and greps free-text columns for the test plaintexts).
+- **Provisioning (out of band)**: `node scripts/set-password.mjs <email> [password]` prints the plaintext **once** plus a hash-only `UPDATE` statement to run against D1. Passwords are delivered to each person out of band and are changeable in-app.
+- **Change password**: `POST /api/auth/change-password` (authenticated) re-verifies the current password (`401` if wrong, hash untouched), enforces a minimum of 10 characters (`422`), and updates only the caller's own row. The SPA exposes this via the key icon in the header.
+- **Dev-login is gone**: `POST /api/auth/dev-login` returns `410 Gone` and never issues a token; a test sweep proves no unauthenticated route can mint one.
+- **Honest out-of-scope**: no external IdP / SSO / Cloudflare Access, no self-signup, no email verification, no email-based password reset (a forgotten password is re-provisioned by the owner via `set-password.mjs`), single-org only, and the `?token=` print-URL fallback below is still flagged for hardening.
 - **Token**: HS256 JWT (`hono/jwt`), 12h TTL, signed with `JWT_SECRET` (set via `.dev.vars` locally, `wrangler secret put JWT_SECRET` in production). Claims: `sub` (user id), `email`, `name`, `role`, `org_id`.
-- **Sending the token**: the SPA stores it in `localStorage` and axios attaches `Authorization: Bearer <token>` to every API call. The one exception is the DYMO label pages opened via `window.open()` for **Browser Print** mode — a plain browser navigation can't carry a header, so those URLs fall back to a `?token=` query param (`extractToken()` in `src/lib/auth.ts` checks the header first, then the query param). **Known limitation, flagged for later hardening**: tokens in URLs can leak into server logs / browser history — acceptable for the current dev/demo auth story, but should be revisited before this goes to production with a real IdP.
-- **Multi-tenancy**: every domain table (`received_devices`, `device_events`, `webhooks`, etc.) carries `organisation_id`. Every write records both `user_id` and `organisation_id` from the verified token; every read query is scoped with `WHERE organisation_id = ?`. There is currently one seeded organisation (`Default Organisation`, id `1`).
+- **Sending the token**: the SPA stores it in `localStorage` and axios attaches `Authorization: Bearer <token>` to every API call. The one exception is the DYMO label pages opened via `window.open()` for **Browser Print** mode — a plain browser navigation can't carry a header, so those URLs fall back to a `?token=` query param (`extractToken()` in `src/lib/auth.ts` checks the header first, then the query param). **Known limitation, flagged for later hardening**: tokens in URLs can leak into server logs / browser history — still flagged after the credentialed-login pass; revisit before wiring a real IdP.
+- **Multi-tenancy**: every domain table (`received_devices`, `device_events`, `webhooks`, etc.) carries `organisation_id`. Every write records both `user_id` and `organisation_id` from the verified token; every read query is scoped with `WHERE organisation_id = ?`. There is currently one seeded organisation (**Saigates Limited**, id `1` — renamed from `Default Organisation` in migration 0016).
 - **Who am I**: `GET /api/auth/me` returns `{user}` for the current token — used by the SPA on boot to validate a stored token before loading app data, and by any external client to sanity-check its token.
 
 ## Workflow Implemented
@@ -130,7 +135,9 @@ Every row below is under `/api/*` and requires `Authorization: Bearer <token>` *
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET`  | `/api/health` | 🔓 | Liveness probe |
-| `POST` | `/api/auth/dev-login` | 🔓 | Body: `{email?}`. Returns `{token, user}` |
+| `POST` | `/api/auth/login` | 🔓 | Body: `{email, password}`. Returns `{token, user}`; identical 401 for unknown email / wrong password |
+| `POST` | `/api/auth/dev-login` | 🔓 | **410 Gone** tombstone — removed 2026-07-28, never issues a token |
+| `POST` | `/api/auth/change-password` | 🔒 | Body: `{current_password, new_password}`. Re-verifies current (401), min 10 chars (422), updates caller's own hash only |
 | `GET`  | `/api/auth/me` | 🔒 | Returns `{user}` for the current token |
 | `GET`  | `/api/inventory/stats` | 🔒 | Counts for dashboard tiles |
 | `GET`  | `/api/manifests` | 🔒 | List manifests with progress |
@@ -269,7 +276,7 @@ Lifecycle     ──► POST /api/devices/:id/transition ──► received_devi
 **Option 3 — Manual / Off:** Use during testing or if you print via some external workflow. `Send` only flips the DB flag.
 
 ### Other production concerns
-- **Authentication**: implemented — HS256 JWT via `hono/jwt` on every `/api/*` route except `/api/health` and `/api/auth/dev-login` (see **Authentication & Multi-Tenancy** above). `POST /api/auth/dev-login` is a dev/demo login with no password; before real production use, swap it for either Cloudflare Access in front of the Pages project, or a real credential/IdP check inside `src/routes/auth.ts` — everything downstream is unaffected either way since routes only consume the verified `c.var.user`.
+- **Authentication**: implemented — real per-person credentialed login (PBKDF2-SHA256, two Saigates Limited accounts) issuing an HS256 JWT via `hono/jwt`; every `/api/*` route requires it except `/api/health`, `/api/auth/login`, and the dev-login **410 tombstone** (see **Authentication & Multi-Tenancy** above). The email-only dev-login was removed 2026-07-28 and provably cannot mint a token. An external IdP / SSO / Cloudflare Access remains a deliberate non-goal for the current two-person internal use case — wiring one later only touches `src/routes/auth.ts` / `src/lib/auth.ts` since routes only consume the verified `c.var.user`.
 - **Multi-tenant**: implemented — every domain table carries `organisation_id`, every write records it plus `user_id` from the verified token, every read is scoped with `WHERE organisation_id = ?`.
 - **Token-in-URL for print windows**: the `window.open()` label pages fall back to `?token=` because a plain navigation can't send an `Authorization` header. Flagged as a known limitation — revisit (e.g. a short-lived single-use print token, or a signed-URL scheme) before hardening auth further for production.
 - **PrintNode key storage**: stored server-side in the `app_settings` D1 table. The `GET /api/print/settings` endpoint only returns whether the key is configured — never the raw value.
@@ -290,7 +297,7 @@ echo "JWT_SECRET=dev-local-insecure-secret-change-me" >> .dev.vars   # required 
 npm run build
 pm2 start ecosystem.config.cjs   # serves on http://localhost:3000
 ```
-Then get a token: `curl -X POST http://localhost:3000/api/auth/dev-login -d '{}' -H 'Content-Type: application/json'` and use it as `Authorization: Bearer <token>` on every other `/api/*` call (the SPA does this automatically once you log in through the UI).
+Then provision a local password (`node scripts/set-password.mjs owner@saigates.com <pw>` prints a hash-only `UPDATE` — run it with `npx wrangler d1 execute webapp-production --local --command="..."`), and get a token: `curl -X POST http://localhost:3000/api/auth/login -d '{"email":"owner@saigates.com","password":"<pw>"}' -H 'Content-Type: application/json'`. Use it as `Authorization: Bearer <token>` on every other `/api/*` call (the SPA does this automatically once you sign in through the UI).
 
 ### Production deploy (Genspark-hosted Cloudflare — current path)
 Deployed 2026-07-27 via `gsk hosted deploy` (Workers for Platform on a Genspark-managed
@@ -352,7 +359,7 @@ Current coverage (211 tests across 8 suites):
 - Automated coverage for CSV export shape (currently manual/live-verified only — see **Testing** above).
 - Grading workflow (next stage after Goods In).
 - QZ Tray local-WebSocket bridge (alternative to PrintNode for sites that don't want cloud printing).
-- Real credential-based login / Cloudflare Access (current auth is a dev/demo email-only `dev-login` — see **Authentication** above).
+- ~~Real credential-based login~~ — **done 2026-07-28** for the two-person internal case (per-person PBKDF2 credentials, dev-login removed). Still honestly out of scope: external IdP / SSO / Cloudflare Access, self-signup, email verification, email-based password reset, multi-org, and `?token=` print-URL hardening.
 - `SOLD` lifecycle transition — deliberately unwired; belongs to a downstream sales flow, not OPR.
 - **Real Gmail credentials + first live send** — OPR 4's send endpoints are wire-proven against a stubbed Gmail API and refuse 503 until `GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET`/`GMAIL_REFRESH_TOKEN` are configured as Wrangler secrets. No real email has ever been sent; verify the first live send when credentials exist.
 - Grading — explicitly out of scope.
