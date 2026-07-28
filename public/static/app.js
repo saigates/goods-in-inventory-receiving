@@ -1566,8 +1566,9 @@
              condition: -1, capacity: -1, color: -1, unit_cost: -1 };
   }
 
-  // Apply a column-mapping to raw rows. Skips rows whose IMEI doesn't look
-  // like 14–17 digits, so header noise and trailing summary rows fall away.
+  // Apply a column-mapping to raw rows. Skips rows whose identifier isn't a
+  // 15-digit IMEI or 10-char alphanumeric serial, so header noise and
+  // trailing summary rows fall away.
   function applyMapping(rows, headerIdx, mapping) {
     if (!rows.length || headerIdx < 0 || (mapping.imei ?? -1) < 0) return [];
     const pick = (r, idx) => idx >= 0 ? (r[idx] ?? null) : null;
@@ -1577,7 +1578,7 @@
       const imeiVal = pick(r, mapping.imei);
       if (imeiVal == null || imeiVal === '') continue;
       const imei = String(imeiVal).trim();
-      if (!/^\d{14,17}$/.test(imei)) continue;
+      if (!/^\d{15}$/.test(imei) && !/^[A-Za-z0-9]{10}$/.test(imei)) continue;
       out.push({
         oem: pick(r, mapping.oem),
         condition: pick(r, mapping.condition),
@@ -2654,7 +2655,7 @@
 
     const submit = async () => {
       const imei = ctx.imei.trim();
-      if (!/^\d{14,17}$/.test(imei)) { toast('IMEI must be 14-17 digits', 'warn'); return; }
+      if (!/^\d{15}$/.test(imei) && !/^[A-Za-z0-9]{10}$/.test(imei)) { toast('IMEI must be strictly 15 digits (or a 10-character alphanumeric serial for non-cellular devices)', 'warn'); return; }
       // Optimistic client-side checks only — the server enforces the same
       // valuation rules on /scan/manual as on /confirm and /force-add.
       if (ctx.buy_price === '' || ctx.buy_price == null) { toast('Buy price is required', 'warn'); return; }

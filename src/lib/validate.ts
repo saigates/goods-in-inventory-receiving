@@ -4,16 +4,17 @@
 // authoritative, independently-enforced version — a future CRM or any other
 // API client bypasses the SPA entirely, so the API must not trust client input.
 
-// ───────── IMEI ─────────
-// Standard IMEI is 15 digits with a Luhn (mod-10) check digit. IMEISV is 16
-// digits with no check digit. Some supplier manifests carry 14-digit TAC+SN
-// values without the check digit. We accept the 14-16 digit range required
-// by the brief, and enforce the Luhn checksum only when the length is the
-// standard 15 digits (where a checksum digit is actually defined).
+// ───────── IMEI / device serial ─────────
+// Rule (tightened 2026-07-28 per brief): an IMEI is STRICTLY 15 digits and
+// must pass the GSMA Luhn (mod-10) checksum. 14-digit TAC+SN and 16-digit
+// IMEISV values are NO LONGER accepted. Non-cellular devices (tablets/
+// wearables without a modem) instead carry a 10-character alphanumeric
+// serial number, normalised to uppercase. Nothing else is a valid device
+// identifier.
 export function isValidImeiFormat(raw: unknown): boolean {
   if (typeof raw !== 'string' && typeof raw !== 'number') return false
   const s = String(raw).trim()
-  return /^\d{14,16}$/.test(s)
+  return /^\d{15}$/.test(s) || /^[A-Za-z0-9]{10}$/.test(s)
 }
 
 // Luhn checksum used by the GSMA IMEI spec.
@@ -40,16 +41,31 @@ export function validateImei(raw: unknown): ImeiValidation {
     return { ok: false, reason: 'IMEI is required' }
   }
   const s = String(raw).trim()
-  if (!/^\d+$/.test(s)) {
-    return { ok: false, reason: 'IMEI must contain only digits' }
+
+  // 15 digits → cellular IMEI; the GSMA Luhn checksum must hold.
+  if (/^\d{15}$/.test(s)) {
+    if (!luhnValid(s)) {
+      return { ok: false, reason: 'IMEI failed checksum validation (Luhn)' }
+    }
+    return { ok: true, imei: s }
   }
-  if (s.length < 14 || s.length > 16) {
-    return { ok: false, reason: 'IMEI must be 14-16 digits' }
+
+  // Exactly 10 alphanumeric characters → non-cellular device serial,
+  // normalised to uppercase so lookups are case-stable. (A 10-digit
+  // all-numeric serial is fine — it cannot be confused with an IMEI,
+  // which is always 15 digits.)
+  if (/^[A-Za-z0-9]{10}$/.test(s)) {
+    return { ok: true, imei: s.toUpperCase() }
   }
-  if (s.length === 15 && !luhnValid(s)) {
-    return { ok: false, reason: 'IMEI failed checksum validation (Luhn)' }
+
+  // Targeted rejections so operators see WHY the scan bounced.
+  if (/^\d+$/.test(s)) {
+    return { ok: false, reason: 'IMEI must be strictly 15 digits (non-cellular devices use a 10-character alphanumeric serial)' }
   }
-  return { ok: true, imei: s }
+  if (/^[A-Za-z0-9]+$/.test(s)) {
+    return { ok: false, reason: 'Non-cellular device serials must be exactly 10 alphanumeric characters' }
+  }
+  return { ok: false, reason: 'Identifier must be a 15-digit IMEI or a 10-character alphanumeric serial' }
 }
 
 // ───────── Currency (ISO 4217) ─────────

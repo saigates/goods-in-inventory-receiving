@@ -76,8 +76,8 @@ app.post('/', async (c) => {
   if (!manifestId) return c.json({ error: 'manifest_id is required' }, 400)
 
   // Server-side IMEI validation is authoritative (Priority 5) — the SPA's
-  // own check is optimistic UX only. 14-16 digits + Luhn checksum when the
-  // length is the standard 15.
+  // own check is optimistic UX only. Strictly 15 digits + Luhn checksum, or
+  // a 10-character alphanumeric serial for non-cellular devices.
   const imeiCheck = validateImei(body.imei)
   if (!imeiCheck.ok) {
     await logDeviceEvent(c.env.DB, {
