@@ -300,10 +300,42 @@ pm2 start ecosystem.config.cjs   # serves on http://localhost:3000
 Then provision a local password (`node scripts/set-password.mjs owner@saigates.com <pw>` prints a hash-only `UPDATE` — run it with `npx wrangler d1 execute webapp-production --local --command="..."`), and get a token: `curl -X POST http://localhost:3000/api/auth/login -d '{"email":"owner@saigates.com","password":"<pw>"}' -H 'Content-Type: application/json'`. Use it as `Authorization: Bearer <token>` on every other `/api/*` call (the SPA does this automatically once you sign in through the UI).
 
 ### Production deploy (Genspark-hosted Cloudflare — current path)
-Deployed 2026-07-27 via `gsk hosted deploy` (Workers for Platform on a Genspark-managed
-Cloudflare account, approval-gated). Managed resources: worker + D1
-`d6aea290-bd61-4f82-aa8d-94378b9f2fec-db` (all 9 migrations applied; SKU seed loaded);
-`JWT_SECRET` set as a write-only worker secret (`gsk hosted secret_put`).
+**Last deployed 2026-07-28** via `gsk hosted deploy` (Workers for Platform on a
+Genspark-managed Cloudflare account, approval-gated). Managed resources: worker + D1
+`d6aea290-bd61-4f82-aa8d-94378b9f2fec-db` (**all 16 migrations applied**; SKU seed
+loaded); `JWT_SECRET` set as a write-only worker secret (`gsk hosted secret_put`).
+Production is **level with `main`** as of this deploy — the CSV-export fixes and the
+credentialed-login pass (migration 0016) are both live.
+
+**Credentialed login is live in production.** Both per-person accounts
+(`owner@saigates.com`, `ops@saigates.com`) have real PBKDF2 hashes and were verified
+by logging in against the live instance; the legacy `admin@goodsin.local` row is
+retained for historical attribution with `password_hash` NULL, so it can never
+authenticate. `POST /api/auth/dev-login` returns **410** in production and no variant
+of it (any email, empty body) returns a token — probed, not assumed.
+
+**Deploy order matters when a migration adds credentials** (learned this pass): the
+new `/api/auth/login` route and the dev-login 410 tombstone ship in the *same* bundle,
+so the deploy that creates real login is the deploy that removes the passwordless one
+— there is no window in which both exist. The safe sequence is therefore: apply the
+migration → write **both** password hashes to prod D1 → **read them back and confirm
+byte-exact non-NULL values** (prove the write committed, don't just issue it) → deploy
+the code → verify both logins live *with a matching wrong-password 401* → only then
+confirm the 410. The real anti-lockout guarantee is that `gsk hosted d1_execute`
+writes prod D1 **independently of the worker**, so a hash can always be re-provisioned
+without a working web login.
+
+**Verifying a login is a place false witnesses hide** (recorded because it nearly bit
+us): before this deploy, prod `POST /api/auth/login` returned `401` — which *looks*
+like a working login rejecting a bad password, but was actually the auth middleware
+rejecting an unknown route, since the old bundle had no `/login` at all. The tell is
+that `/api/auth/nonexistent-xyz` returned the **identical** body
+(`Unauthorized: missing bearer token`), whereas the real route returns
+`Invalid email or password`. Always probe an unknown sibling path to prove a 401 means
+what it appears to mean. (The same pattern appeared once more during this deploy: the
+first post-deploy wrong-password probe returned the middleware error because an old
+worker version was still serving mid-propagation — it resolved on retry, and the
+distinguishable error bodies are what made the difference visible.)
 
 **Remote-D1 caveat (fixed in `f6e69a3`):** Cloudflare's remote D1 rejects explicit
 `BEGIN TRANSACTION` / `COMMIT` in migration files (error 7500) — wrangler applies each
