@@ -86,6 +86,23 @@ app.get('/:id', async (c) => {
 // received/selected batch. `ids` (comma-separated) takes precedence over
 // the status/source filters when supplied, for exporting an exact
 // operator-picked selection from the Inventory view.
+//
+// This file is an audit artefact, so every failure mode here is LOUD rather
+// than a quiet wrong answer:
+//   - `status`/`source` are validated against their enums (a typo like
+//     `RECIEVED` used to return a headers-only CSV, indistinguishable from
+//     "no devices in that state"); `status` accepts a comma-separated list
+//     for parity with `GET /api/devices`.
+//   - a non-numeric entry in `ids` is a 400, never silently dropped — the
+//     operator must never believe they exported a selection they didn't.
+//   - exceeding the row cap is a 413 carrying the true total, never a
+//     silently truncated file.
+// Values are written byte-faithfully: the only transformation is RFC 4180
+// quoting (which must include `\r`, not just `\n` — a bare CR terminates a
+// record in Excel and would corrupt one device into two malformed rows).
+const EXPORT_ROW_CAP = 5000
+const DEVICE_SOURCES = ['manifest', 'unreconciled', 'manual'] as const
+
 app.get('/export/csv', async (c) => {
   const user = currentUser(c)
   const q = c.req.query()
@@ -94,43 +111,78 @@ app.get('/export/csv', async (c) => {
   const binds: unknown[] = [user.organisation_id]
 
   if (q.ids) {
-    const ids = q.ids.split(',').map(Number).filter(Boolean)
-    if (!ids.length) return c.json({ error: 'ids must contain at least one numeric id' }, 400)
+    const raw = q.ids.split(',').map(s => s.trim()).filter(s => s !== '')
+    if (!raw.length) return c.json({ error: 'ids must contain at least one numeric id' }, 400)
+    // Reject junk loudly: silently dropping an unparseable id would hand the
+    // operator a file that is missing rows they believe they selected.
+    const invalid = raw.filter(s => !/^[1-9][0-9]*$/.test(s))
+    if (invalid.length) {
+      return c.json({ error: `ids must be positive integers — invalid: ${invalid.join(', ')}` }, 400)
+    }
+    const ids = raw.map(Number)
     where.push(`id IN (${ids.map(() => '?').join(',')})`)
     binds.push(...ids)
   } else {
     if (q.status) {
-      where.push('status = ?')
-      binds.push(q.status.toUpperCase())
+      const statuses = q.status.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
+      const invalid = statuses.filter(s => !DEVICE_STATUSES.includes(s as DeviceStatus))
+      if (invalid.length) {
+        return c.json({ error: `Invalid status value(s): ${invalid.join(', ')}` }, 400)
+      }
+      if (statuses.length) {
+        where.push(`status IN (${statuses.map(() => '?').join(',')})`)
+        binds.push(...statuses)
+      }
     }
     if (q.source) {
+      const source = q.source.trim().toLowerCase()
+      if (!DEVICE_SOURCES.includes(source as typeof DEVICE_SOURCES[number])) {
+        return c.json({ error: `Invalid source value: ${q.source} — must be one of: ${DEVICE_SOURCES.join(', ')}` }, 400)
+      }
       where.push('source = ?')
-      binds.push(q.source)
+      binds.push(source)
     }
+  }
+
+  const whereSql = where.join(' AND ')
+
+  // Count first so truncation can be refused instead of silently delivered.
+  const countRow = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS total FROM received_devices WHERE ${whereSql}`
+  ).bind(...binds).first<{ total: number }>()
+  const total = countRow?.total ?? 0
+  if (total > EXPORT_ROW_CAP) {
+    return c.json({
+      error: `Export matches ${total} devices, above the ${EXPORT_ROW_CAP}-row cap — narrow the selection with status, source or ids rather than accepting a truncated audit file`,
+      total,
+      cap: EXPORT_ROW_CAP,
+    }, 413)
   }
 
   const { results } = await c.env.DB.prepare(
     `SELECT id, uuid, imei, sku, brand, model, capacity, color, grade, status, source,
             buy_price, currency, vat_type, label_printed_at, created_at
        FROM received_devices
-      WHERE ${where.join(' AND ')}
-      ORDER BY id ASC LIMIT 5000`
-  ).bind(...binds).all<Record<string, unknown>>()
+      WHERE ${whereSql}
+      ORDER BY id ASC LIMIT ?`
+  ).bind(...binds, EXPORT_ROW_CAP).all<Record<string, unknown>>()
 
   const headers = ['id', 'uuid', 'imei', 'sku', 'brand', 'model', 'capacity', 'color', 'grade', 'status', 'source', 'buy_price', 'currency', 'vat_type', 'label_printed_at', 'created_at']
   const escapeCsv = (v: unknown) => {
     if (v == null) return ''
     const s = String(v)
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+    return /["\r\n,]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
   }
   const lines = [headers.join(',')]
   for (const row of results) {
     lines.push(headers.map(h => escapeCsv(row[h])).join(','))
   }
-  const csv = lines.join('\n')
+  const csv = lines.join('\r\n')
 
   c.header('Content-Type', 'text/csv; charset=utf-8')
   c.header('Content-Disposition', `attachment; filename="devices-export-${Date.now()}.csv"`)
+  // Lets a caller cross-check that it received every row the server counted.
+  c.header('X-Export-Row-Count', String(results.length))
   return c.body(csv)
 })
 
