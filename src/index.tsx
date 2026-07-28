@@ -18,17 +18,23 @@ const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 app.use('/api/*', cors())
 app.use(renderer)
 
-// ───────── Auth (Priority 1) ─────────
-// Every /api/* route requires a valid bearer JWT EXCEPT /api/health and
-// /api/auth/dev-login (the login endpoint itself, obviously, can't require
-// auth). Note /api/auth/me DOES need auth (it's how the SPA validates a
-// stored token) — only dev-login is exempt, not the whole /api/auth/* tree.
-// authMiddleware sets c.var.user (organisation_id + user id + role) which
-// every downstream route uses for tenancy scoping and write attribution.
+// ───────── Auth (Priority 1; credentialed 2026-07-28) ─────────
+// Every /api/* route requires a valid bearer JWT EXCEPT /api/health,
+// /api/auth/login (the credential check itself, obviously, can't require
+// auth) and the /api/auth/dev-login tombstone (a hard 410 — kept exempt so
+// the removal is visible as 410, never masked as a generic 401). Note
+// /api/auth/me and /api/auth/change-password DO need auth — only the door
+// is exempt, not the whole /api/auth/* tree. authMiddleware sets c.var.user
+// (organisation_id + user id + role) which every downstream route uses for
+// tenancy scoping and per-person write attribution.
 app.get('/api/health', (c) => c.json({ ok: true, ts: new Date().toISOString() }))
 
 app.use('/api/*', async (c, next) => {
-  if (c.req.path === '/api/health' || c.req.path === '/api/auth/dev-login') {
+  if (
+    c.req.path === '/api/health' ||
+    c.req.path === '/api/auth/login' ||
+    c.req.path === '/api/auth/dev-login'
+  ) {
     return next()
   }
   return authMiddleware(c, next)

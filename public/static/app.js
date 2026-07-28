@@ -261,17 +261,18 @@
   }
 
   // ───────── Login ─────────
-  // Minimal dev/demo login: exchanges a seeded user's email for a JWT via
-  // POST /api/auth/dev-login (see src/routes/auth.ts — there is no password
-  // yet since this app has no real IdP). The token is stored via
-  // setAuthToken() and every subsequent api.* call attaches it.
+  // Real credentialed login (2026-07-28, replaces the email-only dev-login):
+  // POST /api/auth/login with email + password. Two per-person accounts under
+  // Saigates Limited — each person's writes are attributed to their own user
+  // id. The token is stored via setAuthToken() and every subsequent api.*
+  // call attaches it; wrong credentials surface the server's 401 message.
   function LoginView() {
-    const doLogin = async (email) => {
+    const doLogin = async (email, password) => {
       state.authError = null;
       state.authBusy = true;
       render();
       try {
-        const r = await api.post('/auth/dev-login', email ? { email } : {});
+        const r = await api.post('/auth/login', { email, password });
         setAuthToken(r.token);
         state.authUser = r.user;
         state.authBusy = false;
@@ -283,6 +284,8 @@
       }
     };
     let emailValue = '';
+    let passwordValue = '';
+    const submit = () => doLogin(emailValue.trim(), passwordValue);
     return h('div', { class: 'min-h-screen flex items-center justify-center px-4' },
       h('div', { class: 'card p-8 w-full max-w-sm' },
         h('div', { class: 'flex items-center gap-3 mb-6' },
@@ -291,24 +294,81 @@
           ),
           h('div', {},
             h('div', { class: 'text-sm font-bold tracking-wide' }, 'GOODS IN'),
-            h('div', { class: 'text-[10px] text-slate-500 -mt-0.5' }, 'Sign in to continue')
+            h('div', { class: 'text-[10px] text-slate-500 -mt-0.5' }, 'Saigates Limited · sign in to continue')
           )
         ),
         h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Email'),
         h('input', {
-          class: 'input mb-3', type: 'email', placeholder: 'admin@goodsin.local',
+          id: 'login-email', class: 'input mb-3', type: 'email', placeholder: 'you@saigates.com',
+          autocomplete: 'username',
           oninput: (e) => { emailValue = e.target.value; },
-          onkeydown: (e) => { if (e.key === 'Enter') doLogin(emailValue.trim()); },
+          onkeydown: (e) => { if (e.key === 'Enter') submit(); },
+        }),
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Password'),
+        h('input', {
+          id: 'login-password', class: 'input mb-3', type: 'password', placeholder: '••••••••••',
+          autocomplete: 'current-password',
+          oninput: (e) => { passwordValue = e.target.value; },
+          onkeydown: (e) => { if (e.key === 'Enter') submit(); },
         }),
         state.authError ? h('div', { class: 'mb-3 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-200' },
           h('i', { class: 'fas fa-triangle-exclamation mr-2' }), state.authError) : null,
         h('button', {
+          id: 'login-submit',
           class: 'btn btn-primary w-full justify-center' + (state.authBusy ? ' opacity-60 cursor-not-allowed' : ''),
           disabled: state.authBusy ? 'disabled' : null,
-          onclick: () => doLogin(emailValue.trim()),
+          onclick: submit,
         }, state.authBusy ? h('i', { class: 'fas fa-spinner fa-spin' }) : h('i', { class: 'fas fa-right-to-bracket' }), state.authBusy ? 'Signing in…' : 'Sign in'),
         h('div', { class: 'text-[11px] text-slate-500 mt-4 text-center' },
-          'Leave blank and press Sign in to use the seeded admin account.')
+          'Per-person accounts — every action is attributed to the signed-in user.')
+      )
+    );
+  }
+
+  // ───────── Change password (self-service, in-session) ─────────
+  // POST /api/auth/change-password — server re-verifies the CURRENT password
+  // before accepting the new one, so a leftover token alone can't rotate a
+  // credential. Only the signed-in user's own password; no admin reset here.
+  function ChangePasswordModal() {
+    const ctx = state._pwCtx ||= { current: '', next: '', confirm: '' };
+    const close = () => { state.showChangePw = false; state._pwCtx = null; render(); };
+    const submit = async () => {
+      if (!ctx.current) { toast('Enter your current password', 'warn'); return; }
+      if (ctx.next.length < 10) { toast('New password must be at least 10 characters', 'warn'); return; }
+      if (ctx.next !== ctx.confirm) { toast('New passwords do not match', 'warn'); return; }
+      try {
+        await api.post('/auth/change-password', { current_password: ctx.current, new_password: ctx.next });
+        toast('Password changed', 'ok');
+        close();
+      } catch (err) {
+        toast(err.response?.data?.error || 'Failed to change password', 'err');
+      }
+    };
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-sm' },
+        h('div', { class: 'flex items-center gap-3 mb-4' },
+          h('div', { class: 'w-10 h-10 rounded-xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center' },
+            h('i', { class: 'fas fa-key' })),
+          h('div', {},
+            h('h2', { class: 'text-lg font-semibold' }, 'Change password'),
+            h('p', { class: 'text-xs text-slate-400' }, (state.authUser?.email || '') + ' · min 10 characters')
+          )
+        ),
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Current password'),
+        h('input', { id: 'pw-current', class: 'input mb-3', type: 'password', autocomplete: 'current-password',
+          oninput: (e) => { ctx.current = e.target.value; } }),
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'New password'),
+        h('input', { id: 'pw-next', class: 'input mb-3', type: 'password', autocomplete: 'new-password',
+          oninput: (e) => { ctx.next = e.target.value; } }),
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Confirm new password'),
+        h('input', { id: 'pw-confirm', class: 'input mb-3', type: 'password', autocomplete: 'new-password',
+          oninput: (e) => { ctx.confirm = e.target.value; },
+          onkeydown: (e) => { if (e.key === 'Enter') submit(); } }),
+        h('div', { class: 'mt-2 flex justify-end gap-2' },
+          h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
+          h('button', { id: 'pw-submit', class: 'btn btn-primary', onclick: submit },
+            h('i', { class: 'fas fa-check' }), 'Change password')
+        )
       )
     );
   }
@@ -333,6 +393,7 @@
         : state.view === 'settings' ? SettingsView()
         : h('div', {}, 'Not found')
       ),
+      state.showChangePw ? ChangePasswordModal() : null,
       state.pendingMatch ? ConfirmSkuModal() : null,
       state.pendingUnrec ? UnreconciledModal() : null,
       state.labelPreview ? LabelPreviewModal() : null,
@@ -405,6 +466,9 @@
           }, h('i', { class: `fas fa-${state.soundOn ? 'volume-high' : 'volume-xmark'}` })),
           state.authUser ? h('div', { class: 'flex items-center gap-2 pl-2 border-l border-slate-800' },
             h('div', { class: 'text-xs text-slate-400 hidden md:block' }, state.authUser.name || state.authUser.email),
+            h('button', { id: 'change-pw-btn', class: 'btn btn-ghost text-xs', title: 'Change password',
+              onclick: () => { state.showChangePw = true; render(); } },
+              h('i', { class: 'fas fa-key' })),
             h('button', { class: 'btn btn-ghost text-xs', title: 'Sign out', onclick: logout },
               h('i', { class: 'fas fa-right-from-bracket' }))
           ) : null
