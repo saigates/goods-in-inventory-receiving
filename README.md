@@ -140,7 +140,7 @@ Every row below is under `/api/*` and requires `Authorization: Bearer <token>` *
 | `POST` | `/api/manifests/:id/reopen` | 🔒 | Reopen manifest |
 | `DELETE` | `/api/manifests/:id` | 🔒 | Delete manifest (received devices remain) |
 | `POST` | `/api/scan` | 🔒 | Scan IMEI. Body: `{manifest_id, imei}`. Returns `matched` / `duplicate` / `unreconciled` / `rejected`. Server re-validates the identifier (**strictly 15 digits + Luhn**, or a **10-character alphanumeric serial** for non-cellular devices, uppercased) regardless of client-side checks |
-| `POST` | `/api/scan/confirm` | 🔒 | Confirm matched SKU. Body: `{expected_device_id, sku, brand, model, capacity, color, grade, notes?, auto_print?, buy_price, currency, vat_type, supplier_id?}`. Valuation fields (`buy_price`, `currency`, `vat_type`) are **required**, validated server-side (`422` on missing/invalid — e.g. an unrecognised ISO 4217 code) |
+| `POST` | `/api/scan/confirm` | 🔒 | Confirm matched SKU. Body: `{expected_device_id, sku, brand, model, capacity, color, grade, notes?, auto_print?, buy_price, currency, vat_type, supplier_id?}`. Valuation fields (`buy_price`, `currency`, `vat_type`) are **required**, validated server-side (`422` on missing/invalid — e.g. an unrecognised ISO 4217 code). `auto_print:false` receives **without** queueing a print job (the UI's **Confirm only** button); `true`/omitted queues one (**Confirm & Print**) |
 | `POST` | `/api/scan/force-add` | 🔒 | Force-add unreconciled IMEI to inventory. Same body shape as `/confirm`; valuation fields are optional here but still server-validated if present |
 | `POST` | `/api/scan/manual` | 🔒 | Manually add a device outside the scan flow. Same valuation rules as `/force-add` |
 | `POST` | `/api/scan/reject` | 🔒 | Audit-log a rejection (writes a `REJECT` `device_events` row) |
@@ -236,7 +236,7 @@ Lifecycle     ──► POST /api/devices/:id/transition ──► received_devi
 2. Drag the supplier's `.xlsx` (e.g. the provided `YH001-Saigates Limited_260608.xlsx`) into the drop zone.
 3. Fill in reference + supplier (the filename pre-fills both) and **Create Manifest**.
 4. App jumps to the **Receive** view with the scan input focused.
-5. Start scanning. Each successful scan opens the SKU-confirm modal — most fields are pre-filled, just press **Enter** to confirm.
+5. Start scanning. Each successful scan opens the SKU-confirm modal — most fields are pre-filled. Choose **Confirm only** (receive without a print label) or **Confirm & Print** (receive and queue a label) — printing is optional per device (added 2026-07-28 per owner request).
 6. If an off-manifest IMEI is scanned the screen flashes red — either **Reject** or **Force-add** with notes.
 7. As you scan, the right pane ticks devices over from pending → received, and the print queue fills with labels.
 8. When done, go to **Print Queue** and click **Send all** (in production this fires the labels to your DYMO LabelWriter via PrintNode or QZ Tray).
@@ -244,7 +244,7 @@ Lifecycle     ──► POST /api/devices/:id/transition ──► received_devi
 
 ### Keyboard
 - `Esc` while in Receive → refocus the scan input.
-- `Enter` inside the SKU-confirm modal → confirm and queue print.
+- Inside the SKU-confirm modal: two footer buttons — **Confirm only** (no label) / **Confirm & Print** (queues a label). The old “Auto-queue print label” checkbox was replaced by this explicit choice.
 
 ## Production Integration Notes
 
