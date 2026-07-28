@@ -3,7 +3,7 @@ import type { Bindings, AuthUser } from '../types'
 import { normalizeGrade } from '../lib/grade'
 import { resolveCatalogSku, normalizeCapacity } from '../lib/catalog'
 import { currentUser } from '../lib/auth'
-import { validateImei, cleanString } from '../lib/validate'
+import { validateImei, cleanString, validateBuyPrice, isValidCurrency, normalizeCurrency, isValidVatType } from '../lib/validate'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -66,8 +66,41 @@ type ImportRow = {
   model_no?: string | null
   imei: string | number
   unit_cost?: number | null
+  currency?: string | null   // optional ISO 4217 valuation hint (0015)
+  vat_type?: string | null   // optional MARGIN | STANDARD | ZERO hint (0015)
   capacity?: string | null
   color?: string | null
+}
+
+// Optional per-row valuation hints. These PRE-FILL the goods-in confirm
+// modal; they are NOT the authoritative valuation — /scan/confirm still
+// requires the operator to confirm buy_price + vat_type on every receive.
+// Invalid hints reject the ROW (flagged in the response, like bad IMEIs)
+// rather than silently storing junk that would then pre-fill the modal.
+function parseRowValuation(r: ImportRow):
+  | { ok: true; unit_cost: number | null; currency: string | null; vat_type: string | null }
+  | { ok: false; reason: string } {
+  let unitCost: number | null = null
+  if (r.unit_cost != null && String(r.unit_cost) !== '') {
+    const v = validateBuyPrice(r.unit_cost)
+    if (!v.ok) return { ok: false, reason: `unit_cost: ${v.reason}` }
+    unitCost = v.value
+  }
+  let currency: string | null = null
+  if (r.currency != null && String(r.currency).trim() !== '') {
+    if (!isValidCurrency(r.currency)) {
+      return { ok: false, reason: `currency '${r.currency}' is not a valid ISO 4217 code` }
+    }
+    currency = normalizeCurrency(r.currency)
+  }
+  let vatType: string | null = null
+  if (r.vat_type != null && String(r.vat_type).trim() !== '') {
+    if (!isValidVatType(r.vat_type)) {
+      return { ok: false, reason: `vat_type '${r.vat_type}' must be one of MARGIN, STANDARD, ZERO` }
+    }
+    vatType = String(r.vat_type).trim().toUpperCase()
+  }
+  return { ok: true, unit_cost: unitCost, currency, vat_type: vatType }
 }
 
 // Create a manifest with a batch of expected devices (JSON body)
@@ -108,6 +141,7 @@ app.post('/', async (c) => {
   const stmts: D1PreparedStatement[] = []
   let unmatched = 0
   const invalidImeis: Array<{ row_index: number; imei: unknown; reason: string }> = []
+  const invalidValuations: Array<{ row_index: number; imei: unknown; reason: string }> = []
   for (let i = 0; i < body.rows.length; i++) {
     const r = body.rows[i] || ({} as ImportRow)
     const imeiCheck = validateImei(r.imei)
@@ -116,6 +150,11 @@ app.post('/', async (c) => {
       continue
     }
     const imei = imeiCheck.imei
+    const val = parseRowValuation(r)
+    if (!val.ok) {
+      invalidValuations.push({ row_index: i, imei, reason: val.reason })
+      continue
+    }
     const capacity = normalizeCapacity(r.capacity)
     const color = cleanString(r.color, 64)
     // Grade taken verbatim from the manifest column (operator edited the
@@ -142,8 +181,8 @@ app.post('/', async (c) => {
 
     stmts.push(c.env.DB.prepare(
       `INSERT INTO expected_devices
-       (organisation_id, manifest_id, oem, condition, description, grade, model_no, imei, unit_cost, sku, capacity, color)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (organisation_id, manifest_id, oem, condition, description, grade, model_no, imei, unit_cost, currency, vat_type, sku, capacity, color)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       orgId,
       manifestId,
@@ -153,7 +192,9 @@ app.post('/', async (c) => {
       grade,
       cleanString(r.model_no, 128),
       imei,
-      r.unit_cost != null && Number.isFinite(Number(r.unit_cost)) ? Number(r.unit_cost) : null,
+      val.unit_cost,
+      val.currency,
+      val.vat_type,
       sku,
       capacity,
       color,
@@ -169,6 +210,7 @@ app.post('/', async (c) => {
     count: stmts.length,
     catalog_unmatched: unmatched,
     invalid_imeis: invalidImeis,
+    invalid_valuations: invalidValuations,
   })
 })
 

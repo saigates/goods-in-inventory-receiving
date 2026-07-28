@@ -63,6 +63,8 @@ export type ExpectedDevice = {
   model_no: string | null
   imei: string
   unit_cost: number | null
+  currency: string | null   // ISO 4217 hint from the supplier file (0015)
+  vat_type: string | null   // MARGIN | STANDARD | ZERO hint (0015)
   sku: string | null
   status: 'pending' | 'received'
   received_at: string | null

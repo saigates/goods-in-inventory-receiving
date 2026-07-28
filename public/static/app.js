@@ -1381,7 +1381,9 @@
     { key: 'grade',       label: 'Grade *',        hint: 'A | B | C (anything else → UG)' },
     { key: 'description', label: 'Description',    hint: 'optional · human label only' },
     { key: 'condition',   label: 'Condition',      hint: 'New / Used' },
-    { key: 'unit_cost',   label: 'Unit cost',      hint: 'numeric' },
+    { key: 'unit_cost',   label: 'Unit cost',      hint: 'numeric · pre-fills the confirm modal' },
+    { key: 'currency',    label: 'Currency',       hint: 'ISO 4217 (USD, GBP…) · optional' },
+    { key: 'vat_type',    label: 'VAT type',       hint: 'MARGIN | STANDARD | ZERO · optional' },
   ];
   function openManifestUpload() {
     uploadCtx = {
@@ -1633,7 +1635,9 @@
       condition: find(h => h === 'condition' || h === 'status'),
       capacity: find(h => ['storage','capacity','memory','size','rom','gb'].includes(h)),
       color: find(h => ['color','colour'].includes(h)),
-      unit_cost: find(h => ['unit cost','cost','price','unit_cost','unit price'].includes(h)),
+      unit_cost: find(h => ['unit cost','cost','price','unit_cost','unit price','buy price','buy_price'].includes(h)),
+      currency: find(h => ['currency','curr','ccy'].includes(h)),
+      vat_type: find(h => ['vat type','vat_type','vat','vat scheme'].includes(h)),
     };
     // Heuristic: if grade isn't found but there's a 1-col gap between
     // description and model_no, that gap is usually an unnamed grade col.
@@ -1646,7 +1650,7 @@
 
   function emptyMapping() {
     return { imei: -1, oem: -1, description: -1, grade: -1, model_no: -1,
-             condition: -1, capacity: -1, color: -1, unit_cost: -1 };
+             condition: -1, capacity: -1, color: -1, unit_cost: -1, currency: -1, vat_type: -1 };
   }
 
   // Apply a column-mapping to raw rows. Skips rows whose identifier isn't a
@@ -1672,6 +1676,8 @@
         color: pick(r, mapping.color),
         imei,
         unit_cost: mapping.unit_cost >= 0 ? (Number(r[mapping.unit_cost]) || null) : null,
+        currency: mapping.currency >= 0 ? (String(pick(r, mapping.currency) || '').trim() || null) : null,
+        vat_type: mapping.vat_type >= 0 ? (String(pick(r, mapping.vat_type) || '').trim() || null) : null,
       });
     }
     return out;
@@ -1688,7 +1694,10 @@
         notes: uploadCtx.notes,
         rows: uploadCtx.rows,
       });
-      toast(`Manifest created · ${r.count} devices loaded`, 'ok');
+      const skipped = (r.invalid_valuations || []).length;
+      toast(`Manifest created · ${r.count} devices loaded` +
+        (skipped ? `<br><span class="text-xs">${skipped} row${skipped === 1 ? '' : 's'} skipped — bad price/currency/VAT (fix the file and re-upload, or receive those units without prefill)</span>` : ''),
+        skipped ? 'warn' : 'ok', skipped ? 6000 : 3000);
       $('#upload-modal').remove();
       state.activeManifestId = r.manifest_id;
       await refreshManifests();
@@ -1933,9 +1942,11 @@
         grade: matchRow?.grade || expected.grade || 'UG',
         notes: '',
         // Valuation/VAT (Priority 4) — required server-side on /scan/confirm.
-        buy_price: '',
-        currency: 'GBP',
-        vat_type: '',
+        // PRE-FILLED from the manifest line when the supplier file carried
+        // them (0015) — hints only; the operator confirms/overrides here.
+        buy_price: expected.unit_cost != null ? String(expected.unit_cost) : '',
+        currency: expected.currency || 'GBP',
+        vat_type: expected.vat_type || '',
         supplier_id: '',
         // Live lookup state — re-resolved as operator edits fields below
         live: cm,            // { status, row?, candidates?, reason? }
@@ -2179,7 +2190,7 @@
             h('div', {},
               h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Buy price *'),
               h('input', {
-                class: 'input mono', type: 'number', step: '0.01', min: '0',
+                id: 'confirm-buy-price', class: 'input mono', type: 'number', step: '0.01', min: '0',
                 value: ctx.buy_price, placeholder: '0.00',
                 oninput: (e) => { ctx.buy_price = e.target.value; state._confirmCtx = ctx; },
               })
@@ -2187,14 +2198,14 @@
             h('div', {},
               h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Currency'),
               h('input', {
-                class: 'input mono uppercase', maxlength: 3, value: ctx.currency || 'GBP',
+                id: 'confirm-currency', class: 'input mono uppercase', maxlength: 3, value: ctx.currency || 'GBP',
                 oninput: (e) => { ctx.currency = e.target.value.toUpperCase(); state._confirmCtx = ctx; },
               })
             ),
             h('div', {},
               h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'VAT type *'),
               h('select', {
-                class: 'input',
+                id: 'confirm-vat-type', class: 'input',
                 onchange: (e) => { ctx.vat_type = e.target.value; state._confirmCtx = ctx; },
               },
                 h('option', { value: '', selected: !ctx.vat_type ? 'selected' : null }, '— select —'),
@@ -2230,6 +2241,7 @@
                   h('i', { class: 'fas fa-plus' }), 'Add to catalogue & receive')
               : null,
             h('button', {
+              id: 'confirm-receive-btn',
               class: 'btn ' + (matched ? 'btn-primary' : 'btn-ghost opacity-50 cursor-not-allowed'),
               onclick: confirmIt,
               disabled: !matched ? 'disabled' : null,
