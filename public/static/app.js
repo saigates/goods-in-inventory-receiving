@@ -79,6 +79,19 @@
     printSettings: null,         // { print_mode, printnode_api_key_set, printnode_printer_id_large, printnode_printer_id_small }
     printnodePrinters: null,     // [] from /printnode/printers
     settingsSaving: false,
+    // ───── OPR (Outward Processing Relief) UI state ─────
+    oprTab: 'shipments',         // 'shipments' | 'discharge'
+    oprShipments: [],            // list rows (with line_count/total_value)
+    oprAuths: [],                // opr_authorisations for the org
+    oprShipmentId: null,         // open detail view when set
+    oprBundle: null,             // { shipment, lines, authorisation, total_value }
+    oprValidation: null,         // { result, checks[] } for the open shipment
+    oprEmails: [],               // sent_emails outbox for the open shipment
+    oprDischarge: null,          // { discharge[], summary } for the tracker tab
+    oprNewOpen: false,           // new-consignment modal
+    oprFinaliseOpen: false,      // finalise modal (export MRN capture)
+    oprDraftDoc: null,           // { kind: 'prealert'|'clearance', data } text-draft panel
+    oprBusy: false,              // in-flight guard for OPR mutations
   };
   function setLabelSize(v) { state.labelSize = v; localStorage.setItem('labelSize.v2', v); }
   function setLabelRotate(on) { state.labelRotate = !!on; localStorage.setItem('labelRotate.v1', on ? '1' : '0'); }
@@ -211,6 +224,26 @@
     const r = await api.get('/inventory/stats');
     state.stats = r.stats || {};
   }
+  // ───── OPR refreshers ─────
+  async function refreshOprShipments() {
+    const [s, a] = await Promise.all([api.get('/opr/shipments'), api.get('/opr/authorisations')]);
+    state.oprShipments = s.shipments || [];
+    state.oprAuths = a.authorisations || [];
+  }
+  async function refreshOprDetail() {
+    if (!state.oprShipmentId) { state.oprBundle = null; state.oprValidation = null; state.oprEmails = []; return; }
+    const id = state.oprShipmentId;
+    state.oprBundle = await api.get(`/opr/shipments/${id}`);
+    const [v, e] = await Promise.all([
+      api.get(`/opr/shipments/${id}/validation`).catch(() => null),
+      api.get(`/opr/shipments/${id}/emails`).catch(() => ({ emails: [] })),
+    ]);
+    state.oprValidation = v ? v.validation : null;
+    state.oprEmails = e.emails || [];
+  }
+  async function refreshOprDischarge() {
+    state.oprDischarge = await api.get('/opr/discharge');
+  }
 
   // ───────── Layout / Shell ─────────
   function render() {
@@ -296,6 +329,7 @@
         : state.view === 'inventory' ? InventoryView()
         : state.view === 'catalog' ? CatalogView()
         : state.view === 'print' ? PrintView()
+        : state.view === 'opr' ? OprView()
         : state.view === 'settings' ? SettingsView()
         : h('div', {}, 'Not found')
       ),
@@ -304,6 +338,9 @@
       state.labelPreview ? LabelPreviewModal() : null,
       state.deleteDevice ? DeleteDeviceModal() : null,
       state.manualReceiveOpen ? ManualReceiveModal() : null,
+      state.oprNewOpen ? OprNewShipmentModal() : null,
+      state.oprFinaliseOpen ? OprFinaliseModal() : null,
+      state.oprDraftDoc ? OprDraftDocModal() : null,
     );
   }
 
@@ -333,6 +370,7 @@
           Tab('inventory', 'Inventory', 'warehouse'),
           Tab('catalog', 'Catalog', 'tags'),
           Tab('print', 'Print Queue', 'print'),
+          Tab('opr', 'OPR', 'plane-departure'),
           Tab('settings', 'Settings', 'gear'),
         ),
         h('div', { class: 'ml-auto flex items-center gap-3' },
@@ -383,8 +421,628 @@
     else if (v === 'inventory') refreshInventory().then(render);
     else if (v === 'catalog') refreshCatalog().then(render);
     else if (v === 'print') refreshPrint().then(render);
+    else if (v === 'opr') refreshOprAll().then(render);
     else if (v === 'settings') refreshSettings().then(render);
     render();
+  }
+
+  // ───────── OPR (Outward Processing Relief) ─────────
+  // API-backed UI over /api/opr/* — consignment builder (scan-first),
+  // validation traffic lights, finalise, customs documents (invoice,
+  // scan-out, pre-alert, C&E1154, clearance), email outbox + send buttons
+  // (honesty-gated server-side: 503 gmail_not_configured until secrets are
+  // set), receipt/restock for returns, and the discharge tracker.
+  async function refreshOprAll() {
+    await refreshOprShipments();
+    if (state.oprShipmentId) await refreshOprDetail();
+    if (state.oprTab === 'discharge') await refreshOprDischarge();
+  }
+  function oprStatusBadge(s) {
+    return h('span', { class: 'badge ' + (s === 'DRAFT' ? 'badge-amber' : s === 'FINALISED' ? 'badge-green' : 'badge-slate') }, s);
+  }
+  function oprDirBadge(d) {
+    return d === 'export'
+      ? h('span', { class: 'badge badge-cyan' }, h('i', { class: 'fas fa-plane-departure mr-1' }), 'export')
+      : h('span', { class: 'badge badge-violet' }, h('i', { class: 'fas fa-plane-arrival mr-1' }), 'import');
+  }
+  const fmtMoney = (v, cur) => `${cur || 'GBP'} ${Number(v || 0).toFixed(2)}`;
+
+  function OprView() {
+    const TabBtn = (id, label, icon) => h('button', {
+      class: 'btn text-sm ' + (state.oprTab === id ? 'btn-primary' : 'btn-ghost'),
+      onclick: () => {
+        state.oprTab = id;
+        (id === 'discharge' ? refreshOprDischarge() : Promise.resolve()).then(render);
+      },
+    }, h('i', { class: `fas fa-${icon}` }), label);
+    return h('div', { class: 'space-y-5' },
+      h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
+        h('div', {},
+          h('h1', { class: 'text-2xl font-bold' }, 'Outward Processing Relief'),
+          h('p', { class: 'text-slate-400 text-sm' }, 'Export consignments to overseas repairers and their duty-relieved returns.')
+        ),
+        h('div', { class: 'flex items-center gap-2' },
+          TabBtn('shipments', 'Consignments', 'boxes-stacked'),
+          TabBtn('discharge', 'Discharge tracker', 'clipboard-check'),
+        )
+      ),
+      state.oprTab === 'discharge' ? OprDischargeView()
+        : state.oprShipmentId ? OprShipmentDetail()
+        : OprShipmentsList()
+    );
+  }
+
+  // ─── Consignment list ───
+  function OprShipmentsList() {
+    return h('div', { class: 'space-y-4' },
+      h('div', { class: 'flex items-center justify-between' },
+        h('div', { class: 'text-sm text-slate-400' },
+          `${state.oprShipments.length} consignment${state.oprShipments.length === 1 ? '' : 's'}`),
+        h('button', { id: 'opr-new-btn', class: 'btn btn-primary text-sm', onclick: () => { state.oprNewOpen = true; render(); } },
+          h('i', { class: 'fas fa-plus' }), 'New consignment')
+      ),
+      h('div', { class: 'card overflow-hidden' },
+        h('table', { class: 'w-full text-sm' },
+          h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+            h('tr', {},
+              h('th', { class: 'text-left px-4 py-3' }, 'Reference'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Direction'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Status'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Procedure'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Devices'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Value'),
+              h('th', { class: 'text-left px-4 py-3' }, 'MRN'),
+              h('th', { class: 'text-right px-4 py-3' }, '')
+            )
+          ),
+          h('tbody', { class: 'divide-y divide-slate-800' },
+            !state.oprShipments.length
+              ? h('tr', {}, h('td', { colspan: 8, class: 'text-center py-10 text-slate-500' },
+                  'No OPR consignments yet — create one to start scanning devices out for repair.'))
+              : state.oprShipments.map(s => h('tr', { class: 'row-strip' },
+                  h('td', { class: 'px-4 py-2 mono text-cyan-300 font-semibold' }, s.reference),
+                  h('td', { class: 'px-4 py-2' }, oprDirBadge(s.direction)),
+                  h('td', { class: 'px-4 py-2' }, oprStatusBadge(s.status)),
+                  h('td', { class: 'px-4 py-2 mono text-xs' },
+                    s.procedure_code + (s.additional_procedure_code ? ' + ' + s.additional_procedure_code : '')),
+                  h('td', { class: 'px-4 py-2 text-right mono' }, s.line_count),
+                  h('td', { class: 'px-4 py-2 text-right mono text-xs' }, fmtMoney(s.total_value, s.currency)),
+                  h('td', { class: 'px-4 py-2 mono text-xs text-slate-400' },
+                    s.direction === 'import' ? (s.import_mrn || '—') : (s.export_mrn || '—')),
+                  h('td', { class: 'px-4 py-2 text-right' },
+                    h('button', {
+                      class: 'btn btn-ghost text-xs opr-open-btn',
+                      onclick: () => { state.oprShipmentId = s.id; refreshOprDetail().then(render); },
+                    }, h('i', { class: 'fas fa-folder-open' }), 'Open'))
+                ))
+          )
+        )
+      )
+    );
+  }
+
+  // ─── New consignment modal ───
+  function OprNewShipmentModal() {
+    const f = { direction: 'export', reference: '', authorisation_id: state.oprAuths[0]?.id || '',
+                procedure_code: '2100', additional_procedure_code: '', consignee_name: '',
+                related_export_shipment_id: '', ship_date: '' };
+    const close = () => { state.oprNewOpen = false; render(); };
+    const finalisedExports = state.oprShipments.filter(s => s.direction === 'export' && s.status === 'FINALISED');
+    const doCreate = async () => {
+      const body = {
+        direction: f.direction,
+        reference: f.reference.trim(),
+        authorisation_id: Number(f.authorisation_id) || null,
+        procedure_code: f.direction === 'import' ? '6121' : f.procedure_code,
+      };
+      if (f.direction === 'export' && f.additional_procedure_code) body.additional_procedure_code = f.additional_procedure_code;
+      if (f.consignee_name.trim()) body.consignee_name = f.consignee_name.trim();
+      if (f.ship_date) body.ship_date = f.ship_date;
+      if (f.direction === 'import' && f.related_export_shipment_id) {
+        body.related_export_shipment_id = Number(f.related_export_shipment_id);
+      }
+      try {
+        const r = await api.post('/opr/shipments', body);
+        toast(`Consignment <span class="mono">${r.shipment.reference}</span> created`, 'ok');
+        state.oprNewOpen = false;
+        state.oprShipmentId = r.shipment.id;
+        await refreshOprShipments();
+        await refreshOprDetail();
+        render();
+      } catch (err) {
+        toast(err.response?.data?.error || err.message, 'err', 5000);
+      }
+    };
+    // Local re-render of the modal body on direction flip (keeps field state in f)
+    let bodyWrap;
+    const fields = () => h('div', { class: 'space-y-3' },
+      h('div', { class: 'grid grid-cols-2 gap-3' },
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Direction'),
+          h('select', { id: 'opr-new-direction', class: 'input', onchange: (e) => { f.direction = e.target.value; bodyWrap.replaceChildren(fields()); } },
+            h('option', { value: 'export', selected: f.direction === 'export' ? 'selected' : null }, 'Export (send for repair)'),
+            h('option', { value: 'import', selected: f.direction === 'import' ? 'selected' : null }, 'Import (return from repair)'))
+        ),
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Reference *'),
+          h('input', { id: 'opr-new-reference', class: 'input mono', placeholder: f.direction === 'export' ? 'EXP 2026 001' : 'IMP 2026 001',
+            value: f.reference, oninput: (e) => { f.reference = e.target.value; } })
+        )
+      ),
+      h('div', {},
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'OPR authorisation *'),
+        h('select', { class: 'input', onchange: (e) => { f.authorisation_id = e.target.value; } },
+          state.oprAuths.map(a => h('option', { value: a.id, selected: String(f.authorisation_id) === String(a.id) ? 'selected' : null },
+            `${a.holder_name} — ${a.cds_number}`)),
+          !state.oprAuths.length ? h('option', { value: '' }, 'No authorisations — create one via the API first') : null)
+      ),
+      f.direction === 'export' ? h('div', { class: 'grid grid-cols-2 gap-3' },
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Procedure code'),
+          h('select', { class: 'input mono', onchange: (e) => { f.procedure_code = e.target.value; } },
+            h('option', { value: '2100', selected: f.procedure_code === '2100' ? 'selected' : null }, '2100 — outward processing'),
+            h('option', { value: '2200', selected: f.procedure_code === '2200' ? 'selected' : null }, '2200 — OP (warranty et al.)'))
+        ),
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Additional procedure'),
+          h('select', { class: 'input mono', onchange: (e) => { f.additional_procedure_code = e.target.value; } },
+            h('option', { value: '', selected: !f.additional_procedure_code ? 'selected' : null }, '(none)'),
+            h('option', { value: 'B02', selected: f.additional_procedure_code === 'B02' ? 'selected' : null }, 'B02 — repair'),
+            h('option', { value: 'B51', selected: f.additional_procedure_code === 'B51' ? 'selected' : null }, 'B51 — warranty (pairs with 2200)'))
+        )
+      ) : h('div', {},
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Discharges export consignment'),
+        h('select', { class: 'input', onchange: (e) => { f.related_export_shipment_id = e.target.value; } },
+          h('option', { value: '' }, '(none — link later)'),
+          finalisedExports.map(s => h('option', { value: s.id, selected: String(f.related_export_shipment_id) === String(s.id) ? 'selected' : null },
+            `${s.reference} (${s.line_count} devices)`))),
+        h('p', { class: 'text-[11px] text-slate-500 mt-1' }, 'Import procedure code is fixed at 6121 (re-import after OP repair).')
+      ),
+      h('div', { class: 'grid grid-cols-2 gap-3' },
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, f.direction === 'export' ? 'Consignee (overseas repairer)' : 'Consignor label (optional)'),
+          h('input', { class: 'input', placeholder: 'Shenzhen Repair Co', value: f.consignee_name, oninput: (e) => { f.consignee_name = e.target.value; } })
+        ),
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Ship date'),
+          h('input', { class: 'input mono', type: 'date', value: f.ship_date, oninput: (e) => { f.ship_date = e.target.value; } })
+        )
+      )
+    );
+    bodyWrap = h('div', {}, fields());
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-lg' },
+        h('div', { class: 'flex items-center gap-3 mb-4' },
+          h('div', { class: 'w-10 h-10 rounded-xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center' },
+            h('i', { class: 'fas fa-plane-departure' })),
+          h('div', {},
+            h('h2', { class: 'text-lg font-semibold' }, 'New OPR consignment'),
+            h('p', { class: 'text-xs text-slate-400' }, 'Reference flows onto customs declarations — letters, numbers and spaces only.')
+          )
+        ),
+        bodyWrap,
+        h('div', { class: 'flex justify-end gap-2 mt-5' },
+          h('button', { class: 'btn btn-ghost text-sm', onclick: close }, 'Cancel'),
+          h('button', { id: 'opr-new-create', class: 'btn btn-primary text-sm', onclick: doCreate },
+            h('i', { class: 'fas fa-plus' }), 'Create')
+        )
+      )
+    );
+  }
+
+  // ─── Shipment detail ───
+  function OprShipmentDetail() {
+    const b = state.oprBundle;
+    if (!b) return h('div', { class: 'card p-8 text-center text-slate-500' }, 'Loading…');
+    const s = b.shipment;
+    const isDraft = s.status === 'DRAFT';
+    const isExport = s.direction === 'export';
+    const v = state.oprValidation;
+
+    const backBtn = h('button', {
+      class: 'btn btn-ghost text-xs', id: 'opr-back-btn',
+      onclick: () => { state.oprShipmentId = null; state.oprBundle = null; refreshOprShipments().then(render); },
+    }, h('i', { class: 'fas fa-arrow-left' }), 'All consignments');
+
+    // scan-to-add box (DRAFT only)
+    const doScan = async (imei, inputEl) => {
+      const val = (imei || '').trim();
+      if (!val) return;
+      try {
+        await api.post(`/opr/shipments/${s.id}/scan`, { imei: val });
+        beep('ok');
+        toast(`Added <span class="mono">${val}</span>`, 'ok');
+      } catch (err) {
+        beep('err');
+        toast(err.response?.data?.error || err.message, 'err', 5000);
+      }
+      if (inputEl) inputEl.value = '';
+      await refreshOprDetail(); render();
+      setTimeout(() => $('#opr-scan-input')?.focus(), 30);
+    };
+
+    const removeLine = async (line) => {
+      try {
+        await api.del(`/opr/shipments/${s.id}/lines/${line.id}`);
+        toast(`Removed <span class="mono">${line.imei}</span>`, 'warn');
+        await refreshOprDetail(); render();
+      } catch (err) {
+        toast(err.response?.data?.error || err.message, 'err', 5000);
+      }
+    };
+
+    const openDoc = (path) => {
+      const win = window.open(withAuthToken(`/api/opr/shipments/${s.id}/${path}`), '_blank');
+      if (!win) toast('Popup blocked — allow popups for this site', 'warn');
+    };
+    const showDraftDoc = async (kind) => {
+      try {
+        const r = await api.get(`/opr/shipments/${s.id}/${kind}`);
+        state.oprDraftDoc = { kind, data: kind === 'prealert' ? r.prealert : r.clearance, note: r.ce1154_note || null };
+        render();
+      } catch (err) {
+        toast(err.response?.data?.error || err.message, 'err', 5000);
+      }
+    };
+    const sendEmail = async (kind) => {
+      if (state.oprBusy) return;
+      state.oprBusy = true; render();
+      try {
+        const r = await api.post(`/opr/shipments/${s.id}/${kind}/send`, {});
+        toast(`${kind === 'prealert' ? 'Pre-alert' : 'Clearance instruction'} sent — message ${r.provider_message_id || r.message_id || ''}`, 'ok', 4000);
+      } catch (err) {
+        const code = err.response?.data?.code;
+        toast(
+          (code === 'gmail_not_configured' ? '<b>Email not configured.</b> ' : '') +
+          (err.response?.data?.error || err.message),
+          code === 'gmail_not_configured' ? 'warn' : 'err', 6000);
+      } finally {
+        state.oprBusy = false;
+        await refreshOprDetail(); render();
+      }
+    };
+    const doRestock = async () => {
+      try {
+        const r = await api.post(`/opr/shipments/${s.id}/restock`, {});
+        toast(`Restocked ${r.restocked} device${r.restocked === 1 ? '' : 's'}${(r.skipped?.length) ? ` (${r.skipped.length} skipped — already restocked or missing)` : ''}`, 'ok');
+        await refreshOprDetail(); render();
+      } catch (err) {
+        toast(err.response?.data?.error || err.message, 'err', 5000);
+      }
+    };
+
+    return h('div', { class: 'space-y-5' },
+      h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
+        h('div', { class: 'flex items-center gap-3' },
+          backBtn,
+          h('h2', { class: 'text-xl font-bold mono text-cyan-300', id: 'opr-detail-ref' }, s.reference),
+          oprDirBadge(s.direction), oprStatusBadge(s.status)
+        ),
+        h('div', { class: 'flex items-center gap-2 flex-wrap' },
+          // Documents: export → invoice/scan-out/prealert; import → ce1154/clearance
+          isExport
+            ? [h('button', { class: 'btn btn-ghost text-xs', onclick: () => openDoc('invoice'), title: 'Print-ready commercial invoice (A4)' },
+                 h('i', { class: 'fas fa-file-invoice' }), 'Invoice'),
+               h('button', { class: 'btn btn-ghost text-xs', onclick: () => showDraftDoc('prealert'), title: 'Carrier customs pre-alert email draft' },
+                 h('i', { class: 'fas fa-envelope-open-text' }), 'Pre-alert draft'),
+               h('button', { id: 'opr-send-prealert', class: 'btn btn-amber text-xs' + (state.oprBusy ? ' opacity-60' : ''), onclick: () => sendEmail('prealert'),
+                 title: 'Send the pre-alert email with invoice + scan-out attached (requires Gmail secrets)' },
+                 h('i', { class: 'fas fa-paper-plane' }), 'Send pre-alert')]
+            : [h('button', { class: 'btn btn-ghost text-xs', onclick: () => openDoc('ce1154'), title: 'C&E1154 duty-relief form (A4)' },
+                 h('i', { class: 'fas fa-file-lines' }), 'C&E1154'),
+               h('button', { class: 'btn btn-ghost text-xs', onclick: () => showDraftDoc('clearance'), title: 'Broker clearance-instruction draft' },
+                 h('i', { class: 'fas fa-envelope-open-text' }), 'Clearance draft'),
+               h('button', { id: 'opr-send-clearance', class: 'btn btn-amber text-xs' + (state.oprBusy ? ' opacity-60' : ''), onclick: () => sendEmail('clearance'),
+                 title: 'Send the clearance instruction with C&E1154 attached (requires Gmail secrets)' },
+                 h('i', { class: 'fas fa-paper-plane' }), 'Send clearance')],
+          isDraft ? h('button', {
+            id: 'opr-finalise-btn',
+            class: 'btn btn-primary text-xs' + (v && v.result === 'red' ? ' opacity-60' : ''),
+            title: v && v.result === 'red' ? 'Blocked — resolve the red validation results first' : (isExport ? 'Finalise the export (devices become EXPORTED_UNDER_OPR)' : 'Receive the return (devices become RETURNED_UNDER_OPR)'),
+            onclick: () => { state.oprFinaliseOpen = true; render(); },
+          }, h('i', { class: 'fas fa-flag-checkered' }), isExport ? 'Finalise export' : 'Receive return') : null,
+          !isDraft && !isExport ? h('button', { id: 'opr-restock-btn', class: 'btn btn-primary text-xs', onclick: doRestock,
+            title: 'Move RETURNED_UNDER_OPR devices back to ACTIVE_INVENTORY (idempotent)' },
+            h('i', { class: 'fas fa-warehouse' }), 'Restock') : null
+        )
+      ),
+
+      // Header facts
+      h('div', { class: 'grid grid-cols-2 md:grid-cols-4 gap-4' },
+        OprFact('Authorisation', b.authorisation ? b.authorisation.holder_name : '—', 'id-card'),
+        OprFact('Procedure', s.procedure_code + (s.additional_procedure_code ? ' + ' + s.additional_procedure_code : ''), 'stamp'),
+        OprFact(isExport ? 'Export MRN' : 'Import MRN', (isExport ? s.export_mrn : s.import_mrn) || '—', 'barcode'),
+        OprFact('Declared value', fmtMoney(b.total_value, s.currency), 'coins'),
+      ),
+
+      // Validation traffic lights
+      v ? h('div', { class: 'card p-4', id: 'opr-validation' },
+        h('div', { class: 'flex items-center gap-2 mb-2' },
+          h('span', { class: 'badge ' + (v.result === 'green' ? 'badge-green' : v.result === 'amber' ? 'badge-amber' : 'badge-red') },
+            h('i', { class: 'fas fa-' + (v.result === 'green' ? 'check' : v.result === 'amber' ? 'triangle-exclamation' : 'ban') + ' mr-1' }),
+            v.result.toUpperCase()),
+          h('span', { class: 'text-xs text-slate-400' },
+            `${v.checks.length} checks — red blocks ${isExport ? 'finalisation' : 'receipt'}, amber passes with a warning`)
+        ),
+        h('div', { class: 'space-y-1' },
+          v.checks.filter(c2 => c2.level !== 'green').map(c2 =>
+            h('div', { class: 'flex items-start gap-2 text-xs' },
+              h('span', { class: 'badge ' + (c2.level === 'amber' ? 'badge-amber' : 'badge-red') + ' shrink-0' }, c2.level),
+              h('span', { class: 'text-slate-300' }, c2.message))),
+          v.checks.every(c2 => c2.level === 'green')
+            ? h('div', { class: 'text-xs text-slate-500' }, 'All checks green.')
+            : null
+        )
+      ) : null,
+
+      // Repair-invoice / C&E1154 inputs (import DRAFT only) — receipt is
+      // blocked server-side until repair_cost + duty_rate_pct are recorded.
+      isDraft && !isExport ? OprRepairInvoiceCard(s) : null,
+
+      // Scan-to-add (DRAFT only)
+      isDraft ? h('div', { class: 'card p-4' },
+        h('div', { class: 'flex items-center gap-3' },
+          h('i', { class: 'fas fa-barcode text-cyan-400 text-xl' }),
+          h('input', {
+            id: 'opr-scan-input', class: 'input mono flex-1',
+            placeholder: isExport
+              ? 'Scan IMEI to add — device must be READY_FOR_EXPORT with a buy price'
+              : 'Scan IMEI to add to the return — device must be EXPORTED_UNDER_OPR on the linked export',
+            onkeydown: (e) => { if (e.key === 'Enter') doScan(e.target.value, e.target); },
+          }),
+          h('button', { class: 'btn btn-primary text-sm', onclick: () => { const el = $('#opr-scan-input'); doScan(el?.value, el); } },
+            h('i', { class: 'fas fa-plus' }), 'Add')
+        )
+      ) : null,
+
+      // Lines table
+      h('div', { class: 'card overflow-hidden' },
+        h('table', { class: 'w-full text-sm', id: 'opr-lines-table' },
+          h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+            h('tr', {},
+              h('th', { class: 'text-left px-4 py-3' }, '#'),
+              h('th', { class: 'text-left px-4 py-3' }, 'IMEI'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Device'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Grade'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Declared value'),
+              isDraft ? h('th', { class: 'text-right px-4 py-3' }, '') : null
+            )
+          ),
+          h('tbody', { class: 'divide-y divide-slate-800' },
+            !b.lines.length
+              ? h('tr', {}, h('td', { colspan: 6, class: 'text-center py-8 text-slate-500' },
+                  isDraft ? 'No devices yet — scan an IMEI above.' : 'No lines.'))
+              : b.lines.map((l, i) => h('tr', { class: 'row-strip opr-line-row' },
+                  h('td', { class: 'px-4 py-2 text-xs text-slate-500' }, i + 1),
+                  h('td', { class: 'px-4 py-2 mono text-xs' }, l.imei),
+                  h('td', { class: 'px-4 py-2 text-xs' }, [l.brand, l.model, l.capacity].filter(Boolean).join(' ') || l.sku || '—'),
+                  h('td', { class: 'px-4 py-2' }, h('span', { class: gradeBadgeClass(l.grade) }, gradeLabel(l.grade))),
+                  h('td', { class: 'px-4 py-2 text-right mono text-xs' }, fmtMoney(l.unit_value, l.currency)),
+                  isDraft ? h('td', { class: 'px-4 py-2 text-right' },
+                    h('button', { class: 'btn btn-ghost text-xs opr-line-remove', title: 'Remove from consignment', onclick: () => removeLine(l) },
+                      h('i', { class: 'fas fa-xmark' }))) : null
+                ))
+          )
+        )
+      ),
+
+      // Email outbox
+      h('div', { class: 'card p-4', id: 'opr-emails' },
+        h('div', { class: 'flex items-center gap-2 mb-2' },
+          h('h3', { class: 'font-semibold text-sm' }, 'Email outbox'),
+          h('span', { class: 'text-[11px] text-slate-500' }, 'Real send attempts only — nothing is logged until Gmail secrets are configured and a send is attempted.')
+        ),
+        !state.oprEmails.length
+          ? h('div', { class: 'text-xs text-slate-500 py-2' }, 'No emails sent for this consignment.')
+          : h('div', { class: 'divide-y divide-slate-800' },
+              state.oprEmails.map(e => h('div', { class: 'py-2 flex items-center gap-3 text-xs' },
+                h('span', { class: 'badge ' + (e.status === 'sent' ? 'badge-green' : 'badge-red') }, e.status),
+                h('span', { class: 'badge badge-slate' }, e.kind),
+                h('span', { class: 'mono text-slate-300' }, e.to_email),
+                h('span', { class: 'text-slate-400 truncate flex-1' }, e.subject),
+                h('span', { class: 'text-slate-500' }, fmtDate(e.created_at))
+              )))
+      )
+    );
+  }
+  function OprFact(label, value, icon) {
+    return h('div', { class: 'card p-4' },
+      h('div', { class: 'text-[10px] uppercase text-slate-500 mb-1' }, h('i', { class: `fas fa-${icon} mr-1` }), label),
+      h('div', { class: 'text-sm font-semibold mono truncate', title: String(value) }, value)
+    );
+  }
+
+  // Repair-invoice inputs for the C&E1154 (import DRAFT). PATCHes the
+  // shipment header; server rejects these fields on exports.
+  function OprRepairInvoiceCard(s) {
+    const f = {
+      repair_cost: s.repair_cost ?? '',
+      repair_cost_currency: s.repair_cost_currency || 'GBP',
+      customs_exchange_rate: s.customs_exchange_rate ?? '',
+      duty_rate_pct: s.duty_rate_pct ?? '',
+    };
+    const save = async () => {
+      const body = {};
+      if (String(f.repair_cost).trim() !== '') body.repair_cost = Number(f.repair_cost);
+      body.repair_cost_currency = f.repair_cost_currency;
+      if (String(f.customs_exchange_rate).trim() !== '') body.customs_exchange_rate = Number(f.customs_exchange_rate);
+      if (String(f.duty_rate_pct).trim() !== '') body.duty_rate_pct = Number(f.duty_rate_pct);
+      try {
+        await http.patch(`/opr/shipments/${s.id}`, body);
+        toast('Repair invoice details saved', 'ok');
+        await refreshOprDetail(); render();
+      } catch (err) {
+        toast(err.response?.data?.error || err.message, 'err', 5000);
+      }
+    };
+    const Num = (label, key, placeholder, idAttr) => h('div', {},
+      h('label', { class: 'text-xs text-slate-400 mb-1 block' }, label),
+      h('input', { id: idAttr, class: 'input mono', inputmode: 'decimal', placeholder, value: f[key],
+        oninput: (e) => { f[key] = e.target.value; } }));
+    return h('div', { class: 'card p-4', id: 'opr-repair-card' },
+      h('div', { class: 'flex items-center gap-2 mb-3' },
+        h('i', { class: 'fas fa-file-invoice-dollar text-amber-400' }),
+        h('h3', { class: 'font-semibold text-sm' }, 'Repair invoice (C&E1154 inputs)'),
+        h('span', { class: 'text-[11px] text-slate-500' }, 'Receipt is blocked until repair cost and duty rate are recorded — duty is relieved on everything except the repair charge.')
+      ),
+      h('div', { class: 'grid grid-cols-2 md:grid-cols-4 gap-3' },
+        Num('Repair cost *', 'repair_cost', '350.00', 'opr-repair-cost'),
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Invoice currency'),
+          h('select', { class: 'input mono', onchange: (e) => { f.repair_cost_currency = e.target.value; } },
+            ['GBP', 'USD', 'EUR', 'CNY', 'HKD'].map(cur =>
+              h('option', { value: cur, selected: f.repair_cost_currency === cur ? 'selected' : null }, cur)))),
+        Num('Exchange rate (per £1)', 'customs_exchange_rate', 'blank for GBP', 'opr-exchange-rate'),
+        Num('Duty rate % *', 'duty_rate_pct', '0 for duty-free', 'opr-duty-rate')
+      ),
+      h('div', { class: 'flex justify-end mt-3' },
+        h('button', { id: 'opr-repair-save', class: 'btn btn-primary text-xs', onclick: save },
+          h('i', { class: 'fas fa-floppy-disk' }), 'Save invoice details')
+      )
+    );
+  }
+
+  // ─── Finalise / receive modal ───
+  function OprFinaliseModal() {
+    const b = state.oprBundle;
+    const s = b.shipment;
+    const isExport = s.direction === 'export';
+    const f = { export_mrn: '', ducr: '', ead_mrn: '', import_mrn: '' };
+    const close = () => { state.oprFinaliseOpen = false; render(); };
+    const doFinalise = async () => {
+      const body = isExport
+        ? Object.fromEntries(Object.entries({ export_mrn: f.export_mrn, ducr: f.ducr, ead_mrn: f.ead_mrn }).filter(([, v2]) => v2.trim()))
+        : (f.import_mrn.trim() ? { import_mrn: f.import_mrn.trim() } : {});
+      try {
+        const r = await api.post(`/opr/shipments/${s.id}/finalise`, body);
+        state.oprFinaliseOpen = false;
+        const ambers = (r.validation?.checks || []).filter(c2 => c2.level === 'amber');
+        toast(
+          (isExport ? `Export finalised — ${r.devices_exported} devices EXPORTED_UNDER_OPR` : `Return received — ${r.devices_returned ?? b.lines.length} devices RETURNED_UNDER_OPR`) +
+          (ambers.length ? `<br><span class="text-xs">${ambers.length} amber warning${ambers.length === 1 ? '' : 's'} noted</span>` : ''),
+          'ok', 4500);
+        await refreshOprDetail(); await refreshOprShipments(); render();
+      } catch (err) {
+        state.oprFinaliseOpen = false;
+        const detail = err.response?.data;
+        toast(detail?.error || err.message, 'err', 6000);
+        render();
+      }
+    };
+    const Field = (label, key, placeholder) => h('div', {},
+      h('label', { class: 'text-xs text-slate-400 mb-1 block' }, label),
+      h('input', { class: 'input mono', placeholder, oninput: (e) => { f[key] = e.target.value; } }));
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-md' },
+        h('h2', { class: 'text-lg font-semibold mb-1' }, isExport ? 'Finalise export consignment' : 'Receive return consignment'),
+        h('p', { class: 'text-xs text-slate-400 mb-4' }, isExport
+          ? 'Declaration references are optional here — they can be recorded later via export proof. Red validation results block finalisation server-side.'
+          : 'Receipt moves every device to RETURNED_UNDER_OPR and freezes declared values. Import MRN is optional (record later via import proof).'),
+        h('div', { class: 'space-y-3' },
+          isExport
+            ? [Field('Export MRN', 'export_mrn', '26GB34F7Y1AB8CDE12'),
+               Field('DUCR', 'ducr', '6GB369979995000-EXP2026001'),
+               Field('EAD MRN', 'ead_mrn', '(optional)')]
+            : Field('Import MRN (6121 declaration)', 'import_mrn', '26GB89E4Q2CD7FGH34')
+        ),
+        h('div', { class: 'flex justify-end gap-2 mt-5' },
+          h('button', { class: 'btn btn-ghost text-sm', onclick: close }, 'Cancel'),
+          h('button', { id: 'opr-finalise-confirm', class: 'btn btn-primary text-sm', onclick: doFinalise },
+            h('i', { class: 'fas fa-flag-checkered' }), isExport ? 'Finalise' : 'Receive')
+        )
+      )
+    );
+  }
+
+  // ─── Draft-document modal (pre-alert / clearance text drafts) ───
+  function OprDraftDocModal() {
+    const d = state.oprDraftDoc;
+    const close = () => { state.oprDraftDoc = null; render(); };
+    const copy = async (text, what) => {
+      try { await navigator.clipboard.writeText(text); toast(`${what} copied`, 'ok'); }
+      catch { toast('Clipboard unavailable — select and copy manually', 'warn'); }
+    };
+    const isPre = d.kind === 'prealert';
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-2xl' },
+        h('div', { class: 'flex items-center justify-between mb-3' },
+          h('h2', { class: 'text-lg font-semibold' }, isPre ? 'Pre-alert email draft' : 'Clearance instruction draft'),
+          h('button', { class: 'btn btn-ghost text-xs', onclick: close }, h('i', { class: 'fas fa-xmark' }))
+        ),
+        h('div', { class: 'space-y-2 text-xs' },
+          h('div', { class: 'flex gap-2' },
+            h('span', { class: 'text-slate-500 w-14 shrink-0' }, 'To'),
+            h('span', { class: 'mono text-slate-200' }, d.data.to || '(not configured on the authorisation)')),
+          d.data.cutoff ? h('div', { class: 'flex gap-2' },
+            h('span', { class: 'text-slate-500 w-14 shrink-0' }, 'Cut-off'),
+            h('span', { class: 'text-slate-200' }, d.data.cutoff)) : null,
+          h('div', { class: 'flex gap-2' },
+            h('span', { class: 'text-slate-500 w-14 shrink-0' }, 'Subject'),
+            h('span', { class: 'mono text-slate-200' }, d.data.subject)),
+          d.note ? h('div', { class: 'px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-200' },
+            h('i', { class: 'fas fa-triangle-exclamation mr-2' }), d.note) : null,
+          h('pre', { class: 'mt-2 p-3 rounded-lg bg-slate-900/70 border border-slate-800 whitespace-pre-wrap text-slate-300 max-h-[45vh] overflow-auto mono' },
+            d.data.body)
+        ),
+        h('div', { class: 'flex justify-end gap-2 mt-4' },
+          h('button', { class: 'btn btn-ghost text-sm', onclick: () => copy(d.data.subject, 'Subject') }, h('i', { class: 'fas fa-copy' }), 'Copy subject'),
+          h('button', { class: 'btn btn-primary text-sm', onclick: () => copy(d.data.body, 'Body') }, h('i', { class: 'fas fa-copy' }), 'Copy body')
+        )
+      )
+    );
+  }
+
+  // ─── Discharge tracker ───
+  function OprDischargeView() {
+    const d = state.oprDischarge;
+    if (!d) return h('div', { class: 'card p-8 text-center text-slate-500' }, 'Loading…');
+    const badge = (st) => {
+      const map = { discharged: 'badge-green', open: 'badge-cyan', closing: 'badge-amber', overdue: 'badge-red', no_export_date: 'badge-slate' };
+      return h('span', { class: 'badge ' + (map[st] || 'badge-slate') }, st.replace(/_/g, ' '));
+    };
+    return h('div', { class: 'space-y-4', id: 'opr-discharge' },
+      h('div', { class: 'grid grid-cols-2 md:grid-cols-5 gap-4' },
+        StatCard('Finalised exports', d.summary.exports, 'plane-departure', 'cyan'),
+        StatCard('Discharged', d.summary.discharged, 'check', 'green'),
+        StatCard('Open', d.summary.open ?? (d.summary.exports - d.summary.discharged - d.summary.overdue - d.summary.closing), 'hourglass-half', 'indigo'),
+        StatCard('Closing (<30d)', d.summary.closing, 'triangle-exclamation', 'amber'),
+        StatCard('Overdue', d.summary.overdue, 'ban', 'red'),
+      ),
+      h('div', { class: 'card overflow-hidden' },
+        h('table', { class: 'w-full text-sm' },
+          h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+            h('tr', {},
+              h('th', { class: 'text-left px-4 py-3' }, 'Export'),
+              h('th', { class: 'text-left px-4 py-3' }, 'MRN'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Export date'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Deadline'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Days left'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Exported'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Returned'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Outstanding'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Status')
+            )
+          ),
+          h('tbody', { class: 'divide-y divide-slate-800' },
+            !d.discharge.length
+              ? h('tr', {}, h('td', { colspan: 9, class: 'text-center py-10 text-slate-500' },
+                  'No finalised exports — the tracker starts counting once an export consignment finalises.'))
+              : d.discharge.map(r => h('tr', { class: 'row-strip' },
+                  h('td', { class: 'px-4 py-2 mono text-cyan-300 text-xs font-semibold' }, r.reference),
+                  h('td', { class: 'px-4 py-2 mono text-xs text-slate-400' }, r.export_mrn || '—'),
+                  h('td', { class: 'px-4 py-2 mono text-xs' }, r.export_date || '—'),
+                  h('td', { class: 'px-4 py-2 mono text-xs' }, r.discharge_deadline || '—'),
+                  h('td', { class: 'px-4 py-2 text-right mono text-xs ' + (r.days_remaining != null && r.days_remaining < 0 ? 'text-red-400' : r.days_remaining != null && r.days_remaining <= 30 ? 'text-amber-300' : '') },
+                    r.days_remaining ?? '—'),
+                  h('td', { class: 'px-4 py-2 text-right mono' }, r.exported),
+                  h('td', { class: 'px-4 py-2 text-right mono' }, r.returned),
+                  h('td', { class: 'px-4 py-2 text-right mono font-semibold ' + (r.outstanding > 0 ? 'text-amber-300' : 'text-slate-500') }, r.outstanding),
+                  h('td', { class: 'px-4 py-2' }, badge(r.status))
+                ))
+          )
+        )
+      )
+    );
   }
 
   // ───────── Settings ─────────
