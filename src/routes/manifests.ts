@@ -67,7 +67,7 @@ type ImportRow = {
   imei: string | number
   unit_cost?: number | null
   currency?: string | null   // optional ISO 4217 valuation hint (0015)
-  vat_type?: string | null   // optional MARGIN | STANDARD | ZERO hint (0015)
+  vat_type?: string | null   // optional MARGIN | STANDARD | ZERO | PVAT hint (0015)
   capacity?: string | null
   color?: string | null
 }
@@ -96,7 +96,7 @@ function parseRowValuation(r: ImportRow):
   let vatType: string | null = null
   if (r.vat_type != null && String(r.vat_type).trim() !== '') {
     if (!isValidVatType(r.vat_type)) {
-      return { ok: false, reason: `vat_type '${r.vat_type}' must be one of MARGIN, STANDARD, ZERO` }
+      return { ok: false, reason: `vat_type '${r.vat_type}' must be one of MARGIN, STANDARD, ZERO, PVAT` }
     }
     vatType = String(r.vat_type).trim().toUpperCase()
   }

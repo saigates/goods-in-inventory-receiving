@@ -215,3 +215,71 @@ describe('manifest valuation hints: scan prefill + confirm authority', () => {
     expect(device).toBeNull()
   })
 })
+
+// PVAT = Postponed VAT (import accounting) — added 2026-07-28 per owner
+// confirmation, driven by a real supplier file that declares every line PVAT.
+describe('PVAT vat type (Postponed VAT — import accounting)', () => {
+  it('manifest rows with vat_type PVAT import as valid hints (lowercase normalised)', async () => {
+    const imei = nextImei()
+    const { res, json } = await createManifest([
+      { ...ROW_BASE, imei, unit_cost: 106, currency: 'usd', vat_type: 'pvat' },
+    ])
+    expect(res.status).toBe(200)
+    expect(json.count).toBe(1)
+    expect(json.invalid_valuations).toEqual([])
+    const line = await expectedByImei(imei)
+    expect(line?.unit_cost).toBe(106)
+    expect(line?.currency).toBe('USD')
+    expect(line?.vat_type).toBe('PVAT')
+  })
+
+  it('confirm accepts PVAT and persists it on the received device', async () => {
+    const imei = nextImei()
+    const { json: created } = await createManifest([
+      { ...ROW_BASE, imei, unit_cost: 106, currency: 'USD', vat_type: 'PVAT' },
+    ])
+    const { json: scan } = await api('POST', '/scan', { manifest_id: created.manifest_id, imei })
+    expect(scan.outcome).toBe('matched')
+    expect(scan.expected.vat_type).toBe('PVAT')
+    const { json: cat } = await api('POST', '/catalog', {
+      brand: 'Samsung', model: 'Galaxy S24', capacity: '256GB', color: 'Black', grade: 'A',
+    })
+    const sku = cat.row?.sku ?? cat.sku ?? cat.existing?.sku  // 409 duplicate → reuse existing
+    const { res } = await api('POST', '/scan/confirm', {
+      expected_device_id: scan.expected.id, sku,
+      buy_price: 106, currency: 'USD', vat_type: 'PVAT', auto_print: false,
+    })
+    expect(res.status).toBe(200)
+    const device = await db()
+      .prepare('SELECT buy_price, currency, vat_type FROM received_devices WHERE imei = ?')
+      .bind(imei).first<Record<string, any>>()
+    expect(device?.vat_type).toBe('PVAT')
+    expect(device?.currency).toBe('USD')
+  })
+
+  it('junk vat types are STILL rejected after the enum extension (PVAT is not a wildcard)', async () => {
+    const imei = nextImei()
+    const { res, json } = await createManifest([
+      { ...ROW_BASE, imei, unit_cost: 106, currency: 'USD', vat_type: 'POSTPONED' },
+    ])
+    expect(res.status).toBe(200)
+    expect(json.count).toBe(0)
+    expect(json.invalid_valuations).toHaveLength(1)
+    expect(json.invalid_valuations[0].reason).toMatch(/PVAT/)  // message lists the full enum
+    expect(await expectedByImei(imei)).toBeNull()
+    // And confirm-side too: junk still 422s.
+    const imei2 = nextImei()
+    const { json: created } = await createManifest([{ ...ROW_BASE, imei: imei2 }])
+    const { json: scan } = await api('POST', '/scan', { manifest_id: created.manifest_id, imei: imei2 })
+    const { json: cat } = await api('POST', '/catalog', {
+      brand: 'Samsung', model: 'Galaxy S24', capacity: '256GB', color: 'Black', grade: 'A',
+    })
+    const sku = cat.row?.sku ?? cat.sku ?? cat.existing?.sku
+    const { res: bad } = await api('POST', '/scan/confirm', {
+      expected_device_id: scan.expected.id, sku,
+      buy_price: 106, currency: 'USD', vat_type: 'POSTPONED', auto_print: false,
+    })
+    expect(bad.status).toBe(422)
+    expect(await db().prepare('SELECT id FROM received_devices WHERE imei = ?').bind(imei2).first()).toBeNull()
+  })
+})

@@ -1383,7 +1383,7 @@
     { key: 'condition',   label: 'Condition',      hint: 'New / Used' },
     { key: 'unit_cost',   label: 'Unit cost',      hint: 'numeric · pre-fills the confirm modal' },
     { key: 'currency',    label: 'Currency',       hint: 'ISO 4217 (USD, GBP…) · optional' },
-    { key: 'vat_type',    label: 'VAT type',       hint: 'MARGIN | STANDARD | ZERO · optional' },
+    { key: 'vat_type',    label: 'VAT type',       hint: 'MARGIN | STANDARD | ZERO | PVAT · optional' },
   ];
   function openManifestUpload() {
     uploadCtx = {
@@ -1638,7 +1638,22 @@
       unit_cost: find(h => ['unit cost','cost','price','unit_cost','unit price','buy price','buy_price'].includes(h)),
       currency: find(h => ['currency','curr','ccy'].includes(h)),
       vat_type: find(h => ['vat type','vat_type','vat','vat scheme'].includes(h)),
+      currency_from_header: null,
     };
+    // Supplier files often put the currency INSIDE the price header instead
+    // of a separate column — e.g. "Price (USD)", "Unit Cost (GBP)". Recognise
+    // those as the unit_cost column and infer the currency from the header.
+    if (mapping.unit_cost < 0) {
+      const priceCcy = /^(?:unit\s*)?(?:cost|price|buy\s*price|value)\s*[（(]\s*([a-z]{3})\s*[）)]$/;
+      for (let i = 0; i < headers.length; i++) {
+        const m = headers[i].match(priceCcy);
+        if (m) {
+          mapping.unit_cost = i;
+          if (mapping.currency < 0) mapping.currency_from_header = m[1].toUpperCase();
+          break;
+        }
+      }
+    }
     // Heuristic: if grade isn't found but there's a 1-col gap between
     // description and model_no, that gap is usually an unnamed grade col.
     if (mapping.grade < 0 && mapping.description >= 0 && mapping.model_no >= 0
@@ -1650,7 +1665,8 @@
 
   function emptyMapping() {
     return { imei: -1, oem: -1, description: -1, grade: -1, model_no: -1,
-             condition: -1, capacity: -1, color: -1, unit_cost: -1, currency: -1, vat_type: -1 };
+             condition: -1, capacity: -1, color: -1, unit_cost: -1, currency: -1, vat_type: -1,
+             currency_from_header: null };
   }
 
   // Apply a column-mapping to raw rows. Skips rows whose identifier isn't a
@@ -1676,7 +1692,10 @@
         color: pick(r, mapping.color),
         imei,
         unit_cost: mapping.unit_cost >= 0 ? (Number(r[mapping.unit_cost]) || null) : null,
-        currency: mapping.currency >= 0 ? (String(pick(r, mapping.currency) || '').trim() || null) : null,
+        currency: mapping.currency >= 0
+          ? (String(pick(r, mapping.currency) || '').trim() || null)
+          : (mapping.currency_from_header && mapping.unit_cost >= 0 && (Number(r[mapping.unit_cost]) || null) != null
+              ? mapping.currency_from_header : null),
         vat_type: mapping.vat_type >= 0 ? (String(pick(r, mapping.vat_type) || '').trim() || null) : null,
       });
     }
@@ -2209,7 +2228,7 @@
                 onchange: (e) => { ctx.vat_type = e.target.value; state._confirmCtx = ctx; },
               },
                 h('option', { value: '', selected: !ctx.vat_type ? 'selected' : null }, '— select —'),
-                ['MARGIN', 'STANDARD', 'ZERO'].map(v =>
+                ['MARGIN', 'STANDARD', 'ZERO', 'PVAT'].map(v =>
                   h('option', { value: v, selected: v === ctx.vat_type ? 'selected' : null }, v))
               )
             ),
@@ -2346,7 +2365,7 @@
                 onchange: (e) => { ctx.vat_type = e.target.value; state._unrecCtx = ctx; },
               },
                 h('option', { value: '', selected: !ctx.vat_type ? 'selected' : null }, '— select —'),
-                ['MARGIN', 'STANDARD', 'ZERO'].map(v =>
+                ['MARGIN', 'STANDARD', 'ZERO', 'PVAT'].map(v =>
                   h('option', { value: v, selected: v === ctx.vat_type ? 'selected' : null }, v))
               )
             ),
@@ -2893,7 +2912,7 @@
                 onchange: (e) => { ctx.vat_type = e.target.value; state._manualCtx = ctx; },
               },
                 h('option', { value: '', selected: !ctx.vat_type ? 'selected' : null }, '— select —'),
-                ['MARGIN', 'STANDARD', 'ZERO'].map(v =>
+                ['MARGIN', 'STANDARD', 'ZERO', 'PVAT'].map(v =>
                   h('option', { value: v, selected: v === ctx.vat_type ? 'selected' : null }, v))
               )
             ),

@@ -52,7 +52,7 @@ function parseValuation(
   let vatType: string | null = null
   if (body.vat_type != null && body.vat_type !== '') {
     if (!isValidVatType(body.vat_type)) {
-      return { ok: false, error: `vat_type must be one of MARGIN, STANDARD, ZERO` }
+      return { ok: false, error: `vat_type must be one of MARGIN, STANDARD, ZERO, PVAT` }
     }
     vatType = String(body.vat_type).trim().toUpperCase()
   } else if (opts.required) {

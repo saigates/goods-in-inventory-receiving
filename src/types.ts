@@ -64,7 +64,7 @@ export type ExpectedDevice = {
   imei: string
   unit_cost: number | null
   currency: string | null   // ISO 4217 hint from the supplier file (0015)
-  vat_type: string | null   // MARGIN | STANDARD | ZERO hint (0015)
+  vat_type: string | null   // MARGIN | STANDARD | ZERO | PVAT hint (0015)
   sku: string | null
   status: 'pending' | 'received'
   received_at: string | null
@@ -90,7 +90,7 @@ export const DEVICE_STATUSES = [
 
 export type DeviceStatus = typeof DEVICE_STATUSES[number]
 
-export const VAT_TYPES = ['MARGIN', 'STANDARD', 'ZERO'] as const
+export const VAT_TYPES = ['MARGIN', 'STANDARD', 'ZERO', 'PVAT'] as const
 export type VatType = typeof VAT_TYPES[number]
 
 export type ReceivedDevice = {

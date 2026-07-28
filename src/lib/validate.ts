@@ -112,7 +112,9 @@ export function normalizeCurrency(raw: unknown, fallback = 'GBP'): string {
 }
 
 // ───────── VAT type ─────────
-export const VAT_TYPES = ['MARGIN', 'STANDARD', 'ZERO'] as const
+// PVAT = Postponed VAT (import accounting) — added 2026-07-28 per owner
+// confirmation for supplier files that declare it (e.g. Saigates IMEI lists).
+export const VAT_TYPES = ['MARGIN', 'STANDARD', 'ZERO', 'PVAT'] as const
 export type VatTypeValue = typeof VAT_TYPES[number]
 
 export function isValidVatType(raw: unknown): raw is VatTypeValue {
