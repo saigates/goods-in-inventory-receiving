@@ -3,6 +3,13 @@ export type Bindings = {
   // HS256 shared secret used to sign/verify auth JWTs. Set via `.dev.vars`
   // locally and `wrangler pages secret put JWT_SECRET` in production.
   JWT_SECRET: string
+  // OPR 4: Gmail OAuth2 offline-grant secrets for the sending mailbox.
+  // ALL THREE must be set for /prealert/send and /clearance/send to work —
+  // otherwise those endpoints refuse with 503 gmail_not_configured (drafts
+  // keep working). Set via `wrangler pages secret put GMAIL_*`.
+  GMAIL_CLIENT_ID?: string
+  GMAIL_CLIENT_SECRET?: string
+  GMAIL_REFRESH_TOKEN?: string
 }
 
 // ───────── Auth / multi-tenancy ─────────

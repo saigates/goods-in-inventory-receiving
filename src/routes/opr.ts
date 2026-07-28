@@ -74,6 +74,8 @@ import {
   runImportValidation,
   computeDischargeRow,
 } from '../lib/oprImport'
+import { gmailConfigFromEnv, sendGmail, type EmailAttachment } from '../lib/email'
+import { dispatchShipmentWebhooks, type ShipmentEventPayload } from '../lib/webhook'
 import {
   validateShipmentCurrency,
   validateProcedureCodes,
@@ -88,6 +90,20 @@ type OprContext = Context<OprEnv>
 const app = new Hono<OprEnv>()
 
 // ═════════ Authorisations ═════════
+
+// Fire-and-forget shipment webhook. Same executionCtx caveat as
+// devices.ts: c.executionCtx is a THROWING getter under app.request()
+// in tests, so it must be probed inside try/catch, not optional-chained.
+async function notifyShipmentEvent(c: OprContext, payload: ShipmentEventPayload): Promise<void> {
+  const notify = dispatchShipmentWebhooks(c.env.DB, payload)
+  let execCtx: { waitUntil?: (p: Promise<unknown>) => void } | undefined
+  try { execCtx = c.executionCtx as { waitUntil?: (p: Promise<unknown>) => void } } catch { execCtx = undefined }
+  if (typeof execCtx?.waitUntil === 'function') {
+    execCtx.waitUntil(notify)
+  } else {
+    await notify
+  }
+}
 
 app.get('/authorisations', async (c) => {
   const user = currentUser(c)
@@ -991,6 +1007,18 @@ async function finaliseImportShipment(
   }
 
   const finalised = await c.env.DB.prepare('SELECT * FROM shipments WHERE id = ?').bind(id).first()
+  await notifyShipmentEvent(c, {
+    event: 'shipment.finalised',
+    organisation_id: user.organisation_id,
+    shipment_id: id,
+    reference: shipment.reference,
+    direction: 'import',
+    status: 'FINALISED',
+    import_mrn: mrn.value,
+    device_count: deviceIds.length,
+    user_id: user.id,
+    occurred_at: new Date().toISOString(),
+  })
   return c.json({ ok: true, shipment: finalised, devices_returned: deviceIds.length, validation })
 }
 
@@ -1066,6 +1094,18 @@ app.post('/shipments/:id/finalise', async (c) => {
   }
 
   const finalised = await c.env.DB.prepare('SELECT * FROM shipments WHERE id = ?').bind(id).first()
+  await notifyShipmentEvent(c, {
+    event: 'shipment.finalised',
+    organisation_id: user.organisation_id,
+    shipment_id: id,
+    reference: shipment.reference,
+    direction: 'export',
+    status: 'FINALISED',
+    export_mrn: mrn.value,
+    device_count: deviceIds.length,
+    user_id: user.id,
+    occurred_at: new Date().toISOString(),
+  })
   return c.json({ ok: true, shipment: finalised, devices_exported: deviceIds.length, validation })
 })
 
@@ -1176,7 +1216,208 @@ app.post('/shipments/:id/restock', async (c) => {
     })
     restocked++
   }
+  if (restocked > 0) {
+    await notifyShipmentEvent(c, {
+      event: 'shipment.restocked',
+      organisation_id: user.organisation_id,
+      shipment_id: id,
+      reference: shipment.reference,
+      direction: 'import',
+      status: shipment.status,
+      import_mrn: shipment.import_mrn ?? null,
+      device_count: restocked,
+      user_id: user.id,
+      occurred_at: new Date().toISOString(),
+    })
+  }
   return c.json({ ok: true, restocked, skipped })
+})
+
+// ───────── OPR 4: actually sending email (Gmail REST) ─────────
+//
+// POST /shipments/:id/prealert/send — sends the pre-alert email to the
+// authorisation's configured mailbox with the commercial invoice + scan-out
+// list attached as HTML. POST /shipments/:id/clearance/send — sends the
+// clearance instruction (with the C&E1154 attached when computable) to the
+// mailbox in the body (or the authorisation's pre-alert mailbox).
+//
+// HONESTY: with no GMAIL_* secrets configured these refuse 503 and write
+// NOTHING — the sent_emails outbox records real attempts only. Every
+// attempt (success or provider failure) is recorded with the outcome.
+
+async function recordEmail(c: OprContext, row: {
+  organisationId: number; shipmentId: number; kind: 'prealert' | 'clearance'
+  to: string; subject: string; status: 'sent' | 'failed'
+  messageId?: string | null; error?: string | null; userId: number
+}): Promise<number> {
+  const ins = await c.env.DB.prepare(
+    `INSERT INTO sent_emails (organisation_id, shipment_id, kind, to_email, subject, provider, provider_message_id, status, error, user_id)
+     VALUES (?, ?, ?, ?, ?, 'gmail', ?, ?, ?, ?)`
+  ).bind(row.organisationId, row.shipmentId, row.kind, row.to, row.subject,
+    row.messageId ?? null, row.status, row.error ?? null, row.userId).run()
+  return Number(ins.meta.last_row_id)
+}
+
+app.post('/shipments/:id/prealert/send', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+
+  const cfg = gmailConfigFromEnv(c.env as unknown as Record<string, unknown>)
+  if (!cfg) {
+    return c.json({
+      error: 'Email sending is not configured — set the GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN secrets. The draft endpoint (/prealert) still works.',
+      code: 'gmail_not_configured',
+    }, 503)
+  }
+
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+  const { shipment, lines, authorisation } = bundle
+  if (shipment.direction !== 'export') {
+    return c.json({ error: 'Pre-alerts cover EXPORT consignments' }, 409)
+  }
+  if (!authorisation) return c.json({ error: 'Shipment has no resolvable authorisation' }, 422)
+  if (!lines.length) return c.json({ error: 'Consignment has no lines — nothing to pre-alert' }, 422)
+
+  const draft = buildPreAlertDraft(shipment, authorisation, lines)
+  if (!draft.to) {
+    return c.json({ error: 'No pre-alert mailbox configured on the authorisation (set prealert_email) — refusing to invent a recipient' }, 422)
+  }
+
+  const attachments: EmailAttachment[] = [
+    { filename: `invoice-${shipment.reference.replace(/\s+/g, '-')}.html`, contentType: 'text/html', content: buildCommercialInvoiceHtml(shipment, authorisation, lines) },
+    { filename: `scan-out-${shipment.reference.replace(/\s+/g, '-')}.html`, contentType: 'text/html', content: JSON.stringify(buildScanOutList(shipment, lines), null, 2) },
+  ]
+  const result = await sendGmail(cfg, { to: draft.to, subject: draft.subject, body: draft.body, attachments })
+
+  const emailId = await recordEmail(c, {
+    organisationId: user.organisation_id, shipmentId: id, kind: 'prealert',
+    to: draft.to, subject: draft.subject,
+    status: result.ok ? 'sent' : 'failed',
+    messageId: result.ok ? result.messageId : null,
+    error: result.ok ? null : result.error,
+    userId: user.id,
+  })
+
+  if (!result.ok) {
+    return c.json({ error: `Pre-alert send failed: ${result.error}`, email_id: emailId }, 502)
+  }
+  return c.json({ ok: true, email_id: emailId, to: draft.to, subject: draft.subject, provider_message_id: result.messageId, attachments: attachments.map(a => a.filename) })
+})
+
+app.post('/shipments/:id/clearance/send', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+
+  const cfg = gmailConfigFromEnv(c.env as unknown as Record<string, unknown>)
+  if (!cfg) {
+    return c.json({
+      error: 'Email sending is not configured — set the GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN secrets. The draft endpoint (/clearance) still works.',
+      code: 'gmail_not_configured',
+    }, 503)
+  }
+
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+  const { shipment, lines, authorisation, relatedExport } = bundle
+  if (shipment.direction !== 'import') {
+    return c.json({ error: 'Clearance instructions cover IMPORT (re-import) consignments' }, 409)
+  }
+  if (!authorisation) return c.json({ error: 'Shipment has no resolvable authorisation' }, 422)
+  if (!lines.length) return c.json({ error: 'Import consignment has no lines — nothing to clear' }, 422)
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>))
+  const to = cleanString(body.to, 254) || authorisation.prealert_email || null
+  if (!to || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) {
+    return c.json({ error: 'A valid recipient is required — pass { to } or configure prealert_email on the authorisation' }, 422)
+  }
+
+  const ce = computeCe1154(shipment, relatedExport, authorisation, lines)
+  const draft = buildClearanceInstructionDraft(shipment, relatedExport, authorisation, lines, ce.ok ? ce.ce1154 : null)
+  const attachments: EmailAttachment[] = ce.ok
+    ? [{ filename: `ce1154-${shipment.reference.replace(/\s+/g, '-')}.html`, contentType: 'text/html', content: buildCe1154Html(ce.ce1154, shipment, lines) }]
+    : []
+  const result = await sendGmail(cfg, { to, subject: draft.subject, body: draft.body, attachments })
+
+  const emailId = await recordEmail(c, {
+    organisationId: user.organisation_id, shipmentId: id, kind: 'clearance',
+    to, subject: draft.subject,
+    status: result.ok ? 'sent' : 'failed',
+    messageId: result.ok ? result.messageId : null,
+    error: result.ok ? null : result.error,
+    userId: user.id,
+  })
+
+  if (!result.ok) {
+    return c.json({ error: `Clearance send failed: ${result.error}`, email_id: emailId }, 502)
+  }
+  return c.json({
+    ok: true, email_id: emailId, to, subject: draft.subject, provider_message_id: result.messageId,
+    attachments: attachments.map(a => a.filename),
+    ...(ce.ok ? {} : { ce1154_note: `C&E1154 not attached: ${ce.error}` }),
+  })
+})
+
+// GET /shipments/:id/emails — the sent_emails outbox for a shipment. An
+// empty list genuinely means nothing was ever attempted.
+app.get('/shipments/:id/emails', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+  const { results } = await c.env.DB.prepare(
+    'SELECT id, kind, to_email, subject, provider, provider_message_id, status, error, user_id, created_at FROM sent_emails WHERE shipment_id = ? AND organisation_id = ? ORDER BY id DESC'
+  ).bind(id, user.organisation_id).all()
+  return c.json({ emails: results })
+})
+
+// ───────── OPR 4: bulk endpoint for downstream consumers ─────────
+//
+// POST /shipments/:id/scan-bulk — add MANY devices to a DRAFT consignment
+// in one call (body: { imeis: [...] }, max 200). Per-IMEI outcomes: each
+// entry succeeds or fails INDEPENDENTLY through exactly the same
+// direction-aware gate as single /scan — a bad IMEI never blocks the rest,
+// and a failed entry provably leaves no line/status/event side-effects
+// (same guarantees, same code path).
+app.post('/shipments/:id/scan-bulk', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+
+  const gate = await loadDraftShipment(c, user, id)
+  if (!gate.ok) return gate.response
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => null)
+  if (!body || !Array.isArray(body.imeis)) {
+    return c.json({ error: 'Body must be { imeis: […] }' }, 422)
+  }
+  if (!body.imeis.length) return c.json({ error: 'imeis is empty' }, 422)
+  if (body.imeis.length > 200) return c.json({ error: 'Maximum 200 IMEIs per bulk call' }, 422)
+
+  const results: { imei: string; ok: boolean; status: number; error?: string; line_id?: number }[] = []
+  for (const raw of body.imeis) {
+    const imei = cleanString(raw, 16)
+    if (!imei) { results.push({ imei: String(raw ?? ''), ok: false, status: 422, error: 'imei is required' }); continue }
+
+    const device = await c.env.DB.prepare(
+      'SELECT * FROM received_devices WHERE imei = ? AND organisation_id = ?'
+    ).bind(imei, user.organisation_id).first<Record<string, unknown>>()
+    if (!device) { results.push({ imei, ok: false, status: 404, error: `No device with IMEI ${imei} in inventory` }); continue }
+
+    const res = gate.shipment.direction === 'import'
+      ? await addDeviceToReturnShipment(c, user, gate.shipment, device)
+      : await addDeviceToShipment(c, user, gate.shipment, device)
+    const data = await res.json() as { error?: string; line?: { id: number } }
+    results.push(res.status === 201
+      ? { imei, ok: true, status: 201, line_id: data.line?.id }
+      : { imei, ok: false, status: res.status, error: data.error })
+  }
+
+  const added = results.filter(r => r.ok).length
+  return c.json({ ok: true, requested: results.length, added, failed: results.length - added, results })
 })
 
 export default app

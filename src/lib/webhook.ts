@@ -30,16 +30,33 @@ export type DeviceStatusChangePayload = {
   occurred_at: string
 }
 
+// OPR 4: shipment lifecycle events for downstream consumers (CRM, finance).
+// Same envelope/signing as device events so one receiver handles both.
+export type ShipmentEventPayload = {
+  event: 'shipment.finalised' | 'shipment.restocked'
+  organisation_id: number
+  shipment_id: number
+  reference: string
+  direction: 'export' | 'import'
+  status: string
+  export_mrn?: string | null
+  import_mrn?: string | null
+  device_count: number
+  user_id: number | null
+  occurred_at: string
+}
+
 // Fires every enabled webhook for the organisation. Failures are swallowed
 // (logged to console) — a downstream system being down must never block or
-// fail the device transition that triggered it.
-export async function dispatchDeviceStatusWebhooks(
+// fail the transition that triggered it.
+async function dispatchToOrgWebhooks(
   db: D1Database,
-  payload: DeviceStatusChangePayload,
+  organisationId: number,
+  payload: Record<string, unknown>,
 ): Promise<void> {
   const { results } = await db.prepare(
     'SELECT id, url, secret FROM webhooks WHERE organisation_id = ? AND enabled = 1'
-  ).bind(payload.organisation_id).all<{ id: number; url: string; secret: string }>()
+  ).bind(organisationId).all<{ id: number; url: string; secret: string }>()
 
   if (!results.length) return
 
@@ -60,4 +77,18 @@ export async function dispatchDeviceStatusWebhooks(
       console.error(`Webhook ${wh.id} (${wh.url}) delivery failed:`, err)
     }
   }))
+}
+
+export async function dispatchDeviceStatusWebhooks(
+  db: D1Database,
+  payload: DeviceStatusChangePayload,
+): Promise<void> {
+  return dispatchToOrgWebhooks(db, payload.organisation_id, payload)
+}
+
+export async function dispatchShipmentWebhooks(
+  db: D1Database,
+  payload: ShipmentEventPayload,
+): Promise<void> {
+  return dispatchToOrgWebhooks(db, payload.organisation_id, payload)
 }
