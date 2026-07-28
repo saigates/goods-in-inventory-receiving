@@ -2037,8 +2037,9 @@
         ctx.live = { status: 'match', row: r.row };
         state._confirmCtx = ctx;
         render();
-        // Receive immediately
-        await confirmIt();
+        // Receive immediately — keeps the historical default of queueing a
+        // label (the two-button choice applies on the normal confirm path).
+        await confirmIt(true);
       } catch (err) {
         const data = err.response?.data;
         if (data?.existing) {
@@ -2051,7 +2052,11 @@
       }
     };
 
-    const confirmIt = async () => {
+    // withPrint decides whether the server queues a print label for this
+    // receive — printing is OPTIONAL (owner request 2026-07-28): the modal
+    // offers "Confirm only" (withPrint=false) and "Confirm & Print"
+    // (withPrint=true) as two explicit buttons instead of a checkbox.
+    const confirmIt = async (withPrint) => {
       if (!ctx.sku) { toast('No catalogue SKU — pick a candidate or add to catalogue first', 'warn'); return; }
       // Optimistic client-side checks only — the server (Priority 4/5) is the
       // authoritative validator and will 422 with a specific message if these
@@ -2063,11 +2068,11 @@
           expected_device_id: expected.id,
           sku: ctx.sku, brand: ctx.brand, model: ctx.model,
           capacity: ctx.capacity, color: ctx.color, grade: ctx.grade,
-          notes: ctx.notes, auto_print: state.autoPrint,
+          notes: ctx.notes, auto_print: withPrint === true,
           buy_price: ctx.buy_price, currency: ctx.currency || 'GBP', vat_type: ctx.vat_type,
           supplier_id: ctx.supplier_id ? Number(ctx.supplier_id) : undefined,
         });
-        toast(`Received <span class="mono">${r.received.imei}</span> · ${r.received.sku}${state.autoPrint ? ' · 🖨️ label queued' : ''}`, 'ok');
+        toast(`Received <span class="mono">${r.received.imei}</span> · ${r.received.sku}${withPrint === true ? ' · 🖨️ label queued' : ' · no label'}`, 'ok');
         beep('ok');
         state.pendingMatch = null; state._confirmCtx = null;
         // Flash the just-received row
@@ -2075,8 +2080,8 @@
         render();
         const row = $(`#exp-${expected.id}`);
         if (row) { row.classList.add('row-ok-flash'); setTimeout(() => row.classList.remove('row-ok-flash'), 1500); }
-        // Show label preview if user wants
-        if (state.autoPrint && r.print_job_id) {
+        // Show label preview only when a label was actually queued
+        if (withPrint === true && r.print_job_id) {
           state.labelPreview = { jobId: r.print_job_id, payload: {
             uuid: r.received.uuid, sku: r.received.sku, imei: r.received.imei,
             brand: r.received.brand, model: r.received.model,
@@ -2196,11 +2201,8 @@
             h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Grade *'),
             gradeSelect(ctx.grade || 'UG', (v) => update('grade', v))
           ),
-          h('label', { class: 'flex items-center gap-2 text-sm text-slate-300 select-none' },
-            h('input', { type: 'checkbox', class: 'accent-cyan-500', checked: state.autoPrint ? 'checked' : null,
-              onchange: (e) => { state.autoPrint = e.target.checked; } }),
-            'Auto-queue print label'
-          ),
+          // (Auto-queue checkbox removed 2026-07-28 — replaced by the explicit
+          // "Confirm only" / "Confirm & Print" footer buttons.)
         ),
         // Valuation / VAT (Priority 4) — required server-side on confirm.
         h('div', { class: 'mt-3 card p-3 bg-slate-900/40' },
@@ -2259,13 +2261,24 @@
                   title: 'Mint a new catalogue row for this combination, then receive' },
                   h('i', { class: 'fas fa-plus' }), 'Add to catalogue & receive')
               : null,
+            // Printing is optional (owner request 2026-07-28): "Confirm only"
+            // receives WITHOUT queueing a label; "Confirm & Print" also queues one.
+            h('button', {
+              id: 'confirm-only-btn',
+              class: 'btn ' + (matched ? 'btn-ghost border border-slate-600' : 'btn-ghost opacity-50 cursor-not-allowed'),
+              onclick: () => confirmIt(false),
+              disabled: !matched ? 'disabled' : null,
+              title: 'Receive the device without queueing a print label',
+            },
+              h('i', { class: 'fas fa-check' }), 'Confirm only'),
             h('button', {
               id: 'confirm-receive-btn',
               class: 'btn ' + (matched ? 'btn-primary' : 'btn-ghost opacity-50 cursor-not-allowed'),
-              onclick: confirmIt,
+              onclick: () => confirmIt(true),
               disabled: !matched ? 'disabled' : null,
+              title: 'Receive the device and queue a print label',
             },
-              h('i', { class: 'fas fa-check' }), 'Confirm & Print')
+              h('i', { class: 'fas fa-print' }), 'Confirm & Print')
           )
         )
       )

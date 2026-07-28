@@ -283,3 +283,70 @@ describe('PVAT vat type (Postponed VAT — import accounting)', () => {
     expect(await db().prepare('SELECT id FROM received_devices WHERE imei = ?').bind(imei2).first()).toBeNull()
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────
+// Confirm-only vs Confirm & Print (owner request 2026-07-28): printing is
+// OPTIONAL at receive time. The SPA now sends auto_print:false ("Confirm
+// only") or auto_print:true ("Confirm & Print"); these tests prove the
+// server contract behind those two buttons against the REAL app + D1:
+//   • auto_print:false → device received, NO print_jobs row, no print_job_id
+//   • auto_print:true  → device received AND exactly one print_jobs row
+//   • auto_print omitted → defaults to printing (backwards-compatible)
+describe('confirm-only vs confirm-and-print (auto_print contract)', () => {
+  async function scanToConfirm(imei: string) {
+    const { json: created } = await createManifest([{ ...ROW_BASE, imei }])
+    const { json: scan } = await api('POST', '/scan', { manifest_id: created.manifest_id, imei })
+    expect(scan.outcome).toBe('matched')
+    const { json: cat } = await api('POST', '/catalog', {
+      brand: 'Samsung', model: 'Galaxy S24', capacity: '256GB', color: 'Black', grade: 'A',
+    })
+    const sku = cat.row?.sku ?? cat.sku ?? cat.existing?.sku  // 409 duplicate → reuse existing
+    expect(sku).toBeTruthy()
+    return { expectedId: scan.expected.id as number, sku: sku as string }
+  }
+  const VAL = { buy_price: 106, currency: 'USD', vat_type: 'PVAT' }
+  async function printJobsFor(imei: string) {
+    const row = await db().prepare(`
+      SELECT COUNT(*) AS n FROM print_jobs pj
+      JOIN received_devices rd ON rd.id = pj.received_device_id
+      WHERE rd.imei = ?`).bind(imei).first<{ n: number }>()
+    return row?.n ?? -1
+  }
+
+  it('auto_print:false ("Confirm only") receives the device WITHOUT queueing a print job', async () => {
+    const imei = nextImei()
+    const { expectedId, sku } = await scanToConfirm(imei)
+    const { res, json } = await api('POST', '/scan/confirm', {
+      expected_device_id: expectedId, sku, ...VAL, auto_print: false,
+    })
+    expect(res.status).toBe(200)
+    expect(json.received.imei).toBe(imei)
+    expect(json.print_job_id ?? null).toBeNull()   // response advertises no label
+    expect(await printJobsFor(imei)).toBe(0)       // and none exists in D1
+    // The receive itself is complete — expected line flipped to received.
+    const line = await expectedByImei(imei)
+    expect(line?.status).toBe('received')
+  })
+
+  it('auto_print:true ("Confirm & Print") receives AND queues exactly one print job', async () => {
+    const imei = nextImei()
+    const { expectedId, sku } = await scanToConfirm(imei)
+    const { res, json } = await api('POST', '/scan/confirm', {
+      expected_device_id: expectedId, sku, ...VAL, auto_print: true,
+    })
+    expect(res.status).toBe(200)
+    expect(json.print_job_id).toBeTruthy()
+    expect(await printJobsFor(imei)).toBe(1)
+  })
+
+  it('auto_print omitted defaults to printing (backwards-compatible)', async () => {
+    const imei = nextImei()
+    const { expectedId, sku } = await scanToConfirm(imei)
+    const { res, json } = await api('POST', '/scan/confirm', {
+      expected_device_id: expectedId, sku, ...VAL,
+    })
+    expect(res.status).toBe(200)
+    expect(json.print_job_id).toBeTruthy()
+    expect(await printJobsFor(imei)).toBe(1)
+  })
+})
