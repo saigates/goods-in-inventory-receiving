@@ -592,3 +592,165 @@ describe('POST /shipments/:id/scan-bulk', () => {
     expect(res.status).toBe(409)
   })
 })
+
+// ───────── OPR 6: manual dispatch + MUCR (per owner brief — Gmail left
+// as-is until the integration is done) ─────────
+
+describe('OPR 6: mark-sent (manual dispatch)', () => {
+  it('prealert/mark-sent records a provider=manual/status=manual outbox row with the SERVER-built subject', async () => {
+    const { shipment } = await makeFinalisedExport(1, '26GB66666666666601')
+    const res = await api(`/api/opr/shipments/${shipment.id}/prealert/mark-sent`, {
+      method: 'POST', body: JSON.stringify({}),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { ok: boolean; email_id: number; to: string; subject: string; provider: string; status: string }
+    expect(body.ok).toBe(true)
+    expect(body.provider).toBe('manual')
+    expect(body.status).toBe('manual')
+    expect(body.to).toBe('prealert-test@example.com') // from the authorisation
+    expect(body.subject).toContain('OPR export pre-alert')
+    expect(body.subject).toContain(shipment.reference)
+
+    const rows = await emailRows(shipment.id)
+    expect(rows.length).toBe(1)
+    expect(rows[0].provider).toBe('manual')
+    expect(rows[0].status).toBe('manual')
+    expect(rows[0].provider_message_id).toBeNull() // a manual send can never carry a provider id
+    expect(rows[0].to_email).toBe('prealert-test@example.com')
+    expect(rows[0].subject).toBe(body.subject)
+    expect(rows[0].user_id).toBe(1) // operator attribution
+  })
+
+  it('mark-sent works with NO Gmail secrets (bareEnv) — unlike /send which refuses 503', async () => {
+    const { shipment } = await makeFinalisedExport(1, '26GB66666666666602')
+    const send = await api(`/api/opr/shipments/${shipment.id}/prealert/send`, { method: 'POST', body: '{}' }, bareEnv)
+    expect(send.status).toBe(503) // the honesty gate is untouched
+    const mark = await api(`/api/opr/shipments/${shipment.id}/prealert/mark-sent`, { method: 'POST', body: '{}' }, bareEnv)
+    expect(mark.status).toBe(200)
+    const rows = await emailRows(shipment.id)
+    expect(rows.length).toBe(1) // only the manual row — the refused send wrote nothing
+    expect(rows[0].provider).toBe('manual')
+  })
+
+  it('a manual row is NEVER recorded as a real send (status/provider distinct from gmail sent)', async () => {
+    const { shipment } = await makeFinalisedExport(1, '26GB66666666666603')
+    // real send via stub, then a manual record on the same shipment
+    stubFetch(gmailHappyStub)
+    const send = await api(`/api/opr/shipments/${shipment.id}/prealert/send`, { method: 'POST', body: '{}' }, gmailEnv)
+    expect(send.status).toBe(200)
+    globalThis.fetch = realFetch
+    const mark = await api(`/api/opr/shipments/${shipment.id}/prealert/mark-sent`, { method: 'POST', body: '{}' })
+    expect(mark.status).toBe(200)
+    const rows = await emailRows(shipment.id)
+    expect(rows.length).toBe(2)
+    const real = rows.find(r => r.provider === 'gmail')!
+    const manual = rows.find(r => r.provider === 'manual')!
+    expect(real.status).toBe('sent')
+    expect(real.provider_message_id).toBe('stub-message-id-123')
+    expect(manual.status).toBe('manual')
+    expect(manual.provider_message_id).toBeNull()
+  })
+
+  it('recipient override: a valid `to` is recorded as given; junk is 422 with zero outbox rows', async () => {
+    const { shipment } = await makeFinalisedExport(1, '26GB66666666666604')
+    const bad = await api(`/api/opr/shipments/${shipment.id}/prealert/mark-sent`, {
+      method: 'POST', body: JSON.stringify({ to: 'not-an-email' }),
+    })
+    expect(bad.status).toBe(422)
+    expect((await emailRows(shipment.id)).length).toBe(0)
+
+    const good = await api(`/api/opr/shipments/${shipment.id}/prealert/mark-sent`, {
+      method: 'POST', body: JSON.stringify({ to: 'Customs.Desk@Carrier.Example' }),
+    })
+    expect(good.status).toBe(200)
+    const rows = await emailRows(shipment.id)
+    expect(rows.length).toBe(1)
+    expect(rows[0].to_email).toBe('customs.desk@carrier.example') // normalised lowercase
+  })
+
+  it('clearance/mark-sent records a manual clearance row on an import consignment', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB66666666666605')
+    const imp = await makeReturnShipment(exp.id)
+    const scan = await api(`/api/opr/shipments/${imp.id}/scan`, {
+      method: 'POST', body: JSON.stringify({ imei: devices[0].imei }),
+    })
+    expect(scan.status).toBe(201)
+    const res = await api(`/api/opr/shipments/${imp.id}/clearance/mark-sent`, {
+      method: 'POST', body: JSON.stringify({ to: 'broker@example.com' }),
+    })
+    expect(res.status).toBe(200)
+    const rows = await emailRows(imp.id)
+    expect(rows.length).toBe(1)
+    expect(rows[0].kind).toBe('clearance')
+    expect(rows[0].provider).toBe('manual')
+    expect(String(rows[0].subject)).toContain('clearance instruction')
+  })
+
+  it('direction guards: prealert/mark-sent refuses imports, clearance/mark-sent refuses exports (zero side-effects)', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB66666666666606')
+    const imp = await makeReturnShipment(exp.id)
+    await api(`/api/opr/shipments/${imp.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: devices[0].imei }) })
+    const a = await api(`/api/opr/shipments/${imp.id}/prealert/mark-sent`, { method: 'POST', body: '{}' })
+    expect(a.status).toBe(409)
+    const b = await api(`/api/opr/shipments/${exp.id}/clearance/mark-sent`, { method: 'POST', body: '{}' })
+    expect(b.status).toBe(409)
+    expect((await emailRows(exp.id)).length).toBe(0)
+    expect((await emailRows(imp.id)).length).toBe(0)
+  })
+
+  it('empty consignment refuses mark-sent (nothing to pre-alert) with zero outbox rows', async () => {
+    const shipment = await makeExportShipment()
+    const res = await api(`/api/opr/shipments/${shipment.id}/prealert/mark-sent`, { method: 'POST', body: '{}' })
+    expect(res.status).toBe(422)
+    expect((await emailRows(shipment.id)).length).toBe(0)
+  })
+})
+
+describe('OPR 6: MUCR proof reference', () => {
+  it('finalise captures mucr alongside MRN/DUCR/EAD (normalised uppercase)', async () => {
+    const shipment = await makeExportShipment()
+    const d = await makeDevice()
+    await api(`/api/opr/shipments/${shipment.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: d.imei }) })
+    const fin = await api(`/api/opr/shipments/${shipment.id}/finalise`, {
+      method: 'POST', body: JSON.stringify({ export_mrn: '26GB66666666666607', mucr: 'gb/sgat-12345678' }),
+    })
+    expect(fin.status).toBe(200)
+    const row = await env.DB.prepare('SELECT mucr, export_mrn FROM shipments WHERE id = ?').bind(shipment.id).first<{ mucr: string; export_mrn: string }>()
+    expect(row!.mucr).toBe('GB/SGAT-12345678')
+    expect(row!.export_mrn).toBe('26GB66666666666607')
+  })
+
+  it('export-proof records/replaces mucr after finalisation; junk charset is 422 and does not touch the row', async () => {
+    const { shipment } = await makeFinalisedExport(1, '26GB66666666666608')
+    const ok = await api(`/api/opr/shipments/${shipment.id}/export-proof`, {
+      method: 'POST', body: JSON.stringify({ mucr: 'GB/SGAT-00000001' }),
+    })
+    expect(ok.status).toBe(200)
+    let row = await env.DB.prepare('SELECT mucr FROM shipments WHERE id = ?').bind(shipment.id).first<{ mucr: string }>()
+    expect(row!.mucr).toBe('GB/SGAT-00000001')
+
+    const bad = await api(`/api/opr/shipments/${shipment.id}/export-proof`, {
+      method: 'POST', body: JSON.stringify({ mucr: 'GB/SGAT_!!bad' }),
+    })
+    expect(bad.status).toBe(422)
+    row = await env.DB.prepare('SELECT mucr FROM shipments WHERE id = ?').bind(shipment.id).first<{ mucr: string }>()
+    expect(row!.mucr).toBe('GB/SGAT-00000001') // unchanged
+
+    const replace = await api(`/api/opr/shipments/${shipment.id}/export-proof`, {
+      method: 'POST', body: JSON.stringify({ mucr: 'GB/SGAT-00000002' }),
+    })
+    expect(replace.status).toBe(200)
+    row = await env.DB.prepare('SELECT mucr FROM shipments WHERE id = ?').bind(shipment.id).first<{ mucr: string }>()
+    expect(row!.mucr).toBe('GB/SGAT-00000002')
+  })
+
+  it('DRAFT shipments still refuse export-proof (mucr included) — finalise first', async () => {
+    const shipment = await makeExportShipment()
+    const res = await api(`/api/opr/shipments/${shipment.id}/export-proof`, {
+      method: 'POST', body: JSON.stringify({ mucr: 'GB/SGAT-99999999' }),
+    })
+    expect(res.status).toBe(409)
+    const row = await env.DB.prepare('SELECT mucr FROM shipments WHERE id = ?').bind(shipment.id).first<{ mucr: string | null }>()
+    expect(row!.mucr).toBeNull()
+  })
+})

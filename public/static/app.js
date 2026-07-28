@@ -755,6 +755,12 @@
         OprFact('Declared value', fmtMoney(b.total_value, s.currency), 'coins'),
       ),
 
+      // Export proof card (FINALISED exports) — record/replace MRN / DUCR /
+      // EAD / MUCR after the fact (e.g. when the carrier's declaration or
+      // consolidation reference lands later). The only mutation a FINALISED
+      // export accepts.
+      !isDraft && isExport ? OprExportProofCard(s) : null,
+
       // Validation traffic lights
       v ? h('div', { class: 'card p-4', id: 'opr-validation' },
         h('div', { class: 'flex items-center gap-2 mb-2' },
@@ -830,13 +836,15 @@
       h('div', { class: 'card p-4', id: 'opr-emails' },
         h('div', { class: 'flex items-center gap-2 mb-2' },
           h('h3', { class: 'font-semibold text-sm' }, 'Email outbox'),
-          h('span', { class: 'text-[11px] text-slate-500' }, 'Real send attempts only — nothing is logged until Gmail secrets are configured and a send is attempted.')
+          h('span', { class: 'text-[11px] text-slate-500' }, 'System send attempts (sent/failed) and operator-recorded manual sends (manual). Nothing is auto-sent until Gmail is configured.')
         ),
         !state.oprEmails.length
-          ? h('div', { class: 'text-xs text-slate-500 py-2' }, 'No emails sent for this consignment.')
+          ? h('div', { class: 'text-xs text-slate-500 py-2' }, 'No emails recorded for this consignment.')
           : h('div', { class: 'divide-y divide-slate-800' },
-              state.oprEmails.map(e => h('div', { class: 'py-2 flex items-center gap-3 text-xs' },
-                h('span', { class: 'badge ' + (e.status === 'sent' ? 'badge-green' : 'badge-red') }, e.status),
+              state.oprEmails.map(e => h('div', { class: 'py-2 flex items-center gap-3 text-xs opr-email-row' },
+                h('span', { class: 'badge ' + (e.status === 'sent' ? 'badge-green' : e.status === 'manual' ? 'badge-cyan' : 'badge-red'),
+                  title: e.status === 'manual' ? 'Recorded by an operator as sent from their own mail client — NOT sent by the system' : undefined },
+                  e.status === 'manual' ? 'manual' : e.status),
                 h('span', { class: 'badge badge-slate' }, e.kind),
                 h('span', { class: 'mono text-slate-300' }, e.to_email),
                 h('span', { class: 'text-slate-400 truncate flex-1' }, e.subject),
@@ -845,6 +853,42 @@
       )
     );
   }
+  function OprExportProofCard(s) {
+    const f = { export_mrn: '', ducr: '', ead_mrn: '', mucr: '' };
+    const save = async () => {
+      const body = Object.fromEntries(Object.entries(f).filter(([, v]) => v.trim()));
+      if (!Object.keys(body).length) { toast('Enter at least one reference to record', 'warn'); return; }
+      try {
+        await api.post(`/opr/shipments/${s.id}/export-proof`, body);
+        toast('Export proof recorded', 'ok');
+        await refreshOprDetail(); render();
+      } catch (err) {
+        toast(err.response?.data?.error || err.message, 'err', 5000);
+      }
+    };
+    const Field = (label, key, current, placeholder) => h('div', {},
+      h('label', { class: 'text-[10px] uppercase text-slate-500 mb-1 block' }, label,
+        current ? h('span', { class: 'ml-2 mono text-cyan-300 normal-case' }, current) : null),
+      h('input', { id: `opr-proof-${key}`, class: 'input mono text-xs', placeholder: current ? 'replace…' : placeholder,
+        oninput: (e) => { f[key] = e.target.value; } }));
+    return h('div', { class: 'card p-4', id: 'opr-proof-card' },
+      h('div', { class: 'flex items-center gap-2 mb-3' },
+        h('h3', { class: 'font-semibold text-sm' }, h('i', { class: 'fas fa-stamp mr-2 text-cyan-400' }), 'Export proof references'),
+        h('span', { class: 'text-[11px] text-slate-500' }, 'Record declaration references as they land — MRN, DUCR, EAD, MUCR. Existing values shown beside each label.')
+      ),
+      h('div', { class: 'grid grid-cols-2 md:grid-cols-4 gap-3' },
+        Field('Export MRN', 'export_mrn', s.export_mrn, '26GB34F7Y1AB8CDE12'),
+        Field('DUCR', 'ducr', s.ducr, '6GB369979995000-EXP…'),
+        Field('EAD MRN', 'ead_mrn', s.ead_mrn, '(optional)'),
+        Field('MUCR', 'mucr', s.mucr, 'GB/SGAT-12345678')
+      ),
+      h('div', { class: 'flex justify-end mt-3' },
+        h('button', { id: 'opr-proof-save', class: 'btn btn-primary text-xs', onclick: save },
+          h('i', { class: 'fas fa-floppy-disk' }), 'Record proof')
+      )
+    );
+  }
+
   function OprFact(label, value, icon) {
     return h('div', { class: 'card p-4' },
       h('div', { class: 'text-[10px] uppercase text-slate-500 mb-1' }, h('i', { class: `fas fa-${icon} mr-1` }), label),
@@ -907,11 +951,11 @@
     const b = state.oprBundle;
     const s = b.shipment;
     const isExport = s.direction === 'export';
-    const f = { export_mrn: '', ducr: '', ead_mrn: '', import_mrn: '' };
+    const f = { export_mrn: '', ducr: '', ead_mrn: '', mucr: '', import_mrn: '' };
     const close = () => { state.oprFinaliseOpen = false; render(); };
     const doFinalise = async () => {
       const body = isExport
-        ? Object.fromEntries(Object.entries({ export_mrn: f.export_mrn, ducr: f.ducr, ead_mrn: f.ead_mrn }).filter(([, v2]) => v2.trim()))
+        ? Object.fromEntries(Object.entries({ export_mrn: f.export_mrn, ducr: f.ducr, ead_mrn: f.ead_mrn, mucr: f.mucr }).filter(([, v2]) => v2.trim()))
         : (f.import_mrn.trim() ? { import_mrn: f.import_mrn.trim() } : {});
       try {
         const r = await api.post(`/opr/shipments/${s.id}/finalise`, body);
@@ -942,7 +986,8 @@
           isExport
             ? [Field('Export MRN', 'export_mrn', '26GB34F7Y1AB8CDE12'),
                Field('DUCR', 'ducr', '6GB369979995000-EXP2026001'),
-               Field('EAD MRN', 'ead_mrn', '(optional)')]
+               Field('EAD MRN', 'ead_mrn', '(optional)'),
+               Field('MUCR (master UCR)', 'mucr', 'GB/SGAT-12345678 (optional)')]
             : Field('Import MRN (6121 declaration)', 'import_mrn', '26GB89E4Q2CD7FGH34')
         ),
         h('div', { class: 'flex justify-end gap-2 mt-5' },
@@ -963,30 +1008,68 @@
       catch { toast('Clipboard unavailable — select and copy manually', 'warn'); }
     };
     const isPre = d.kind === 'prealert';
+    const to = d.data.to || null;
+    const s = state.oprBundle?.shipment;
+    // Manual dispatch: operator sends from their own mail client, then
+    // records it. The server rebuilds the draft to log the true to/subject.
+    const markSent = async () => {
+      if (!s) return;
+      try {
+        const body = to ? {} : { to: (d.manualTo || '').trim() };
+        if (!to && !body.to) { toast('Enter the mailbox you sent it to first', 'warn'); return; }
+        const r = await api.post(`/opr/shipments/${s.id}/${d.kind}/mark-sent`, body);
+        toast(`Recorded as manually sent to ${r.to} — outbox entry #${r.email_id} (provider: manual)`, 'ok', 4500);
+        state.oprDraftDoc = null;
+        await refreshOprDetail(); render();
+      } catch (err) {
+        toast(err.response?.data?.error || err.message, 'err', 5000);
+      }
+    };
+    const mailtoHref = () => {
+      const rcpt = to || (d.manualTo || '').trim();
+      return `mailto:${encodeURIComponent(rcpt)}?subject=${encodeURIComponent(d.data.subject)}&body=${encodeURIComponent(d.data.body)}`;
+    };
+    const CopyBtn = (text, what) => h('button', {
+      class: 'btn btn-ghost text-[11px] px-2 py-0.5 shrink-0', title: `Copy ${what.toLowerCase()}`,
+      onclick: () => copy(text, what),
+    }, h('i', { class: 'fas fa-copy' }));
     return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
       h('div', { class: 'modal p-6 max-w-2xl' },
         h('div', { class: 'flex items-center justify-between mb-3' },
           h('h2', { class: 'text-lg font-semibold' }, isPre ? 'Pre-alert email draft' : 'Clearance instruction draft'),
           h('button', { class: 'btn btn-ghost text-xs', onclick: close }, h('i', { class: 'fas fa-xmark' }))
         ),
+        h('div', { class: 'px-3 py-2 mb-2 rounded-lg bg-cyan-500/10 border border-cyan-500/30 text-cyan-200 text-xs' },
+          h('i', { class: 'fas fa-hand mr-2' }),
+          'Manual dispatch: copy the fields below into your own mail client, send, then record it with “Mark as manually sent”. Nothing is sent by the system.'),
         h('div', { class: 'space-y-2 text-xs' },
-          h('div', { class: 'flex gap-2' },
+          h('div', { class: 'flex items-center gap-2' },
             h('span', { class: 'text-slate-500 w-14 shrink-0' }, 'To'),
-            h('span', { class: 'mono text-slate-200' }, d.data.to || '(not configured on the authorisation)')),
+            to
+              ? [h('span', { class: 'mono text-slate-200 flex-1', id: 'opr-draft-to' }, to), CopyBtn(to, 'To')]
+              : h('input', { class: 'input mono flex-1 text-xs', id: 'opr-draft-to',
+                  placeholder: 'not configured on the authorisation — enter the mailbox you will send to',
+                  value: d.manualTo || '', oninput: (e) => { d.manualTo = e.target.value; } })),
           d.data.cutoff ? h('div', { class: 'flex gap-2' },
             h('span', { class: 'text-slate-500 w-14 shrink-0' }, 'Cut-off'),
             h('span', { class: 'text-slate-200' }, d.data.cutoff)) : null,
-          h('div', { class: 'flex gap-2' },
+          h('div', { class: 'flex items-center gap-2' },
             h('span', { class: 'text-slate-500 w-14 shrink-0' }, 'Subject'),
-            h('span', { class: 'mono text-slate-200' }, d.data.subject)),
+            h('span', { class: 'mono text-slate-200 flex-1', id: 'opr-draft-subject' }, d.data.subject),
+            CopyBtn(d.data.subject, 'Subject')),
           d.note ? h('div', { class: 'px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-200' },
             h('i', { class: 'fas fa-triangle-exclamation mr-2' }), d.note) : null,
-          h('pre', { class: 'mt-2 p-3 rounded-lg bg-slate-900/70 border border-slate-800 whitespace-pre-wrap text-slate-300 max-h-[45vh] overflow-auto mono' },
+          h('pre', { class: 'mt-2 p-3 rounded-lg bg-slate-900/70 border border-slate-800 whitespace-pre-wrap text-slate-300 max-h-[38vh] overflow-auto mono' },
             d.data.body)
         ),
-        h('div', { class: 'flex justify-end gap-2 mt-4' },
+        h('div', { class: 'flex justify-end items-center gap-2 mt-4 flex-wrap' },
           h('button', { class: 'btn btn-ghost text-sm', onclick: () => copy(d.data.subject, 'Subject') }, h('i', { class: 'fas fa-copy' }), 'Copy subject'),
-          h('button', { class: 'btn btn-primary text-sm', onclick: () => copy(d.data.body, 'Body') }, h('i', { class: 'fas fa-copy' }), 'Copy body')
+          h('button', { class: 'btn btn-ghost text-sm', onclick: () => copy(d.data.body, 'Body') }, h('i', { class: 'fas fa-copy' }), 'Copy body'),
+          h('a', { class: 'btn btn-ghost text-sm', href: mailtoHref(), title: 'Open a pre-filled email in your default mail client' },
+            h('i', { class: 'fas fa-envelope' }), 'Open in mail app'),
+          h('button', { id: 'opr-mark-sent', class: 'btn btn-primary text-sm', onclick: markSent,
+            title: 'Record that you sent this email manually — logged in the outbox as provider: manual (distinct from real system sends)' },
+            h('i', { class: 'fas fa-check-double' }), 'Mark as manually sent')
         )
       )
     );

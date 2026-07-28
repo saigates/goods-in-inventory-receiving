@@ -208,6 +208,7 @@ export type Shipment = {
   export_mrn: string | null
   ducr: string | null             // Declaration UCR — proof of export (0011)
   ead_mrn: string | null          // EAD MRN — proof of export (0011)
+  mucr: string | null             // Master UCR — consolidation ref (0014)
   finalised_at: string | null
   finalised_by_user_id: number | null
   // ── OPR 3 (0012): C&E1154 inputs + re-import proof (import shipments) ──

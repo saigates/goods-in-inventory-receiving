@@ -55,9 +55,14 @@
 //   - GET /discharge — tracker over FINALISED exports: exported vs
 //     returned vs outstanding, deadline = export date + discharge period.
 //
-// Explicitly OUT of scope (OPR 4 — do not add without a brief):
-//   - actually SENDING pre-alert / clearance emails, bulk endpoints,
-//     webhook fan-out for OPR events beyond the device-status webhooks.
+// OPR 4 (automation): Gmail send endpoints (honesty-gated 503 until the
+// GMAIL_* secrets exist), sent_emails outbox, shipment webhooks, bulk scan.
+//
+// OPR 6 (manual dispatch, per owner brief — Gmail left as-is until the
+// integration is done): /prealert/mark-sent and /clearance/mark-sent record
+// an operator's manual copy-paste send in the outbox with provider='manual'
+// / status='manual' (never confusable with a real system send); MUCR joins
+// MRN/DUCR/EAD as proof-of-export material (migration 0014).
 
 import { Hono } from 'hono'
 import type { Context } from 'hono'
@@ -1049,6 +1054,8 @@ app.post('/shipments/:id/finalise', async (c) => {
   if (!ducr.ok) return c.json({ error: ducr.error }, 422)
   const ead = cleanProofRef(body.ead_mrn, 'ead_mrn')
   if (!ead.ok) return c.json({ error: ead.error }, 422)
+  const mucr = cleanProofRef(body.mucr, 'mucr')
+  if (!mucr.ok) return c.json({ error: mucr.error }, 422)
 
   // The gate: any red check blocks finalisation. Ambers pass but are
   // returned so the caller can surface them.
@@ -1076,10 +1083,10 @@ app.post('/shipments/:id/finalise', async (c) => {
   // validated and event-logged.
   const upd = await c.env.DB.prepare(
     `UPDATE shipments SET status = 'FINALISED', export_mrn = COALESCE(?, export_mrn),
-       ducr = COALESCE(?, ducr), ead_mrn = COALESCE(?, ead_mrn),
+       ducr = COALESCE(?, ducr), ead_mrn = COALESCE(?, ead_mrn), mucr = COALESCE(?, mucr),
        finalised_at = CURRENT_TIMESTAMP, finalised_by_user_id = ?, updated_at = CURRENT_TIMESTAMP
      WHERE id = ? AND organisation_id = ? AND status = 'DRAFT'`
-  ).bind(mrn.value, ducr.value, ead.value, user.id, id, user.organisation_id).run()
+  ).bind(mrn.value, ducr.value, ead.value, mucr.value, user.id, id, user.organisation_id).run()
   if (!upd.meta.changes) {
     return c.json({ error: 'Shipment was modified concurrently — reload and retry' }, 409)
   }
@@ -1132,14 +1139,14 @@ app.post('/shipments/:id/export-proof', async (c) => {
   if (!body) return c.json({ error: 'Invalid JSON body' }, 400)
 
   const fields: Record<string, string> = {}
-  for (const [key, label] of [['export_mrn', 'export_mrn'], ['ducr', 'ducr'], ['ead_mrn', 'ead_mrn']] as const) {
+  for (const [key, label] of [['export_mrn', 'export_mrn'], ['ducr', 'ducr'], ['ead_mrn', 'ead_mrn'], ['mucr', 'mucr']] as const) {
     if (body[key] !== undefined) {
       const parsed = cleanProofRef(body[key], label)
       if (!parsed.ok) return c.json({ error: parsed.error }, 422)
       if (parsed.value) fields[key] = parsed.value
     }
   }
-  if (!Object.keys(fields).length) return c.json({ error: 'Provide at least one of export_mrn, ducr, ead_mrn' }, 422)
+  if (!Object.keys(fields).length) return c.json({ error: 'Provide at least one of export_mrn, ducr, ead_mrn, mucr' }, 422)
 
   const sets = Object.keys(fields).map(k => `${k} = ?`).join(', ')
   await c.env.DB.prepare(
@@ -1247,16 +1254,107 @@ app.post('/shipments/:id/restock', async (c) => {
 
 async function recordEmail(c: OprContext, row: {
   organisationId: number; shipmentId: number; kind: 'prealert' | 'clearance'
-  to: string; subject: string; status: 'sent' | 'failed'
+  to: string; subject: string; status: 'sent' | 'failed' | 'manual'
+  provider?: 'gmail' | 'manual'
   messageId?: string | null; error?: string | null; userId: number
 }): Promise<number> {
   const ins = await c.env.DB.prepare(
     `INSERT INTO sent_emails (organisation_id, shipment_id, kind, to_email, subject, provider, provider_message_id, status, error, user_id)
-     VALUES (?, ?, ?, ?, ?, 'gmail', ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(row.organisationId, row.shipmentId, row.kind, row.to, row.subject,
-    row.messageId ?? null, row.status, row.error ?? null, row.userId).run()
+    row.provider ?? 'gmail', row.messageId ?? null, row.status, row.error ?? null, row.userId).run()
   return Number(ins.meta.last_row_id)
 }
+
+// ───────── OPR 6: manual dispatch (until Gmail integration is live) ─────────
+//
+// POST /shipments/:id/prealert/mark-sent and /clearance/mark-sent — the
+// operator copies the draft out of the UI, sends it from their own mail
+// client, then records the manual send here. The outbox row is written
+// with provider='manual' / status='manual' so it can NEVER be confused
+// with a real system send: the honesty rule stays intact (a 'sent' row
+// still means the system itself delivered via a provider).
+//
+// The recorded to/subject are taken from the SERVER-built draft (not the
+// client), so the audit row reflects what the system drafted; the operator
+// may override `to` (they may have sent it to a different mailbox) — the
+// override is recorded as given.
+
+function cleanManualEmailOverride(raw: unknown):
+  | { ok: true; value: string | null }
+  | { ok: false; error: string } {
+  if (raw === undefined || raw === null || raw === '') return { ok: true, value: null }
+  if (typeof raw !== 'string') return { ok: false, error: 'to must be a string email address' }
+  const v = raw.trim()
+  if (v.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) {
+    return { ok: false, error: 'to must be a valid email address' }
+  }
+  return { ok: true, value: v.toLowerCase() }
+}
+
+app.post('/shipments/:id/prealert/mark-sent', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+  const { shipment, lines, authorisation } = bundle
+  if (shipment.direction !== 'export') {
+    return c.json({ error: 'Pre-alerts cover EXPORT consignments' }, 409)
+  }
+  if (!authorisation) return c.json({ error: 'Shipment has no resolvable authorisation' }, 422)
+  if (!lines.length) return c.json({ error: 'Consignment has no lines — nothing to pre-alert' }, 422)
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>))
+  const override = cleanManualEmailOverride(body.to)
+  if (!override.ok) return c.json({ error: override.error }, 422)
+
+  const draft = buildPreAlertDraft(shipment, authorisation, lines)
+  const to = override.value ?? draft.to
+  if (!to) {
+    return c.json({ error: 'No recipient — the authorisation has no pre-alert mailbox configured and no `to` was supplied' }, 422)
+  }
+
+  const emailId = await recordEmail(c, {
+    organisationId: user.organisation_id, shipmentId: id, kind: 'prealert',
+    to, subject: draft.subject, status: 'manual', provider: 'manual', userId: user.id,
+  })
+  return c.json({ ok: true, email_id: emailId, to, subject: draft.subject, provider: 'manual', status: 'manual' })
+})
+
+app.post('/shipments/:id/clearance/mark-sent', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+  const { shipment, lines, authorisation, relatedExport } = bundle
+  if (shipment.direction !== 'import') {
+    return c.json({ error: 'Clearance instructions cover IMPORT (re-import) consignments' }, 409)
+  }
+  if (!authorisation) return c.json({ error: 'Shipment has no resolvable authorisation' }, 422)
+  if (!lines.length) return c.json({ error: 'Import consignment has no lines — nothing to clear' }, 422)
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>))
+  const override = cleanManualEmailOverride(body.to)
+  if (!override.ok) return c.json({ error: override.error }, 422)
+
+  const to = override.value ?? authorisation.prealert_email ?? null
+  if (!to) {
+    return c.json({ error: 'No recipient — supply `to` (or configure prealert_email on the authorisation)' }, 422)
+  }
+
+  const ce = computeCe1154(shipment, relatedExport, authorisation, lines)
+  const draft = buildClearanceInstructionDraft(shipment, relatedExport, authorisation, lines, ce.ok ? ce.ce1154 : null)
+
+  const emailId = await recordEmail(c, {
+    organisationId: user.organisation_id, shipmentId: id, kind: 'clearance',
+    to, subject: draft.subject, status: 'manual', provider: 'manual', userId: user.id,
+  })
+  return c.json({ ok: true, email_id: emailId, to, subject: draft.subject, provider: 'manual', status: 'manual' })
+})
 
 app.post('/shipments/:id/prealert/send', async (c) => {
   const user = currentUser(c)
