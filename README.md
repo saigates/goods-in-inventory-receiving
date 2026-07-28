@@ -29,6 +29,7 @@ Every route under `/api/*` requires a valid JWT **except** `GET /api/health` and
 - **Upload module** in `Manifests` view: drag-and-drop or click to ingest **CSV / XLS / XLSX**.
 - Auto-parses the supplier's *Packing List* format (the provided `YH001-Saigates Limited_260608.xlsx` works out of the box — columns: OEM, Condition, Description, Grade, MODEL NO., IMEI).
 - Validates identifiers (strictly **15-digit IMEIs** passing the GSMA Luhn checksum, or **10-character alphanumeric serials** for non-cellular devices — rule tightened 2026-07-28 per owner brief; 14-digit TAC+SN and 16-digit IMEISV forms are rejected), de-duplicates, and pre-resolves a candidate SKU from the description.
+- **Optional valuation-hint columns** (added 2026-07-28 after the owner asked “no option to include the prices in USD and VAT Type — do we add the prices at a later stage?” while manually testing): the upload mapper also recognises **Unit cost** (`unit cost`, `price`, `buy price`…), **Currency** (`currency`, `curr`, `ccy` — ISO 4217, uppercased at import so `usd` → `USD`) and **VAT type** (`vat type`, `vat`, `vat scheme` — `MARGIN` / `STANDARD` / `ZERO`). Each row's hints are validated server-side at import with the **same validators** goods-in uses; a row with a junk hint (unknown currency, negative price, bad VAT type) is flagged in the response's `invalid_valuations` and **skipped** — never silently stored — and the UI shows a warn toast with the skipped count. At scan time, a matched line's hints **pre-fill** the confirm modal's Buy price / Currency / VAT type. **Hints only**: `/scan/confirm` still requires operator-confirmed valuation, and the operator's (possibly edited) values are what land on the received device — the manifest line itself is never modified.
 - Populates the **Pending Receipt Queue** visible in the receive view.
 - Progress widget shows `received / expected` and a `%` bar that updates after every scan.
 
@@ -134,7 +135,7 @@ Every row below is under `/api/*` and requires `Authorization: Bearer <token>` *
 | `GET`  | `/api/inventory/stats` | 🔒 | Counts for dashboard tiles |
 | `GET`  | `/api/manifests` | 🔒 | List manifests with progress |
 | `GET`  | `/api/manifests/:id` | 🔒 | Detail with expected & unreconciled |
-| `POST` | `/api/manifests` | 🔒 | Create manifest. Body: `{reference, supplier, notes?, rows[]}` |
+| `POST` | `/api/manifests` | 🔒 | Create manifest. Body: `{reference, supplier, notes?, rows[]}`. Rows may carry optional valuation hints `unit_cost` / `currency` (ISO 4217, uppercased) / `vat_type` (`MARGIN`\|`STANDARD`\|`ZERO`) — validated per row; bad-hint rows are returned in `invalid_valuations` and skipped |
 | `POST` | `/api/manifests/:id/close` | 🔒 | Close manifest |
 | `POST` | `/api/manifests/:id/reopen` | 🔒 | Reopen manifest |
 | `DELETE` | `/api/manifests/:id` | 🔒 | Delete manifest (received devices remain) |
@@ -205,7 +206,7 @@ Every row below is under `/api/*` and requires `Authorization: Bearer <token>` *
 - `organisations` — tenants. One seeded row (`Default Organisation`, id `1`).
 - `users` — seeded operator/admin accounts, each tied to an `organisation_id`. No passwords yet (see **Authentication** above).
 - `manifests` — supplier ASN header (reference, supplier, status open/closed). Org-scoped.
-- `expected_devices` — one row per IMEI on the ASN, status `pending` → `received`. Org-scoped.
+- `expected_devices` — one row per IMEI on the ASN, status `pending` → `received`. Org-scoped. Also carries **optional valuation hints** from the supplier file (`unit_cost` since 0001; `currency` + `vat_type` added in migration 0015) that pre-fill the confirm modal — hints only, never a substitute for the operator-confirmed valuation on `received_devices`.
 - `received_devices` — the core inventory record: UUID, SKU, source (`manifest` | `unreconciled`), lifecycle `status` (see **Device Status Lifecycle** above), valuation (`buy_price`, `currency`, `vat_type`, `supplier_id`), and `created_by_user_id` + `organisation_id` on every row.
 - `device_events` — **append-only** audit trail of every lifecycle mutation (`RECEIVE`, `STATUS_CHANGE`, `REJECT`) with `from_status`/`to_status`, `user_id`, `organisation_id`, optional `reference`/`metadata`. A device's `status` always equals its latest event's `to_status`.
 - `scan_events` — pre-existing audit trail of every raw scan *attempt* (matched, duplicate, unreconciled, rejected) — kept unchanged and written alongside `device_events`, which covers the device-mutation side specifically.
