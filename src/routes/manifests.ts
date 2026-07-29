@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import type { Bindings, AuthUser } from '../types'
 import { normalizeGrade } from '../lib/grade'
-import { resolveCatalogSku, normalizeCapacity } from '../lib/catalog'
+import { resolveCatalogSkuBulk, normalizeCapacity } from '../lib/catalog'
 import { currentUser } from '../lib/auth'
 import { validateImei, cleanString, validateBuyPrice, isValidCurrency, normalizeCurrency, isValidVatType } from '../lib/validate'
 
@@ -138,10 +138,37 @@ app.post('/', async (c) => {
   // anymore — if the catalog has no entry for (model, capacity, color, grade),
   // the manifest line gets sku=NULL and the scan modal will prompt the
   // operator to fix it. Count unmatched lines so we can surface them.
+  //
+  // IMPORTANT (2026-07-29 production bug fix): this used to call
+  // resolveCatalogSku() — 1-3 sequential D1 queries — once per row inside
+  // this loop. That's free against the local dev SQLite stub (in-process,
+  // no network hop) but against REAL remote D1 each call is a network round
+  // trip, so a several-hundred-row manifest turned into several-hundred
+  // SEQUENTIAL round trips in one request. The manifest HEADER insert above
+  // already commits, but this loop (and the expected_devices batch insert
+  // after it) runs afterwards — so a slow upload that outran the client's
+  // patience (or any timeout in the request path) left a manifest row with
+  // ZERO expected_devices, with no error surfaced anywhere. Confirmed: a
+  // 197-row upload created manifest id 11 in production with 0 devices,
+  // while the identical upload against local dev correctly got all 197.
+  // Fixed by loading the whole organisation's catalog ONCE up front
+  // (`resolveCatalogSkuBulk`) and matching every row in memory — O(1) DB
+  // round trips instead of O(rows).
   const stmts: D1PreparedStatement[] = []
   let unmatched = 0
   const invalidImeis: Array<{ row_index: number; imei: unknown; reason: string }> = []
   const invalidValuations: Array<{ row_index: number; imei: unknown; reason: string }> = []
+
+  type ValidRow = {
+    r: ImportRow
+    imei: string
+    val: { unit_cost: number | null; currency: string | null; vat_type: string | null }
+    capacity: string | null
+    color: string | null
+    grade: ReturnType<typeof normalizeGrade>
+    modelForLookup: string | null
+  }
+  const validRows: ValidRow[] = []
   for (let i = 0; i < body.rows.length; i++) {
     const r = body.rows[i] || ({} as ImportRow)
     const imeiCheck = validateImei(r.imei)
@@ -164,15 +191,27 @@ app.post('/', async (c) => {
     // human-readable model name there); fall back to description if model_no
     // is empty (older manifests where description holds "Galaxy S24_256G").
     const modelForLookup = r.model_no || r.description || null
+    validRows.push({ r, imei, val, capacity, color, grade, modelForLookup })
+  }
 
+  // One query for the whole organisation's catalog, then match every valid
+  // row against it in memory (see comment above).
+  const lookups = await resolveCatalogSkuBulk(
+    c.env.DB,
+    validRows.map((vr) => ({
+      model: vr.modelForLookup,
+      capacity: vr.capacity,
+      color: vr.color,
+      grade: vr.grade,
+    })),
+    orgId,
+  )
+
+  for (let i = 0; i < validRows.length; i++) {
+    const { r, imei, val, capacity, color, grade, modelForLookup } = validRows[i]
     let sku: string | null = null
     if (modelForLookup) {
-      const lookup = await resolveCatalogSku(c.env.DB, {
-        model: modelForLookup,
-        capacity,
-        color,
-        grade,
-      }, orgId)
+      const lookup = lookups[i]
       if (lookup.status === 'match') sku = lookup.row.sku
       else unmatched += 1
     } else {
