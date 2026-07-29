@@ -217,7 +217,7 @@ Every row below is under `/api/*` and requires `Authorization: Bearer <token>` *
 - `received_devices` — the core inventory record: UUID, SKU, source (`manifest` | `unreconciled`), lifecycle `status` (see **Device Status Lifecycle** above), valuation (`buy_price`, `currency`, `vat_type`, `supplier_id`), and `created_by_user_id` + `organisation_id` on every row.
 - `device_events` — **append-only** audit trail of every lifecycle mutation (`RECEIVE`, `STATUS_CHANGE`, `REJECT`) with `from_status`/`to_status`, `user_id`, `organisation_id`, optional `reference`/`metadata`. A device's `status` always equals its latest event's `to_status`.
 - `scan_events` — pre-existing audit trail of every raw scan *attempt* (matched, duplicate, unreconciled, rejected) — kept unchanged and written alongside `device_events`, which covers the device-mutation side specifically.
-- `sku_catalog` — reference catalog of clean SKUs (seeded for the Samsung models in the sample manifest).
+- `sku_catalog` — reference catalog of clean SKUs. **Expanded 2026-07-29** (migration 0017): all `brand`/`model`/`color` values are now uppercase-normalized (matching had already been case-insensitive via `UPPER()` in `resolveCatalogSku()`, so this was a data-hygiene/UI-consistency fix, not a bug fix); legacy `GALAXY S22/S23 PLUS` rows were renamed to the canonical `GALAXY S22+`/`S23+` form and the 5 resulting exact duplicates removed (verified unreferenced elsewhere); 668 rows were added (all grades A/B/C/UG) for 14 latest-generation models — iPhone 17, 17 Pro, 17 Pro Max, Air, XR, SE and Galaxy S26, S26+, S26 Ultra, S25 FE, Z Fold6, Flip6, Fold7, Flip7. Production now holds **2,781 rows** (up from 2,118); local dev mirrors this (2,783, differing only by 2 test-fixture rows).
 - `print_jobs` — queued/sent label print jobs with JSON payload.
 - `webhooks` — per-organisation outbound webhook config (`url`, `secret`, `enabled`).
 - `suppliers` — referenced by `received_devices.supplier_id` (optional FK, no CRUD UI yet — id-only for now).
@@ -286,7 +286,7 @@ Lifecycle     ──► POST /api/devices/:id/transition ──► received_devi
 - **Platform**: Cloudflare Pages + Workers
 - **Status**: ✅ Running in sandbox (port 3000 via Wrangler)
 - **Tech Stack**: Hono · TypeScript · Cloudflare D1 · vanilla JS SPA · Tailwind CDN
-- **Last Updated**: 2026-07-28 (OPR 6) (OPR 5 frontend UI — full OPR tab in the SPA, browser-proven by 30 Playwright checks; identifier rule tightened to strict 15-digit IMEI + Luhn / 10-character alphanumeric serial; previously OPR 1–4 API-level, JWT auth + multi-tenancy, device status lifecycle + `device_events` audit log, valuation fields, server-side authoritative validation, `/api/devices` read+CSV-export API, outbound signed webhooks)
+- **Last Updated**: 2026-07-29 — `sku_catalog` uppercase-normalized + expanded with 14 latest Apple/Samsung models (668 new rows; production 2,118 → 2,781 rows; migration 0017, applied directly to prod/local D1 and captured in the migration file for future fresh-environment sync). Previously 2026-07-28 (OPR 6) (OPR 5 frontend UI — full OPR tab in the SPA, browser-proven by 30 Playwright checks; identifier rule tightened to strict 15-digit IMEI + Luhn / 10-character alphanumeric serial; previously OPR 1–4 API-level, JWT auth + multi-tenancy, device status lifecycle + `device_events` audit log, valuation fields, server-side authoritative validation, `/api/devices` read+CSV-export API, outbound signed webhooks)
 
 ### Local dev
 ```bash
