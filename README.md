@@ -374,6 +374,38 @@ on that Worker's tracking table) — confirmed idempotent: row count stayed at
 2,781 and zero duplicate `(model, capacity, color, grade)` tuples exist
 post-redeploy.
 
+**2026-07-29 redeploy — fixed "197-IMEI manifest upload succeeds in sandbox
+but silently loads zero devices in production":** reported as: same manifest
+CSV uploaded to both environments, sandbox showed all 197 devices, production
+showed a manifest header with **0** expected_devices and no visible error.
+Root cause: `POST /api/manifests` resolved each row's catalog SKU via
+`resolveCatalogSku()` **sequentially inside the upload loop** — 1–3 D1 SELECT
+queries per row. Against the sandbox's in-process SQLite stub this is free;
+against real remote D1 each call is a network round trip. Once `sku_catalog`
+grew to 2,781 rows (see the LIMIT-1000 fix above), a 197-row upload meant
+200–600+ sequential round trips in a single Worker invocation — slow enough
+to trigger a client disconnect before the (separately batched) `expected_devices`
+INSERT — which runs only *after* the loop completes — ever executed. The
+manifest header commits early and is left orphaned with zero children and no
+surfaced error. Confirmed by direct D1 comparison: prod manifest id 11
+("ASN-OUTON260724-177PCS") had 0 `expected_devices` rows while the identical
+upload's local manifest id 36 had all 197; `gsk hosted worker_stats` also
+showed 3 `clientDisconnected` events in 24h against 0 hard errors. Fixed by
+loading the organisation's whole `sku_catalog` **once** up front
+(`resolveCatalogSkuBulk` in `src/lib/catalog.ts`) and matching every row
+against it in memory (`matchCatalogRows`, pure JS, no DB I/O) — O(1) DB round
+trips instead of O(rows). `resolveCatalogSku()` is kept unchanged for genuine
+single-lookup callers (`scan.ts`, the catalog add/lookup UI actions in
+`catalog.ts`). Verified end-to-end locally before deploying: minted a test
+JWT, uploaded a synthetic 197-row manifest with Luhn-valid IMEIs against the
+running sandbox — all 197 rows inserted with `catalog_unmatched: 0` and the
+correct SKU resolved on every row, completing in ~270ms; the test manifest
+was deleted afterwards. Redeployed via `gsk hosted deploy`
+(`56938504-8f85-4e0c-83fb-8f6644a3de3c`, approved, `Current Version ID:
+d6b91c70-9b46-4b35-9148-736863956435`) — no migrations pending, so this was a
+code-only redeploy. The broken orphaned manifest (id 11) is gone from
+production, freeing the reference for re-upload.
+
 <details><summary>Alternative: deploy to your own Cloudflare account (BYOK)</summary>
 
 ```bash
