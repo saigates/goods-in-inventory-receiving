@@ -357,6 +357,23 @@ Redeploy: `npm run build && gsk hosted deploy` (user approves in the UI), then r
 secrets if the redeploy dropped bindings. D1 data ops: `gsk hosted d1_query` /
 `d1_execute`.
 
+**2026-07-29 redeploy — fixed "new catalog SKUs invisible in the Catalog tab":**
+after migration 0017 expanded `sku_catalog` to 2,781 rows, the new iPhone 17/Air/
+SE/XR and Galaxy S26/Z Fold7/Flip7-family rows were correctly in D1 (confirmed via
+direct `d1_query`) but never appeared in the UI. Root cause: `GET /api/catalog`'s
+unfiltered listing had a flat `ORDER BY brand, model, capacity ASC LIMIT 1000` —
+with ~1,472 Apple rows sorting alphabetically before "IPHONE 17", the cap cut the
+result set off mid-way through the IPHONE 13/14 range, so no iPhone 17-and-later
+row (and no Samsung row at all, since APPLE < SAMSUNG) was ever returned — a
+hidden pagination bug, not a data problem. Fixed by raising the cap to 5000 (see
+`src/routes/catalog.ts`); redeployed via `gsk hosted deploy`
+(`efa77e79-eb5f-4b02-aef7-b88eef084efa`, approved, `Current Version ID:
+ac6ffdff-bfee-41c5-8b0f-5c23a86805fa`). The redeploy also re-ran migration 0017
+against prod D1 (wrangler applies any migration file not yet recorded as applied
+on that Worker's tracking table) — confirmed idempotent: row count stayed at
+2,781 and zero duplicate `(model, capacity, color, grade)` tuples exist
+post-redeploy.
+
 <details><summary>Alternative: deploy to your own Cloudflare account (BYOK)</summary>
 
 ```bash
