@@ -58,3 +58,34 @@ blocked attempts; valid values persist exactly (`77.50 / GBP / STANDARD`,
 `source=manual`). The script prints `CLEANUP_IMEI=<imei>` at the end — delete
 that row (+ its device_events / scan_events / print_jobs) from local D1 after
 a green run.
+
+## `login-prod.browser.mjs` (14 checks) — credentialed login through the real form
+
+Added 2026-07-28 after a reported "Invalid email or password" on accounts that
+had been verified **at the API level with curl but never through the UI**. Drives
+the actual login form in real Chromium: types into `#login-email` /
+`#login-password`, clicks `#login-submit`, and asserts the SPA reaches the app
+shell — for both `owner@saigates.com` and `ops@saigates.com`.
+
+Every positive is paired with a negative, so it cannot pass against a broken
+always-true verifier: a one-character-off password must return 401 **and** stay
+on the login screen with the server's message rendered; the owner's password on
+the ops account must be refused; and the session must survive a reload.
+
+Runs against either environment — credentials come from env vars so no plaintext
+enters the repo:
+
+```bash
+# production
+OWNER_PW='...' OPS_PW='...' node test/browser/login-prod.browser.mjs
+# local preview
+BASE=http://localhost:3000 OWNER_PW='...' OPS_PW='...' node test/browser/login-prod.browser.mjs
+```
+
+**Why it exists (the actual bug it would have caught):** production and the local
+sandbox preview are two separate D1 databases with independently provisioned
+password hashes. The prod passwords therefore returned a truthful
+`Invalid email or password` against the local preview — indistinguishable, to the
+person typing, from a broken deploy. The two databases are now provisioned with
+the *same* hashes, and this suite is run against **both** URLs so the divergence
+cannot recur silently.

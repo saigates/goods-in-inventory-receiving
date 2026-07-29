@@ -307,6 +307,17 @@ loaded); `JWT_SECRET` set as a write-only worker secret (`gsk hosted secret_put`
 Production is **level with `main`** as of this deploy — the CSV-export fixes and the
 credentialed-login pass (migration 0016) are both live.
 
+> ⚠️ **Two environments, and until 2026-07-28 they had DIFFERENT passwords.** The
+> production Worker and the local sandbox preview (`localhost:3000` / the in-chat
+> Preview panel) are backed by **two separate D1 databases**, each with its own
+> independently provisioned `password_hash`. A password that works on one returned a
+> perfectly truthful `Invalid email or password` on the other — which, to the person
+> typing it, is indistinguishable from a broken deploy. That exact confusion happened.
+> **Both databases are now provisioned with the same hashes**, and
+> `test/browser/login-prod.browser.mjs` is run against **both URLs** so the
+> divergence cannot recur unnoticed. When handing over credentials, always name the
+> URL they belong to.
+
 **Credentialed login is live in production.** Both per-person accounts
 (`owner@saigates.com`, `ops@saigates.com`) have real PBKDF2 hashes and were verified
 by logging in against the live instance; the legacy `admin@goodsin.local` row is
