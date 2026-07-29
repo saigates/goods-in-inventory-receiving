@@ -8,7 +8,21 @@ import { cleanString } from '../lib/validate'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
-// List catalogue entries (optionally filtered by free-text q), org-scoped
+// List catalogue entries (optionally filtered by free-text q), org-scoped.
+//
+// NOTE (2026-07-29): this used to be a flat `LIMIT 1000` with no pagination.
+// That silently truncated the unfiltered listing well before it could reach
+// alphabetically-later brands/models — e.g. with ~2,780 rows and ~1,472 of
+// them being Apple models sorting before "IPHONE 17", the 1000-row cap cut
+// off partway through "IPHONE 13...", so no iPhone 17/Air/SE/XR row (and no
+// Samsung row at all, since APPLE < SAMSUNG) was ever returned to the UI —
+// even though every one of those rows was correctly present in D1. This
+// wasn't a missing-data bug, it was a hidden truncation the UI never
+// surfaced. Fixed by raising the cap well above the current+near-future
+// catalogue size (matches the 5000-row cap used elsewhere in this project,
+// e.g. the CSV device export) so an unfiltered browse always returns every
+// row. If the catalogue keeps growing past that, this endpoint should move
+// to real pagination (page/page_size) rather than raising the cap again.
 app.get('/', async (c) => {
   const user = currentUser(c)
   const q = c.req.query('q')?.trim()
@@ -19,7 +33,7 @@ app.get('/', async (c) => {
     const w = `%${q}%`
     binds.push(w, w, w)
   }
-  sql += ' ORDER BY brand ASC, model ASC, capacity ASC LIMIT 1000'
+  sql += ' ORDER BY brand ASC, model ASC, capacity ASC LIMIT 5000'
   const { results } = await c.env.DB.prepare(sql).bind(...binds).all()
   return c.json({ catalog: results })
 })
