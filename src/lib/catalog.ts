@@ -26,7 +26,12 @@ export function normalizeCapacity(raw: unknown): string | null {
   return s.toUpperCase().replace(/\s+/g, ' ')
 }
 
-function norm(s: string | null | undefined): string {
+// Exported (2026-07-30) so callers outside this file — the manifest bulk
+// "apply this SKU to all matching lines" feature in src/routes/manifests.ts
+// — can group unresolved manifest rows by the SAME normalisation the
+// matcher itself uses, rather than re-implementing (and risking drifting
+// from) this rule.
+export function norm(s: string | null | undefined): string {
   return (s ?? '').trim().toUpperCase().replace(/\s+/g, ' ')
 }
 

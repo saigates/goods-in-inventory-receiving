@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import type { Bindings, AuthUser } from '../types'
 import { normalizeGrade } from '../lib/grade'
-import { resolveCatalogSkuBulk, normalizeCapacity } from '../lib/catalog'
+import { resolveCatalogSkuBulk, normalizeCapacity, norm } from '../lib/catalog'
 import { currentUser } from '../lib/auth'
 import { validateImei, cleanString, validateBuyPrice, isValidCurrency, normalizeCurrency, isValidVatType } from '../lib/validate'
 
@@ -250,6 +250,134 @@ app.post('/', async (c) => {
     catalog_unmatched: unmatched,
     invalid_imeis: invalidImeis,
     invalid_valuations: invalidValuations,
+  })
+})
+
+// ───────── "Use this for all other SKUs in this batch" ─────────
+//
+// When the operator picks a catalog candidate (or edits fields to a
+// re-resolved match) for one unmatched manifest line in the Confirm-SKU
+// modal, this lets them apply that SAME sku/brand/model/capacity/color/grade
+// to every OTHER still-pending line on the manifest that has the SAME
+// unresolved signature — instead of repeating the identical pick for every
+// unit in a batch of, say, 50 identical phones with one supplier typo.
+//
+// Deliberately narrow in scope to avoid silently mislabelling devices:
+//  - only lines with status = 'pending' (a received line is a permanent
+//    audit record — sku is never rewritten after receipt);
+//  - only lines whose CURRENT (model_no||description, capacity, color, grade)
+//    tuple matches the line the operator started from, using the exact same
+//    norm()/normalizeCapacity() rules the catalog matcher itself uses (so
+//    "128GB" and "128 GB" are treated as the same signature, matching what
+//    the operator saw as "the same unresolved SKU" in the modal);
+//  - the target sku MUST already exist in this organisation's sku_catalog —
+//    refuses otherwise, same rule as /scan/confirm, so a batch-apply can
+//    never assign a SKU that isn't a real catalogue entry;
+//  - this does NOT receive/scan anything — it only pre-fills
+//    expected_devices.sku so that scanning each remaining IMEI in the
+//    Confirm-SKU modal shows an immediate green "from catalogue" match
+//    instead of the red "no match" banner, without a second manual pick.
+app.post('/:id/apply-sku-to-batch', async (c) => {
+  const user = currentUser(c)
+  const orgId = user.organisation_id
+  const manifestId = Number(c.req.param('id'))
+  if (!manifestId) return c.json({ error: 'Invalid manifest id' }, 400)
+
+  const body = await c.req.json<{
+    sku: string
+    model?: string | null
+    capacity?: string | null
+    color?: string | null
+    grade?: string | null
+    // Optional: restrict to one specific line's signature (the line the
+    // operator started from) rather than re-deriving it from model/capacity/
+    // color/grade — belt-and-braces so a client bug can't accidentally
+    // widen the match to an unrelated signature.
+    source_expected_device_id?: number
+  }>().catch(() => ({} as any))
+
+  const sku = cleanString(body.sku, 128)
+  if (!sku) return c.json({ error: 'sku is required' }, 400)
+
+  const manifest = await c.env.DB.prepare(
+    'SELECT id, status FROM manifests WHERE id = ? AND organisation_id = ?'
+  ).bind(manifestId, orgId).first<{ id: number; status: string }>()
+  if (!manifest) return c.json({ error: 'Manifest not found' }, 404)
+
+  // SKU must exist in the catalogue — same rule as /scan/confirm. Also pull
+  // brand/model/capacity/color/grade back so the response can tell the
+  // client exactly what got applied (it should match what's on screen, but
+  // the catalogue row is authoritative).
+  const catalogRow = await c.env.DB.prepare(
+    'SELECT sku, brand, model, capacity, color, grade FROM sku_catalog WHERE sku = ? AND organisation_id = ?'
+  ).bind(sku, orgId).first<{ sku: string; brand: string; model: string; capacity: string | null; color: string | null; grade: string | null }>()
+  if (!catalogRow) {
+    return c.json({
+      error: `SKU '${sku}' is not in the catalogue. Add it via the Catalog tab, then retry.`,
+      code: 'sku_not_in_catalog',
+    }, 422)
+  }
+
+  // Derive the target signature either from the source line (preferred —
+  // guarantees we match exactly what the operator was looking at) or from
+  // the body fields directly.
+  let targetModel = body.model ?? null
+  let targetCapacity = body.capacity ?? null
+  let targetColor = body.color ?? null
+  let targetGrade = body.grade ?? null
+  if (body.source_expected_device_id) {
+    const src = await c.env.DB.prepare(
+      'SELECT model_no, description, capacity, color, grade FROM expected_devices WHERE id = ? AND organisation_id = ? AND manifest_id = ?'
+    ).bind(body.source_expected_device_id, orgId, manifestId)
+      .first<{ model_no: string | null; description: string | null; capacity: string | null; color: string | null; grade: string | null }>()
+    if (src) {
+      targetModel = src.model_no || src.description || null
+      targetCapacity = src.capacity
+      targetColor = src.color
+      targetGrade = src.grade
+    }
+  }
+
+  const targetModelNorm = norm(targetModel)
+  const targetCapacityNorm = norm(normalizeCapacity(targetCapacity))
+  const targetColorNorm = norm(targetColor)
+  const targetGradeNorm = normalizeGrade(targetGrade)
+  if (!targetModelNorm) {
+    return c.json({ error: 'Could not determine the manifest line signature (no model) to match other lines against' }, 422)
+  }
+
+  // Pull every still-pending line on this manifest and match in memory —
+  // same "load once, compare in memory" discipline as resolveCatalogSkuBulk,
+  // since this can also run against a several-hundred-line manifest.
+  const { results: pending } = await c.env.DB.prepare(
+    `SELECT id, model_no, description, capacity, color, grade FROM expected_devices
+     WHERE manifest_id = ? AND organisation_id = ? AND status = 'pending'`
+  ).bind(manifestId, orgId).all<{ id: number; model_no: string | null; description: string | null; capacity: string | null; color: string | null; grade: string | null }>()
+
+  const matchingIds: number[] = []
+  for (const row of pending) {
+    const model = row.model_no || row.description || null
+    if (norm(model) !== targetModelNorm) continue
+    if (norm(normalizeCapacity(row.capacity)) !== targetCapacityNorm) continue
+    if (norm(row.color) !== targetColorNorm) continue
+    if (normalizeGrade(row.grade) !== targetGradeNorm) continue
+    matchingIds.push(row.id)
+  }
+
+  if (matchingIds.length === 0) {
+    return c.json({ ok: true, applied: 0, sku: catalogRow.sku, message: 'No other pending lines share this signature.' })
+  }
+
+  const placeholders = matchingIds.map(() => '?').join(',')
+  await c.env.DB.prepare(
+    `UPDATE expected_devices SET sku = ? WHERE id IN (${placeholders}) AND organisation_id = ? AND manifest_id = ? AND status = 'pending'`
+  ).bind(catalogRow.sku, ...(matchingIds as unknown[]), orgId, manifestId).run()
+
+  return c.json({
+    ok: true,
+    applied: matchingIds.length,
+    sku: catalogRow.sku,
+    expected_device_ids: matchingIds,
   })
 })
 

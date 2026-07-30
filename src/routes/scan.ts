@@ -4,6 +4,7 @@ import { buildSku } from '../lib/sku'
 import { shortUuid } from '../lib/uuid'
 import { normalizeGrade } from '../lib/grade'
 import { resolveCatalogSku, normalizeCapacity } from '../lib/catalog'
+import type { CatalogLookup, CatalogRow } from '../lib/catalog'
 import { currentUser } from '../lib/auth'
 import { validateImei, validateBuyPrice, isValidCurrency, isValidVatType, normalizeCurrency, cleanString } from '../lib/validate'
 import { logDeviceEvent } from '../lib/deviceLifecycle'
@@ -135,12 +136,32 @@ app.post('/', async (c) => {
   // Prefer model (the actual model column) over description for lookup.
   // expected.description is now optional and may be a junk code like "FL".
   const modelForLookup = expected.model_no || expected.description || null
-  const lookup = await resolveCatalogSku(c.env.DB, {
-    model: modelForLookup,
-    capacity: expected.capacity,
-    color: expected.color,
-    grade,
-  }, orgId)
+
+  // Fast path: expected_devices.sku may already be pre-filled — either the
+  // manifest upload matched it directly, or an operator used "Use this for
+  // all other SKUs in this batch" (POST /manifests/:id/apply-sku-to-batch)
+  // to stamp it onto this line after resolving a sibling with the same
+  // (model, capacity, color, grade) signature. In that case, trust the
+  // stored sku directly (a single indexed lookup by primary key, not the
+  // 4-field catalog match) instead of re-running the same
+  // (model, capacity, color, grade) lookup that produced no_match/ambiguous
+  // at upload time in the first place — re-deriving it here would silently
+  // ignore the pre-filled sku and show the same red banner again.
+  let lookup: CatalogLookup
+  if (expected.sku) {
+    const row = await c.env.DB.prepare(
+      'SELECT id, sku, brand, model, capacity, color, grade FROM sku_catalog WHERE sku = ? AND organisation_id = ?'
+    ).bind(expected.sku, orgId).first<CatalogRow>()
+    lookup = row
+      ? { status: 'match', row }
+      // The pre-filled sku no longer exists in the catalogue (e.g. deleted
+      // after being applied) — fall back to the normal
+      // (model, capacity, color, grade) resolution rather than failing
+      // outright.
+      : await resolveCatalogSku(c.env.DB, { model: modelForLookup, capacity: expected.capacity, color: expected.color, grade }, orgId)
+  } else {
+    lookup = await resolveCatalogSku(c.env.DB, { model: modelForLookup, capacity: expected.capacity, color: expected.color, grade }, orgId)
+  }
 
   await c.env.DB.prepare(
     "INSERT INTO scan_events (organisation_id, manifest_id, imei, outcome, message, user_id) VALUES (?, ?, ?, 'matched', NULL, ?)"
