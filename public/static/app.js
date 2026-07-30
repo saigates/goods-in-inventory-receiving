@@ -9,6 +9,14 @@
       if (k === 'class') el.className = v;
       else if (k === 'html') el.innerHTML = v;
       else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
+      // <textarea> has no `value` CONTENT ATTRIBUTE — its displayed text only
+      // comes from the `.value` PROPERTY (or child text nodes at parse time).
+      // setAttribute('value', ...) is a silent no-op for textareas, so text
+      // typed/pasted in would vanish on the very next re-render (every
+      // keystroke re-creates the element via oninput -> render()). Set the
+      // property directly for textarea; keep setAttribute for every other
+      // tag (inputs mirror the attribute to the property fine).
+      else if (k === 'value' && tag === 'textarea') el.value = v ?? '';
       else if (v !== undefined && v !== null) el.setAttribute(k, v);
     }
     for (const c of children.flat()) {
@@ -3071,7 +3079,16 @@
       raw: '',              // textarea contents — one IMEI per line (or whitespace-separated)
       buy_price: '', currency: 'GBP', vat_type: '', supplier_id: '',
       busy: false,
-      result: null,         // { requested, received, failed, results[] } from the last run
+      // Cumulative outcome per IMEI across ALL runs in this modal session,
+      // keyed by imei — NOT replaced by the latest run's response. A bulk
+      // scan is typically iterative (run → pick SKUs for the failures → run
+      // again for just the outstanding ones), and re-sending an
+      // already-received IMEI on a later run correctly comes back as
+      // 'duplicate' from the server — replacing the whole results view with
+      // that later run alone would make previously-received devices look
+      // like they vanished / were never received. Map preserves insertion
+      // order so rows stay in first-seen order across runs.
+      resultsByImei: new Map(),
     };
     const close = () => { state.bulkScanOpen = false; state._bulkCtx = null; render(); };
 
@@ -3079,9 +3096,14 @@
       ctx.raw.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean)
     ));
 
-    const run = async () => {
-      const imeis = parsedImeis();
-      if (imeis.length === 0) { toast('Paste or scan at least one IMEI', 'warn'); return; }
+    // Outcomes that mean "nothing left to do here" — stripped from the
+    // textarea after a run so a follow-up click only resends IMEIs that
+    // still need action (a fix, or simply haven't been tried yet).
+    const isSettled = (outcome) => outcome === 'received' || outcome === 'duplicate';
+
+    const run = async (imeisOverride) => {
+      const imeis = imeisOverride || parsedImeis();
+      if (imeis.length === 0) { toast('Nothing to scan — add an IMEI or you\u2019re all done', 'warn'); return; }
       if (imeis.length > 200) { toast(`${imeis.length} IMEIs — maximum is 200 per batch. Split into smaller batches.`, 'warn'); return; }
       if (ctx.buy_price === '' || ctx.buy_price == null) { toast('Buy price is required — it applies to every device received in this batch', 'warn'); return; }
       if (!ctx.vat_type) { toast('VAT type is required', 'warn'); return; }
@@ -3094,17 +3116,49 @@
           supplier_id: ctx.supplier_id ? Number(ctx.supplier_id) : undefined,
           auto_print: state.autoPrint,
         });
-        ctx.result = r;
+        // Merge this run's per-IMEI outcomes into the cumulative map — see
+        // comment on resultsByImei above for why this must be a merge, not
+        // a replace.
+        for (const row of r.results) ctx.resultsByImei.set(row.imei, row);
+        // Drop settled IMEIs from the textarea so the next click (whether
+        // "Receive batch" again or an auto-retry after picking a SKU below)
+        // only resends what's still outstanding.
+        ctx.raw = parsedImeis().filter(i => !isSettled(ctx.resultsByImei.get(i)?.outcome)).join('\n');
         beep(r.failed === 0 ? 'ok' : (r.received === 0 ? 'err' : 'warn'));
-        toast(`Bulk scan: ${r.received} received, ${r.failed} not received (of ${r.requested})`,
+        toast(`This run: ${r.received} received, ${r.failed} not received (of ${r.requested} scanned)`,
           r.failed === 0 ? 'ok' : 'warn', 4000);
         await refreshActiveManifest();
         await Promise.all([refreshPrint().catch(() => {}), refreshStats().catch(() => {})]);
-        render();
       } catch (err) {
         toast(err.response?.data?.error || 'Bulk scan failed', 'err');
       } finally {
         ctx.busy = false; state._bulkCtx = ctx; render();
+      }
+    };
+
+    // Apply a suggested SKU (from a no_match/ambiguous row's candidates) to
+    // this manifest line AND every other pending line sharing the same
+    // signature — same call the single-scan Confirm-SKU modal's "Use for
+    // all in batch" button makes — then immediately re-scan every IMEI
+    // still outstanding so the now-resolved lines get received without a
+    // second manual click.
+    const applyBusy = { current: false };
+    const useSuggestedSku = async (row, candidate) => {
+      if (applyBusy.current) return;
+      applyBusy.current = true;
+      render();
+      try {
+        const r = await api.post(`/manifests/${state.activeManifestId}/apply-sku-to-batch`, {
+          sku: candidate.sku,
+          source_expected_device_id: row.expected_device_id,
+        });
+        toast(`Applied <span class="mono">${r.sku}</span> to ${r.applied} pending line${r.applied === 1 ? '' : 's'} — re-scanning…`, 'ok');
+        await run(parsedImeis());
+      } catch (err) {
+        toast(err.response?.data?.error || 'Failed to apply SKU', 'err');
+      } finally {
+        applyBusy.current = false;
+        render();
       }
     };
 
@@ -3114,20 +3168,42 @@
       rejected: 'badge-slate', no_match: 'badge-red', ambiguous: 'badge-red', error: 'badge-red',
     };
 
-    const resultsPanel = ctx.result ? h('div', { class: 'mt-4 card p-3 bg-slate-900/40' },
+    const allResults = Array.from(ctx.resultsByImei.values());
+    const totalReceived = allResults.filter(r => r.outcome === 'received').length;
+    const totalOutstanding = allResults.length - totalReceived;
+
+    const resultsPanel = allResults.length > 0 ? h('div', { class: 'mt-4 card p-3 bg-slate-900/40' },
       h('div', { class: 'flex items-center justify-between mb-2' },
-        h('div', { class: 'text-[10px] uppercase tracking-wider text-slate-500' }, 'Last run'),
+        h('div', { class: 'text-[10px] uppercase tracking-wider text-slate-500' }, 'Progress (all runs this session)'),
         h('div', { class: 'text-xs' },
-          h('span', { class: 'text-green-400 font-semibold' }, ctx.result.received), ' received · ',
-          h('span', { class: 'text-red-400 font-semibold' }, ctx.result.failed), ' not received',
-          ' (of ', ctx.result.requested, ')')
+          h('span', { class: 'text-green-400 font-semibold' }, totalReceived), ' received · ',
+          h('span', { class: 'text-red-400 font-semibold' }, totalOutstanding), ' outstanding',
+          ' (of ', allResults.length, ' scanned)')
       ),
-      h('div', { class: 'max-h-56 overflow-y-auto divide-y divide-slate-800' },
-        ctx.result.results.map(r => h('div', { class: 'flex items-center gap-3 py-1.5 px-1 text-xs' },
-          h('span', { class: 'badge ' + (outcomeCls[r.outcome] || 'badge-slate') }, r.outcome),
-          h('code', { class: 'mono flex-1' }, r.imei),
-          r.sku ? h('span', { class: 'mono text-cyan-300' }, r.sku) : null,
-          r.message ? h('span', { class: 'text-slate-400 truncate max-w-xs' }, r.message) : null
+      h('div', { class: 'max-h-64 overflow-y-auto divide-y divide-slate-800' },
+        allResults.map(r => h('div', { class: 'py-1.5 px-1 text-xs' },
+          h('div', { class: 'flex items-center gap-3' },
+            h('span', { class: 'badge ' + (outcomeCls[r.outcome] || 'badge-slate') }, r.outcome),
+            h('code', { class: 'mono flex-1' }, r.imei),
+            r.sku ? h('span', { class: 'mono text-cyan-300' }, r.sku) : null,
+            r.message ? h('span', { class: 'text-slate-400 truncate max-w-xs' }, r.message) : null
+          ),
+          // Suggested-SKU picker — only for rows the server returned
+          // candidates for (no_match / ambiguous), same idea as the
+          // Confirm-SKU modal's candidate list.
+          (Array.isArray(r.candidates) && r.candidates.length > 0) ? h('div', {
+            class: 'mt-1.5 ml-1 pl-2 border-l border-slate-700 flex flex-wrap gap-1.5',
+          },
+            r.candidates.slice(0, 5).map(cand => h('button', {
+              class: 'btn btn-ghost text-[11px]' + (applyBusy.current ? ' opacity-50 cursor-not-allowed' : ''),
+              disabled: applyBusy.current ? 'disabled' : null,
+              onclick: () => useSuggestedSku(r, cand),
+              title: `${cand.brand} ${cand.model} ${cand.capacity || ''} ${cand.color || ''} · grade ${cand.grade || '?'}`,
+            },
+              h('i', { class: 'fas fa-layer-group' }),
+              h('span', { class: 'mono' }, cand.sku), ' — use for batch')
+            )
+          ) : null
         ))
       )
     ) : null;
@@ -3140,7 +3216,7 @@
           h('div', {},
             h('h2', { class: 'text-lg font-semibold' }, 'Bulk scan'),
             h('p', { class: 'text-xs text-slate-400' },
-              'Scan or paste many IMEIs (one per line) — up to 200 per batch. Only IMEIs that resolve to exactly one catalogue SKU are received automatically; anything else is reported below for the normal single-scan flow.')
+              'Scan or paste many IMEIs (one per line) — up to 200 per batch. IMEIs that resolve to exactly one catalogue SKU are received automatically. Anything else appears below with suggested SKUs you can apply to the whole batch — pick one and the outstanding IMEIs are re-scanned automatically.')
           )
         ),
 
@@ -3212,11 +3288,16 @@
             'Auto-queue print labels for received devices'
           ),
           h('div', { class: 'flex gap-2' },
-            h('button', { class: 'btn btn-ghost', onclick: close }, ctx.result ? 'Close' : 'Cancel'),
+            h('button', { class: 'btn btn-ghost', onclick: close }, allResults.length > 0 ? 'Close' : 'Cancel'),
             h('button', {
               class: 'btn btn-primary' + (ctx.busy ? ' opacity-60 cursor-not-allowed' : ''),
               id: 'bulk-scan-run-btn',
-              onclick: run,
+              // Wrapped in an arrow fn — run() takes an optional imeisOverride
+              // array; binding it directly as onclick would pass the click
+              // Event as that argument instead (truthy, so the `|| parsedImeis()`
+              // fallback never kicks in), silently sending the DOM Event as
+              // the `imeis` field in the POST body.
+              onclick: () => run(),
               disabled: ctx.busy ? 'disabled' : null,
             }, ctx.busy
               ? [h('i', { class: 'fas fa-spinner fa-spin' }), 'Processing…']

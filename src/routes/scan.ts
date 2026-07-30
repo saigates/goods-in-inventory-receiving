@@ -445,6 +445,15 @@ app.post('/bulk', async (c) => {
     received_id?: number
     sku?: string
     print_job_id?: number | null
+    // Populated for 'no_match' / 'ambiguous' only — lets the client resolve
+    // these the same way the single-scan Confirm-SKU modal does: pick a
+    // candidate row and (optionally) apply it to every other pending line
+    // on this manifest sharing the same signature via
+    // POST /manifests/:id/apply-sku-to-batch, then re-run the bulk scan.
+    // Without this the operator has no way to act on a failed bulk line
+    // except re-scanning it one at a time through the normal modal.
+    expected_device_id?: number
+    candidates?: CatalogRow[]
   }
   const results: BulkOutcome[] = []
 
@@ -495,7 +504,10 @@ app.post('/bulk', async (c) => {
       const lookup = matchCatalogRows(catalog, { model: modelForLookup, capacity: expected.capacity, color: expected.color, grade })
       if (lookup.status === 'match') catalogRow = lookup.row
       else {
-        results.push({ imei, ok: false, outcome: lookup.status, message: lookup.reason })
+        results.push({
+          imei, ok: false, outcome: lookup.status, message: lookup.reason,
+          expected_device_id: expected.id, candidates: lookup.candidates,
+        })
         continue
       }
     }
