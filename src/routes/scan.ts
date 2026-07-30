@@ -3,7 +3,7 @@ import type { Bindings, ExpectedDevice, ReceivedDevice, AuthUser } from '../type
 import { buildSku } from '../lib/sku'
 import { shortUuid } from '../lib/uuid'
 import { normalizeGrade } from '../lib/grade'
-import { resolveCatalogSku, normalizeCapacity } from '../lib/catalog'
+import { resolveCatalogSku, normalizeCapacity, matchCatalogRows } from '../lib/catalog'
 import type { CatalogLookup, CatalogRow } from '../lib/catalog'
 import { currentUser } from '../lib/auth'
 import { validateImei, validateBuyPrice, isValidCurrency, isValidVatType, normalizeCurrency, cleanString } from '../lib/validate'
@@ -349,6 +349,216 @@ app.post('/confirm', async (c) => {
     .bind(receivedId).first<ReceivedDevice>()
 
   return c.json({ ok: true, received, print_job_id: printJobId })
+})
+
+// ───────── Bulk scan ─────────
+//
+// POST /scan/bulk — process MANY IMEIs against one manifest in a single
+// call, instead of the operator scanning + confirming one at a time through
+// the modal. Body: { manifest_id, imeis: [...] } (max 200, mirroring the
+// OPR 4 scan-bulk cap in src/routes/opr.ts). Optional shared valuation
+// fields (buy_price, currency, vat_type, supplier_id) apply to every IMEI
+// in the batch that reaches a receivable outcome — this is the natural
+// complement to "use this SKU for all other lines in this batch": once a
+// batch of identical units all carry the same pre-filled catalog SKU
+// (via /manifests/:id/apply-sku-to-batch), the operator can scan the whole
+// stack and receive them in one shot with one shared cost/currency/VAT
+// entry, rather than re-typing the same valuation in the confirm modal for
+// every unit.
+//
+// Each IMEI is processed INDEPENDENTLY — a bad, duplicate, unreconciled, or
+// unresolvable IMEI never blocks the rest of the batch and leaves NO
+// partial side-effects of its own (same guarantee as /scan/confirm; this
+// endpoint literally reuses /scan/confirm's core write sequence per row,
+// just without a modal round-trip per device).
+//
+// Deliberately conservative about what it will auto-receive: an IMEI only
+// receives automatically if
+//   (a) it validates (15-digit Luhn or 10-char serial),
+//   (b) it is on this manifest and still pending,
+//   (c) it is not already received,
+//   (d) the catalog match for it resolves to EXACTLY ONE sku — a
+//       pre-filled expected_devices.sku (from apply-sku-to-batch) is
+//       trusted directly, same fast-path as single /scan; otherwise it
+//       falls back to the normal (model, capacity, color, grade) match.
+// Anything else (unreconciled, ambiguous, no_match, already received,
+// invalid IMEI) is reported back with a reason and NOT auto-resolved —
+// the operator still has to go through the single-scan modal for those,
+// same as before. This endpoint never invents a SKU or guesses among
+// candidates.
+//
+// The catalog is loaded ONCE for the whole batch and matched in memory
+// (matchCatalogRows) — the same "load once, match in memory" discipline
+// that fixed the 197-IMEI production bug (see README) — so a 200-IMEI
+// batch against a several-thousand-row catalog is O(1) catalog round
+// trips, not O(imeis).
+app.post('/bulk', async (c) => {
+  const user = currentUser(c)
+  const orgId = user.organisation_id
+
+  const body = await c.req.json<{
+    manifest_id?: number
+    imeis?: unknown[]
+    buy_price?: number | string
+    currency?: string
+    vat_type?: string
+    supplier_id?: number
+    auto_print?: boolean
+  }>().catch(() => ({} as any))
+
+  const manifestId = Number(body.manifest_id)
+  if (!manifestId) return c.json({ error: 'manifest_id is required' }, 400)
+  if (!Array.isArray(body.imeis)) return c.json({ error: 'Body must be { manifest_id, imeis: [...] }' }, 422)
+  if (!body.imeis.length) return c.json({ error: 'imeis is empty' }, 422)
+  if (body.imeis.length > 200) return c.json({ error: 'Maximum 200 IMEIs per bulk call' }, 422)
+
+  const manifest = await c.env.DB.prepare(
+    'SELECT id, status FROM manifests WHERE id = ? AND organisation_id = ?'
+  ).bind(manifestId, orgId).first<{ id: number; status: string }>()
+  if (!manifest) return c.json({ error: 'Manifest not found' }, 404)
+
+  // Valuation is shared across the whole batch (Priority 4 still applies —
+  // every device that gets created has buy_price/currency/vat_type, they
+  // just come from one shared entry instead of a per-device modal).
+  const valuation = parseValuation(body, { required: true })
+  if (!valuation.ok) return c.json({ error: valuation.error }, 422)
+
+  let supplierId: number | null = null
+  if (body.supplier_id) {
+    const sup = await c.env.DB.prepare('SELECT id FROM suppliers WHERE id = ? AND organisation_id = ?')
+      .bind(Number(body.supplier_id), orgId).first()
+    if (!sup) return c.json({ error: `supplier_id ${body.supplier_id} not found for this organisation` }, 400)
+    supplierId = Number(body.supplier_id)
+  }
+
+  // Load the whole org catalog ONCE — matched in memory per row below.
+  const { results: catalog } = await c.env.DB.prepare(
+    'SELECT id, sku, brand, model, capacity, color, grade FROM sku_catalog WHERE organisation_id = ?'
+  ).bind(orgId).all<CatalogRow>()
+  const catalogBySku = new Map(catalog.map((r) => [r.sku, r]))
+
+  type BulkOutcome = {
+    imei: string
+    ok: boolean
+    outcome: 'received' | 'duplicate' | 'unreconciled' | 'rejected' | 'no_match' | 'ambiguous' | 'error'
+    message?: string
+    received_id?: number
+    sku?: string
+    print_job_id?: number | null
+  }
+  const results: BulkOutcome[] = []
+
+  for (const raw of body.imeis) {
+    const imeiCheck = validateImei(raw)
+    if (!imeiCheck.ok) {
+      results.push({ imei: String(raw ?? ''), ok: false, outcome: 'rejected', message: imeiCheck.reason })
+      await logDeviceEvent(c.env.DB, {
+        organisationId: orgId, deviceId: null, eventType: 'SCAN', userId: user.id,
+        reference: String(manifestId), metadata: { outcome: 'rejected', reason: imeiCheck.reason, raw_imei: raw, bulk: true },
+      })
+      continue
+    }
+    const imei = imeiCheck.imei
+
+    // Already received anywhere in this org?
+    const already = await c.env.DB.prepare(
+      'SELECT id, uuid FROM received_devices WHERE imei = ? AND organisation_id = ?'
+    ).bind(imei, orgId).first<{ id: number; uuid: string }>()
+    if (already) {
+      results.push({ imei, ok: false, outcome: 'duplicate', message: `Already received (UUID ${already.uuid})` })
+      continue
+    }
+
+    const expected = await c.env.DB.prepare(
+      'SELECT * FROM expected_devices WHERE manifest_id = ? AND imei = ? AND organisation_id = ?'
+    ).bind(manifestId, imei, orgId).first<ExpectedDevice>()
+    if (!expected) {
+      results.push({ imei, ok: false, outcome: 'unreconciled', message: 'Not on this manifest' })
+      await c.env.DB.prepare(
+        "INSERT INTO scan_events (organisation_id, manifest_id, imei, outcome, message, user_id) VALUES (?, ?, ?, 'unreconciled', 'Not on manifest (bulk)', ?)"
+      ).bind(orgId, manifestId, imei, user.id).run()
+      continue
+    }
+    if (expected.status === 'received') {
+      results.push({ imei, ok: false, outcome: 'duplicate', message: 'This manifest line was already received' })
+      continue
+    }
+
+    // Resolve catalog SKU: trust a pre-filled expected.sku first (same
+    // fast-path as single /scan), else match in memory against the
+    // catalog loaded above.
+    const grade = normalizeGrade(expected.grade)
+    let catalogRow: CatalogRow | undefined
+    if (expected.sku) catalogRow = catalogBySku.get(expected.sku)
+    if (!catalogRow) {
+      const modelForLookup = expected.model_no || expected.description || null
+      const lookup = matchCatalogRows(catalog, { model: modelForLookup, capacity: expected.capacity, color: expected.color, grade })
+      if (lookup.status === 'match') catalogRow = lookup.row
+      else {
+        results.push({ imei, ok: false, outcome: lookup.status, message: lookup.reason })
+        continue
+      }
+    }
+
+    // Write the received device — same core sequence as /confirm.
+    const uuid = shortUuid()
+    let insRecv
+    try {
+      insRecv = await c.env.DB.prepare(
+        `INSERT INTO received_devices
+         (organisation_id, uuid, imei, sku, brand, model, capacity, color, grade, source, manifest_id, expected_device_id,
+          status, created_by_user_id, buy_price, currency, vat_type, supplier_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manifest', ?, ?, 'RECEIVED', ?, ?, ?, ?, ?)`
+      ).bind(
+        orgId, uuid, imei, catalogRow.sku, catalogRow.brand, catalogRow.model, catalogRow.capacity, catalogRow.color,
+        normalizeGrade(catalogRow.grade ?? grade), manifestId, expected.id, user.id,
+        valuation.buy_price, valuation.currency, valuation.vat_type, supplierId,
+      ).run()
+    } catch (err) {
+      if (isImeiUniqueError(err)) {
+        results.push({ imei, ok: false, outcome: 'duplicate', message: 'Already received (race)' })
+        continue
+      }
+      results.push({ imei, ok: false, outcome: 'error', message: err instanceof Error ? err.message : String(err) })
+      continue
+    }
+
+    const receivedId = insRecv.meta.last_row_id as number
+
+    await c.env.DB.prepare(
+      `UPDATE expected_devices SET status = 'received', received_at = CURRENT_TIMESTAMP, received_device_id = ? WHERE id = ? AND organisation_id = ?`
+    ).bind(receivedId, expected.id, orgId).run()
+
+    await c.env.DB.prepare(
+      "INSERT INTO scan_events (organisation_id, manifest_id, imei, outcome, message, user_id) VALUES (?, ?, ?, 'received', ?, ?)"
+    ).bind(orgId, manifestId, imei, `SKU ${catalogRow.sku} · grade ${grade} (bulk)`, user.id).run()
+
+    await logDeviceEvent(c.env.DB, {
+      organisationId: orgId, deviceId: receivedId, eventType: 'RECEIVE', userId: user.id,
+      toStatus: 'RECEIVED', reference: String(manifestId),
+      metadata: { sku: catalogRow.sku, grade, source: 'manifest', bulk: true, buy_price: valuation.buy_price, currency: valuation.currency, vat_type: valuation.vat_type },
+    })
+
+    let printJobId: number | null = null
+    if (body.auto_print !== false) {
+      const payload = { uuid, sku: catalogRow.sku, imei, brand: catalogRow.brand, model: catalogRow.model, capacity: catalogRow.capacity, color: catalogRow.color, grade: normalizeGrade(catalogRow.grade ?? grade) }
+      const pj = await c.env.DB.prepare(
+        `INSERT INTO print_jobs (organisation_id, received_device_id, payload_json, created_by_user_id) VALUES (?, ?, ?, ?)`
+      ).bind(orgId, receivedId, JSON.stringify(payload), user.id).run()
+      printJobId = pj.meta.last_row_id as number
+    }
+
+    results.push({ imei, ok: true, outcome: 'received', sku: catalogRow.sku, received_id: receivedId, print_job_id: printJobId })
+  }
+
+  const received = results.filter((r) => r.ok).length
+  return c.json({
+    ok: true,
+    requested: results.length,
+    received,
+    failed: results.length - received,
+    results,
+  })
 })
 
 // Force-add an unreconciled IMEI (not on manifest) to the inventory bucket
