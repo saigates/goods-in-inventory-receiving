@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { Bindings, AuthUser } from '../types'
-import { signAuthToken, currentUser } from '../lib/auth'
+import { signAuthToken, signDocToken, currentUser } from '../lib/auth'
 import { verifyPassword, hashPassword, passwordPolicyError } from '../lib/password'
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -99,6 +99,26 @@ app.post('/change-password', async (c) => {
   ).bind(newHash, user.id, user.organisation_id).run()
 
   return c.json({ ok: true })
+})
+
+// ───────── Doc token minting (2026-07-30 hardening) ─────────
+// Issues a short-lived (5-minute), purpose-scoped token for the handful of
+// routes opened via window.open() — print labels, the OPR invoice / C&E1154
+// print views — which can't carry an Authorization header on a plain
+// browser navigation. Requires the caller to already be authenticated with
+// a normal session token (this route sits BEHIND authMiddleware, same as
+// every other /api/* route except /login and the dev-login tombstone).
+//
+// Replaces the old approach of putting the full 12h session token straight
+// into the URL: that token would work on ANY route for up to 12 hours if
+// the URL ever leaked (browser history, proxy logs, Referer header). A doc
+// token minted here only works on the exact print/document route it's
+// used against, and only for 5 minutes — call this immediately before each
+// window.open(), not once and reused.
+app.post('/doc-token', async (c) => {
+  const user = currentUser(c as never)
+  const token = await signDocToken(c.env.JWT_SECRET, user)
+  return c.json({ token })
 })
 
 // Who am I — lets the SPA confirm the stored token is still valid and show

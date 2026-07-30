@@ -189,6 +189,36 @@
     del: (p) => http.delete(p).then(r => r.data),
   };
 
+  // Browser-mode label/document URLs (GET /api/print/label/:id,
+  // /api/print/labels, /api/opr/shipments/:id/invoice, .../ce1154) are
+  // opened via window.open(), which is a plain browser navigation and
+  // can't carry our Authorization header.
+  //
+  // 2026-07-30 hardening: this used to append the full 12h session token as
+  // `?token=` — a leaked URL (browser history, proxy/access logs, Referer)
+  // would then grant full API access for hours. Fixed by minting a fresh,
+  // 5-minute, route-scoped "doc token" (POST /api/auth/doc-token) right
+  // before opening the window, instead of reusing the long-lived session
+  // token. See src/lib/auth.ts for the server-side enforcement.
+  //
+  // window.open() must be called SYNCHRONOUSLY inside the click handler or
+  // popup blockers kill it — but minting the doc token is an async API
+  // call. Fix: open a blank window synchronously (preserves the "user
+  // gesture" the browser needs to allow it), then navigate it once the doc
+  // token comes back.
+  async function openWithDocToken(url, features) {
+    const win = window.open('', '_blank', features);
+    if (!win) return null; // popup blocked before we even had a token
+    try {
+      const { token } = await api.post('/auth/doc-token');
+      win.location = url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
+    } catch (e) {
+      win.close();
+      throw e;
+    }
+    return win;
+  }
+
   async function refreshManifests() {
     const r = await api.get('/manifests');
     state.manifests = r.manifests || [];
@@ -745,9 +775,13 @@
       }
     };
 
-    const openDoc = (path) => {
-      const win = window.open(withAuthToken(`/api/opr/shipments/${s.id}/${path}`), '_blank');
-      if (!win) toast('Popup blocked — allow popups for this site', 'warn');
+    const openDoc = async (path) => {
+      try {
+        const win = await openWithDocToken(`/api/opr/shipments/${s.id}/${path}`);
+        if (!win) toast('Popup blocked — allow popups for this site', 'warn');
+      } catch (err) {
+        toast(err.response?.data?.error || err.message, 'err', 4000);
+      }
     };
     const showDraftDoc = async (kind) => {
       try {
@@ -3873,19 +3907,11 @@
           )
     );
   }
-  // Browser-mode label URLs (GET /api/print/label/:id, /api/print/labels)
-  // are opened via window.open(), which is a plain browser navigation and
-  // can't carry our Authorization header. The backend's extractToken()
-  // falls back to a `?token=` query param for exactly this case.
-  function withAuthToken(url) {
-    if (!authToken) return url;
-    return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(authToken);
-  }
   async function sendPrint(id) {
     try {
       const r = await api.post(`/print/send/${id}?size=${state.labelSize}${state.labelRotate ? '&rotate=1' : ''}`);
       if (r.mode === 'browser') {
-        const win = window.open(withAuthToken(r.url), '_blank', 'width=720,height=520');
+        const win = await openWithDocToken(r.url, 'width=720,height=520');
         if (!win) {
           toast('Pop-up blocked — please allow pop-ups for this site', 'err', 4000);
           return;
@@ -3906,7 +3932,7 @@
     try {
       const r = await api.post(`/print/send-all?size=${state.labelSize}${state.labelRotate ? '&rotate=1' : ''}`);
       if (r.mode === 'browser') {
-        const win = window.open(withAuthToken(r.url), '_blank', 'width=720,height=520');
+        const win = await openWithDocToken(r.url, 'width=720,height=520');
         if (!win) {
           toast('Pop-up blocked — please allow pop-ups for this site', 'err', 4000);
           return;

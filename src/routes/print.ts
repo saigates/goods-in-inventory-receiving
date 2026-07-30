@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { Bindings, AuthUser } from '../types'
-import { currentUser } from '../lib/auth'
+import { currentUser, signDocToken } from '../lib/auth'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -326,7 +326,8 @@ async function sendToPrintNode(
   job: { id: number; received_device_id: number; sku: string; imei: string },
   size: 'large' | 'small',
   labelUrlBase: string,
-  authToken: string,
+  jwtSecret: string,
+  user: AuthUser,
 ): Promise<{ ok: true; printnode_job_id: unknown } | { ok: false; error: string; status: number }> {
   if (!s.printnode_api_key) return { ok: false, error: 'PrintNode API key not configured', status: 400 }
   const printerId = size === 'small' ? s.printnode_printer_id_small : s.printnode_printer_id_large
@@ -334,12 +335,22 @@ async function sendToPrintNode(
 
   // Render the label HTML and send to PrintNode as pdf_uri pointing at our
   // endpoint. PrintNode's headless renderer fetches this URL itself — it
-  // can't send our normal Authorization header, so we pass the same bearer
-  // token as a `?token=` query param (see extractToken() fallback in
-  // src/lib/auth.ts, scoped to exactly this use case).
+  // can't send our normal Authorization header, so we pass a bearer token
+  // as a `?token=` query param (extractToken() fallback in src/lib/auth.ts).
+  //
+  // 2026-07-30 hardening: this used to be the caller's full 12h SESSION
+  // token — which meant it was handed, in full, to a THIRD PARTY
+  // (PrintNode's own servers fetch this URL to render the PDF). Any replay,
+  // log line, or breach on PrintNode's side would have exposed a live
+  // session credential with full API access for hours. Fixed by minting a
+  // fresh 5-minute doc token (signDocToken, same claim shape as the
+  // frontend's POST /api/auth/doc-token, just minted in-process here since
+  // this code already has the JWT secret + user) that is only ever valid
+  // on this exact GET /api/print/label/:id path.
+  const docToken = await signDocToken(jwtSecret, user)
   const labelUrl = new URL(labelUrlBase)
   labelUrl.pathname = `/api/print/label/${job.id}`
-  labelUrl.search = `?size=${size}&token=${encodeURIComponent(authToken)}`
+  labelUrl.search = `?size=${size}&token=${encodeURIComponent(docToken)}`
 
   const pnResp = await fetch('https://api.printnode.com/printjobs', {
     method: 'POST',
@@ -391,9 +402,7 @@ app.post('/send/:id', async (c) => {
   }
 
   if (s.print_mode === 'printnode') {
-    const authHeader = c.req.header('Authorization') || ''
-    const authToken = authHeader.replace(/^Bearer\s+/i, '')
-    const result = await sendToPrintNode(c.env.DB, s, job, size, c.req.url, authToken)
+    const result = await sendToPrintNode(c.env.DB, s, job, size, c.req.url, c.env.JWT_SECRET, user)
     if (!result.ok) return c.json({ error: result.error }, result.status as any)
     return c.json({ ok: true, mode: 'printnode', printnode_job_id: result.printnode_job_id })
   }
@@ -427,11 +436,9 @@ app.post('/send-all', async (c) => {
   if (s.print_mode === 'printnode') {
     // For simplicity, kick off jobs sequentially. They are sent to PrintNode
     // independently so the warehouse printer queues them in order.
-    const authHeader = c.req.header('Authorization') || ''
-    const authToken = authHeader.replace(/^Bearer\s+/i, '')
     let sent = 0
     for (const job of results) {
-      const result = await sendToPrintNode(c.env.DB, s, job, size, c.req.url, authToken)
+      const result = await sendToPrintNode(c.env.DB, s, job, size, c.req.url, c.env.JWT_SECRET, user)
       if (result.ok) sent++
     }
     return c.json({ ok: true, mode: 'printnode', sent })

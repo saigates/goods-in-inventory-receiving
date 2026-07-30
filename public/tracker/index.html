@@ -277,10 +277,10 @@ DATA.testCoverage = {
 
 DATA.backlog = [
   ['Real credential login — DONE 2026-07-28 for the two-person internal case (per-person PBKDF2 credentials, dev-login removed with a 410 tombstone). Still out of scope: external IdP / SSO / Cloudflare Access, self-signup, email verification, email-based reset, multi-org', 'Done (internal case)', 'IdP/SSO only if the team outgrows two seeded accounts'],
-  ['?token= query-param hardening on print-label URLs (can leak into logs/history)', 'Deferred', 'Still open after the credentialed-login pass — next auth hardening item'],
+  ['?token= query-param hardening on print-label URLs — DONE 2026-07-30. New short-lived (5-min) "doc token" (typ:\u2019doc\u2019 claim) replaces the old fallback of accepting the full 12h session JWT via ?token= on any route; doc tokens only work via ?token= on 4 allow-listed print/OPR-document paths, session tokens are now rejected outright if presented via ?token= anywhere. Also fixes the more severe sibling bug: sendToPrintNode() was forwarding the caller\u2019s live session token to PrintNode\u2019s third-party servers \u2014 it now mints its own doc token in-process instead.', 'Done', 'Covered by test/docToken.spec.ts (9 tests): mint endpoint, allow-list enforcement, header-vs-query rejection, and the key regression proof \u2014 a session token via ?token= is rejected on every route'],
   ['Export lifecycle transitions (READY_FOR_EXPORT ↔ IN_EXPORT_CONSIGNMENT → EXPORTED_UNDER_OPR)', 'Done (OPR 2)', 'Wired to the consignment builder/finalisation — OPR-workflow-only, generic endpoint refuses them'],
   ['SOLD lifecycle transition', 'Deferred', 'Downstream sales flow, not OPR — return transitions (→ RETURNED_UNDER_OPR → ACTIVE_INVENTORY) are wired by OPR 3'],
-  ['Automated tests: CSV export shape (webhook HMAC + IMEI/Luhn suites now done — OPR 4 + IMEI-rule passes)', 'Open', 'Next testing pass'],
+  ['Automated tests: CSV export shape (webhook HMAC + IMEI/Luhn suites now done — OPR 4 + IMEI-rule passes)', 'Done', 'Covered by test/csvExport.spec.ts (30 tests, added 2026-07-28) — no automated gap remains here'],
   ['Bulk endpoints + webhook hardening for downstream consumers', 'Deferred', 'When OPR / downstream integration starts (OPR 4)'],
   ['Supplier CSV import (only device CSV export exists)', 'Deferred', 'When supplier master data grows beyond hand-entry'],
   ['Multi-warehouse / multi-location', 'Deferred', 'Second physical site'],
