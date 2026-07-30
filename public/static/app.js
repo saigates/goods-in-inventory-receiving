@@ -61,6 +61,7 @@
     catalog: [],                     // sku_catalog rows
     catalogUpload: null,             // { fileName, rows, report, summary } during preview
     manualReceiveOpen: false,        // manual-receive (no manifest) modal
+    bulkScanOpen: false,              // bulk-scan (many IMEIs at once) modal
     printQueue: [],
     stats: {},
     pendingMatch: null,   // { expected, catalog_match: { status, row? , candidates?, reason? } }
@@ -399,6 +400,7 @@
       state.labelPreview ? LabelPreviewModal() : null,
       state.deleteDevice ? DeleteDeviceModal() : null,
       state.manualReceiveOpen ? ManualReceiveModal() : null,
+      state.bulkScanOpen ? BulkScanModal() : null,
       state.oprNewOpen ? OprNewShipmentModal() : null,
       state.oprFinaliseOpen ? OprFinaliseModal() : null,
       state.oprDraftDoc ? OprDraftDocModal() : null,
@@ -1809,6 +1811,8 @@
               onclick: () => { state.manualReceiveOpen = true; render(); }
             }, h('i', { class: 'fas fa-plus' }), 'Quick receive (no manifest)')
           )
+          // Bulk scan needs an active manifest to receive against — not offered
+          // in the zero-manifest empty state above.
         )
       );
     }
@@ -1844,6 +1848,11 @@
             onclick: () => { state.manualReceiveOpen = true; render(); },
             title: 'Receive a device without a manifest',
           }, h('i', { class: 'fas fa-plus' }), 'Quick receive'),
+          m ? h('button', {
+            class: 'btn btn-ghost text-xs',
+            onclick: () => { state.bulkScanOpen = true; render(); },
+            title: 'Scan/paste many IMEIs at once and receive them in one shot',
+          }, h('i', { class: 'fas fa-layer-group' }), 'Bulk scan') : null,
           m ? h('div', { class: 'text-right' },
             h('div', { class: 'text-3xl font-bold mono' },
               h('span', { class: 'text-cyan-300' }, state.summary.received_count),
@@ -2089,6 +2098,36 @@
       render();
     };
 
+    // Pick a candidate AND apply its SKU to every other pending line on this
+    // manifest sharing the same (model, capacity, color, grade) signature —
+    // avoids repeating "Use this" one device at a time for a batch of
+    // identical units. Uses the CURRENT manifest line as the signature
+    // source (source_expected_device_id) rather than re-deriving it from the
+    // editable fields, so it can't accidentally widen to an unrelated line.
+    const applyBatchBusy = { current: false };
+    const pickCandidateForBatch = async (row) => {
+      if (applyBatchBusy.current) return;
+      applyBatchBusy.current = true;
+      pickCandidate(row);
+      try {
+        const r = await api.post(`/manifests/${state.activeManifestId}/apply-sku-to-batch`, {
+          sku: row.sku,
+          source_expected_device_id: expected.id,
+        });
+        if (r.applied > 0) {
+          toast(`Applied <span class="mono">${r.sku}</span> to ${r.applied} other pending line${r.applied === 1 ? '' : 's'} in this batch`, 'ok');
+          await refreshActiveManifest();
+          render();
+        } else {
+          toast('No other pending lines share this signature', 'warn');
+        }
+      } catch (err) {
+        toast(err.response?.data?.error || 'Failed to apply SKU to batch', 'err');
+      } finally {
+        applyBatchBusy.current = false;
+      }
+    };
+
     // Mint a new catalogue row from the current fields, then continue receiving.
     const addToCatalogAndReceive = async () => {
       try {
@@ -2209,8 +2248,16 @@
                 h('div', { class: 'text-[11px] text-slate-400 truncate' },
                   [row.brand, row.model, row.capacity, row.color, `grade ${row.grade || '?'}`].filter(Boolean).join(' · '))
               ),
-              h('button', { class: 'btn btn-ghost text-[11px]', onclick: () => pickCandidate(row) },
-                h('i', { class: 'fas fa-check' }), 'Use this')
+              h('div', { class: 'flex gap-1.5 flex-shrink-0' },
+                h('button', { class: 'btn btn-ghost text-[11px]', onclick: () => pickCandidate(row) },
+                  h('i', { class: 'fas fa-check' }), 'Use this'),
+                h('button', {
+                  class: 'btn btn-ghost text-[11px]',
+                  onclick: () => pickCandidateForBatch(row),
+                  title: 'Apply this SKU to every other pending line on this manifest with the same model/capacity/color/grade',
+                },
+                  h('i', { class: 'fas fa-layer-group' }), 'Use for all in batch')
+              )
             ))
           )
         )
@@ -3010,6 +3057,176 @@
     );
   }
 
+  // ───────── Bulk scan modal ─────────
+  // Paste/scan many IMEIs at once against the active manifest and receive
+  // them in one POST /scan/bulk call. Deliberately conservative: only IMEIs
+  // that are on the manifest, still pending, and resolve to EXACTLY ONE
+  // catalogue SKU (trusting a pre-filled expected_devices.sku from "Use for
+  // all in batch", or falling back to the normal model/capacity/color/grade
+  // match) get received automatically. Anything else (no match, ambiguous,
+  // duplicate, off-manifest, malformed) is reported back per-IMEI so the
+  // operator can fix those individually through the normal single-scan flow.
+  function BulkScanModal() {
+    const ctx = state._bulkCtx ||= {
+      raw: '',              // textarea contents — one IMEI per line (or whitespace-separated)
+      buy_price: '', currency: 'GBP', vat_type: '', supplier_id: '',
+      busy: false,
+      result: null,         // { requested, received, failed, results[] } from the last run
+    };
+    const close = () => { state.bulkScanOpen = false; state._bulkCtx = null; render(); };
+
+    const parsedImeis = () => Array.from(new Set(
+      ctx.raw.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean)
+    ));
+
+    const run = async () => {
+      const imeis = parsedImeis();
+      if (imeis.length === 0) { toast('Paste or scan at least one IMEI', 'warn'); return; }
+      if (imeis.length > 200) { toast(`${imeis.length} IMEIs — maximum is 200 per batch. Split into smaller batches.`, 'warn'); return; }
+      if (ctx.buy_price === '' || ctx.buy_price == null) { toast('Buy price is required — it applies to every device received in this batch', 'warn'); return; }
+      if (!ctx.vat_type) { toast('VAT type is required', 'warn'); return; }
+      ctx.busy = true; state._bulkCtx = ctx; render();
+      try {
+        const r = await api.post('/scan/bulk', {
+          manifest_id: state.activeManifestId,
+          imeis,
+          buy_price: ctx.buy_price, currency: ctx.currency || 'GBP', vat_type: ctx.vat_type,
+          supplier_id: ctx.supplier_id ? Number(ctx.supplier_id) : undefined,
+          auto_print: state.autoPrint,
+        });
+        ctx.result = r;
+        beep(r.failed === 0 ? 'ok' : (r.received === 0 ? 'err' : 'warn'));
+        toast(`Bulk scan: ${r.received} received, ${r.failed} not received (of ${r.requested})`,
+          r.failed === 0 ? 'ok' : 'warn', 4000);
+        await refreshActiveManifest();
+        await Promise.all([refreshPrint().catch(() => {}), refreshStats().catch(() => {})]);
+        render();
+      } catch (err) {
+        toast(err.response?.data?.error || 'Bulk scan failed', 'err');
+      } finally {
+        ctx.busy = false; state._bulkCtx = ctx; render();
+      }
+    };
+
+    // Outcome badge styling mirrors the Recent scans feed on the main Receive view.
+    const outcomeCls = {
+      received: 'badge-cyan', duplicate: 'badge-amber', unreconciled: 'badge-red',
+      rejected: 'badge-slate', no_match: 'badge-red', ambiguous: 'badge-red', error: 'badge-red',
+    };
+
+    const resultsPanel = ctx.result ? h('div', { class: 'mt-4 card p-3 bg-slate-900/40' },
+      h('div', { class: 'flex items-center justify-between mb-2' },
+        h('div', { class: 'text-[10px] uppercase tracking-wider text-slate-500' }, 'Last run'),
+        h('div', { class: 'text-xs' },
+          h('span', { class: 'text-green-400 font-semibold' }, ctx.result.received), ' received · ',
+          h('span', { class: 'text-red-400 font-semibold' }, ctx.result.failed), ' not received',
+          ' (of ', ctx.result.requested, ')')
+      ),
+      h('div', { class: 'max-h-56 overflow-y-auto divide-y divide-slate-800' },
+        ctx.result.results.map(r => h('div', { class: 'flex items-center gap-3 py-1.5 px-1 text-xs' },
+          h('span', { class: 'badge ' + (outcomeCls[r.outcome] || 'badge-slate') }, r.outcome),
+          h('code', { class: 'mono flex-1' }, r.imei),
+          r.sku ? h('span', { class: 'mono text-cyan-300' }, r.sku) : null,
+          r.message ? h('span', { class: 'text-slate-400 truncate max-w-xs' }, r.message) : null
+        ))
+      )
+    ) : null;
+
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-2xl' },
+        h('div', { class: 'flex items-center gap-3 mb-1' },
+          h('div', { class: 'w-10 h-10 rounded-xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center' },
+            h('i', { class: 'fas fa-layer-group' })),
+          h('div', {},
+            h('h2', { class: 'text-lg font-semibold' }, 'Bulk scan'),
+            h('p', { class: 'text-xs text-slate-400' },
+              'Scan or paste many IMEIs (one per line) — up to 200 per batch. Only IMEIs that resolve to exactly one catalogue SKU are received automatically; anything else is reported below for the normal single-scan flow.')
+          )
+        ),
+
+        h('div', { class: 'mt-3' },
+          h('label', { class: 'text-xs text-slate-400 mb-1 block flex items-center justify-between' },
+            h('span', {}, 'IMEIs *'),
+            h('span', { class: 'text-slate-500' }, `${parsedImeis().length} unique IMEI${parsedImeis().length === 1 ? '' : 's'}`)
+          ),
+          h('textarea', {
+            id: 'bulk-scan-textarea',
+            class: 'input mono text-sm',
+            rows: 8,
+            autofocus: 'true',
+            placeholder: 'Scan IMEIs here, one per line…',
+            value: ctx.raw,
+            oninput: (e) => { ctx.raw = e.target.value; state._bulkCtx = ctx; render(); },
+          })
+        ),
+
+        // Shared valuation — applies to EVERY device received in this batch,
+        // same required-fields rule as the single confirm/manual/force-add paths.
+        h('div', { class: 'mt-3 card p-3 bg-slate-900/40' },
+          h('div', { class: 'text-[10px] uppercase tracking-wider text-slate-500 mb-2' },
+            h('i', { class: 'fas fa-sterling-sign mr-1' }), 'Valuation & VAT — shared across this whole batch'),
+          h('div', { class: 'grid grid-cols-3 gap-3' },
+            h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Buy price *'),
+              h('input', {
+                id: 'bulk-buy-price', class: 'input mono', type: 'number', step: '0.01', min: '0',
+                value: ctx.buy_price, placeholder: '0.00',
+                oninput: (e) => { ctx.buy_price = e.target.value; state._bulkCtx = ctx; },
+              })
+            ),
+            h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Currency'),
+              h('input', {
+                id: 'bulk-currency', class: 'input mono uppercase', maxlength: 3, value: ctx.currency || 'GBP',
+                oninput: (e) => { ctx.currency = e.target.value.toUpperCase(); state._bulkCtx = ctx; },
+              })
+            ),
+            h('div', {},
+              h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'VAT type *'),
+              h('select', {
+                id: 'bulk-vat-type', class: 'input',
+                onchange: (e) => { ctx.vat_type = e.target.value; state._bulkCtx = ctx; },
+              },
+                h('option', { value: '', selected: !ctx.vat_type ? 'selected' : null }, '— select —'),
+                ['MARGIN', 'STANDARD', 'ZERO', 'PVAT'].map(v =>
+                  h('option', { value: v, selected: v === ctx.vat_type ? 'selected' : null }, v))
+              )
+            ),
+          ),
+          h('div', { class: 'mt-2' },
+            h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Supplier ID (optional)'),
+            h('input', {
+              class: 'input mono', type: 'number', min: '1', value: ctx.supplier_id,
+              placeholder: 'Leave blank if unknown',
+              oninput: (e) => { ctx.supplier_id = e.target.value; state._bulkCtx = ctx; },
+            })
+          ),
+        ),
+
+        resultsPanel,
+
+        h('div', { class: 'mt-5 flex items-center justify-between' },
+          h('label', { class: 'flex items-center gap-2 text-sm text-slate-300 select-none' },
+            h('input', { type: 'checkbox', class: 'accent-cyan-500', checked: state.autoPrint ? 'checked' : null,
+              onchange: (e) => { state.autoPrint = e.target.checked; } }),
+            'Auto-queue print labels for received devices'
+          ),
+          h('div', { class: 'flex gap-2' },
+            h('button', { class: 'btn btn-ghost', onclick: close }, ctx.result ? 'Close' : 'Cancel'),
+            h('button', {
+              class: 'btn btn-primary' + (ctx.busy ? ' opacity-60 cursor-not-allowed' : ''),
+              id: 'bulk-scan-run-btn',
+              onclick: run,
+              disabled: ctx.busy ? 'disabled' : null,
+            }, ctx.busy
+              ? [h('i', { class: 'fas fa-spinner fa-spin' }), 'Processing…']
+              : [h('i', { class: 'fas fa-check-double' }), 'Receive batch'])
+          )
+        )
+      )
+    );
+  }
+
   // ───────── Catalog view ─────────
   function CatalogView() {
     return h('div', { class: 'space-y-5' },
@@ -3644,7 +3861,7 @@
   // ───────── Boot ─────────
   document.addEventListener('keydown', (e) => {
     // Global Esc refocuses scan input on receive view
-    if (e.key === 'Escape' && state.view === 'receive' && !state.pendingMatch && !state.pendingUnrec) {
+    if (e.key === 'Escape' && state.view === 'receive' && !state.pendingMatch && !state.pendingUnrec && !state.bulkScanOpen) {
       $('#scan-input')?.focus();
     }
   });
@@ -3652,7 +3869,7 @@
   // Keep scan input focused (HID scanner safety net)
   document.addEventListener('click', (e) => {
     if (state.view !== 'receive') return;
-    if (state.pendingMatch || state.pendingUnrec || state.labelPreview) return;
+    if (state.pendingMatch || state.pendingUnrec || state.labelPreview || state.bulkScanOpen) return;
     const tag = (e.target.tagName || '').toLowerCase();
     if (['input','select','textarea','button','option','label'].includes(tag)) return;
     setTimeout(() => $('#scan-input')?.focus(), 10);
