@@ -1488,11 +1488,166 @@
     { key: 'color',       label: 'Color *',        hint: 'Phantom Black… (case-insensitive)' },
     { key: 'grade',       label: 'Grade *',        hint: 'A | B | C (anything else → UG)' },
     { key: 'description', label: 'Description',    hint: 'optional · human label only' },
-    { key: 'condition',   label: 'Condition',      hint: 'New / Used' },
+    { key: 'condition',   label: 'Condition',      hint: 'Raw | Used | Refurbished | New' },
     { key: 'unit_cost',   label: 'Unit cost',      hint: 'numeric · pre-fills the confirm modal' },
     { key: 'currency',    label: 'Currency',       hint: 'ISO 4217 (USD, GBP…) · optional' },
     { key: 'vat_type',    label: 'VAT type',       hint: 'MARGIN | STANDARD | ZERO | PVAT · optional' },
   ];
+
+  // ───────── AI cleanup prompt (Copilot in Excel / Claude in Excel) ─────────
+  // Supplier manifests arrive in wildly varied shapes. This prompt walks an
+  // in-Excel AI assistant through reorganising one into our exact
+  // MAPPABLE_FIELDS header set (so the upload mapper below auto-detects
+  // every column with zero manual remapping) — and, critically, tells it to
+  // ASK the operator rather than silently guess whenever information
+  // genuinely isn't in the file (currency, VAT type, condition, grade,
+  // brand). Keep the accepted Condition / VAT Type / currency-format rules
+  // below in sync with src/lib/validate.ts and this file's own
+  // MAPPABLE_FIELDS hints if either ever changes.
+  const MANIFEST_CLEANUP_PROMPT = `STEP 1 — Before touching anything, scan the whole file and ask me any
+clarifying questions you need BEFORE reorganizing it. In particular, check
+for and ask about:
+
+- Currency: if there is no Currency column and no currency symbol/code
+  anywhere in the cost header (e.g. "Price (USD)"), ASK ME what currency
+  the prices are in rather than defaulting to anything.
+- VAT Type: if there is no VAT/tax column anywhere in the file, ASK ME
+  which of MARGIN, STANDARD, ZERO, or PVAT applies to this whole shipment
+  (explain briefly: MARGIN = margin scheme for used/second-hand phones,
+  STANDARD = full VAT on sale price, ZERO = zero-rated, PVAT = Postponed
+  VAT/import accounting) — most second-hand phone shipments use MARGIN,
+  but don't assume, ask.
+- Condition: if there is no condition column at all, ASK ME whether every
+  device in this shipment should be treated as one single condition (Raw,
+  Used, Refurbished, or New), or whether it varies by row and I need to
+  provide that some other way.
+- Grade: if there is no grade/condition/quality column at all (not even
+  under a different name), ask me whether every device in this file
+  should be treated as the same grade, or whether grading needs to happen
+  later (in which case leave Grade blank rather than guessing UG for
+  everything).
+- OEM/Brand: if there is no brand column and the model names don't make
+  the brand obvious (e.g. generic model codes), ask me for the brand
+  rather than guessing.
+- Any column you genuinely cannot map with confidence to IMEI, OEM, Model
+  No., Storage, Color, Grade, Description, Condition, Unit Cost, Currency,
+  or VAT Type — tell me what that column's header/sample values are and
+  ask what it should map to, instead of dropping it silently.
+
+Wait for my answers before proceeding to Step 2. If everything IS present
+and unambiguous in the file already, skip straight to Step 2 and tell me
+you didn't need to ask anything.
+
+STEP 2 — Once you have my answers (or determined nothing is missing),
+reorganize the spreadsheet into a clean, standardized device manifest with
+exactly these column headers, in this order, starting in row 1 (delete any
+title/instruction/logo rows above the real header):
+
+IMEI | OEM | Model No. | Storage | Color | Grade | Description | Condition | Unit Cost | Currency | VAT Type
+
+Map my existing columns onto these using your best judgment — my file may
+label things differently (e.g. "Serial"/"IMEI1"/"SN" → IMEI; "Brand"/
+"Manufacturer"/"Make" → OEM; "Memory"/"Capacity"/"Size"/"ROM" → Storage;
+"Colour" → Color; "Model"/"Model Name"/"Product Name"/"Item" → Description
+if there's no separate model-number column; "Cost"/"Price"/"Buy Price" →
+Unit Cost; "Ccy" → Currency; "VAT"/"VAT Scheme" → VAT Type).
+
+Apply these exact rules per column:
+
+1. IMEI (required, must not be blank):
+   - Format the column as TEXT before filling it in, so Excel never
+     truncates digits or shows scientific notation, and never drops a
+     leading zero.
+   - Strip spaces, dashes, and any trailing ".0".
+   - Valid values are either exactly 15 digits, or exactly 10 alphanumeric
+     characters (for non-cellular serials) — flag any row that is neither
+     length in a new column called "Flag" with the text "Bad IMEI length".
+   - Delete exact duplicate IMEI rows, keeping the first occurrence.
+
+2. OEM: brand name only (e.g. Apple, Samsung, Google). Title-case it. If
+   you had to ask me for this in Step 1, apply my answer to every row.
+
+3. Model No.: the manufacturer's model identifier/name (e.g. "iPhone 15
+   Pro", "Galaxy S24 Ultra"). If my file only has a combined "Model +
+   Storage + Color" description in one cell (e.g. "iPhone 15 Pro 256GB
+   Black"), split it: put the model name here, the storage into Storage,
+   and the color into Color.
+
+4. Storage: a plain number immediately followed by "GB" — e.g. "128GB",
+   "256GB", "1TB" → convert to "1024GB". Remove all other text/units.
+
+5. Color: just the color name, no extra text. Normalize obvious spelling
+   variants (e.g. "Space Grey"/"Space Gray" → pick one consistently).
+
+6. Grade: normalize to exactly one of A, B, C, or UG (ungraded). Map common
+   supplier terms as follows — "Grade A"/"Excellent"/"Like New" → A;
+   "Grade B"/"Good" → B; "Grade C"/"Fair"/"Acceptable" → C; anything
+   unclear or not matching these → UG. If you had to ask me in Step 1
+   whether to apply one grade to everything, apply my answer; if I said
+   grading happens later, leave this column blank for every row instead
+   of defaulting to UG.
+
+7. Description: short free-text label only — do not duplicate what's
+   already captured in Model No./Storage/Color.
+
+8. Condition: must be exactly one of these four values (these are the
+   only conditions we deal in):
+      - Raw          — untested / as received, not yet inspected
+      - Used         — tested/working, previously owned
+      - Refurbished  — repaired/restored to a working standard
+      - New          — unused, sealed (we rarely receive New stock, but
+                       it is still a valid value — keep it as an option)
+   Map common supplier wording as: "Raw"/"Untested"/"As-is"/"Bulk"/
+   "Grade U" → Raw; "Used"/"Pre-owned"/"Second Hand"/"2nd Hand" → Used;
+   "Refurb"/"Refurbished"/"Renewed"/"Reconditioned" → Refurbished; "New"/
+   "Brand New"/"Sealed"/"Unused" → New. If a value doesn't clearly match
+   one of these four, or the whole file has no condition information and
+   you didn't already get an answer from me in Step 1, ask me rather than
+   guessing — do not leave this column inconsistently filled.
+
+9. Unit Cost: plain number only — no currency symbols, no thousands
+   separators, no text. Leave blank if unknown (do not enter 0).
+
+10. Currency: must be a valid 3-letter ISO 4217 currency code, UPPERCASE
+    — e.g. GBP, USD, EUR, CNY, HKD, AED, JPY. Not a symbol ("$", "£", "€"),
+    not a country name, not lowercase. If my file shows the currency
+    inside the cost header instead of its own column (e.g. "Price (USD)"),
+    extract that 3-letter code into this column. If you had to ask me for
+    the currency in Step 1 because it wasn't in the file, apply my answer
+    to every row that has a Unit Cost.
+
+11. VAT Type: must be exactly one of these four values (uppercase, no
+    others are accepted):
+      - MARGIN   — margin scheme (VAT charged on profit margin only, the
+                   standard scheme for used/second-hand phones)
+      - STANDARD — standard-rated VAT (full VAT on the sale price)
+      - ZERO     — zero-rated VAT
+      - PVAT     — Postponed VAT (import VAT accounting for goods brought
+                   into the country under postponed accounting)
+    Map common supplier wording as: "Margin"/"Margin Scheme"/"2nd hand
+    margin" → MARGIN; "Standard"/"Std"/"20%"/"Standard Rate" → STANDARD;
+    "Zero"/"Zero Rate"/"0%"/"Exempt" → ZERO; "Postponed"/"PVA"/"Import
+    VAT"/"Deferred VAT" → PVAT. If you had to ask me for the VAT type in
+    Step 1 because it wasn't in the file, apply my answer to every row.
+
+General cleanup:
+- Remove any merged cells — unmerge and repeat the value into every
+  affected row.
+- Remove blank rows in the middle of the data.
+- Remove trailing "Total"/"Summary"/"Count" rows at the bottom.
+- One row = one physical device. If a row represents a quantity greater
+  than 1 (e.g. a "Qty" column shows 5 for one IMEI-less line), do NOT
+  duplicate it — flag it in the "Flag" column as "No IMEI — qty row" since
+  every device needs its own unique IMEI to be received.
+- Put the cleaned result on a new sheet named "Manifest Import", with the
+  11 headers above in row 1 and one device per row below, and nothing else
+  on that sheet (no extra title rows, no summary rows, no merged cells).
+- Add the "Flag" column only if any row still needed one after Step 1;
+  otherwise omit it.
+
+Show me a short summary at the end: total rows processed, how many were
+flagged and why, how many duplicate IMEIs were removed, and a breakdown of
+how many rows fell into each Condition, each VAT Type, and each Currency.`;
   function openManifestUpload() {
     uploadCtx = {
       reference: '', supplier: '', notes: '',
@@ -1502,6 +1657,7 @@
       headerIdx: -1,   // index of the detected header row in rawRows
       mapping: {},     // { fieldKey: columnIndex | -1 }
       rows: [],        // parsed rows (the payload we POST)
+      showPrompt: false, // toggles the AI cleanup prompt preview panel
     };
     renderUploadModal();
   }
@@ -1514,6 +1670,37 @@
           h('h2', { class: 'text-lg font-semibold' }, 'Upload Shipping Manifest'),
           h('button', { class: 'btn btn-ghost text-xs', onclick: () => $('#upload-modal').remove() },
             h('i', { class: 'fas fa-times' }))
+        ),
+        // ── AI cleanup prompt (Copilot in Excel / Claude in Excel) ──
+        h('div', { class: 'card p-4 mb-4', style: 'border-color:#3b4a63' },
+          h('div', { class: 'flex items-center justify-between gap-3' },
+            h('div', { class: 'text-sm' },
+              h('i', { class: 'fas fa-wand-magic-sparkles text-indigo-400 mr-2' }),
+              h('span', { class: 'font-medium' }, 'Manifest in a different format? '),
+              h('span', { class: 'text-slate-400' },
+                'Copy this prompt into Copilot in Excel or Claude in Excel to reorganise it first.')
+            ),
+            h('div', { class: 'flex gap-2 shrink-0' },
+              h('button', {
+                class: 'btn btn-ghost text-xs',
+                onclick: () => { uploadCtx.showPrompt = !uploadCtx.showPrompt; renderUploadModal(); },
+              },
+                h('i', { class: `fas fa-chevron-${uploadCtx.showPrompt ? 'up' : 'down'} mr-1` }),
+                uploadCtx.showPrompt ? 'Hide prompt' : 'Show prompt'),
+              h('button', {
+                class: 'btn btn-primary text-xs',
+                onclick: async () => {
+                  try { await navigator.clipboard.writeText(MANIFEST_CLEANUP_PROMPT); toast('Prompt copied', 'ok'); }
+                  catch { toast('Clipboard unavailable — select and copy manually', 'warn'); }
+                },
+              },
+                h('i', { class: 'fas fa-copy mr-1' }), 'Copy Prompt')
+            )
+          ),
+          uploadCtx.showPrompt ? h('pre', {
+            class: 'text-xs text-slate-400 mt-3 p-3 rounded-lg overflow-auto',
+            style: 'max-height:260px; white-space:pre-wrap; background:#0d1520; border:1px solid #263449',
+          }, MANIFEST_CLEANUP_PROMPT) : null
         ),
         h('div', { class: 'grid grid-cols-2 gap-3 mb-4' },
           h('div', {},
