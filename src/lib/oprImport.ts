@@ -5,9 +5,13 @@
 // them in, keeping every rule unit-testable without HTTP.
 //
 // Domain rules encoded (from the authorisation reference notes):
-//   - The C&E1154's "OPR authorisation number" field takes the legacy
-//     CHIEF-format number (OP/…); the CDS-format number appears ONLY in the
-//     cross-referenced statement. Confusing them is a known failure mode.
+//   - The C&E1154's "OPR authorisation number" field takes the OPR
+//     Authorisation Number (op_authorisation_number, e.g. OP/0922/601/31);
+//     the CDS Authorisation Number appears ONLY in the cross-referenced
+//     statement. Confusing the two is a known failure mode. Neither is a
+//     "CHIEF number" — no legacy CHIEF-format identifier exists on this
+//     authorisation; that label was a documentation error and has been
+//     scrubbed from the schema, types and this module.
 //   - Duty/VAT on re-import (procedure 6121) is assessed on the REPAIR COST
 //     only, never the full value of the goods — that is the relief.
 //   - Exported-goods value on the form = sum of the RETURNING devices'
@@ -55,9 +59,9 @@ export type Ce1154Result =
 
 export type Ce1154 = {
   form: 'C&E1154'
-  // CHIEF-format number — the ONLY place it may appear.
+  // OPR Authorisation Number (e.g. OP/0922/601/31) — the ONLY place it may appear.
   opr_authorisation_number: string
-  // CDS number lives in the cross-referenced statement, never the field above.
+  // CDS Authorisation Number lives in the cross-referenced statement, never the field above.
   cross_reference_statement: string
   export_mrn: string
   quantity: number
@@ -96,11 +100,11 @@ export function computeCe1154(
   if (!authorisation) {
     return { ok: false, error: 'Import shipment has no resolvable OPR authorisation' }
   }
-  // The C&E1154 authorisation field is CHIEF-format. Refusing to fall back
-  // to the CDS number here is deliberate — that substitution is the known
-  // failure mode.
-  if (!authorisation.chief_number) {
-    return { ok: false, error: 'Authorisation record has no legacy CHIEF-format number (chief_number) — the C&E1154 authorisation field requires it and the CDS number must NOT be substituted' }
+  // The C&E1154 authorisation field takes the OPR Authorisation Number.
+  // Refusing to fall back to the CDS Authorisation Number here is
+  // deliberate — that substitution is the known failure mode.
+  if (!authorisation.op_authorisation_number) {
+    return { ok: false, error: 'Authorisation record has no OPR Authorisation Number (op_authorisation_number) — the C&E1154 authorisation field requires it and the CDS Authorisation Number must NOT be substituted' }
   }
   if (!exportShipment || !exportShipment.export_mrn) {
     return { ok: false, error: 'Related export shipment has no export MRN — the C&E1154 must reference the original export declaration' }
@@ -146,7 +150,7 @@ export function computeCe1154(
     ok: true,
     ce1154: {
       form: 'C&E1154',
-      opr_authorisation_number: authorisation.chief_number,
+      opr_authorisation_number: authorisation.op_authorisation_number,
       cross_reference_statement:
         `Goods re-imported after outward processing under CDS authorisation ${authorisation.cds_number} ` +
         `held by ${authorisation.holder_name} (EORI ${authorisation.eori}); original export MRN ${exportShipment.export_mrn}`,
@@ -348,13 +352,13 @@ export function runImportValidation(
     add('IMP_DUTY_RATE', 'green', `Duty rate ${dutyPct}%`)
   }
 
-  // ── IMP_CHIEF_NUMBER — the C&E1154 needs the CHIEF-format number ──
+  // ── IMP_OP_AUTH_NUMBER — the C&E1154 needs the OPR Authorisation Number ──
   if (!authorisation) {
-    add('IMP_CHIEF_NUMBER', 'red', 'Import shipment has no resolvable OPR authorisation')
-  } else if (!authorisation.chief_number) {
-    add('IMP_CHIEF_NUMBER', 'red', 'Authorisation has no CHIEF-format number — the C&E1154 authorisation field requires it (the CDS number must NOT be substituted)')
+    add('IMP_OP_AUTH_NUMBER', 'red', 'Import shipment has no resolvable OPR authorisation')
+  } else if (!authorisation.op_authorisation_number) {
+    add('IMP_OP_AUTH_NUMBER', 'red', 'Authorisation has no OPR Authorisation Number — the C&E1154 authorisation field requires it (the CDS Authorisation Number must NOT be substituted)')
   } else {
-    add('IMP_CHIEF_NUMBER', 'green', `CHIEF-format number ${authorisation.chief_number} available for the C&E1154`)
+    add('IMP_OP_AUTH_NUMBER', 'green', `OPR Authorisation Number ${authorisation.op_authorisation_number} available for the C&E1154`)
   }
 
   // ── IMP_AUTH_VALID — authorisation valid on receipt date ──

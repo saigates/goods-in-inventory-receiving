@@ -1,0 +1,26 @@
+-- Migration 0018: Correct a fabricated identifier — there is no "CHIEF
+-- number". Rename opr_authorisations.chief_number to op_authorisation_number.
+--
+-- Source-of-truth correction (per HMRC authorisation correspondence for
+-- Saigates Limited): the OPR authorisation carries exactly TWO reference
+-- identifiers —
+--   1. CDS Authorisation Number — GBOPO36997999500020260226105539
+--      (cds_number column; used on CDS declarations and the cross-reference
+--      statement).
+--   2. OPR Authorisation Number — OP/0922/601/31
+--      (this column, renamed here; used in the C&E1154 authorisation field).
+--
+-- Neither is, or was ever, a "CHIEF-format" or legacy CHIEF number — that
+-- label was introduced in error in an earlier pass and has propagated into
+-- the schema, code comments, error messages, and validation-check IDs.
+-- OP/0922/601/31 is simply the OPR Authorisation Number; it must be labelled
+-- as such everywhere, never as "CHIEF" anything, and must never be
+-- substituted with the CDS number (and vice versa) — that substitution risk
+-- is real regardless of what the field is called.
+--
+-- No "legacy_chief_number" column is added — no such value exists.
+--
+-- (No explicit transaction wrapper: remote D1 rejects BEGIN/COMMIT
+-- [CF 7500]; wrangler applies this file as a single batch.)
+
+ALTER TABLE opr_authorisations RENAME COLUMN chief_number TO op_authorisation_number;

@@ -7,8 +7,8 @@
 //     EXPORT may join; the line snapshot copies the ORIGINAL export line's
 //     frozen value (not today's device row); device status does not move
 //     while the return is DRAFT; duplicate-draft guard.
-//   - C&E1154: CHIEF-format number in the authorisation field and NEVER
-//     the CDS number; CDS only in the cross-referenced statement;
+//   - C&E1154: OPR Authorisation Number in the authorisation field and
+//     NEVER the CDS Authorisation Number; CDS only in the cross-referenced statement;
 //     exported-goods value = returning units only (partial return);
 //     repair cost → GBP at the customs rate; relief + net duty computed;
 //     quantity guardrail.
@@ -148,7 +148,7 @@ beforeAll(async () => {
       holder_name: 'Saigates Limited',
       eori: 'GB369979995000',
       cds_number: 'GBOPO36997999500020260226105539',
-      chief_number: 'OP/0922/601/31',
+      op_authorisation_number: 'OP/0922/601/31',
       valid_from: '2026-03-01',
       valid_to: '2031-02-28',
       supervising_office_name: 'HMRC S1756 IP-OP Customs Liverpool',
@@ -271,7 +271,7 @@ describe('OPR 3 — return-consignment builder', () => {
 describe('OPR 3 — computeCe1154', () => {
   const baseAuth: OprAuthorisation = {
     id: 1, organisation_id: 1, holder_name: 'Saigates Limited', eori: 'GB369979995000',
-    cds_number: 'GBOPO36997999500020260226105539', chief_number: 'OP/0922/601/31',
+    cds_number: 'GBOPO36997999500020260226105539', op_authorisation_number: 'OP/0922/601/31',
     valid_from: '2026-03-01', valid_to: '2031-02-28',
     supervising_office_name: null, supervising_office_code: null,
     commodity_scope: 'Smartphones', commodity_codes: '8517130000',
@@ -305,7 +305,7 @@ describe('OPR 3 — computeCe1154', () => {
     added_by_user_id: null, created_at: '',
   })
 
-  it('computes conversion, relief and net duty; CHIEF number in the auth field, CDS only in the statement', () => {
+  it('computes conversion, relief and net duty; OPR Authorisation Number in the auth field, CDS only in the statement', () => {
     // 1000 USD / 1.25 = £800 repair. Duty 2%.
     // Without OPR: (300 + 800) * 2% = £22. Net (repair only): 800 * 2% = £16. Relief £6.
     const r = computeCe1154(mkImport(), mkExport(), baseAuth, [mkLine(150, 1), mkLine(150, 2)])
@@ -352,11 +352,11 @@ describe('OPR 3 — computeCe1154', () => {
     expect(r.ce1154.opr_relief_gbp).toBe(0)
   })
 
-  it('refuses without a CHIEF number — the CDS number must NOT be substituted', () => {
-    const r = computeCe1154(mkImport(), mkExport(), { ...baseAuth, chief_number: null }, [mkLine(150)])
+  it('refuses without an OPR Authorisation Number — the CDS Authorisation Number must NOT be substituted', () => {
+    const r = computeCe1154(mkImport(), mkExport(), { ...baseAuth, op_authorisation_number: null }, [mkLine(150)])
     expect(r.ok).toBe(false)
     if (r.ok) return
-    expect(r.error).toMatch(/CHIEF-format number/)
+    expect(r.error).toMatch(/OPR Authorisation Number/)
     expect(r.error).toMatch(/must NOT be substituted/)
   })
 
@@ -418,7 +418,7 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     const data = await res.json() as { direction: string; validation: { checks: { code: string }[] } }
     expect(data.direction).toBe('import')
     const codes = data.validation.checks.map(ch => ch.code)
-    for (const code of ['IMP_HAS_LINES', 'IMP_PROCEDURE_6121', 'IMP_CURRENCY_GBP', 'IMP_RELATED_EXPORT', 'IMP_EXPORT_MRN', 'IMP_REPAIR_COST', 'IMP_DUTY_RATE', 'IMP_CHIEF_NUMBER', 'IMP_AUTH_VALID', 'IMP_DISCHARGE_WINDOW']) {
+    for (const code of ['IMP_HAS_LINES', 'IMP_PROCEDURE_6121', 'IMP_CURRENCY_GBP', 'IMP_RELATED_EXPORT', 'IMP_EXPORT_MRN', 'IMP_REPAIR_COST', 'IMP_DUTY_RATE', 'IMP_OP_AUTH_NUMBER', 'IMP_AUTH_VALID', 'IMP_DISCHARGE_WINDOW']) {
       expect(codes).toContain(code)
     }
   })
@@ -433,7 +433,7 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
       status: 'FINALISED', reference: 'EXP X', export_mrn: 'M', ship_date: '2026-07-01', finalised_at: null,
     } as unknown as Shipment
     const auth = {
-      cds_number: 'X', chief_number: 'OP/1/2/3', valid_from: '2026-03-01', valid_to: '2031-02-28',
+      cds_number: 'X', op_authorisation_number: 'OP/1/2/3', valid_from: '2026-03-01', valid_to: '2031-02-28',
       discharge_period_months: 6, holder_name: 'H', eori: 'E',
     } as unknown as OprAuthorisation
     const line = { id: 1, imei: '860455199999991', unit_value: 150, currency: 'GBP', received_device_id: 1 } as unknown as ShipmentLine
@@ -490,8 +490,8 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     expect(ce.exported_goods_value_gbp).toBe(300)
     expect(ce.opr_authorisation_number).toBe('OP/0922/601/31')
 
-    // C&E1154 HTML: CHIEF number present; CDS number ONLY inside the
-    // cross-referenced statement section.
+    // C&E1154 HTML: OPR Authorisation Number present; CDS Authorisation
+    // Number ONLY inside the cross-referenced statement section.
     const htmlRes = await api(`/api/opr/shipments/${ret.id}/ce1154`)
     expect(htmlRes.status).toBe(200)
     const html = await htmlRes.text()

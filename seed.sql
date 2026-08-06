@@ -17,11 +17,14 @@ INSERT OR IGNORE INTO sku_catalog (sku, brand, model, capacity, color) VALUES
 
 -- ───────── OPR authorisation (OPR 1) ─────────
 -- The Saigates OPR authorisation as configurable DATA (never inline in
--- code). Both number formats stored deliberately: cds_number goes on CDS
--- declarations; chief_number goes in the C&E1154 paper form's
--- authorisation field. They must never be confused.
+-- code). Two distinct identifiers stored deliberately: cds_number (CDS
+-- Authorisation Number) goes on CDS declarations; op_authorisation_number
+-- (OPR Authorisation Number, e.g. OP/0922/601/31) goes in the C&E1154 paper
+-- form's authorisation field. They must never be confused. Neither is a
+-- "CHIEF number" — no legacy CHIEF-format identifier exists on this
+-- authorisation (per HMRC authorisation correspondence).
 INSERT OR IGNORE INTO opr_authorisations
-  (id, organisation_id, holder_name, eori, cds_number, chief_number,
+  (id, organisation_id, holder_name, eori, cds_number, op_authorisation_number,
    valid_from, valid_to, supervising_office_name, supervising_office_code,
    commodity_scope, commodity_codes, rate_of_yield, discharge_period_months, notes,
    prealert_email, prealert_cutoff)

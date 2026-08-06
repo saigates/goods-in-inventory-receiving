@@ -194,7 +194,7 @@ beforeAll(async () => {
     body: JSON.stringify({
       holder_name: 'Auto Test Holder', eori: 'GB111222333444',
       cds_number: 'GBOPO11122233344420260101000000',
-      chief_number: 'OP/1111/222/33',
+      op_authorisation_number: 'OP/1111/222/33',
       valid_from: '2026-01-01', valid_to: '2031-01-01',
       commodity_codes: '8517130000', discharge_period_months: 6,
       prealert_email: 'prealert-test@example.com', prealert_cutoff: '16:00',

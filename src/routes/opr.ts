@@ -37,12 +37,12 @@
 //     placed on two open return consignments.
 //   - GET /shipments/:id/validation — direction-aware: imports run the
 //     import validation engine (procedure 6121, related-export + MRN,
-//     C&E1154 inputs, CHIEF-number availability, discharge window).
-//   - GET /shipments/:id/ce1154 — C&E1154 duty calculation: CHIEF-format
-//     number in the authorisation field, CDS number ONLY in the
-//     cross-referenced statement; repair cost → GBP at the customs rate;
-//     exported-goods value = returning units only; relief + net duty.
-//     HTML (print A4) by default, ?format=json for the figures.
+//     C&E1154 inputs, OPR Authorisation Number availability, discharge window).
+//   - GET /shipments/:id/ce1154 — C&E1154 duty calculation: OPR
+//     Authorisation Number in the authorisation field, CDS Authorisation
+//     Number ONLY in the cross-referenced statement; repair cost → GBP at
+//     the customs rate; exported-goods value = returning units only;
+//     relief + net duty. HTML (print A4) by default, ?format=json for the figures.
 //   - GET /shipments/:id/clearance — re-import clearance-instruction DRAFT
 //     (procedure 6121, quotes export MRN, duty/VAT on repair cost only).
 //     Nothing is sent (OPR 4).
@@ -155,9 +155,12 @@ function parseAuthorisationBody(body: AuthBody, partial: boolean):
     if (!v) return { ok: false, error: 'cds_number is required (the CDS-format authorisation number used on CDS declarations)' }
     fields.cds_number = v.toUpperCase()
   }
-  if (want('chief_number')) {
+  if (want('op_authorisation_number')) {
     // Optional, but if present keep as-is (contains slashes by format).
-    fields.chief_number = cleanString(body.chief_number, 40)
+    // This is the OPR Authorisation Number (e.g. OP/0922/601/31) — a
+    // distinct identifier from the CDS Authorisation Number, and NOT a
+    // "CHIEF number" (no such identifier exists on this authorisation).
+    fields.op_authorisation_number = cleanString(body.op_authorisation_number, 40)
   }
   if (want('valid_from')) {
     if (!isValidIsoDate(body.valid_from)) return { ok: false, error: 'valid_from must be an ISO date (YYYY-MM-DD)' }
@@ -212,13 +215,13 @@ app.post('/authorisations', async (c) => {
   try {
     const result = await c.env.DB.prepare(`
       INSERT INTO opr_authorisations
-        (organisation_id, holder_name, eori, cds_number, chief_number,
+        (organisation_id, holder_name, eori, cds_number, op_authorisation_number,
          valid_from, valid_to, supervising_office_name, supervising_office_code,
          commodity_scope, commodity_codes, rate_of_yield, discharge_period_months, notes,
          prealert_email, prealert_cutoff)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
-      user.organisation_id, f.holder_name, f.eori, f.cds_number, f.chief_number ?? null,
+      user.organisation_id, f.holder_name, f.eori, f.cds_number, f.op_authorisation_number ?? null,
       f.valid_from, f.valid_to, f.supervising_office_name ?? null, f.supervising_office_code ?? null,
       f.commodity_scope ?? null, f.commodity_codes ?? null, f.rate_of_yield ?? '1:1',
       f.discharge_period_months ?? 6, f.notes ?? null,
@@ -811,7 +814,7 @@ async function loadShipmentBundle(
 // GET /shipments/:id/validation — run the green/amber/red engine.
 // Direction-aware: exports run the OPR 2 export engine, imports the OPR 3
 // import engine (procedure 6121, related export + MRN, C&E1154 inputs,
-// CHIEF-number availability, discharge window).
+// OPR Authorisation Number availability, discharge window).
 app.get('/shipments/:id/validation', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
@@ -870,8 +873,8 @@ app.get('/shipments/:id/prealert', async (c) => {
 
 // GET /shipments/:id/ce1154 — the OPR duty-calculation form for a
 // returning consignment. HTML (print A4) by default; ?format=json returns
-// the computed figures. CHIEF-format number in the authorisation field,
-// CDS number ONLY in the cross-referenced statement.
+// the computed figures. OPR Authorisation Number in the authorisation
+// field, CDS Authorisation Number ONLY in the cross-referenced statement.
 app.get('/shipments/:id/ce1154', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))

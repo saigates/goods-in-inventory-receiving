@@ -71,7 +71,7 @@ const VALID_AUTH = {
   holder_name: 'Saigates Limited',
   eori: 'GB369979995000',
   cds_number: 'GBOPO36997999500020260226105539',
-  chief_number: 'OP/0922/601/31',
+  op_authorisation_number: 'OP/0922/601/31',
   valid_from: '2026-03-01',
   valid_to: '2031-02-28',
   supervising_office_code: 'GBNCL001',
@@ -101,13 +101,13 @@ describe('authorisations', () => {
     expect(res.status).toBe(401)
   })
 
-  it('stores CDS and CHIEF numbers as distinct fields', async () => {
+  it('stores CDS Authorisation Number and OPR Authorisation Number as distinct fields', async () => {
     const res = await api(`/api/opr/authorisations/${authId}`)
     expect(res.status).toBe(200)
     const { authorisation } = await res.json() as { authorisation: Record<string, unknown> }
     expect(authorisation.cds_number).toBe('GBOPO36997999500020260226105539')
-    expect(authorisation.chief_number).toBe('OP/0922/601/31')
-    expect(authorisation.cds_number).not.toBe(authorisation.chief_number)
+    expect(authorisation.op_authorisation_number).toBe('OP/0922/601/31')
+    expect(authorisation.cds_number).not.toBe(authorisation.op_authorisation_number)
     expect(authorisation.rate_of_yield).toBe('1:1')
     expect(authorisation.discharge_period_months).toBe(6)
   })

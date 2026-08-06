@@ -1,13 +1,22 @@
 -- Migration 0010: OPR (Outward Processing Relief) Foundation — OPR 1 track.
 --
+-- CORRECTION (see migration 0018): the chief_number column below was named
+-- from a fabricated premise — there is no "CHIEF number" on this
+-- authorisation. It was renamed to op_authorisation_number in 0018; the
+-- comments here are left as historical record of what this migration
+-- actually applied, but must not be read as confirming a CHIEF-format
+-- identifier exists.
+--
 -- Entities only (no export/import workflow yet — that's OPR 2/3):
 --   1. opr_authorisations — a configurable Authorisation record. The real
---      values (Saigates Limited, EORI GB369979995000, CDS + legacy CHIEF
+--      values (Saigates Limited, EORI GB369979995000, CDS + [see 0018]
 --      numbers, GBNCL001 supervising office, 8517130000 commodity scope,
 --      1:1 yield, 6-month discharge) live as DATA in this table, never
 --      inline in code. Both number formats are stored because HMRC paper
---      forms (C&E1154) want the CHIEF-format number while CDS declarations
---      want the CDS-format number — confusing them is a known failure mode.
+--      forms (C&E1154) want the OPR Authorisation Number while CDS
+--      declarations want the CDS Authorisation Number — confusing them is
+--      a known failure mode (renamed from "CHIEF" in 0018 — no such
+--      identifier exists).
 --   2. shipments — the consignment entity ABOVE devices: direction
 --      (export|import), type (OPR_REPAIR), status, procedure code +
 --      additional procedure code, consignee, carrier, incoterm, currency

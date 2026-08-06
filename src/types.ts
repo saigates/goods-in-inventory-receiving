@@ -169,8 +169,8 @@ export type OprAuthorisation = {
   organisation_id: number
   holder_name: string
   eori: string
-  cds_number: string      // CDS-format — for CDS declarations
-  chief_number: string | null // legacy CHIEF-format — for C&E1154 paper forms
+  cds_number: string      // CDS Authorisation Number — for CDS declarations and the cross-reference statement
+  op_authorisation_number: string | null // OPR Authorisation Number (e.g. OP/0922/601/31) — for the C&E1154 authorisation field. NOT a "CHIEF number" — no such identifier exists on this authorisation.
   valid_from: string
   valid_to: string
   supervising_office_name: string | null

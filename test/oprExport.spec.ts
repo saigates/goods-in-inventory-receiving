@@ -115,7 +115,7 @@ beforeAll(async () => {
       holder_name: 'Saigates Limited',
       eori: 'GB369979995000',
       cds_number: 'GBOPO36997999500020260226105539',
-      chief_number: 'OP/0922/601/31',
+      op_authorisation_number: 'OP/0922/601/31',
       valid_from: '2026-03-01',
       valid_to: '2031-02-28',
       supervising_office_name: 'HMRC S1756 IP-OP Customs Liverpool',
@@ -258,7 +258,7 @@ describe('validation engine — coded green/amber/red', () => {
   })
   const baseAuth: OprAuthorisation = {
     id: 1, organisation_id: 1, holder_name: 'Saigates Limited', eori: 'GB369979995000',
-    cds_number: 'GBOPO36997999500020260226105539', chief_number: 'OP/0922/601/31',
+    cds_number: 'GBOPO36997999500020260226105539', op_authorisation_number: 'OP/0922/601/31',
     valid_from: '2026-03-01', valid_to: '2031-02-28',
     supervising_office_name: null, supervising_office_code: 'GBNCL001',
     commodity_scope: 'Smartphones', commodity_codes: '8517130000',
@@ -381,8 +381,8 @@ describe('documents — invoice, scan-out, pre-alert', () => {
     const html = await res.text()
 
     expect(html).toContain('COMMERCIAL INVOICE')
-    expect(html).toContain('GBOPO36997999500020260226105539') // CDS number, never the CHIEF one
-    expect(html).not.toContain('OP/0922/601/31')              // CHIEF number is for the C&E1154 (OPR 3)
+    expect(html).toContain('GBOPO36997999500020260226105539') // CDS Authorisation Number, never the OPR one
+    expect(html).not.toContain('OP/0922/601/31')              // OPR Authorisation Number is for the C&E1154 (OPR 3)
     expect(html).toContain('2100')
     expect(html).toContain('8517130000')
     expect(html).toContain('£488.49')
