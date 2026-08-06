@@ -1,0 +1,19 @@
+{
+  "form": "C&E1154",
+  "opr_authorisation_number": "OP/0922/601/31",
+  "cross_reference_statement": "Goods re-imported after outward processing under CDS authorisation GBOPO36997999500020260226105539 held by Saigates Limited (EORI GB123456789000); original export MRN 26GB1111111111XX01",
+  "export_mrn": "26GB1111111111XX01",
+  "quantity": 2,
+  "exported_goods_value_gbp": 300,
+  "repair_cost": {
+    "amount": 800,
+    "currency": "USD"
+  },
+  "customs_exchange_rate": 1.25,
+  "repair_cost_gbp": 640,
+  "duty_rate_pct": 2,
+  "duty_without_relief_gbp": 18.8,
+  "duty_on_repair_cost_gbp": 12.8,
+  "opr_relief_gbp": 6,
+  "vat_note": "Import VAT is assessed on the repair cost (plus any duty and return freight) only — never on the full value of the goods"
+}

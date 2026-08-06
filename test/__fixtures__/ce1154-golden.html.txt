@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>C&amp;E1154 — IMP-GOLDEN-0001</title>
+<style>
+  @page { size: A4; margin: 18mm; }
+  body { font-family: Arial, Helvetica, sans-serif; font-size: 11pt; color: #111; }
+  h1 { font-size: 15pt; margin: 0 0 2mm; }
+  h2 { font-size: 11pt; margin: 6mm 0 2mm; border-bottom: 1px solid #999; }
+  table { width: 100%; border-collapse: collapse; margin-top: 2mm; }
+  th, td { border: 1px solid #bbb; padding: 1.5mm 2mm; text-align: left; font-size: 9.5pt; }
+  .num { text-align: right; }
+  .kv td:first-child { width: 42%; font-weight: bold; background: #f6f6f6; }
+  .statement { margin-top: 4mm; padding: 3mm; border: 1px solid #999; background: #fafafa; font-size: 9.5pt; }
+</style>
+</head>
+<body>
+  <header id="ce1154-header">
+    <h1>C&amp;E1154 — Outward Processing Relief duty calculation</h1>
+    <p>Returning consignment: <strong>IMP-GOLDEN-0001</strong> · Procedure code <strong>2100</strong></p>
+  </header>
+  <section id="ce1154-authorisation">
+    <h2>Authorisation &amp; export reference</h2>
+    <table class="kv">
+      <tr><td>OPR authorisation number (this form)</td><td>OP/0922/601/31</td></tr>
+      <tr><td>Original export MRN</td><td>26GB1111111111XX01</td></tr>
+    </table>
+  </section>
+  <section id="ce1154-calculation">
+    <h2>Duty calculation</h2>
+    <table class="kv">
+      <tr><td>Quantity of exported goods (this consignment)</td><td>2</td></tr>
+      <tr><td>Value of exported goods (returning units only)</td><td>£300.00</td></tr>
+      <tr><td>Repair cost (as invoiced)</td><td>800.00 USD</td></tr>
+      <tr><td>Customs exchange rate (USD per £1)</td><td>1.25</td></tr>
+      <tr><td>Repair cost in GBP</td><td>£640.00</td></tr>
+      <tr><td>Duty rate</td><td>2%</td></tr>
+      <tr><td>Duty without OPR (full value + repair)</td><td>£18.80</td></tr>
+      <tr><td>OPR relief</td><td>£6.00</td></tr>
+      <tr><td><strong>Net duty payable (repair cost only)</strong></td><td><strong>£12.80</strong></td></tr>
+    </table>
+    <p>Import VAT is assessed on the repair cost (plus any duty and return freight) only — never on the full value of the goods.</p>
+  </section>
+  <section id="ce1154-lines">
+    <h2>Returning devices</h2>
+    <table>
+      <thead><tr><th>#</th><th>IMEI</th><th>Description</th><th class="num">Export value</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>860455101000012</td>
+          <td>Samsung Galaxy S23 128GB Black</td>
+          <td class="num">£150.00</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>860455101000029</td>
+          <td>Samsung Galaxy S23 128GB Black</td>
+          <td class="num">£150.00</td>
+        </tr></tbody>
+    </table>
+  </section>
+  <section id="ce1154-statement" class="statement">
+    <strong>Cross-referenced statement:</strong> Goods re-imported after outward processing under CDS authorisation GBOPO36997999500020260226105539 held by Saigates Limited (EORI GB123456789000); original export MRN 26GB1111111111XX01
+  </section>
+</body>
+</html>
