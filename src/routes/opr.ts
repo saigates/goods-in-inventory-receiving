@@ -70,7 +70,7 @@ import type { Bindings, AuthUser, Shipment, ShipmentLine, OprAuthorisation, Devi
 import { currentUser } from '../lib/auth'
 import { cleanString, isValidCurrency } from '../lib/validate'
 import { transitionDevice, logDeviceEvent } from '../lib/deviceLifecycle'
-import { runExportValidation } from '../lib/oprValidation'
+import { runExportValidation, sumLineValues } from '../lib/oprValidation'
 import { buildCommercialInvoiceHtml, buildScanOutList, buildPreAlertDraft } from '../lib/oprDocs'
 import {
   computeCe1154,
@@ -78,6 +78,8 @@ import {
   buildClearanceInstructionDraft,
   runImportValidation,
   computeDischargeRow,
+  computeValueDelta,
+  round2,
 } from '../lib/oprImport'
 import { gmailConfigFromEnv, sendGmail, type EmailAttachment } from '../lib/email'
 import { dispatchShipmentWebhooks, type ShipmentEventPayload } from '../lib/webhook'
@@ -919,6 +921,14 @@ app.get('/shipments/:id/clearance', async (c) => {
 // outstanding, deadline = export date + the authorisation's discharge
 // period. Returned = lines on FINALISED import shipments related to the
 // export (receipt is what discharges; draft returns are still abroad).
+//
+// Value reconciliation (0019): also compares goods VALUE, not just unit
+// counts. exported_value_gbp is the batch's reconciled_value_gbp if ops
+// has explicitly set one, else the computed sum of the batch's frozen
+// lines (COALESCE — the implicit value before any reconciliation).
+// returned_value_gbp sums the frozen unit_value of the lines that have
+// actually discharged it (FINALISED import legs). A batch is only fully
+// discharged when BOTH counts and value balance (value_balanced).
 app.get('/discharge', async (c) => {
   const user = currentUser(c)
   const { results } = await c.env.DB.prepare(`
@@ -928,15 +938,26 @@ app.get('/discharge', async (c) => {
            (SELECT COUNT(*) FROM shipment_lines rl
               JOIN shipments r ON r.id = rl.shipment_id
              WHERE r.direction = 'import' AND r.status = 'FINALISED'
-               AND r.related_export_shipment_id = s.id) AS returned
+               AND r.related_export_shipment_id = s.id) AS returned,
+           COALESCE(s.reconciled_value_gbp,
+             (SELECT COALESCE(SUM(sl.unit_value), 0) FROM shipment_lines sl WHERE sl.shipment_id = s.id)
+           ) AS exported_value_gbp,
+           (SELECT COALESCE(SUM(rl.unit_value), 0) FROM shipment_lines rl
+              JOIN shipments r ON r.id = rl.shipment_id
+             WHERE r.direction = 'import' AND r.status = 'FINALISED'
+               AND r.related_export_shipment_id = s.id) AS returned_value_gbp
       FROM shipments s
       JOIN opr_authorisations a ON a.id = s.authorisation_id
      WHERE s.organisation_id = ? AND s.direction = 'export' AND s.status = 'FINALISED'
      ORDER BY s.id ASC
-  `).bind(user.organisation_id).all<Shipment & { discharge_period_months: number; exported: number; returned: number }>()
+  `).bind(user.organisation_id).all<Shipment & {
+    discharge_period_months: number; exported: number; returned: number
+    exported_value_gbp: number; returned_value_gbp: number
+  }>()
 
   const rows = (results || []).map(r => computeDischargeRow(
     r, r.discharge_period_months, Number(r.exported), Number(r.returned),
+    undefined, undefined, Number(r.exported_value_gbp), Number(r.returned_value_gbp),
   ))
   return c.json({
     discharge: rows,
@@ -947,8 +968,80 @@ app.get('/discharge', async (c) => {
       closing: rows.filter(r => r.status === 'closing').length,
       open: rows.filter(r => r.status === 'open').length,
       devices_outstanding: rows.reduce((s, r) => s + Math.max(0, r.outstanding), 0),
+      // Value-balanced mirrors "discharged" but on goods value, not counts —
+      // a batch can balance on one and not the other; both must hold.
+      value_balanced_count: rows.filter(r => r.value_balanced === true).length,
+      value_outstanding_gbp: round2(rows.reduce((s, r) => s + Math.max(0, r.outstanding_value_gbp ?? 0), 0)),
     },
   })
+})
+
+// ───────── Value reconciliation + delta trail (0019) ─────────
+//
+// POST /shipments/:id/reconcile-value { value_gbp, note? } — set/correct
+// the export batch's declared reconciliation value against an external
+// total (e.g. FedEx/manifest). Every call writes a permanent delta record
+// (old, new, difference, timestamp, actor) to shipment_value_deltas —
+// nothing is ever overwritten silently. The baseline ("old" value) is the
+// shipment's current reconciled_value_gbp, or — the first time this is
+// ever called — the computed sum of the shipment's frozen lines (the
+// implicit value before any explicit reconciliation existed).
+//
+// INVARIANT: this endpoint only ever reads/writes reconciled_value_gbp
+// and shipment_value_deltas. It does not touch repair_cost,
+// repair_cost_currency, customs_exchange_rate or duty_rate_pct — the
+// C&E1154 VAT/duty basis is untouched by design (see the isolation test).
+app.post('/shipments/:id/reconcile-value', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+  const { shipment, lines } = bundle
+  if (shipment.direction !== 'export') {
+    return c.json({ error: 'Value reconciliation applies to EXPORT batches (the value being discharged)' }, 409)
+  }
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>))
+  const newValueRaw = Number(body.value_gbp)
+  if (body.value_gbp == null || Number.isNaN(newValueRaw)) {
+    return c.json({ error: 'value_gbp is required and must be a number' }, 422)
+  }
+  const note = body.note !== undefined ? cleanString(body.note, 500) : null
+
+  const oldValue = shipment.reconciled_value_gbp != null
+    ? Number(shipment.reconciled_value_gbp)
+    : sumLineValues(lines)
+
+  const delta = computeValueDelta(oldValue, newValueRaw)
+  if (!delta.ok) return c.json({ error: delta.error }, 422)
+
+  await c.env.DB.prepare(
+    `UPDATE shipments SET reconciled_value_gbp = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organisation_id = ?`
+  ).bind(delta.new_value_gbp, id, user.organisation_id).run()
+
+  const ins = await c.env.DB.prepare(`
+    INSERT INTO shipment_value_deltas
+      (organisation_id, shipment_id, old_value_gbp, new_value_gbp, difference_gbp, note, user_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    user.organisation_id, id, delta.old_value_gbp, delta.new_value_gbp, delta.difference_gbp, note, user.id,
+  ).run()
+
+  const deltaRow = await c.env.DB.prepare('SELECT * FROM shipment_value_deltas WHERE id = ?')
+    .bind(ins.meta.last_row_id).first()
+  return c.json({ ok: true, delta: deltaRow }, 201)
+})
+
+// GET /shipments/:id/value-deltas — full, permanent correction history.
+app.get('/shipments/:id/value-deltas', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM shipment_value_deltas WHERE shipment_id = ? AND organisation_id = ? ORDER BY id ASC'
+  ).bind(id, user.organisation_id).all()
+  return c.json({ deltas: results || [] })
 })
 
 // Proof-of-export fields share one validator: declaration-safe-ish refs

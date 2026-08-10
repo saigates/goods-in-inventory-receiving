@@ -28,7 +28,7 @@ import type { CheckLevel, ValidationCheck, ValidationResult } from './oprValidat
 
 // ───────── Money helpers ─────────
 
-function round2(v: number): number {
+export function round2(v: number): number {
   return Math.round(v * 100) / 100
 }
 
@@ -413,6 +413,13 @@ export type DischargeRow = {
   returned: number
   outstanding: number
   status: 'discharged' | 'overdue' | 'closing' | 'open' | 'no_export_date'
+  // ── Value reconciliation (goods VALUE, not just unit counts) ──
+  // Present only when value inputs were supplied (existing counts-only
+  // callers are unaffected — these fields are additive/optional).
+  exported_value_gbp?: number
+  returned_value_gbp?: number
+  outstanding_value_gbp?: number
+  value_balanced?: boolean   // true once outstanding_value_gbp <= 0 (mirrors 'discharged' on counts)
 }
 
 export function computeDischargeRow(
@@ -422,6 +429,13 @@ export function computeDischargeRow(
   returned: number,
   today = new Date().toISOString().slice(0, 10),
   closingWindowDays = 30,
+  // Optional value inputs, in GBP — pass both to get value fields on the
+  // row. exportedValueGbp is the export batch's reconciled/declared goods
+  // value; returnedValueGbp is the value of the lines that have actually
+  // discharged it so far (both counts- and value-based checks must pass
+  // before a batch is considered fully discharged).
+  exportedValueGbp?: number,
+  returnedValueGbp?: number,
 ): DischargeRow {
   const exportDate = exportShipment.ship_date
     || (exportShipment.finalised_at ? String(exportShipment.finalised_at).slice(0, 10) : null)
@@ -439,7 +453,7 @@ export function computeDischargeRow(
     else if (daysRemaining <= closingWindowDays) status = 'closing'
     else status = 'open'
   }
-  return {
+  const row: DischargeRow = {
     export_shipment_id: exportShipment.id,
     reference: exportShipment.reference,
     export_mrn: exportShipment.export_mrn ?? null,
@@ -451,4 +465,66 @@ export function computeDischargeRow(
     outstanding,
     status,
   }
+  if (exportedValueGbp != null && returnedValueGbp != null) {
+    const outstandingValue = round2(exportedValueGbp - returnedValueGbp)
+    row.exported_value_gbp = round2(exportedValueGbp)
+    row.returned_value_gbp = round2(returnedValueGbp)
+    row.outstanding_value_gbp = outstandingValue
+    row.value_balanced = outstandingValue <= 0
+  }
+  return row
+}
+
+// ───────── Value reconciliation — goods value vs unit counts, delta trail ─────────
+//
+// shipment_lines.unit_value is FROZEN at add-time and never edited — so
+// the "value change" tracked here is never an edit to a line. It is the
+// export batch's DECLARED reconciliation value (reconciled_value_gbp on
+// the shipment row) being set/corrected by ops against some external
+// total (e.g. a FedEx/manifest figure) — always pence-exact, always
+// producing a permanent delta record (old, new, difference, timestamp,
+// actor), never silently overwritten.
+//
+// INVARIANT: this module is pure goods-value arithmetic. It takes no
+// repair_cost/customs_exchange_rate input and returns nothing that feeds
+// computeCe1154() — the VAT/duty basis (repair cost) is untouched by
+// design; see the isolation test in oprImport.spec.ts.
+
+export type ValueDeltaResult =
+  | { ok: true; old_value_gbp: number; new_value_gbp: number; difference_gbp: number }
+  | { ok: false; error: string }
+
+// Computes the delta record fields for a reconciliation correction.
+// oldValueGbp is the shipment's current reconciled_value_gbp (or, if that
+// is still NULL, the computed sum of its lines — the implicit starting
+// point before any explicit reconciliation has ever been recorded).
+export function computeValueDelta(oldValueGbp: number, newValueGbp: number): ValueDeltaResult {
+  if (!isPenceExact(newValueGbp)) {
+    return { ok: false, error: `Reconciled value ${newValueGbp} is not expressible in minor units (2dp)` }
+  }
+  if (newValueGbp < 0) {
+    return { ok: false, error: 'Reconciled value cannot be negative' }
+  }
+  return {
+    ok: true,
+    old_value_gbp: round2(oldValueGbp),
+    new_value_gbp: round2(newValueGbp),
+    difference_gbp: round2(newValueGbp - oldValueGbp),
+  }
+}
+
+// Multi-leg balance check: given an export batch's declared/reconciled
+// value and the goods value of the return legs that have discharged it so
+// far, is the batch balanced (fully accounted for) on VALUE as well as on
+// unit count? Both must hold before the batch can be treated as
+// discharged — a leg that balances on count but not value (or vice versa)
+// is not actually reconciled.
+export function isValueBalanced(exportedValueGbp: number, returnedLegsValueGbp: number[]): {
+  balanced: boolean
+  returned_value_gbp: number
+  outstanding_value_gbp: number
+} {
+  const returnedTotal = round2(returnedLegsValueGbp.reduce((s, v) => round2(s + v), 0))
+  const outstanding = round2(exportedValueGbp - returnedTotal)
+  return { balanced: outstanding <= 0, returned_value_gbp: returnedTotal, outstanding_value_gbp: outstanding }
 }

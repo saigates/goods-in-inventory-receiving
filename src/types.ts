@@ -219,6 +219,11 @@ export type Shipment = {
   customs_exchange_rate: number | null  // HMRC monthly rate (foreign units per £1)
   duty_rate_pct: number | null          // duty rate for the commodity (0 valid)
   import_mrn: string | null             // MRN of the 6121 import declaration
+  // ── Value reconciliation (0019): export shipments only ──
+  // Declared/reconciled goods value for this export batch. NULL until ops
+  // explicitly reconciles it (defaults to the computed sum of lines until
+  // then); every correction after that is recorded in shipment_value_deltas.
+  reconciled_value_gbp: number | null
   notes: string | null
   created_by_user_id: number | null
   created_at: string
@@ -241,5 +246,20 @@ export type ShipmentLine = {
   unit_value: number
   currency: string
   added_by_user_id: number | null
+  created_at: string
+}
+
+// Permanent audit record of every declared-goods-value correction on a
+// shipment (0019). Never updated or deleted — a full history of old →
+// new value, difference, timestamp and actor.
+export type ShipmentValueDelta = {
+  id: number
+  organisation_id: number
+  shipment_id: number
+  old_value_gbp: number
+  new_value_gbp: number
+  difference_gbp: number
+  note: string | null
+  user_id: number | null
   created_at: string
 }

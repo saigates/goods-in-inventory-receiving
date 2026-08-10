@@ -166,6 +166,12 @@ beforeAll(async () => {
 afterAll(async () => {
   // Leave the shared local D1 clean for other suites / manual smokes.
   await env.DB.prepare("DELETE FROM shipment_lines WHERE imei LIKE '8604551%'").run()
+  // shipment_value_deltas FK-references shipments — must be cleared first.
+  await env.DB.prepare(`
+    DELETE FROM shipment_value_deltas WHERE shipment_id IN (
+      SELECT id FROM shipments WHERE reference LIKE 'EXP RTN %' OR reference LIKE 'IMP RTN %'
+    )
+  `).run()
   await env.DB.prepare("DELETE FROM shipments WHERE reference LIKE 'EXP RTN %' OR reference LIKE 'IMP RTN %'").run()
   await env.DB.prepare('DELETE FROM opr_authorisations WHERE id = ?').bind(authId).run()
 })
@@ -622,5 +628,220 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     const noCost = await api(`/api/opr/shipments/${ret.id}/ce1154?format=json`)
     expect(noCost.status).toBe(422)
     expect(((await noCost.json()) as { error: string }).error).toMatch(/nothing to declare|repair_cost/)
+  })
+})
+
+// ═════════ Value reconciliation + delta trail (0019) ═════════
+//
+// shipment_lines.unit_value is FROZEN at add-time and never subsequently
+// UPDATEd anywhere (confirmed by code search) — so "value change" here is
+// never an edit to a line. It is the export batch's DECLARED
+// reconciliation value (reconciled_value_gbp) being corrected by ops
+// against an external total (e.g. FedEx/manifest), always producing a
+// permanent delta record.
+import { computeValueDelta, isValueBalanced } from '../src/lib/oprImport'
+
+describe('OPR — value reconciliation: multi-leg balancing (pure)', () => {
+  it('Batch 001 = 162 units / £39,386 → 90/£22,042 + 72/£17,344 balances on BOTH counts and value', () => {
+    const exportedUnits = 162
+    const exportedValue = 39386
+    const leg1 = { units: 90, value: 22042 }
+    const leg2 = { units: 72, value: 17344 }
+
+    // Counts.
+    expect(leg1.units + leg2.units).toBe(exportedUnits)
+
+    // Value — via the pure isValueBalanced helper.
+    const balance = isValueBalanced(exportedValue, [leg1.value, leg2.value])
+    expect(balance.returned_value_gbp).toBe(39386)
+    expect(balance.outstanding_value_gbp).toBe(0)
+    expect(balance.balanced).toBe(true)
+
+    // Same figures through computeDischargeRow's value fields, end to end.
+    const row = computeDischargeRow(
+      { id: 1, reference: 'BATCH 001', export_mrn: 'M', ship_date: '2026-07-01', finalised_at: null },
+      6, exportedUnits, leg1.units + leg2.units, '2026-08-01', 30,
+      exportedValue, leg1.value + leg2.value,
+    )
+    expect(row.outstanding).toBe(0)
+    expect(row.status).toBe('discharged')
+    expect(row.exported_value_gbp).toBe(39386)
+    expect(row.returned_value_gbp).toBe(39386)
+    expect(row.outstanding_value_gbp).toBe(0)
+    expect(row.value_balanced).toBe(true)
+  })
+
+  it('a partial leg (only 90 of 162 returned) balances on count-so-far but NOT on value if the value is short', () => {
+    // Only the first leg (90 units / £22,042) has landed so far.
+    const balance = isValueBalanced(39386, [22042])
+    expect(balance.returned_value_gbp).toBe(22042)
+    expect(balance.outstanding_value_gbp).toBe(17344) // exactly the second leg still owed
+    expect(balance.balanced).toBe(false)
+
+    const row = computeDischargeRow(
+      { id: 1, reference: 'BATCH 001', export_mrn: 'M', ship_date: '2026-07-01', finalised_at: null },
+      6, 162, 90, '2026-08-01', 30,
+      39386, 22042,
+    )
+    // Counts alone would say "outstanding 72" but the row must ALSO expose
+    // that £17,344 of value is outstanding — a batch that looks closer to
+    // done on count is not actually reconciled until value matches too.
+    expect(row.outstanding).toBe(72)
+    expect(row.value_balanced).toBe(false)
+    expect(row.outstanding_value_gbp).toBe(17344)
+  })
+
+  it('computeValueDelta: the £16,798→£17,344 fixture reproduces a visible £546 delta', () => {
+    const delta = computeValueDelta(16798, 17344)
+    expect(delta.ok).toBe(true)
+    if (!delta.ok) return
+    expect(delta.old_value_gbp).toBe(16798)
+    expect(delta.new_value_gbp).toBe(17344)
+    expect(delta.difference_gbp).toBe(546)
+  })
+
+  it('computeValueDelta refuses a non-pence-exact or negative correction', () => {
+    expect(computeValueDelta(100, 100.001).ok).toBe(false)
+    expect(computeValueDelta(100, -5).ok).toBe(false)
+  })
+})
+
+describe('OPR — value reconciliation: durable delta record (end-to-end)', () => {
+  it('reconcile-value on an export batch writes a permanent delta record for £16,798→£17,344 (£546 delta) with old/new/diff/timestamp/actor', async () => {
+    const res = await api('/api/opr/shipments', {
+      method: 'POST',
+      body: JSON.stringify({
+        reference: `EXP RTN ${100 + shipmentSeq++}`, direction: 'export', authorisation_id: authId,
+        procedure_code: '2100', ship_date: '2026-07-01',
+        consignee_name: 'Overseas Repairer BV', consignee_address: 'Repairstraat 1, Amsterdam, NL',
+        carrier: 'FedEx', incoterm: 'DAP',
+      }),
+    })
+    expect(res.status).toBe(201)
+    const shipment = ((await res.json()) as { shipment: Shipment }).shipment
+
+    // First reconciliation: baseline is the (empty) computed line sum (0),
+    // ops sets the FedEx-manifest-declared value of £16,798.
+    const first = await api(`/api/opr/shipments/${shipment.id}/reconcile-value`, {
+      method: 'POST', body: JSON.stringify({ value_gbp: 16798, note: 'Initial FedEx manifest total' }),
+    })
+    expect(first.status).toBe(201)
+    const firstDelta = ((await first.json()) as { delta: { old_value_gbp: number; new_value_gbp: number; difference_gbp: number; user_id: number; created_at: string } }).delta
+    expect(firstDelta.old_value_gbp).toBe(0)
+    expect(firstDelta.new_value_gbp).toBe(16798)
+    expect(firstDelta.difference_gbp).toBe(16798)
+    expect(firstDelta.user_id).toBe(1)
+    expect(firstDelta.created_at).toBeTruthy()
+
+    // Correction: manifest re-issued at £17,344 — must show a VISIBLE £546 delta.
+    const second = await api(`/api/opr/shipments/${shipment.id}/reconcile-value`, {
+      method: 'POST', body: JSON.stringify({ value_gbp: 17344, note: 'Corrected manifest — carrier re-weighed batch' }),
+    })
+    expect(second.status).toBe(201)
+    const secondDelta = ((await second.json()) as { delta: { old_value_gbp: number; new_value_gbp: number; difference_gbp: number } }).delta
+    expect(secondDelta.old_value_gbp).toBe(16798)
+    expect(secondDelta.new_value_gbp).toBe(17344)
+    expect(secondDelta.difference_gbp).toBe(546)
+
+    // The full, permanent history is retrievable — nothing was overwritten.
+    const hist = await api(`/api/opr/shipments/${shipment.id}/value-deltas`)
+    expect(hist.status).toBe(200)
+    const deltas = ((await hist.json()) as { deltas: { old_value_gbp: number; new_value_gbp: number; difference_gbp: number }[] }).deltas
+    expect(deltas.length).toBe(2)
+    expect(deltas[0].difference_gbp).toBe(16798)
+    expect(deltas[1].difference_gbp).toBe(546)
+
+    // The shipment row itself reflects the latest reconciled value.
+    const shipRow = await env.DB.prepare('SELECT reconciled_value_gbp FROM shipments WHERE id = ?')
+      .bind(shipment.id).first<{ reconciled_value_gbp: number }>()
+    expect(Number(shipRow!.reconciled_value_gbp)).toBe(17344)
+  })
+
+  it('refuses reconciliation on an IMPORT shipment (value reconciliation is an export-batch concept)', async () => {
+    const { shipment: exp } = await makeFinalisedExport(1, '26GB0000000000AA12')
+    const ret = await makeReturnShipment(exp.id)
+    const res = await api(`/api/opr/shipments/${ret.id}/reconcile-value`, {
+      method: 'POST', body: JSON.stringify({ value_gbp: 100 }),
+    })
+    expect(res.status).toBe(409)
+  })
+
+  it('discharge tracker exposes value_balanced / outstanding_value_gbp end to end', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(2, '26GB0000000000AA13')
+    // Two £150 lines → export batch value = £300 by default (no explicit reconciliation yet).
+    const ret = await makeReturnShipment(exp.id)
+    for (const d of devices) {
+      const s = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: d.imei }) })
+      expect(s.status).toBe(201)
+    }
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, {
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB3333333333ZZ01' }),
+    })
+    expect(fin.status).toBe(200)
+
+    const tracker = await api('/api/opr/discharge')
+    expect(tracker.status).toBe(200)
+    const rows = ((await tracker.json()) as {
+      discharge: { export_shipment_id: number; exported_value_gbp: number; returned_value_gbp: number; outstanding_value_gbp: number; value_balanced: boolean }[]
+    }).discharge
+    const row = rows.find(r => r.export_shipment_id === exp.id)!
+    expect(row.exported_value_gbp).toBe(300)   // computed sum of the 2 frozen £150 lines
+    expect(row.returned_value_gbp).toBe(300)   // both returned and finalised
+    expect(row.outstanding_value_gbp).toBe(0)
+    expect(row.value_balanced).toBe(true)
+  })
+})
+
+describe('OPR — value reconciliation: isolation from the C&E1154 VAT/duty basis (protected invariant)', () => {
+  it('reconciling an EXPORT batch\'s goods value does not change repair_cost / customs_exchange_rate / duty_rate_pct on ANY import shipment, nor computeCe1154()\'s output', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(2, '26GB0000000000AA14')
+    const ret = await makeReturnShipment(exp.id, { repair_cost: 800, repair_cost_currency: 'USD', customs_exchange_rate: 1.25, duty_rate_pct: 2 })
+    for (const d of devices) {
+      const s = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: d.imei }) })
+      expect(s.status).toBe(201)
+    }
+
+    // Snapshot the import shipment's VAT/duty-basis fields AND the full
+    // computed C&E1154 BEFORE any value-reconciliation activity.
+    const beforeShip = await env.DB.prepare(
+      'SELECT repair_cost, repair_cost_currency, customs_exchange_rate, duty_rate_pct FROM shipments WHERE id = ?'
+    ).bind(ret.id).first<{ repair_cost: number; repair_cost_currency: string; customs_exchange_rate: number; duty_rate_pct: number }>()
+    const ceBefore = await api(`/api/opr/shipments/${ret.id}/ce1154?format=json`)
+    expect(ceBefore.status).toBe(200)
+    const ceBeforeBody = await ceBefore.json()
+
+    // Exercise value-reconciliation on the EXPORT batch — repeatedly, with
+    // real corrections, exactly as an operator would.
+    for (const value of [16798, 17344, 12000]) {
+      const r = await api(`/api/opr/shipments/${exp.id}/reconcile-value`, {
+        method: 'POST', body: JSON.stringify({ value_gbp: value }),
+      })
+      expect(r.status).toBe(201)
+    }
+
+    // AFTER: the import shipment's VAT/duty-basis fields must be BYTE-IDENTICAL.
+    const afterShip = await env.DB.prepare(
+      'SELECT repair_cost, repair_cost_currency, customs_exchange_rate, duty_rate_pct FROM shipments WHERE id = ?'
+    ).bind(ret.id).first<{ repair_cost: number; repair_cost_currency: string; customs_exchange_rate: number; duty_rate_pct: number }>()
+    expect(afterShip).toEqual(beforeShip)
+
+    // And computeCe1154()'s full output — including repair_cost_gbp, duty
+    // figures and the VAT note — must be identical too.
+    const ceAfter = await api(`/api/opr/shipments/${ret.id}/ce1154?format=json`)
+    expect(ceAfter.status).toBe(200)
+    const ceAfterBody = await ceAfter.json()
+    expect(ceAfterBody).toEqual(ceBeforeBody)
+  })
+
+  it('computeValueDelta / isValueBalanced take no repair-cost input at all — pure goods-value arithmetic, structurally isolated', () => {
+    // Type-level + behavioural proof: neither function accepts or returns
+    // anything resembling repair_cost/customs_exchange_rate/duty_rate_pct.
+    const delta = computeValueDelta(100, 200)
+    expect(delta.ok).toBe(true)
+    if (delta.ok) {
+      expect(Object.keys(delta).sort()).toEqual(['difference_gbp', 'new_value_gbp', 'ok', 'old_value_gbp'].sort())
+    }
+    const balance = isValueBalanced(500, [200, 300])
+    expect(Object.keys(balance).sort()).toEqual(['balanced', 'outstanding_value_gbp', 'returned_value_gbp'].sort())
   })
 })
