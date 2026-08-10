@@ -224,6 +224,11 @@ export type Shipment = {
   // explicitly reconciles it (defaults to the computed sum of lines until
   // then); every correction after that is recorded in shipment_value_deltas.
   reconciled_value_gbp: number | null
+  // ── Outstanding-items checklist (0020): import/re-import shipments ──
+  customs_entry_ref: string | null              // C88 / CDS entry reference
+  vat_evidence_ref: string | null               // generic VAT evidence ref — NOT PVA/C79-specific (awaiting agent)
+  repair_cost_confirmed_at: string | null
+  repair_cost_confirmed_by_user_id: number | null
   notes: string | null
   created_by_user_id: number | null
   created_at: string
@@ -261,5 +266,18 @@ export type ShipmentValueDelta = {
   difference_gbp: number
   note: string | null
   user_id: number | null
+  created_at: string
+}
+
+// Received correspondence logged against a shipment (0020). The counterpart
+// of sent_emails (kind='correspondence' for outbound) — this is inbound.
+export type ShipmentReply = {
+  id: number
+  organisation_id: number
+  shipment_id: number
+  from_mailbox: string
+  summary: string
+  received_at: string
+  logged_by_user_id: number | null
   created_at: string
 }

@@ -63,6 +63,19 @@
 // an operator's manual copy-paste send in the outbox with provider='manual'
 // / status='manual' (never confusable with a real system send); MUCR joins
 // MRN/DUCR/EAD as proof-of-export material (migration 0014).
+//
+// Ticket C (communication tracker):
+//   - POST /shipments/:id/correspondence — log a general FedEx/customs send
+//     (date/mailbox/summary/true status) alongside the structured
+//     pre-alert/clearance drafts — reuses sent_emails (kind='correspondence').
+//   - POST /shipments/:id/replies + GET .../replies — log/list received
+//     correspondence against the shipment (new shipment_replies table).
+//   - GET /shipments/:id/follow-up — 3-working-day (Mon–Fri, bank holidays
+//     ignored) chase flag: trips when the most recent send has no reply
+//     logged against it since.
+//   - GET /shipments/:id/checklist + POST .../checklist — per-return
+//     outstanding-items checklist (import MRN, C88/CDS entry, VAT evidence
+//     — generic, not PVA/C79-specific — repair-cost confirmation).
 
 import { Hono } from 'hono'
 import type { Context } from 'hono'
@@ -81,6 +94,7 @@ import {
   computeValueDelta,
   round2,
 } from '../lib/oprImport'
+import { computeFollowUpStatus, computeOutstandingChecklist, type SentEmailLite, type ShipmentReplyLite } from '../lib/oprComms'
 import { gmailConfigFromEnv, sendGmail, type EmailAttachment } from '../lib/email'
 import { dispatchShipmentWebhooks, type ShipmentEventPayload } from '../lib/webhook'
 import {
@@ -1349,7 +1363,7 @@ app.post('/shipments/:id/restock', async (c) => {
 // attempt (success or provider failure) is recorded with the outcome.
 
 async function recordEmail(c: OprContext, row: {
-  organisationId: number; shipmentId: number; kind: 'prealert' | 'clearance'
+  organisationId: number; shipmentId: number; kind: 'prealert' | 'clearance' | 'correspondence'
   to: string; subject: string; status: 'sent' | 'failed' | 'manual'
   provider?: 'gmail' | 'manual'
   messageId?: string | null; error?: string | null; userId: number
@@ -1566,6 +1580,198 @@ app.get('/shipments/:id/emails', async (c) => {
     'SELECT id, kind, to_email, subject, provider, provider_message_id, status, error, user_id, created_at FROM sent_emails WHERE shipment_id = ? AND organisation_id = ? ORDER BY id DESC'
   ).bind(id, user.organisation_id).all()
   return c.json({ emails: results })
+})
+
+// ═════════ Ticket C — communication tracker ═════════
+//
+// POST /shipments/:id/correspondence — log a general FedEx/customs message
+// the operator actually sent (or attempted). Distinct from the structured
+// pre-alert/clearance mark-sent endpoints: this is for ad-hoc chases and
+// other correspondence that isn't one of those two document types. Reuses
+// sent_emails with kind='correspondence' — same honesty rule applies:
+// `status` must be the true outcome ('sent' | 'failed' | 'manual'), the
+// caller states it explicitly, nothing defaults to 'sent'.
+function cleanCommsStatus(raw: unknown): { ok: true; value: 'sent' | 'failed' | 'manual' } | { ok: false; error: string } {
+  if (raw === 'sent' || raw === 'failed' || raw === 'manual') return { ok: true, value: raw }
+  return { ok: false, error: "status is required and must be exactly one of 'sent' | 'failed' | 'manual' — never defaulted, to keep the send log honest" }
+}
+
+function cleanCommsMailbox(raw: unknown): { ok: true; value: string } | { ok: false; error: string } {
+  if (typeof raw !== 'string' || !raw.trim()) return { ok: false, error: 'mailbox is required' }
+  const v = raw.trim()
+  if (v.length > 200) return { ok: false, error: 'mailbox is too long' }
+  return { ok: true, value: v }
+}
+
+function cleanCommsSummary(raw: unknown): { ok: true; value: string } | { ok: false; error: string } {
+  const v = cleanString(raw, 300)
+  if (!v) return { ok: false, error: 'summary is required (one-line description of the message)' }
+  return { ok: true, value: v }
+}
+
+app.post('/shipments/:id/correspondence', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => null)
+  if (!body) return c.json({ error: 'Invalid JSON body' }, 400)
+
+  const mailbox = cleanCommsMailbox(body.mailbox)
+  if (!mailbox.ok) return c.json({ error: mailbox.error }, 422)
+  const summary = cleanCommsSummary(body.summary)
+  if (!summary.ok) return c.json({ error: summary.error }, 422)
+  const status = cleanCommsStatus(body.status)
+  if (!status.ok) return c.json({ error: status.error }, 422)
+  const errorDetail = body.error !== undefined ? cleanString(body.error, 500) : null
+  if (status.value === 'failed' && !errorDetail) {
+    return c.json({ error: "status 'failed' requires an `error` detail — recording a failure with no reason is not an honest log" }, 422)
+  }
+
+  const emailId = await recordEmail(c, {
+    organisationId: user.organisation_id, shipmentId: id, kind: 'correspondence',
+    to: mailbox.value, subject: summary.value,
+    status: status.value, provider: status.value === 'manual' ? 'manual' : 'gmail',
+    error: status.value === 'failed' ? errorDetail : null,
+    userId: user.id,
+  })
+  return c.json({ ok: true, email_id: emailId, mailbox: mailbox.value, summary: summary.value, status: status.value }, 201)
+})
+
+// POST /shipments/:id/replies — log a received reply against the shipment.
+// received_at defaults to now but may be backdated (e.g. logging an email
+// that actually arrived yesterday) — never forward-dated.
+app.post('/shipments/:id/replies', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => null)
+  if (!body) return c.json({ error: 'Invalid JSON body' }, 400)
+
+  const mailbox = cleanCommsMailbox(body.from_mailbox ?? body.mailbox)
+  if (!mailbox.ok) return c.json({ error: mailbox.error.replace('mailbox', 'from_mailbox') }, 422)
+  const summary = cleanCommsSummary(body.summary)
+  if (!summary.ok) return c.json({ error: summary.error }, 422)
+
+  let receivedAt: string | null = null
+  if (body.received_at !== undefined && body.received_at !== null && body.received_at !== '') {
+    if (typeof body.received_at !== 'string' || !isValidIsoDate(body.received_at.slice(0, 10))) {
+      return c.json({ error: 'received_at must be an ISO date/datetime' }, 422)
+    }
+    const nowIso = new Date().toISOString()
+    if (body.received_at > nowIso) {
+      return c.json({ error: 'received_at cannot be in the future' }, 422)
+    }
+    receivedAt = body.received_at
+  }
+
+  const ins = await c.env.DB.prepare(
+    `INSERT INTO shipment_replies (organisation_id, shipment_id, from_mailbox, summary, received_at, logged_by_user_id)
+     VALUES (?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?)`
+  ).bind(user.organisation_id, id, mailbox.value, summary.value, receivedAt, user.id).run()
+
+  const reply = await c.env.DB.prepare('SELECT * FROM shipment_replies WHERE id = ?').bind(ins.meta.last_row_id).first()
+  return c.json({ ok: true, reply }, 201)
+})
+
+app.get('/shipments/:id/replies', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM shipment_replies WHERE shipment_id = ? AND organisation_id = ? ORDER BY id ASC'
+  ).bind(id, user.organisation_id).all()
+  return c.json({ replies: results || [] })
+})
+
+// GET /shipments/:id/follow-up — 3-working-day (Mon–Fri, bank holidays
+// ignored per instruction) chase flag over the real sent_emails/
+// shipment_replies rows for this shipment.
+app.get('/shipments/:id/follow-up', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+
+  const { results: sends } = await c.env.DB.prepare(
+    'SELECT status, created_at FROM sent_emails WHERE shipment_id = ? AND organisation_id = ?'
+  ).bind(id, user.organisation_id).all<SentEmailLite>()
+  const { results: replies } = await c.env.DB.prepare(
+    'SELECT received_at FROM shipment_replies WHERE shipment_id = ? AND organisation_id = ?'
+  ).bind(id, user.organisation_id).all<ShipmentReplyLite>()
+
+  const status = computeFollowUpStatus(sends || [], replies || [])
+  return c.json({ shipment_id: id, ...status })
+})
+
+// GET /shipments/:id/checklist — per-return outstanding-items checklist.
+// POST to record the checklist fields (import MRN uses the existing
+// /import-proof endpoint — not duplicated here).
+app.get('/shipments/:id/checklist', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+  const { shipment } = bundle
+  if (shipment.direction !== 'import') {
+    return c.json({ error: 'The outstanding-items checklist applies to IMPORT (return) consignments' }, 409)
+  }
+  const result = computeOutstandingChecklist(shipment)
+  return c.json({ shipment_id: id, ...result })
+})
+
+app.post('/shipments/:id/checklist', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+  const { shipment } = bundle
+  if (shipment.direction !== 'import') {
+    return c.json({ error: 'The outstanding-items checklist applies to IMPORT (return) consignments' }, 409)
+  }
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => null)
+  if (!body) return c.json({ error: 'Invalid JSON body' }, 400)
+
+  const updates: string[] = []
+  const values: unknown[] = []
+
+  if (body.customs_entry_ref !== undefined) {
+    const v = cleanString(body.customs_entry_ref, 60)
+    updates.push('customs_entry_ref = ?'); values.push(v)
+  }
+  if (body.vat_evidence_ref !== undefined) {
+    // Deliberately generic free text — no PVA/C79 enum, awaiting agent.
+    const v = cleanString(body.vat_evidence_ref, 300)
+    updates.push('vat_evidence_ref = ?'); values.push(v)
+  }
+  if (body.repair_cost_confirmed !== undefined) {
+    if (body.repair_cost_confirmed === true) {
+      updates.push('repair_cost_confirmed_at = CURRENT_TIMESTAMP', 'repair_cost_confirmed_by_user_id = ?')
+      values.push(user.id)
+    } else if (body.repair_cost_confirmed === false) {
+      updates.push('repair_cost_confirmed_at = NULL', 'repair_cost_confirmed_by_user_id = NULL')
+    } else {
+      return c.json({ error: 'repair_cost_confirmed must be a boolean' }, 422)
+    }
+  }
+  if (!updates.length) return c.json({ error: 'No checklist fields supplied' }, 422)
+
+  await c.env.DB.prepare(
+    `UPDATE shipments SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organisation_id = ?`
+  ).bind(...values, id, user.organisation_id).run()
+
+  const updated = await c.env.DB.prepare('SELECT * FROM shipments WHERE id = ?').bind(id).first<Shipment>()
+  const result = computeOutstandingChecklist(updated!)
+  return c.json({ ok: true, shipment_id: id, ...result })
 })
 
 // ───────── OPR 4: bulk endpoint for downstream consumers ─────────
