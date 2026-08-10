@@ -735,6 +735,46 @@ describe('OPR — value reconciliation: multi-leg balancing (pure)', () => {
     expect(row.value_balanced).toBe(true)
   })
 
+  // Phase-0 regression A2: the CONFIRMED Batch 001 supporting-documentation
+  // values (Return A £22,588.00 + Return B £16,798.00 = Export £39,386.00).
+  // Distinct fixture from the £22,042/£17,344 pair above — that fixture
+  // stays untouched; this one exists alongside it, not in place of it.
+  it('Batch 001 (confirmed supporting docs) = 162 units / £39,386 → Return A £22,588 + Return B £16,798 balances on BOTH counts and value', () => {
+    const exportedUnits = 162
+    const exportedValue = 39386
+    const returnA = { units: 90, value: 22588 }
+    const returnB = { units: 72, value: 16798 }
+
+    // Units: 90 + 72 = 162.
+    expect(returnA.units + returnB.units).toBe(exportedUnits)
+
+    // Value — via the pure isValueBalanced helper.
+    const balance = isValueBalanced(exportedValue, [returnA.value, returnB.value])
+    expect(balance.returned_value_gbp).toBe(39386)
+    expect(balance.outstanding_value_gbp).toBe(0)
+    expect(balance.balanced).toBe(true)
+
+    // Same figures through computeDischargeRow's value fields, end to end.
+    const row = computeDischargeRow(
+      { id: 1, reference: 'BATCH 001', export_mrn: 'M', ship_date: '2026-07-01', finalised_at: null },
+      6, exportedUnits, returnA.units + returnB.units, '2026-08-01', 30,
+      exportedValue, returnA.value + returnB.value,
+    )
+    expect(row.outstanding).toBe(0)
+    expect(row.status).toBe('discharged')
+    expect(row.exported_value_gbp).toBe(39386)
+    expect(row.returned_value_gbp).toBe(39386)
+    expect(row.outstanding_value_gbp).toBe(0)
+    expect(row.value_balanced).toBe(true)
+
+    // This fixture is additive, not a replacement — the pre-existing
+    // £22,042/£17,344 pair (different Batch 001 leg split) must still sum
+    // to the same £39,386 export value without collision or overwrite.
+    const otherPairBalance = isValueBalanced(exportedValue, [22042, 17344])
+    expect(otherPairBalance.balanced).toBe(true)
+    expect(otherPairBalance.returned_value_gbp).toBe(39386)
+  })
+
   it('a partial leg (only 90 of 162 returned) balances on count-so-far but NOT on value if the value is short', () => {
     // Only the first leg (90 units / £22,042) has landed so far.
     const balance = isValueBalanced(39386, [22042])
