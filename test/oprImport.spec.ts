@@ -270,6 +270,70 @@ describe('OPR 3 — return-consignment builder', () => {
     expect(scan.status).toBe(409)
     expect(((await scan.json()) as { error: string }).error).toMatch(/only EXPORTED_UNDER_OPR/)
   })
+
+  // Phase-0 regression A10: a device that has been through a FULL OPR
+  // round trip (exported → returned → restocked to ACTIVE_INVENTORY)
+  // must not be reusable in ANY new export/return without a legitimate
+  // transition back to READY_FOR_EXPORT. Today's ALLOWED_TRANSITIONS has
+  // no outgoing edge from ACTIVE_INVENTORY at all, so this is structurally
+  // guaranteed — but it was not previously exercised with a real
+  // full-round-trip fixture (only with a device that had never left
+  // READY_FOR_EXPORT), so this closes that gap explicitly.
+  it('a device that completed a full round trip (restocked to ACTIVE_INVENTORY) cannot rejoin a NEW export or a NEW return — zero side-effects', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000AA07')
+    const ret1 = await makeReturnShipment(exp.id)
+    const scanIn = await api(`/api/opr/shipments/${ret1.id}/scan`, {
+      method: 'POST', body: JSON.stringify({ imei: devices[0].imei }),
+    })
+    expect(scanIn.status).toBe(201)
+    const fin = await api(`/api/opr/shipments/${ret1.id}/finalise`, {
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB0000000000BB01' }),
+    })
+    expect(fin.status).toBe(200)
+    expect(await deviceStatus(devices[0].id)).toBe('RETURNED_UNDER_OPR')
+    const restock = await api(`/api/opr/shipments/${ret1.id}/restock`, { method: 'POST' })
+    expect(restock.status).toBe(200)
+    expect(await deviceStatus(devices[0].id)).toBe('ACTIVE_INVENTORY')
+
+    // (a) Cannot rejoin a brand-new EXPORT consignment — the export
+    // builder requires READY_FOR_EXPORT, and there is no allowed edge
+    // from ACTIVE_INVENTORY back to it.
+    const newExpRes = await api('/api/opr/shipments', {
+      method: 'POST',
+      body: JSON.stringify({
+        reference: `EXP RTN ${100 + shipmentSeq++}`, direction: 'export', authorisation_id: authId,
+        procedure_code: '2100', consignee_name: 'Overseas Repairer BV',
+        consignee_address: 'Repairstraat 1, Amsterdam, NL',
+      }),
+    })
+    expect(newExpRes.status).toBe(201)
+    const newExp = ((await newExpRes.json()) as { shipment: { id: number } }).shipment
+    const linesBefore = await env.DB.prepare('SELECT COUNT(*) AS n FROM shipment_lines WHERE shipment_id = ?')
+      .bind(newExp.id).first<{ n: number }>()
+    const rejoinExport = await api(`/api/opr/shipments/${newExp.id}/scan`, {
+      method: 'POST', body: JSON.stringify({ imei: devices[0].imei }),
+    })
+    expect(rejoinExport.status).toBe(409)
+    expect(((await rejoinExport.json()) as { error: string }).error).toMatch(/READY_FOR_EXPORT/)
+    expect(await deviceStatus(devices[0].id)).toBe('ACTIVE_INVENTORY')
+    const linesAfter = await env.DB.prepare('SELECT COUNT(*) AS n FROM shipment_lines WHERE shipment_id = ?')
+      .bind(newExp.id).first<{ n: number }>()
+    expect(linesAfter!.n).toBe(linesBefore!.n)
+
+    // (b) Cannot rejoin a NEW return linked to the ORIGINAL export either
+    // — the return builder requires EXPORTED_UNDER_OPR, and this device
+    // is now ACTIVE_INVENTORY, not EXPORTED_UNDER_OPR.
+    const ret2 = await makeReturnShipment(exp.id)
+    const rejoinReturn = await api(`/api/opr/shipments/${ret2.id}/scan`, {
+      method: 'POST', body: JSON.stringify({ imei: devices[0].imei }),
+    })
+    expect(rejoinReturn.status).toBe(409)
+    expect(((await rejoinReturn.json()) as { error: string }).error).toMatch(/only EXPORTED_UNDER_OPR/)
+    expect(await deviceStatus(devices[0].id)).toBe('ACTIVE_INVENTORY')
+    const ret2Lines = await env.DB.prepare('SELECT COUNT(*) AS n FROM shipment_lines WHERE shipment_id = ?')
+      .bind(ret2.id).first<{ n: number }>()
+    expect(ret2Lines!.n).toBe(0)
+  })
 })
 
 // ═════════ C&E1154 computation (pure) ═════════
