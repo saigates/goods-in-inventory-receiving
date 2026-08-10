@@ -28,53 +28,80 @@ migration path.
   is fully specified now, so no data is lost or reinterpreted later.
   That specification follows below.
 
-### `repair_jobs` cost fields (first slice — authoritative for now)
+### `repair_jobs` cost fields (first slice — authoritative for now, CONFIRMED field list)
 
 ```
-repair_jobs.parts_cost   REAL NULL
-repair_jobs.labour_cost  REAL NULL
-repair_jobs.repair_cost  REAL NULL   -- = parts_cost + labour_cost when both set,
-                                     -- or a single manager-entered total otherwise
-repair_jobs.repair_cost_currency TEXT NOT NULL DEFAULT 'GBP'
+repair_jobs.repair_cost_gbp        REAL NULL   -- total repair cost, GBP
+repair_jobs.parts_cost_gbp         REAL NULL   -- parts component, GBP
+repair_jobs.labour_cost_gbp        REAL NULL   -- labour component, GBP
+repair_jobs.cost_source            TEXT NULL   -- e.g. 'MANUAL_MANAGER_ENTRY'
+repair_jobs.cost_source_reference  TEXT NULL   -- free-form reference to the
+                                                -- source (invoice no., ERP
+                                                -- id once that exists, etc.)
+repair_jobs.cost_recorded_at       TEXT NULL   -- ISO timestamp cost was recorded
+repair_jobs.cost_recorded_by       INTEGER NULL -- users.id of the recording user
+                                                -- (explicit field — NOT
+                                                -- inferred from qc_by or
+                                                -- assigned_to)
 ```
 
-These are the ONLY authoritative record of in-house repair cost until
-Workstream D ships. No other table duplicates them in this slice.
+This is the CONFIRMED, authoritative field list for slice 1 (superseding
+an earlier draft that used `parts_cost`/`labour_cost`/`repair_cost`/
+`repair_cost_currency` without the `_gbp` suffix and without
+`cost_source`/`cost_source_reference`/`cost_recorded_at`/
+`cost_recorded_by`). These are the ONLY authoritative record of in-house
+repair cost until Workstream D ships. No other table duplicates them in
+this slice.
+
+**Slice 1 is GBP-only by design — an intentional interim scope
+decision, not an oversight.** All repair-cost fields above are
+GBP-denominated; there is no currency or FX-rate field on `repair_jobs`
+in this slice. If a repair invoice ever arrives in a non-GBP currency,
+the manager enters the GBP-converted figure directly — same discipline
+already used for `shipments.repair_cost`/`customs_exchange_rate` in the
+OPR module, just deferred rather than duplicated here. The future
+`device_costs` ledger (Workstream D) will support original currency, FX
+rate, allocation method, and additional cost types beyond in-house
+repair — none of that is needed or built in slice 1.
+
+**The supplier ERP webhook is explicitly NOT part of Slice 1.** It is a
+Workstream D deliverable; slice 1 has no webhook receiver, no ERP
+cost-ingestion path, and no ERP-derived fields on `repair_jobs`.
 
 ### Documented migration path to `device_costs` (Workstream D, later)
 
-When `device_costs` is built, a migration will backfill one row per
-existing `repair_jobs` completion:
+**Existing slice 1 repair-cost data must be backfillable into
+`device_costs` without loss.** When `device_costs` is built, a
+migration will backfill one row per existing `repair_jobs` completion:
 
 ```
 device_costs.device_id        = repair_jobs.device_id
 device_costs.imei             = repair_jobs.imei
 device_costs.cost_type        = 'INHOUSE_REPAIR'
-device_costs.amount           = repair_jobs.repair_cost
-device_costs.currency         = repair_jobs.repair_cost_currency
-device_costs.fx_rate          = NULL  -- repair_jobs has no FX field in slice 1;
-                                       -- GBP-only for this slice (see below)
-device_costs.amount_gbp       = repair_jobs.repair_cost   -- GBP-only in slice 1
-device_costs.source           = 'repair_job'
-device_costs.source_reference = repair_jobs.id
+device_costs.amount           = repair_jobs.repair_cost_gbp
+device_costs.currency         = 'GBP'   -- slice 1 is GBP-only; see above
+device_costs.fx_rate          = NULL    -- no FX in slice 1 by design
+device_costs.amount_gbp       = repair_jobs.repair_cost_gbp
+device_costs.source           = repair_jobs.cost_source
+device_costs.source_reference = repair_jobs.cost_source_reference
 device_costs.allocation_method = 'MANUAL_MANAGER_ENTRY'
-device_costs.created_by       = repair_jobs.qc_by (or assigned_to, TBD at migration time)
-device_costs.created_at       = repair_jobs.completed_at
+device_costs.created_by       = repair_jobs.cost_recorded_by   -- explicit
+                                                                -- field, no
+                                                                -- longer TBD
+device_costs.created_at       = repair_jobs.cost_recorded_at
 ```
+
+The explicit `cost_source`/`cost_source_reference`/`cost_recorded_at`/
+`cost_recorded_by` fields on `repair_jobs` exist specifically so this
+backfill is lossless and unambiguous — no field on the future
+`device_costs` row needs to be inferred, guessed, or defaulted from an
+unrelated column (e.g. `qc_by`).
 
 From that point forward, new repair completions write to `device_costs`
 directly; `repair_jobs`'s own cost columns become a read-only cached
 snapshot (kept for backward-compatible queries/UI, never the source of
 truth again). **No repair_jobs row is ever deleted or altered by this
 future migration — it is additive only.**
-
-**Constraint carried into slice 1 now, to make that migration painless
-later:** `repair_jobs` cost fields are GBP-only (no currency conversion)
-in this slice. If a repair invoice ever arrives in a non-GBP currency,
-the manager enters the GBP-converted figure directly — same discipline
-already used for `shipments.repair_cost`/`customs_exchange_rate` in the
-OPR module, just deferred rather than duplicated here. FX support is a
-Workstream D concern (the `device_costs.fx_rate`/`amount_gbp` columns).
 
 ### Freight allocation rule — preserved, not implemented
 
@@ -88,10 +115,12 @@ cost entry exists in this slice at all.
 
 ### ERP precedence rule — preserved, not implemented
 
-When the ERP webhook (deferred) supplies a per-IMEI cost directly, that
-value is authoritative and MUST NOT be recalculated or overridden by an
-app-side allocation. Recorded here for Workstream D's design; not
-applicable until the webhook exists.
+**When the supplier ERP later provides an authoritative per-IMEI cost,
+that ERP value takes precedence over an app-calculated allocation** and
+MUST NOT be recalculated or overridden by an app-side allocation.
+Recorded here for Workstream D's design; not applicable until the
+webhook exists (the webhook itself is out of scope for slice 1 — see
+above).
 
 ---
 
@@ -104,6 +133,21 @@ reason); collapsing QC failure into it would make "why is this on hold"
 ambiguous exactly where the amendment asks for it not to be. Two states
 keep QC failure specifically legible in the ledger and on the device
 record without inspecting `repair_jobs.qc_result` separately.
+
+**Confirmed QC rules for slice 1 (explicit statement):**
+
+- `QC_FAILED` is a separate status — it is never overloaded onto a
+  generic `HOLD`.
+- Generic `HOLD` is **not included** in slice 1 at all (see below).
+- A `QC_FAILED` result **requires a mandatory reason.** The reason is
+  not optional metadata — the QC-fail endpoint must reject a request
+  that omits it, and `repair_jobs` must persist the reason value
+  alongside `qc_result = 'FAILED'`.
+- A device can enter `READY_FOR_ZOHO` **only after a successful QC
+  result** (`qc_result = 'PASSED'`, plus the other gate conditions
+  below).
+- A failed or incomplete QC result (`FAILED` or `PENDING`) **cannot**
+  enter the Zoho queue — only `READY_FOR_ZOHO` devices are eligible.
 
 ### New device statuses (Workstream B, slice 1 only)
 
@@ -122,7 +166,9 @@ workstream needs a non-QC hold, it will be added then, not preemptively.
 ```
 SORTING          → IN_HOUSE_REPAIR        (unchanged, already exists)
 IN_HOUSE_REPAIR  → READY_FOR_ZOHO         (NEW — QC passed)
-IN_HOUSE_REPAIR  → QC_FAILED              (NEW — QC failed)
+IN_HOUSE_REPAIR  → QC_FAILED              (NEW — QC failed; MANDATORY reason
+                                            required on this transition, see
+                                            "Confirmed QC rules" above)
 QC_FAILED        → IN_HOUSE_REPAIR        (NEW — re-open for further repair;
                                             required so a failed device is
                                             not a dead end)
@@ -147,7 +193,9 @@ PENDING   -- default until QC is recorded; scan-back does NOT itself set
 ### Gate for entering `READY_FOR_ZOHO` (all must hold)
 
 1. Repair job `status = 'completed'` (repair itself finished)
-2. `qc_result = 'PASSED'`
+2. `qc_result = 'PASSED'` — a `FAILED` or still-`PENDING` result blocks
+   this transition outright; there is no path from `QC_FAILED` straight
+   to `READY_FOR_ZOHO` (a fresh scan-back/QC cycle is required)
 3. Required device data present (imei, model, capacity/grade — same
    fields OPR's `runExportValidation` already treats as mandatory
    elsewhere, reused here rather than inventing a new rule set)
