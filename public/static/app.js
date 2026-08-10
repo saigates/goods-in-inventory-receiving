@@ -1042,7 +1042,7 @@
         h('div', {},
           h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Invoice currency'),
           h('select', { class: 'input mono', onchange: (e) => { f.repair_cost_currency = e.target.value; } },
-            ['GBP', 'USD', 'EUR', 'CNY', 'HKD'].map(cur =>
+            ['GBP', 'USD', 'EUR', 'CNY', 'HKD', 'AED'].map(cur =>
               h('option', { value: cur, selected: f.repair_cost_currency === cur ? 'selected' : null }, cur)))),
         Num('Exchange rate (per £1)', 'customs_exchange_rate', 'blank for GBP', 'opr-exchange-rate'),
         Num('Duty rate % *', 'duty_rate_pct', '0 for duty-free', 'opr-duty-rate')
