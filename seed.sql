@@ -32,7 +32,7 @@ VALUES
   (1, 1, 'Saigates Limited', 'GB369979995000',
    'GBOPO36997999500020260226105539', 'OP/0922/601/31',
    '2026-03-01', '2031-02-28',
-   'HMRC S1756 IP-OP Customs Liverpool', 'GBNCL001',
+   'HMRC S1756 IP-OP Customs Liverpool', 'GBLIV002',
    'Smartphones', '8517130000', '1:1', 6,
    'Correspondence: Central Mail Unit Newcastle NE98 1ZZ. Goods identified by IMEI. Export 2100 (standard) / 2200+B51 or B02 (warranty; 2100+B51 NOT permitted). Re-import 6121. Carrier FedEx (declarant FedEx Express UK Limited, EORI GB271251133000); pre-alert controlprealert@fedex.com, cut-off 4pm.',
    'controlprealert@fedex.com', '16:00');

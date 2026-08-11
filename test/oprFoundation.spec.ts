@@ -74,7 +74,7 @@ const VALID_AUTH = {
   op_authorisation_number: 'OP/0922/601/31',
   valid_from: '2026-03-01',
   valid_to: '2031-02-28',
-  supervising_office_code: 'GBNCL001',
+  supervising_office_code: 'GBLIV002',
   commodity_codes: '8517130000',
 }
 

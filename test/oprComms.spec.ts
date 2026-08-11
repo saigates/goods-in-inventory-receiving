@@ -152,7 +152,7 @@ beforeAll(async () => {
       valid_from: '2026-03-01',
       valid_to: '2031-02-28',
       supervising_office_name: 'HMRC S1756 IP-OP Customs Liverpool',
-      supervising_office_code: 'GBNCL001',
+      supervising_office_code: 'GBLIV002',
       commodity_scope: 'Smartphones',
       commodity_codes: '8517130000',
       prealert_email: 'controlprealert@fedex.com',
