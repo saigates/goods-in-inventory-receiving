@@ -1,7 +1,25 @@
 // Device Lifecycle slice 1 — repair-workflow + Zoho upload-queue test bodies
 // (approved draft list #15–37, see docs/plan/device-lifecycle-slice1.md
-// section "Test plan", C. and D., renumbered to insert three net-new items:
-// #22 QC-FAILED-needs-reason, #28 no-generic-HOLD, #37 ERP-webhook-absent).
+// section "Test plan", C. and D., renumbered to insert four net-new items:
+// #22 QC-FAILED-needs-reason, #28 no-generic-HOLD, #37 ERP-webhook-absent,
+// and #25a–#25e (added 2026-08-11) — five failing-path tests for gate
+// condition 6 (SKU grade-suffix parsing). #24/#25 only ever exercised the
+// ACCEPT path for condition 6 (fixture default grade is '-A', which never
+// trips the reject branch) — a green suite around an untriggered branch
+// proves the branch didn't break anything, not that it works. #25a–#25e
+// force the reject branch itself, with assertions that check the *parsed*
+// grade appears in the error message (not just any 409), so a hardcoded
+// or fixed-position-parsed implementation would fail these even though it
+// might satisfy a looser assertion.
+//
+// Group D (#30–37) status: SKIPPED for #30–36 (see the two describe.skip
+// blocks below) — Zoho batch generation/confirmation was never built and
+// was parked by explicit owner decision (stock currently goes into Zoho by
+// hand). Carrying seven permanent reds made the board unreadable; skipping
+// with a stated reason is more honest than "not yet green". #37 (ERP
+// webhook absence) stays unskipped — it asserts an absence against
+// already-existing code/schema, so it's genuinely green, not blocked on
+// unbuilt routes.
 //
 // STATUS: TEST BODIES ONLY, per explicit instruction. No schema, no
 // migration, no `repair_jobs` table, no application-code implementation
@@ -146,6 +164,21 @@ async function repairJobsFor(deviceId: number) {
 async function repairJobsCount(): Promise<number> {
   const row = await db().prepare('SELECT COUNT(*) AS n FROM repair_jobs').first<{ n: number }>()
   return row!.n
+}
+
+// Test-local sku_catalog row, for condition-6 tests that need a SKU with a
+// malformed/atypical grade suffix to exist in the catalog (so the device
+// clears condition 4's existence check and actually reaches condition 6 —
+// an unmapped SKU would be rejected by condition 4 first, per #25, and
+// would never exercise condition 6 at all).
+async function seedCatalogSku(sku: string, organisationId = 1): Promise<void> {
+  await db()
+    .prepare(
+      `INSERT OR IGNORE INTO sku_catalog (sku, brand, model, organisation_id)
+       VALUES (?, 'TESTBRAND', 'TESTMODEL', ?)`
+    )
+    .bind(sku, organisationId)
+    .run()
 }
 
 async function tokenFor(user: AuthUser) {
@@ -377,6 +410,161 @@ describe('C. repair workflow — scan-back and QC (#20–25, incl. NEW #22)', ()
   })
 })
 
+// Gate condition 6 (src/lib/repairWorkflow.ts:149–166) — reject-path tests.
+// #24 and #25 only ever exercise the ACCEPT side of condition 6 (fixture
+// default grade '-A' never trips it, and #25 is blocked by condition 4
+// before condition 6 is ever reached). None of the five tests below are
+// duplicates of #24/#25: each forces the reject branch itself and checks
+// something the accept-path tests cannot prove.
+describe('C. repair workflow — gate condition 6, SKU grade-suffix reject-path (#25a–#25e, NEW)', () => {
+  it('#25a QC PASSED with SKU grade suffix -UG → 409, error message names the parsed grade (UG), device stays IN_HOUSE_REPAIR', async () => {
+    // 'SAM-S26-256-CVT-UG' already exists in the migrated catalog
+    // (migrations/0017_catalog_case_normalize_and_expand.sql:357) — no
+    // test-local catalog insert needed, so this device clears condition 4
+    // and reaches condition 6.
+    const deviceId = await seedDevice('SORTING', { sku: 'SAM-S26-256-CVT-UG' })
+    await api(`/api/devices/${deviceId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
+    await api(`/api/devices/${deviceId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
+
+    const res = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/qc`, {
+      method: 'POST',
+      body: JSON.stringify({ result: 'PASSED' }),
+    })
+    expect(res.status).toBe(409)
+    const body = await res.json() as { error: string }
+    // Must name the GRADE FOUND ('UG'), not just mention "sku" or "grade"
+    // generically — this is what proves the parsed value, not a hardcoded
+    // string, reached the message.
+    expect(body.error).toContain('UG')
+
+    expect(await deviceStatus(deviceId)).toBe('IN_HOUSE_REPAIR')
+  })
+
+  it('#25b seven-segment SKU: -A passes, identical SKU ending -UG fails — the only test that distinguishes last-segment parsing from fixed-position parsing', async () => {
+    // No naturally-occurring 7-segment SKU exists in the migrated catalog
+    // (longest -A-ending rows are 5-segment, e.g. 'SAM-ZFOLD7-512-SSH-A' —
+    // confirmed via grep) — a fixed-position parser (e.g. "always take
+    // index 4") could accidentally pass a 5-segment suite while being
+    // wrong on this shape. Both custom SKUs are inserted test-locally.
+    const passSku = 'APL-I17-PRO-MAX-256-BLK-A'
+    const failSku = 'APL-I17-PRO-MAX-256-BLK-UG'
+    await seedCatalogSku(passSku)
+    await seedCatalogSku(failSku)
+
+    const passId = await seedDevice('SORTING', { sku: passSku })
+    await api(`/api/devices/${passId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
+    await api(`/api/devices/${passId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
+    const passRes = await apiAs(MANAGER_USER, `/api/devices/${passId}/repair/qc`, {
+      method: 'POST',
+      body: JSON.stringify({ result: 'PASSED' }),
+    })
+    expect(passRes.status).toBe(200)
+    expect(await deviceStatus(passId)).toBe('READY_FOR_ZOHO')
+
+    const failId = await seedDevice('SORTING', { sku: failSku })
+    await api(`/api/devices/${failId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
+    await api(`/api/devices/${failId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
+    const failRes = await apiAs(MANAGER_USER, `/api/devices/${failId}/repair/qc`, {
+      method: 'POST',
+      body: JSON.stringify({ result: 'PASSED' }),
+    })
+    expect(failRes.status).toBe(409)
+    const failBody = await failRes.json() as { error: string }
+    expect(failBody.error).toContain('UG')
+    expect(await deviceStatus(failId)).toBe('IN_HOUSE_REPAIR')
+  })
+
+  it('#25c unrecognised grade suffix (X) → 409, rejected rather than silently treated as A', async () => {
+    // Normalisation happens at scan-in (src/lib/grade.ts#normalizeGrade),
+    // so an 'X' suffix reaching this gate means something upstream
+    // leaked — the gate must say so, not absorb it as a pass.
+    const sku = 'TESTBRAND-MODEL-100-BLK-X'
+    await seedCatalogSku(sku)
+    const deviceId = await seedDevice('SORTING', { sku })
+    await api(`/api/devices/${deviceId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
+    await api(`/api/devices/${deviceId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
+
+    const res = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/qc`, {
+      method: 'POST',
+      body: JSON.stringify({ result: 'PASSED' }),
+    })
+    expect(res.status).toBe(409)
+    const body = await res.json() as { error: string }
+    expect(body.error).toContain('X')
+
+    expect(await deviceStatus(deviceId)).toBe('IN_HOUSE_REPAIR')
+  })
+
+  it('#25d no grade segment at all, and a SKU with no hyphen at all — both rejected (409) without throwing (no 500)', async () => {
+    // Trailing hyphen: split('-') puts an empty string in the final
+    // position — "no grade segment" is a real, distinct input shape from
+    // "wrong grade segment" and must not throw or fall through to a pass.
+    const noGradeSku = 'TESTBRAND-MODEL-100-BLK-'
+    await seedCatalogSku(noGradeSku)
+    const noGradeId = await seedDevice('SORTING', { sku: noGradeSku })
+    await api(`/api/devices/${noGradeId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
+    await api(`/api/devices/${noGradeId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
+    const noGradeRes = await apiAs(MANAGER_USER, `/api/devices/${noGradeId}/repair/qc`, {
+      method: 'POST',
+      body: JSON.stringify({ result: 'PASSED' }),
+    })
+    expect(noGradeRes.status).toBe(409) // not 500 — proves split('-') on a
+    // trailing hyphen didn't throw and didn't fall through to a pass
+    expect(await deviceStatus(noGradeId)).toBe('IN_HOUSE_REPAIR')
+
+    // No hyphen at all: split('-') returns a single-element array, so
+    // "skuGrade" becomes the whole SKU string — must still be rejected,
+    // not throw on an out-of-bounds/undefined access.
+    const noHyphenSku = 'NOHYPHENSKUATALL'
+    await seedCatalogSku(noHyphenSku)
+    const noHyphenId = await seedDevice('SORTING', { sku: noHyphenSku })
+    await api(`/api/devices/${noHyphenId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
+    await api(`/api/devices/${noHyphenId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
+    const noHyphenRes = await apiAs(MANAGER_USER, `/api/devices/${noHyphenId}/repair/qc`, {
+      method: 'POST',
+      body: JSON.stringify({ result: 'PASSED' }),
+    })
+    expect(noHyphenRes.status).toBe(409) // not 500
+    expect(await deviceStatus(noHyphenId)).toBe('IN_HOUSE_REPAIR')
+  })
+
+  it('#25e lowercase grade suffix (a) → 409, rejected — DECISION: condition 6 is case-sensitive by design, unlike grade.ts#normalizeGrade', async () => {
+    // Decision (documented here, not inferred from whatever the code
+    // happened to do): condition 6 stays case-sensitive/strict. Two
+    // reasons, both from the actual code, not from convenience:
+    //   1. Condition 6's own stated intent is "rejected outright, not
+    //      defaulted to a pass/fail-safe value" (see the comment at
+    //      repairWorkflow.ts:149-161) — silently uppercasing a malformed
+    //      grade before that check would be exactly the kind of silent
+    //      default the condition exists to avoid.
+    //   2. No migration or insert-time hook anywhere normalises the `sku`
+    //      column's case (confirmed: zero-match grep for
+    //      "UPPER(sku)|SET sku" across migrations/*.sql) — a lowercase 'a'
+    //      reaching this gate indicates an upstream anomaly (bad manual
+    //      entry, bad import) that deserves investigation, not silent
+    //      accept. This is the opposite purpose from grade.ts's
+    //      normalizeGrade(), which exists to canonicalise
+    //      HUMAN/SUPPLIER-entered grades on the way IN, at scan-time —
+    //      not to validate the catalogue's authoritative, already-clean
+    //      SKU string on the way OUT to Zoho.
+    const sku = 'TESTBRAND-MODEL-100-BLK-a'
+    await seedCatalogSku(sku)
+    const deviceId = await seedDevice('SORTING', { sku })
+    await api(`/api/devices/${deviceId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
+    await api(`/api/devices/${deviceId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
+
+    const res = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/qc`, {
+      method: 'POST',
+      body: JSON.stringify({ result: 'PASSED' }),
+    })
+    expect(res.status).toBe(409)
+    const body = await res.json() as { error: string }
+    expect(body.error).toContain('a')
+
+    expect(await deviceStatus(deviceId)).toBe('IN_HOUSE_REPAIR')
+  })
+})
+
 describe('C. repair workflow — cost entry (#26)', () => {
   it('#26 repair cost entered (7 confirmed cost fields) → correctly linked to device_id/IMEI, GBP-only, no currency field', async () => {
     const deviceId = await seedDevice('SORTING')
@@ -504,7 +692,17 @@ async function zohoBatchRows(batchId: number) {
   return results
 }
 
-describe('D. Zoho upload queue — batch generation (#30–32)', () => {
+// SKIPPED (2026-08-11) by explicit owner decision: Zoho batch
+// generation/confirmation (the /api/zoho/batches* routes, zoho_batches and
+// zoho_batch_devices/zoho_batch_events tables) was never built and is not
+// scheduled next — stock currently goes into Zoho by hand. These bodies
+// document the intended contract for whenever that work is picked up, but
+// carrying them as permanent reds made the test board unreadable, so they
+// are marked skipped rather than left red. Do not un-skip without a
+// deliberate decision to build Group D — see queue order in the standing
+// project status (date-enterability → verified/tested backup → Item 3 →
+// Group D).
+describe.skip('D. Zoho upload queue — batch generation (#30–32) [SKIPPED: Zoho batch upload not built; stock goes into Zoho by hand for now]', () => {
   it('#30 generating a Zoho file with N selected READY_FOR_ZOHO devices → batch with exactly those N IMEIs, one row per IMEI, no aggregation', async () => {
     const a = await makeReadyForZohoDevice()
     const b = await makeReadyForZohoDevice()
@@ -561,7 +759,10 @@ describe('D. Zoho upload queue — batch generation (#30–32)', () => {
   })
 })
 
-describe('D. Zoho upload queue — confirmation (#33–36)', () => {
+// SKIPPED (2026-08-11) — same reason as the batch-generation block above:
+// confirmation depends on batch generation, which is not built. See the
+// note above #30–32 for the full rationale and un-skip conditions.
+describe.skip('D. Zoho upload queue — confirmation (#33–36) [SKIPPED: depends on unbuilt Zoho batch generation; stock goes into Zoho by hand for now]', () => {
   async function makeBatch(): Promise<number> {
     const a = await makeReadyForZohoDevice()
     const res = await apiAs(MANAGER_USER, '/api/zoho/batches', {
