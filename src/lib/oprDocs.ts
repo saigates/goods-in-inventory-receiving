@@ -112,7 +112,7 @@ export function buildCommercialInvoiceHtml(
 <section class="customs" id="invoice-customs">
   <div><strong>Customs procedure code:</strong> ${esc(shipment.procedure_code)}${shipment.additional_procedure_code ? ' + ' + esc(shipment.additional_procedure_code) : ''}</div>
   <div><strong>OPR authorisation (CDS):</strong> ${esc(authorisation.cds_number)}</div>
-  <div><strong>Supervising office:</strong> ${esc(authorisation.supervising_office_name ?? '')} ${authorisation.supervising_office_code ? '(' + esc(authorisation.supervising_office_code) + ')' : ''}</div>
+  <div><strong>Supervising office:</strong> ${esc(authorisation.supervising_office_name ?? '')}</div>
   <div><strong>Commodity code(s):</strong> ${esc(authorisation.commodity_codes ?? '')}</div>
   <div><strong>Carrier:</strong> ${esc(shipment.carrier ?? '(not set)')}${shipment.carrier_account ? ' — account ' + esc(shipment.carrier_account) : ''}</div>
   <div><strong>Reason for export:</strong> Temporary export for repair and return under Outward Processing. Goods remain the property of the exporter. Values shown for customs purposes only — no sale has taken place.</div>
