@@ -22,8 +22,7 @@
 --
 --   * device_events.device_id and shipment_lines.received_device_id both
 --     carry a FOREIGN KEY REFERENCES received_devices(id) with no ON DELETE
---     action (added in migrations 0008 and 0010 respectively) — unlike
---     print_jobs/grade_audit, which use ON DELETE CASCADE and are unaffected.
+--     action (added in migrations 0008 and 0010 respectively).
 --   * DROP TABLE received_devices is an implicit delete of every row in it;
 --     SQLite's FK enforcement checks that against device_events/
 --     shipment_lines and blocks it. Production device_events has 403 live
@@ -47,22 +46,48 @@
 --     sqlite_master directly, with and without `PRAGMA legacy_alter_table`),
 --     so DROP TABLE received_devices_old still trips the same check.
 --
--- REAL FIX: recreate all three tables together (parent + both unguarded
--- children) in dependency order — children created and repointed at the
--- NEW parent's temp name first, then BOTH old children dropped (dropping
--- a table only checks constraints IT declares, never incoming references
--- to it, so this is always safe), THEN the old parent is dropped (nothing
--- references it any more — the new children already point at *_new), then
--- everything is renamed into its final name in one go. Verified end-to-end
--- against `wrangler d1 migrations apply --local` (not just raw sqlite3):
--- succeeds, zero `PRAGMA foreign_key_check` violations, device_events'
--- device_id and shipment_lines' received_device_id resolve correctly
--- against the recreated received_devices, and the widened status CHECK
--- correctly accepts QC_FAILED / READY_FOR_ZOHO afterwards.
+-- REVISION 3 (this pass, 2026-08-11, post-deploy discovery): REVISION 2's
+-- comment above claimed print_jobs and grade_audit were "unaffected"
+-- because they use ON DELETE CASCADE. That claim was WRONG and the
+-- resulting migration (as it ran in production earlier today) was UNSAFE.
+-- Corrected understanding, verified with a seeded before/after local test
+-- (3 print_jobs rows + 3 grade_audit rows inserted, migration run, counts
+-- re-checked): DROP TABLE received_devices is an implicit DELETE of every
+-- row in it. SQLite enforces FK actions on implicit deletes exactly as on
+-- explicit ones — a NO-ACTION child (device_events, shipment_lines) BLOCKS
+-- the delete if rows reference it, but an ON DELETE CASCADE child does the
+-- opposite: it lets the delete through and silently deletes every one of
+-- its OWN rows too. `PRAGMA foreign_key_check` afterwards reports zero
+-- violations only because there is nothing left to violate — the child
+-- rows are gone, not preserved. print_jobs and grade_audit are therefore
+-- exactly as at-risk as device_events/shipment_lines, just via silent data
+-- loss instead of a loud constraint error. (Production currently has 0
+-- rows in both tables, confirmed via `gsk hosted d1_query`, so the
+-- REVISION-2 migration that already ran in production today did not
+-- destroy real data — but the migration file itself was still incorrect
+-- and would destroy real print_jobs/grade_audit rows the next time either
+-- table is populated, e.g. by a real print job or grade change.)
 --
--- device_events and shipment_lines are otherwise UNCHANGED — same columns,
--- same defaults, same indexes — this migration only touches them because
--- their FK's target table is being recreated underneath them.
+-- REAL FIX (revised): recreate ALL FIVE tables together (parent + all four
+-- children with any FK pointing at received_devices — the two unguarded
+-- NO ACTION children device_events/shipment_lines, AND the two ON DELETE
+-- CASCADE children print_jobs/grade_audit) in dependency order — children
+-- created and repointed at the NEW parent's temp name first, then ALL FOUR
+-- old children dropped (dropping a table only checks constraints IT
+-- declares, never incoming references to it, so this is always safe),
+-- THEN the old parent is dropped (nothing references it any more — the
+-- new children already point at *_new), then everything is renamed into
+-- its final name in one go. Verified end-to-end against `wrangler d1
+-- migrations apply --local` with a seeded database (not an empty one —
+-- an empty-DB test would not have caught the print_jobs/grade_audit
+-- cascade-wipe defect, since `PRAGMA foreign_key_check` reports zero
+-- violations both when rows are correctly preserved AND when a CASCADE
+-- has silently emptied a child with nothing left to check against).
+--
+-- device_events, shipment_lines, print_jobs and grade_audit are otherwise
+-- UNCHANGED — same columns, same defaults, same indexes — this migration
+-- only touches them because their FK's target table is being recreated
+-- underneath them.
 
 CREATE TABLE received_devices_new (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,17 +188,68 @@ SELECT
   unit_value, currency, added_by_user_id, created_at
 FROM shipment_lines;
 
--- Drop the two children FIRST (dropping a table only checks constraints IT
--- declares, never incoming references to it — this is always safe), THEN
--- the parent (safe now: nothing references the old received_devices any
--- more, the new children already point at received_devices_new).
+-- ── print_jobs: MUST be recreated too — it carries an ON DELETE CASCADE
+-- FK to received_devices(id) (migration 0001, line 80). REVISION 2 wrongly
+-- assumed CASCADE made this "unaffected"; in fact CASCADE means DROP TABLE
+-- received_devices would silently delete every print_jobs row instead of
+-- blocking. Column list, defaults and indexes byte-for-byte identical to
+-- production's current print_jobs (0001 + 0008's added org/user columns).
+CREATE TABLE print_jobs_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  received_device_id INTEGER NOT NULL REFERENCES received_devices_new(id) ON DELETE CASCADE,
+  printer TEXT NOT NULL DEFAULT 'DYMO LabelWriter 450',
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  sent_at DATETIME,
+  organisation_id INTEGER NOT NULL DEFAULT 1,
+  created_by_user_id INTEGER
+);
+INSERT INTO print_jobs_new
+  (id, received_device_id, printer, payload_json, status, created_at, sent_at, organisation_id, created_by_user_id)
+SELECT
+  id, received_device_id, printer, payload_json, status, created_at, sent_at, organisation_id, created_by_user_id
+FROM print_jobs;
+
+-- ── grade_audit: MUST be recreated too — it carries an ON DELETE CASCADE
+-- FK to received_devices(id) (migration 0004, line 85). Same rationale as
+-- print_jobs above. Column list, defaults and indexes byte-for-byte
+-- identical to production's current grade_audit.
+CREATE TABLE grade_audit_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  received_device_id INTEGER NOT NULL REFERENCES received_devices_new(id) ON DELETE CASCADE,
+  imei TEXT NOT NULL,
+  old_grade TEXT,
+  new_grade TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT 'operator',
+  reason TEXT,
+  bulk_id TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  organisation_id INTEGER NOT NULL DEFAULT 1,
+  user_id INTEGER
+);
+INSERT INTO grade_audit_new
+  (id, received_device_id, imei, old_grade, new_grade, actor, reason, bulk_id, created_at, organisation_id, user_id)
+SELECT
+  id, received_device_id, imei, old_grade, new_grade, actor, reason, bulk_id, created_at, organisation_id, user_id
+FROM grade_audit;
+
+-- Drop all four children FIRST (dropping a table only checks constraints
+-- IT declares, never incoming references to it — this is always safe for
+-- both NO ACTION and CASCADE children), THEN the parent (safe now:
+-- nothing references the old received_devices any more, the new children
+-- already point at received_devices_new).
 DROP TABLE device_events;
 DROP TABLE shipment_lines;
+DROP TABLE print_jobs;
+DROP TABLE grade_audit;
 DROP TABLE received_devices;
 
 ALTER TABLE received_devices_new RENAME TO received_devices;
 ALTER TABLE device_events_new    RENAME TO device_events;
 ALTER TABLE shipment_lines_new   RENAME TO shipment_lines;
+ALTER TABLE print_jobs_new       RENAME TO print_jobs;
+ALTER TABLE grade_audit_new      RENAME TO grade_audit;
 
 CREATE INDEX IF NOT EXISTS idx_received_imei     ON received_devices(imei);
 CREATE INDEX IF NOT EXISTS idx_received_sku      ON received_devices(sku);
@@ -189,3 +265,10 @@ CREATE INDEX IF NOT EXISTS idx_device_events_type   ON device_events(event_type)
 CREATE INDEX IF NOT EXISTS idx_shipment_lines_device   ON shipment_lines(received_device_id);
 CREATE INDEX IF NOT EXISTS idx_shipment_lines_shipment ON shipment_lines(shipment_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_shipment_lines_unique ON shipment_lines(shipment_id, received_device_id);
+
+CREATE INDEX IF NOT EXISTS idx_print_status   ON print_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_print_jobs_org ON print_jobs(organisation_id);
+
+CREATE INDEX IF NOT EXISTS idx_grade_audit_device ON grade_audit(received_device_id);
+CREATE INDEX IF NOT EXISTS idx_grade_audit_bulk   ON grade_audit(bulk_id);
+CREATE INDEX IF NOT EXISTS idx_grade_audit_org    ON grade_audit(organisation_id);
