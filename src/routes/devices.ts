@@ -9,8 +9,9 @@
 import { Hono } from 'hono'
 import type { Bindings, AuthUser, DeviceStatus } from '../types'
 import { currentUser } from '../lib/auth'
-import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES } from '../lib/deviceLifecycle'
+import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES } from '../lib/deviceLifecycle'
 import { dispatchDeviceStatusWebhooks } from '../lib/webhook'
+import { startRepair, scanBackRepair, recordQc, reopenRepair, recordRepairCost, RepairJobError } from '../lib/repairWorkflow'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -211,12 +212,22 @@ app.post('/:id/transition', async (c) => {
   if (OPR_WORKFLOW_ONLY_STATUSES.includes(toStatus)) {
     return c.json({ error: `${toStatus} is managed by the OPR consignment workflow — use /api/opr/shipments/:id/lines (add/remove) and /finalise instead of a direct transition` }, 409)
   }
+  // Repair-job-derived statuses (Device Lifecycle slice 1) may only be
+  // driven by the repair-workflow endpoints below — moving a device
+  // in/out of them here would desynchronise repair_jobs from the device
+  // ledger. Same pattern/reasoning as the OPR guard above.
+  if (REPAIR_WORKFLOW_ONLY_STATUSES.includes(toStatus)) {
+    return c.json({ error: `${toStatus} is managed by the repair workflow — use /api/devices/:id/repair/* instead of a direct transition` }, 409)
+  }
   {
     const device = await c.env.DB.prepare(
       'SELECT status FROM received_devices WHERE id = ? AND organisation_id = ?'
     ).bind(id, user.organisation_id).first<{ status: DeviceStatus }>()
     if (device && OPR_WORKFLOW_ONLY_STATUSES.includes(device.status)) {
       return c.json({ error: `Device is ${device.status}, which is managed by the OPR consignment workflow — it cannot be transitioned via this endpoint` }, 409)
+    }
+    if (device && REPAIR_WORKFLOW_ONLY_STATUSES.includes(device.status)) {
+      return c.json({ error: `Device is ${device.status}, which is managed by the repair workflow — it cannot be transitioned via this endpoint` }, 409)
     }
   }
 
@@ -257,6 +268,87 @@ app.post('/:id/transition', async (c) => {
   } catch (err) {
     if (err instanceof InvalidTransitionError) return c.json({ error: err.message, code: err.code }, 409)
     if (err instanceof DeviceNotFoundError) return c.json({ error: err.message, code: err.code }, 404)
+    throw err
+  }
+})
+
+// ───────── Device Lifecycle slice 1 — in-house repair workflow (Workstream C) ─────────
+// See docs/plan/device-lifecycle-slice1.md and src/lib/repairWorkflow.ts.
+// QC recording (repair/qc) is manager-only per the agreed placeholder —
+// NOT hard-coded against a future separate QC role, just checked against
+// the current 'manager'/'admin' roles (test #29 asserts operator -> 403,
+// manager -> 200).
+function requireManager(c: any): boolean {
+  const role = (c.var.user as AuthUser).role
+  return role === 'manager' || role === 'admin'
+}
+
+app.post('/:id/repair/start', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const body = await c.req.json<{ fault_code?: string }>().catch(() => ({} as any))
+  try {
+    const result = await startRepair(c.env.DB, id, body.fault_code, user)
+    return c.json(result, 201)
+  } catch (err) {
+    if (err instanceof RepairJobError) return c.json({ error: err.message }, err.status)
+    throw err
+  }
+})
+
+app.post('/:id/repair/scan-back', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  try {
+    const result = await scanBackRepair(c.env.DB, id, user)
+    return c.json(result, 200)
+  } catch (err) {
+    if (err instanceof RepairJobError) return c.json({ error: err.message }, err.status)
+    throw err
+  }
+})
+
+app.post('/:id/repair/qc', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'QC recording is manager-only' }, 403)
+  const body = await c.req.json<{ result?: string; reason?: string }>().catch(() => ({} as any))
+  try {
+    const result = await recordQc(c.env.DB, id, body.result, body.reason, user)
+    return c.json(result, 200)
+  } catch (err) {
+    if (err instanceof RepairJobError) return c.json({ error: err.message }, err.status)
+    throw err
+  }
+})
+
+app.post('/:id/repair/reopen', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  try {
+    const result = await reopenRepair(c.env.DB, id, user)
+    return c.json(result, 200)
+  } catch (err) {
+    if (err instanceof RepairJobError) return c.json({ error: err.message }, err.status)
+    throw err
+  }
+})
+
+app.post('/:id/repair/cost', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Repair cost entry is manager-only' }, 403)
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as any))
+  try {
+    const result = await recordRepairCost(c.env.DB, id, body, user)
+    return c.json(result, 200)
+  } catch (err) {
+    if (err instanceof RepairJobError) return c.json({ error: err.message }, err.status)
     throw err
   }
 })

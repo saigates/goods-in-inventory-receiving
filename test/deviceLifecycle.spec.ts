@@ -229,12 +229,18 @@ describe('transitionDevice — audit-trail invariant', () => {
   })
 
   it('holds after a chain of transitions', async () => {
+    // NOTE: IN_HOUSE_REPAIR -> ACTIVE_INVENTORY was removed by Device
+    // Lifecycle slice 1 (docs/plan/device-lifecycle-slice1.md, "Amendment
+    // 2 resolution") — devices now leave IN_HOUSE_REPAIR only via a
+    // recorded QC result. This chain is updated to use the new
+    // IN_HOUSE_REPAIR -> READY_FOR_ZOHO edge so the test keeps exercising
+    // a genuine multi-hop chain rather than being deleted.
     const deviceId = await seedDevice('RECEIVED')
     await transitionDevice(db(), deviceId, 'SORTING', { user: ADMIN_USER })
     await assertInvariant(deviceId)
     await transitionDevice(db(), deviceId, 'IN_HOUSE_REPAIR', { user: ADMIN_USER })
     await assertInvariant(deviceId)
-    await transitionDevice(db(), deviceId, 'ACTIVE_INVENTORY', { user: ADMIN_USER })
+    await transitionDevice(db(), deviceId, 'READY_FOR_ZOHO', { user: ADMIN_USER })
     await assertInvariant(deviceId)
   })
 

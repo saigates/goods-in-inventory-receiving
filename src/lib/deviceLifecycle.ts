@@ -27,17 +27,29 @@ export { DEVICE_STATUSES }
 // must stay in lockstep with shipment_lines — only src/routes/opr.ts may
 // drive them. Sale transitions (→ SOLD) remain NOT enabled: selling is a
 // downstream sales flow, not part of the OPR tracks.
+// Device Lifecycle slice 1 (docs/plan/device-lifecycle-slice1.md,
+// "Amendment 2 resolution — New transition edges"): the old direct
+// IN_HOUSE_REPAIR -> ACTIVE_INVENTORY edge is REMOVED for devices going
+// through the new repair-job flow. Devices now leave IN_HOUSE_REPAIR only
+// via a recorded QC result (-> READY_FOR_ZOHO on PASSED, -> QC_FAILED on
+// FAILED), and QC_FAILED can only re-enter IN_HOUSE_REPAIR (re-open) for a
+// fresh scan-back/QC cycle. All three new edges are driven exclusively by
+// the repair-workflow routes (src/routes/devices.ts repair/* handlers via
+// src/lib/repairWorkflow.ts), never by the generic /transition endpoint —
+// see REPAIR_WORKFLOW_ONLY_STATUSES below.
 export const ALLOWED_TRANSITIONS: Record<DeviceStatus, DeviceStatus[]> = {
   RECEIVED: ['SORTING', 'REJECTED'],
   SORTING: ['ACTIVE_INVENTORY', 'IN_HOUSE_REPAIR', 'READY_FOR_EXPORT'],
   ACTIVE_INVENTORY: [],
-  IN_HOUSE_REPAIR: ['ACTIVE_INVENTORY'],
+  IN_HOUSE_REPAIR: ['READY_FOR_ZOHO', 'QC_FAILED'],
   READY_FOR_EXPORT: ['IN_EXPORT_CONSIGNMENT'],
   IN_EXPORT_CONSIGNMENT: ['READY_FOR_EXPORT', 'EXPORTED_UNDER_OPR'],
   EXPORTED_UNDER_OPR: ['RETURNED_UNDER_OPR'],
   RETURNED_UNDER_OPR: ['ACTIVE_INVENTORY'],
   SOLD: [],
   REJECTED: [],
+  QC_FAILED: ['IN_HOUSE_REPAIR'],
+  READY_FOR_ZOHO: [],
 }
 
 // Statuses whose membership is DERIVED from consignment state (a device is
@@ -50,6 +62,19 @@ export const OPR_WORKFLOW_ONLY_STATUSES: readonly DeviceStatus[] = [
   'IN_EXPORT_CONSIGNMENT',
   'EXPORTED_UNDER_OPR',
   'RETURNED_UNDER_OPR',
+] as const
+
+// Device Lifecycle slice 1 — same pattern as OPR_WORKFLOW_ONLY_STATUSES
+// above, for the repair-job flow (docs/plan/device-lifecycle-slice1.md,
+// "Interaction with the existing generic /api/devices/:id/transition
+// endpoint"). IN_HOUSE_REPAIR/QC_FAILED/READY_FOR_ZOHO may only be set (or
+// left) via the repair-workflow routes (repair/start, repair/qc,
+// repair/reopen) so a raw POST /transition call cannot desynchronise a
+// device from its repair_jobs row.
+export const REPAIR_WORKFLOW_ONLY_STATUSES: readonly DeviceStatus[] = [
+  'IN_HOUSE_REPAIR',
+  'QC_FAILED',
+  'READY_FOR_ZOHO',
 ] as const
 
 export class InvalidTransitionError extends Error {

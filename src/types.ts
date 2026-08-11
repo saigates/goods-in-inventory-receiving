@@ -86,6 +86,13 @@ export const DEVICE_STATUSES = [
   'RETURNED_UNDER_OPR',
   'SOLD',
   'REJECTED',
+  // ── Device Lifecycle slice 1 (Amendment 2 resolution) ──
+  // QC_FAILED is a distinct status, never overloaded onto a generic HOLD
+  // (which is explicitly NOT added in this slice). READY_FOR_ZOHO is the
+  // gate a device must pass through (5 conditions, see
+  // docs/plan/device-lifecycle-slice1.md) before it can join a Zoho batch.
+  'QC_FAILED',
+  'READY_FOR_ZOHO',
 ] as const
 
 export type DeviceStatus = typeof DEVICE_STATUSES[number]
