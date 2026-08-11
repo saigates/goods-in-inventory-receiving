@@ -706,6 +706,10 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
 import { computeValueDelta, isValueBalanced } from '../src/lib/oprImport'
 
 describe('OPR — value reconciliation: multi-leg balancing (pure)', () => {
+  // Provenance: £22,042 is the Return A packing-list PDF total (20260726_OPR_90.pdf,
+  // 90 IMEIs); £17,344 is £39,386 (Batch 001 invoice) minus that £22,042 — a DERIVED
+  // remainder, not Return B's own shipment invoice (which separately states £16,798;
+  // see the other fixture below) — kept only as its own internally-consistent pair.
   it('Batch 001 = 162 units / £39,386 → 90/£22,042 + 72/£17,344 balances on BOTH counts and value', () => {
     const exportedUnits = 162
     const exportedValue = 39386
@@ -739,6 +743,11 @@ describe('OPR — value reconciliation: multi-leg balancing (pure)', () => {
   // values (Return A £22,588.00 + Return B £16,798.00 = Export £39,386.00).
   // Distinct fixture from the £22,042/£17,344 pair above — that fixture
   // stays untouched; this one exists alongside it, not in place of it.
+  // Provenance: £22,588 (Return A) and £16,798 (Return B) are each the
+  // shipment/reconciliation values used on the live FedEx correspondence for
+  // AWB 874874338764 (Return A) and AWB 875147276207 (Return B) — the actual
+  // figures declared/discharged, distinct from the £22,042 packing-list total
+  // and its £17,344 derived remainder in the fixture above.
   it('Batch 001 (confirmed supporting docs) = 162 units / £39,386 → Return A £22,588 + Return B £16,798 balances on BOTH counts and value', () => {
     const exportedUnits = 162
     const exportedValue = 39386
