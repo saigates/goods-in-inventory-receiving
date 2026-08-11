@@ -418,14 +418,14 @@ npm run deploy
 
 ## Testing
 
-**Automated suite**: [Vitest](https://vitest.dev/) via [`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/), which runs tests inside the real `workerd`/Miniflare runtime against a real D1 binding (all 13 migrations in `migrations/` applied before each test file — see `vitest.config.ts` and `test/apply-migrations.ts`), not mocks.
+**Automated suite**: [Vitest](https://vitest.dev/) via [`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/), which runs tests inside the real `workerd`/Miniflare runtime against a real D1 binding (all 22 migrations in `migrations/` applied before each test file — see `vitest.config.ts` and `test/apply-migrations.ts`), not mocks.
 
 ```bash
 npm test              # vitest run — runs once and exits
 npm run test:watch    # vitest — watch mode
 ```
 
-Current coverage (269 tests across 11 suites):
+Current coverage (349 tests across 15 suites, run 2026-08-11: **342 passed, 7 skipped, 0 failed** — `npx vitest run` output; the 7 skipped are `test/repairWorkflow.spec.ts`'s Group D `#30–36`, see **Active Workstreams** below):
 - **`test/deviceLifecycle.spec.ts`** (24 tests) — `transitionDevice()`: every entry in `ALLOWED_TRANSITIONS` succeeds; a representative set of disallowed transitions (explicitly including `RECEIVED → SOLD`) reject with `InvalidTransitionError`; unknown-status and unknown-device-id error paths; org-scoping (a device in another organisation is treated as not-found, never a cross-tenant leak); each transition writes **exactly one** `device_events` row with the correct `from_status`/`to_status`/`user_id`/`organisation_id`; and — the audit-trail invariant from Priority 3 — `device.status === (most recent device_events row).to_status`, asserted automatically after single transitions, chains of transitions, and rejected-attempt no-ops, so a future refactor can't silently break it without a test failing (verified by deliberately injecting a bug that skips the status UPDATE — the invariant tests caught it immediately, then the fix was confirmed reverted byte-identical via `git diff`).
 - **`test/validate.spec.ts`** (40 tests) — `isValidCurrency()`: every code in `ISO_4217_CODES` accepted; `"UKL"`, empty string, whitespace-only, and assorted junk (`"XXX"`, `"GB"`, `"GBPX"`, non-string input, etc.) all rejected. Note: the validator normalizes to uppercase *before* checking (`.trim().toUpperCase()`), so a lowercase **valid** code like `"gbp"` currently passes — this is documented and locked in as its own explicit test (not silently asserted as a rejection), while lowercase **junk** (`"ukl"`, `"xyz"`) is still correctly rejected in any case. Also covers `normalizeCurrency()`'s fallback behaviour. **IMEI/serial rule (13 tests, added 2026-07-28)**: `validateImei()` accepts a Luhn-valid strict 15-digit IMEI and rejects a broken checksum; 14-digit and 16-digit numerics are **rejected** with the targeted "strictly 15 digits" message; a 10-character alphanumeric serial is accepted and **normalised to uppercase** (`c02xk1abcd` → `C02XK1ABCD`, all-numeric `1234567890` also accepted); 9/11-character serials and punctuation/whitespace forms are rejected with targeted messages; `isValidImeiFormat()` mirrors the same rule. Verified-can-fail ×2: loosening the regex back to 14–16 digits fails exactly the two rejection tests; dropping the uppercase normalisation fails exactly the normalisation test — both reverts confirmed sha1-identical.
 - **`test/forceAddValuation.spec.ts`** (21 tests) — `POST /api/scan/force-add` exercised through the **real Hono app** (`app.request()` with a signed JWT) against the real D1 binding. Proves the off-manifest exception branch enforces the same server-side valuation rules as the manifest-matched `/confirm` path: missing/empty/invalid `buy_price` → 422, missing/invalid `vat_type` → 422, invalid ISO 4217 `currency` (incl. `"UKL"`) → 422 — and every rejection is asserted to leave **zero side-effects** (no `received_devices` row, no `FORCE_ADD` event, no `scan_events` 'received' row, no print job). The happy path asserts the persisted row AND the `FORCE_ADD` `device_events` metadata both carry the exact valuation (`buy_price`/`currency`/`vat_type`, normalised). Lowercase `"gbp"` accepted-and-normalised is locked in as an explicit test, consistent with the validate suite. Verified-can-fail: the server requirement was deliberately flipped to `required: false` → 4 tests failed immediately; the revert was confirmed sha1-identical to the committed file.
@@ -447,17 +447,19 @@ Current coverage (269 tests across 11 suites):
 
 - **`test/csvExport.spec.ts`** (30 tests, added 2026-07-28) — `GET /api/devices/export/csv`, the last item that was still "manual/live-verified only". A CSV export is an **audit artefact**: if it silently omits or mangles rows, nobody can tell by looking at the file, so every test asserts the exact bytes rather than just a 200. Three defect classes are locked out. **(1) Silent wrong answers — three real bugs found and fixed while writing this suite:** a misspelled status (`?status=RECIEVED`, a very plausible typo) used to return a headers-only 200 CSV that is visually indistinguishable from "you have no devices in that state" — now a `400 Invalid status value(s)`; a non-numeric entry in `?ids=` was silently discarded by `.map(Number).filter(Boolean)`, so `?ids=12,abc,13` exported 2 of the 3 rows the operator had selected — now a `400` naming the invalid entry (`0`/negative likewise); and the 5000-row `LIMIT` truncated without a word — now counted first and refused with `413` carrying the true total, because a truncated audit file is worse than no file. An invalid `?source=` is a 400 for the same reason, `?status=` accepts a comma-separated list for parity with `GET /api/devices`, and a new `X-Export-Row-Count` header lets a caller cross-check it received every row the server counted. **(2) Structural corruption:** values containing a comma, a `"`, an LF **or a bare CR** are RFC 4180 quoted — the CR case was a genuine bug (the old regex tested `["\n,]` only, and a lone `\r` is a record terminator to Excel, so one device became two malformed rows); records are CRLF-delimited with no trailing separator, and each record is parsed with a real quote-aware parser and asserted to be exactly 16 fields, so no value can shift a column. NULLs render as empty fields, never `"null"`. Field values are compared against the **DB row** rather than the seeded literals, which is what catches a column-shift. **(3) Cross-tenant leakage:** a second organisation's device is absent on the status path and absent even when its id is named explicitly, and the same id set returns each org only its own row. Verified-can-fail ×5 (14 targeted failures total): removing the status enum guard → 2 fails; restoring the silent id-drop → 2; dropping the org scoping → 4; removing CSV quoting entirely → 4; un-escaping `\r` → 1. Every revert confirmed sha1-identical (`eb02e4f…`). **One honest correction to record:** the CR test as first written *passed under sabotage* — it asserted a CRLF-split row count, which by construction cannot observe a lone `\r`. It was rewritten to assert the quoting itself and only then did it genuinely fail, so this proof is real rather than decorative.
 
+- **`test/repairWorkflow.spec.ts`** (30 tests, 23 passing + 7 skipped — Device Lifecycle slice 1, Workstream C/D) — the in-house repair workflow (`startRepair`/`scanBackRepair`/`recordQc`/`reopenRepair`/`recordRepairCost` in `src/lib/repairWorkflow.ts`) and the `READY_FOR_ZOHO` gate that feeds the (not-yet-built) Zoho upload queue. Group C (`#15–29`, start/scan-back/QC/reopen/cost-recording) is green. `checkReadyForZohoGate()`'s six conditions are covered, including the **sixth condition** (SKU grade-suffix parsing — the SKU's final hyphen-delimited segment must be exactly `A`/`B`/`C`, case-sensitive): `#24`/`#25` only ever exercised the *accept* path (fixture default grade `-A` never trips the reject branch — a green test around an untriggered branch proves nothing about the reject side), so **five new failing-path tests were added this pass** — `#25a` (`-UG` rejected, parsed grade named in the message), `#25b` (a 7-segment SKU, asserting the parser reads the *last* segment rather than a fixed position — proven with a test-seeded catalog SKU `APL-I17-PRO-MAX-256-BLK-A`/`-UG`), `#25c` (unrecognised suffix `-X` rejected), `#25d` (no-grade-segment / no-hyphen SKUs rejected without throwing), `#25e` (lowercase `-a` rejected — case-sensitivity is a documented, deliberate decision, not an oversight). **Group D (`#30–36`, Zoho batch generation + confirmation) is `describe.skip`ped** with a stated reason in the skip label itself: Zoho batch upload was never built and was parked by explicit owner decision (stock currently goes into Zoho by hand) — carrying permanent reds made the board unreadable, so an honest skip replaces a misleading red. `#37` (ERP-webhook absence) stays unskipped since it asserts an absence against already-existing code, so it's genuinely green rather than blocked on unbuilt routes. Schema: migrations `0021` (status enum: `IN_HOUSE_REPAIR`/`QC_FAILED`/`READY_FOR_ZOHO`, no generic `HOLD`) and `0022` (`repair_jobs` table + Zoho queue scaffold). See `docs/plan/device-lifecycle-slice1.md` for the full design record.
+
 **Manual/live verification (not yet automated)**: none outstanding — auth 401s are asserted in `auth.spec.ts` and the CSV export shape now has the dedicated suite above (it was additionally re-smoked with live `curl` against the running instance: 401 unauthenticated, correct `Content-Type`/`Content-Disposition`/`X-Export-Row-Count`, and the three new 400s). The webhook `X-Signature` HMAC and IMEI/serial validation, formerly in this list, are covered by the OPR 4 suite and `validate.spec.ts` respectively.
 
 ## Active Workstreams (as of 2026-08-11)
 
 **Deploy-hold posture**: production remains on commit `10f9544` (the last
 `gsk hosted deploy`, described in **Production deploy** above). Local `main`
-is currently 11 commits ahead of that production commit — all of it is
-**local-only, not pushed to `origin`, and not deployed**, per an explicit
-standing instruction, except where a step below is separately authorised to
-push docs-only. Two workstreams are active in parallel and are kept
-strictly separate (a change in one must never touch the other):
+is pushed to `origin/main` on GitHub as of this pass (see commit history for
+the exact tip), but **nothing beyond `10f9544` has been deployed** —
+pushing source control is not a production deploy, and none is authorised by
+this pass. Two workstreams are active in parallel and are kept strictly
+separate (a change in one must never touch the other):
 
 1. **OPR Auth Batch** — CHIEF→OPR authorisation-number rename (migration
    `0018`, done) + three new not-yet-built features (exchange-rate-month
@@ -474,11 +476,22 @@ strictly separate (a change in one must never touch the other):
    production D1 backup-and-restore-tested, migration replay against a prod
    schema copy, post-deploy verification query) — not yet triggered.
 2. **Device Lifecycle slice 1** — repair-workflow + Zoho upload-queue tests
-   (C15–D33), test-bodies-only phase, no schema/migration/implementation
-   yet. See `docs/plan/device-lifecycle-slice1.md` for the full design
-   resolution (confirmed 7-field GBP-only repair-cost fields, `QC_FAILED`
-   with mandatory reason, no generic `HOLD`, `READY_FOR_ZOHO` only after a
-   PASSED QC).
+   (`#15–37`), schema (migrations `0021`/`0022`) and `src/lib/repairWorkflow.ts`
+   + `src/routes/devices.ts` implementation now exist. Group C (`#15–29`,
+   start/scan-back/QC/reopen/cost-recording, including the six
+   `checkReadyForZohoGate()` conditions) is green, with **five new
+   failing-path tests (`#25a–#25e`) added this pass** to actually exercise
+   gate condition 6's reject branch (SKU grade-suffix parsing — final
+   hyphen-delimited segment must be exactly `A`/`B`/`C`, case-sensitive),
+   which the original `#24`/`#25` never triggered. **Group D (`#30–36`, Zoho
+   batch generation/confirmation) is `describe.skip`ped** — Zoho batch
+   upload was never built and was parked by explicit owner decision (stock
+   currently goes into Zoho by hand); `#37` (ERP-webhook absence) stays
+   green since it asserts an absence, not an unbuilt route. See
+   `docs/plan/device-lifecycle-slice1.md` for the full design resolution
+   (confirmed 7-field GBP-only repair-cost fields, `QC_FAILED` with
+   mandatory reason, no generic `HOLD`, `READY_FOR_ZOHO` only after a
+   PASSED QC) and **Testing** above for the current pass/skip breakdown.
 
 **Future (not yet started, documentation/scope only)**: a staged **Zoho
 replacement & integrated inventory + accounting connection** — build
