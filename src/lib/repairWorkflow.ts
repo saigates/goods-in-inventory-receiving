@@ -161,6 +161,24 @@ export async function checkReadyForZohoGate(
   // grade column.
   const skuSegments = String(device.sku).split('-')
   const skuGrade = skuSegments[skuSegments.length - 1]
+
+  // 6a. (Added 2026-08-11 during evidentiary review of Item 7a.) Some
+  // catalogue SKUs use the 4-segment brand-model-capacity-colour shape and
+  // never carry a grade segment at all — confirmed against production's
+  // real sku_catalog (2781 rows): 9 rows, all Samsung (e.g.
+  // 'SMSG-S24-256-PBK'), are exactly 4 segments with the final segment a
+  // colour code (PBK/GRY/GRA/CLD), never a grade. Every other catalogue
+  // row is 5 segments with the final segment always A/B/C/UG. Without
+  // this branch, the generic check below would reject these devices with
+  // a message reading "...has grade 'PBK'...", falsely implying the
+  // colour code IS a (merely invalid) grade value, when in fact there is
+  // no grade position on this SKU shape to be wrong about — a distinct
+  // failure mode from "SKU has an unrecognised grade" and one that must
+  // say so explicitly, not overload the same wording.
+  if (skuSegments.length === 4) {
+    return `SKU '${device.sku}' has no grade segment (4-segment brand-model-capacity-colour SKU) — cannot determine A/B/C grade for Zoho`
+  }
+
   if (skuGrade !== 'A' && skuGrade !== 'B' && skuGrade !== 'C') {
     return `SKU '${device.sku}' has grade '${skuGrade}' — only A, B, or C may reach Zoho`
   }

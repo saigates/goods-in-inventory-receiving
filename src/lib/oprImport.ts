@@ -274,9 +274,10 @@ export function buildClearanceInstructionDraft(
       ? `  Net duty payable: £${ce1154.duty_on_repair_cost_gbp.toFixed(2)} (duty rate ${ce1154.duty_rate_pct}%, OPR relief £${ce1154.opr_relief_gbp.toFixed(2)})`
       : '',
     '',
-    'IMPORTANT: duty and import VAT are to be assessed on the repair cost only',
-    '(plus duty and return freight where applicable), NOT the full value of the',
-    'goods — the goods are returning under Outward Processing Relief.',
+    'IMPORTANT: duty and import VAT are to be assessed on the three-part',
+    'cost breakdown only — (1) repair cost, (2) inbound freight,',
+    '(3) outbound freight — NOT the full value of the goods, which are',
+    'returning under Outward Processing Relief.',
     '',
     'Kind regards',
   ].filter(l => l !== '')

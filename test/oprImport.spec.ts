@@ -569,13 +569,20 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     const statementStart = html.indexOf('id="ce1154-statement"')
     expect(html.indexOf('GBOPO36997999500020260226105539')).toBeGreaterThan(statementStart)
 
-    // Clearance draft: quotes the export MRN, repair-cost-only wording.
+    // Clearance draft: quotes the export MRN, three-part cost-breakdown
+    // wording (repair cost / inbound freight / outbound freight — see
+    // docs/plan/device-lifecycle-slice1.md:486-492; "repair cost only" was
+    // replaced with this breakdown so the template no longer implies
+    // freight is out of scope of the customs assessment).
     const clr = await api(`/api/opr/shipments/${ret.id}/clearance`)
     expect(clr.status).toBe(200)
     const clearance = ((await clr.json()) as { clearance: { body: string; export_mrn_present: boolean; note: string } }).clearance
     expect(clearance.export_mrn_present).toBe(true)
     expect(clearance.body).toContain('26GB0000000000AA09')
-    expect(clearance.body).toContain('repair cost only')
+    expect(clearance.body).toContain('repair cost')
+    expect(clearance.body).toContain('inbound freight')
+    expect(clearance.body).toContain('outbound freight')
+    expect(clearance.body).not.toContain('repair cost only')
     expect(clearance.note).toMatch(/no email is sent/)
 
     // Receipt.

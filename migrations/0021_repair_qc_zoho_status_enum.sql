@@ -1,3 +1,33 @@
+-- PRODUCTION NOTE (2026-08-11, post-deploy reconciliation): D1 tracks
+-- migrations as applied by FILENAME, not by content — production's
+-- d1_migrations ledger already records "0021_repair_qc_zoho_status_enum.sql"
+-- as applied (2026-08-11 16:54:39), so this REVISION-3 file rewrite below
+-- will NEVER re-run against production; it only affects new/from-scratch
+-- database builds. Production actually ran REVISION 2 (the version that
+-- recreated received_devices/device_events/shipment_lines but wrongly
+-- treated print_jobs/grade_audit as "unaffected" by DROP TABLE
+-- received_devices — see REVISION 3 note below for why that claim was
+-- wrong). Both production print_jobs and grade_audit had 0 rows at
+-- deploy time, so REVISION 2 running in production did not destroy real
+-- data; the risk was to any future row, not a historical one.
+--
+-- Full 5-table DDL diff performed this reconciliation, comparing
+-- production's live sqlite_master text (`gsk hosted d1_schema`) against
+-- a from-scratch local D1 built on this corrected REVISION-3 file
+-- (`wrangler d1 execute ... --local`): received_devices, device_events,
+-- and shipment_lines are byte-identical (normalized) between production
+-- and this file. print_jobs and grade_audit differ ONLY in FK-clause
+-- placement/formatting (production expresses the FK as a trailing
+-- `FOREIGN KEY (...) REFERENCES received_devices(id) ON DELETE CASCADE`
+-- clause; this file inlines the same reference on the column) — same
+-- columns, types, nullability, defaults, target table, and ON DELETE
+-- CASCADE action in both. All 17 named indexes on these 5 tables match
+-- exactly by name and SQL text. Conclusion: production, having run
+-- REVISION 2, reached the SAME END STATE this REVISION-3 file produces.
+-- The divergence between "what's recorded as applied" and "what this
+-- file now contains" is cosmetic only — no forward migration (e.g. 0023)
+-- is needed to reconcile production's schema.
+--
 -- Migration 0021: Device Lifecycle slice 1 (C15-D33) — status enum only.
 --
 -- This is deliberately the FIRST and ONLY schema change in this migration

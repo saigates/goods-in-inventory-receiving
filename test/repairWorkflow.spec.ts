@@ -2,15 +2,18 @@
 // (approved draft list #15–37, see docs/plan/device-lifecycle-slice1.md
 // section "Test plan", C. and D., renumbered to insert four net-new items:
 // #22 QC-FAILED-needs-reason, #28 no-generic-HOLD, #37 ERP-webhook-absent,
-// and #25a–#25e (added 2026-08-11) — five failing-path tests for gate
-// condition 6 (SKU grade-suffix parsing). #24/#25 only ever exercised the
-// ACCEPT path for condition 6 (fixture default grade is '-A', which never
-// trips the reject branch) — a green suite around an untriggered branch
-// proves the branch didn't break anything, not that it works. #25a–#25e
-// force the reject branch itself, with assertions that check the *parsed*
-// grade appears in the error message (not just any 409), so a hardcoded
-// or fixed-position-parsed implementation would fail these even though it
-// might satisfy a looser assertion.
+// and #25a–#25f (added 2026-08-11; #25f added later the same day after
+// production catalogue analysis surfaced the 4-segment colour-code SKU
+// shape) — six failing-path tests for gate condition 6 (SKU grade-suffix
+// parsing). #24/#25 only ever exercised the ACCEPT path for condition 6
+// (fixture default grade is '-A', which never trips the reject branch) —
+// a green suite around an untriggered branch proves the branch didn't
+// break anything, not that it works. #25a–#25f force the reject branch
+// itself, with assertions that check the *parsed* grade (or, for #25f,
+// the distinct "no grade segment" wording) appears in the error message
+// (not just any 409), so a hardcoded or fixed-position-parsed
+// implementation would fail these even though it might satisfy a looser
+// assertion.
 //
 // Group D (#30–37) status: SKIPPED for #30–36 (see the two describe.skip
 // blocks below) — Zoho batch generation/confirmation was never built and
@@ -410,10 +413,10 @@ describe('C. repair workflow — scan-back and QC (#20–25, incl. NEW #22)', ()
   })
 })
 
-// Gate condition 6 (src/lib/repairWorkflow.ts:149–166) — reject-path tests.
+// Gate condition 6 (src/lib/repairWorkflow.ts:149–183) — reject-path tests.
 // #24 and #25 only ever exercise the ACCEPT side of condition 6 (fixture
 // default grade '-A' never trips it, and #25 is blocked by condition 4
-// before condition 6 is ever reached). None of the five tests below are
+// before condition 6 is ever reached). None of the six tests below are
 // duplicates of #24/#25: each forces the reject branch itself and checks
 // something the accept-path tests cannot prove.
 describe('C. repair workflow — gate condition 6, SKU grade-suffix reject-path (#25a–#25e, NEW)', () => {
@@ -560,6 +563,37 @@ describe('C. repair workflow — gate condition 6, SKU grade-suffix reject-path 
     expect(res.status).toBe(409)
     const body = await res.json() as { error: string }
     expect(body.error).toContain('a')
+
+    expect(await deviceStatus(deviceId)).toBe('IN_HOUSE_REPAIR')
+  })
+
+  it('#25f four-segment SKU ending in a colour code → 409, error says "no grade segment", does NOT name the colour as a grade', async () => {
+    // Real production shape, not synthetic: production's live sku_catalog
+    // (confirmed via gsk hosted d1_query against all 2781 rows) has 9
+    // SKUs that are exactly 4 segments — brand-model-capacity-colour,
+    // e.g. 'SMSG-S24-256-PBK' — with NO grade segment at all. Before this
+    // test, the generic reject branch below would have caught these too,
+    // but with a misleading message ("...has grade 'PBK'...") that
+    // implies PBK is a recognised-but-wrong grade value, when the real
+    // problem is there is no grade position on this SKU shape to begin
+    // with. This test locks in the distinct wording and proves the
+    // colour code itself is never quoted as if it were a grade.
+    const sku = 'SMSG-S24-256-PBK'
+    await seedCatalogSku(sku)
+    const deviceId = await seedDevice('SORTING', { sku })
+    await api(`/api/devices/${deviceId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
+    await api(`/api/devices/${deviceId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
+
+    const res = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/qc`, {
+      method: 'POST',
+      body: JSON.stringify({ result: 'PASSED' }),
+    })
+    expect(res.status).toBe(409)
+    const body = await res.json() as { error: string }
+    expect(body.error.toLowerCase()).toContain('no grade segment')
+    // Must NOT read as "has grade 'PBK'" — the colour code must never be
+    // presented as if it were a (merely invalid) grade value.
+    expect(body.error).not.toContain(`has grade 'PBK'`)
 
     expect(await deviceStatus(deviceId)).toBe('IN_HOUSE_REPAIR')
   })
