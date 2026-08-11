@@ -76,19 +76,24 @@ function newImei(): string {
 // path; pass sku: 'UNMAPPED-SKU-NOT-IN-CATALOG' explicitly for that case.
 async function seedDevice(
   status: DeviceStatus,
-  opts: { sku?: string; organisationId?: number } = {},
+  opts: { sku?: string; organisationId?: number; model?: string } = {},
 ): Promise<number> {
   const imei = newImei()
   const uuid = `repair-test-uuid-${imei}`
   const sku = opts.sku ?? 'SMSG-S24-256-PBK'
   const organisationId = opts.organisationId ?? 1
+  // model is required by checkReadyForZohoGate's condition 3
+  // (src/lib/repairWorkflow.ts:127) — set a non-null value here so
+  // gate-condition tests exercise the SKU/movement checks (4-5) rather
+  // than failing on the earlier, unrelated model check.
+  const model = opts.model ?? 'Galaxy S24'
   const result = await db()
     .prepare(
       `INSERT INTO received_devices
-         (organisation_id, uuid, imei, sku, source, status)
-       VALUES (?, ?, ?, ?, 'manual', ?)`
+         (organisation_id, uuid, imei, sku, model, source, status)
+       VALUES (?, ?, ?, ?, ?, 'manual', ?)`
     )
-    .bind(organisationId, uuid, imei, sku, status)
+    .bind(organisationId, uuid, imei, sku, model, status)
     .run()
   return result.meta.last_row_id as number
 }
