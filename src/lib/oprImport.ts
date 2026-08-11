@@ -63,6 +63,10 @@ export type Ce1154 = {
   opr_authorisation_number: string
   // CDS Authorisation Number lives in the cross-referenced statement, never the field above.
   cross_reference_statement: string
+  // Supervising office NAME only — never the code, never an address. The
+  // office code is a reference-only field on our authorisation record and
+  // is not ours to put on a customs document.
+  supervising_office_name: string | null
   export_mrn: string
   quantity: number
   exported_goods_value_gbp: number
@@ -154,6 +158,7 @@ export function computeCe1154(
       cross_reference_statement:
         `Goods re-imported after outward processing under CDS authorisation ${authorisation.cds_number} ` +
         `held by ${authorisation.holder_name} (EORI ${authorisation.eori}); original export MRN ${exportShipment.export_mrn}`,
+      supervising_office_name: authorisation.supervising_office_name,
       export_mrn: exportShipment.export_mrn,
       quantity,
       exported_goods_value_gbp: exportedValue,
@@ -205,6 +210,7 @@ export function buildCe1154Html(ce: Ce1154, importShipment: Shipment, lines: Shi
     <h2>Authorisation &amp; export reference</h2>
     <table class="kv">
       <tr><td>OPR authorisation number (this form)</td><td>${ce.opr_authorisation_number}</td></tr>
+      ${ce.supervising_office_name ? `<tr><td>Issued by</td><td>${ce.supervising_office_name}</td></tr>` : ''}
       <tr><td>Original export MRN</td><td>${ce.export_mrn}</td></tr>
     </table>
   </section>

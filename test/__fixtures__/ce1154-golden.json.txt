@@ -2,6 +2,7 @@
   "form": "C&E1154",
   "opr_authorisation_number": "OP/0922/601/31",
   "cross_reference_statement": "Goods re-imported after outward processing under CDS authorisation GBOPO36997999500020260226105539 held by Saigates Limited (EORI GB123456789000); original export MRN 26GB1111111111XX01",
+  "supervising_office_name": "IP-OP Customs Liverpool",
   "export_mrn": "26GB1111111111XX01",
   "quantity": 2,
   "exported_goods_value_gbp": 300,

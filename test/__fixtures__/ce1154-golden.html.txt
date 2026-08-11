@@ -24,6 +24,7 @@
     <h2>Authorisation &amp; export reference</h2>
     <table class="kv">
       <tr><td>OPR authorisation number (this form)</td><td>OP/0922/601/31</td></tr>
+      <tr><td>Issued by</td><td>IP-OP Customs Liverpool</td></tr>
       <tr><td>Original export MRN</td><td>26GB1111111111XX01</td></tr>
     </table>
   </section>

@@ -40,7 +40,12 @@ const authorisation: OprAuthorisation = {
   op_authorisation_number: 'OP/0922/601/31',
   valid_from: '2026-03-01',
   valid_to: '2031-02-28',
-  supervising_office_name: null,
+  // Deliberately populated (was null) — the golden fixture recapture that
+  // added the "Issued by" field (C&E1154 output change, name-only) chose a
+  // realistic value here so the frozen golden actually exercises the new
+  // row instead of freezing an empty render. supervising_office_code stays
+  // null: the code is reference-only and must never appear on this form.
+  supervising_office_name: 'IP-OP Customs Liverpool',
   supervising_office_code: null,
   commodity_scope: null,
   commodity_codes: null,
