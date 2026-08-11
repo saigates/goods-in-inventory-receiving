@@ -70,17 +70,34 @@ function newImei(): string {
 }
 
 // Seeds a received_devices row directly (bypassing the API), same pattern
-// as test/deviceLifecycle.spec.ts#seedDevice. Uses a SKU that already
-// exists in the seeded sku_catalog by default (see seed.sql) so
-// SKU-mapping-exists tests aren't accidentally exercising the missing-SKU
-// path; pass sku: 'UNMAPPED-SKU-NOT-IN-CATALOG' explicitly for that case.
+// as test/deviceLifecycle.spec.ts#seedDevice.
+//
+// Correction (2026-08-11): the previous comment here claimed the default
+// SKU "already exists in the seeded sku_catalog (see seed.sql)". That was
+// false in the test environment — test/apply-migrations.ts runs
+// applyD1Migrations() against ./migrations only; seed.sql is never loaded
+// by the test harness (confirmed: zero-match grep for a seed.sql load call
+// anywhere under test/). 'SMSG-S24-256-PBK' is inserted only by seed.sql,
+// so against the migrated-only test catalogue it has no mapping, which
+// silently broke #24/#29 once the separate missing-model defect was fixed.
+//
+// The default is now 'SAM-S26-256-CVT-A' — a SKU migration 0017 actually
+// inserts (migrations/0017_catalog_case_normalize_and_expand.sql:354), so
+// the comment's claim is true of the environment the tests really run in.
+// It also carries a grade suffix ('-A'), which the SKU catalogue's other
+// legacy-shape rows (e.g. the old '-PBK' colour-suffix SKUs) do not — the
+// planned sixth READY_FOR_ZOHO gate condition parses that suffix, so the
+// default fixture SKU needs to have one.
+//
+// Pass sku: 'UNMAPPED-SKU-NOT-IN-CATALOG' explicitly for the missing-SKU
+// case.
 async function seedDevice(
   status: DeviceStatus,
   opts: { sku?: string; organisationId?: number; model?: string } = {},
 ): Promise<number> {
   const imei = newImei()
   const uuid = `repair-test-uuid-${imei}`
-  const sku = opts.sku ?? 'SMSG-S24-256-PBK'
+  const sku = opts.sku ?? 'SAM-S26-256-CVT-A'
   const organisationId = opts.organisationId ?? 1
   // model is required by checkReadyForZohoGate's condition 3
   // (src/lib/repairWorkflow.ts:127) — set a non-null value here so
