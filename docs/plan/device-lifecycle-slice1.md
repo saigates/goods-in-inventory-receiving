@@ -5,8 +5,24 @@ exist yet for this workstream. This document is the "work tracker" entry
 required before implementation begins, per the agreed protocol.
 
 Baseline: commit `0b76a8899b1ae373b6647851e88b6cec9770a7ed`
-(tag `baseline-pre-device-lifecycle-2026-08-10`), D1 backup at
+("Ticket C: communication tracker"), D1 backup at
 `backups/d1-local-baseline-2026-08-10.sql` (see `backups/RESTORE.md`).
+
+**Baseline resolution (2026-08-11 audit):** this document originally
+named the tag `baseline-pre-device-lifecycle-2026-08-10` alongside the
+commit above as if they were interchangeable. They are not the same
+git object. `git rev-parse baseline-pre-device-lifecycle-2026-08-10`
+returns `d2b0e4df6d0d01fdaabb42843bbb0faf49a3138c` — that is the
+annotated **tag object's own SHA**, not a commit. The tag's *target*
+commit — what `git rev-parse baseline-pre-device-lifecycle-2026-08-10^{commit}`
+resolves to, and what `git checkout baseline-pre-device-lifecycle-2026-08-10`
+actually rolls back to — is `0b76a8899b1ae373b6647851e88b6cec9770a7ed`,
+confirmed via `git cat-file -p` on the tag object
+(`object 0b76a8899b1ae373b6647851e88b6cec9770a7ed`, `type commit`).
+**The commit hash above is the true rollback point; the tag correctly
+points at it.** The only error was this document's phrasing, which
+implied the tag's own SHA and the commit SHA were one value — no git
+state needed to change, and none did.
 
 ---
 
@@ -56,13 +72,48 @@ this slice.
 **Slice 1 is GBP-only by design — an intentional interim scope
 decision, not an oversight.** All repair-cost fields above are
 GBP-denominated; there is no currency or FX-rate field on `repair_jobs`
-in this slice. If a repair invoice ever arrives in a non-GBP currency,
-the manager enters the GBP-converted figure directly — same discipline
-already used for `shipments.repair_cost`/`customs_exchange_rate` in the
-OPR module, just deferred rather than duplicated here. The future
-`device_costs` ledger (Workstream D) will support original currency, FX
-rate, allocation method, and additional cost types beyond in-house
-repair — none of that is needed or built in slice 1.
+in this slice.
+
+**Correction (2026-08-11 audit):** this was originally justified as
+"the manager enters the GBP-converted figure directly — same
+discipline already used for `shipments.repair_cost`/
+`customs_exchange_rate` in the OPR module." That precedent is false.
+Reading `computeCe1154()` (`src/lib/oprImport.ts:113-135`) shows the
+OPR module does the opposite: it stores the repairer's invoice in its
+original currency (`repair_cost`/`repair_cost_currency`) and the app
+itself computes `repairCostGbp = round2(cost / rate)` at
+`oprImport.ts:135` using the stored `customs_exchange_rate` — nobody
+manually enters a pre-converted GBP figure there. There is no existing
+"manually enter the converted figure" discipline to be consistent
+with.
+
+**The true position, stated plainly:** in-house repairs are GBP-native
+— the repairer is a domestic third party invoicing in GBP, so there is
+no foreign-currency figure to convert in the first place. Manual GBP
+entry on `repair_jobs` is appropriate for a different reason than the
+one originally given: there is nothing to convert, not that conversion
+happens by hand elsewhere. `shipments.repair_cost` (the overseas
+repairer's invoice, converted programmatically per above) and
+`repair_jobs.repair_cost_gbp` (the in-house repair cost, GBP-native,
+manually entered) remain two separate figures for two separate
+reasons, and must stay separate — see the naming rule below. The
+future `device_costs` ledger (Workstream D) will support original
+currency, FX rate, allocation method, and additional cost types beyond
+in-house repair — none of that is needed or built in slice 1.
+
+### Naming rule — `repair_jobs.repair_cost_gbp` vs the OPR repair cost
+
+`repair_jobs.repair_cost_gbp` is the **in-house** repair cost (this
+device lifecycle workstream). It is a different concept from
+`shipments.repair_cost` / `Ce1154.repair_cost_gbp`
+(`src/lib/oprImport.ts:75`) — the **overseas repairer's invoice**,
+which forms the customs VAT base on the C&E1154. These must never
+share a field, a name, or a code path. In application code this is
+enforced by namespacing access by object path
+(`repair_job.repair_cost_gbp` vs `shipment.repair_cost` /
+`ce1154.repair_cost_gbp`), not by renaming either column — both names
+are independently correct for what they each describe; the risk is
+only in conflating them, not in the names themselves.
 
 **The supplier ERP webhook is explicitly NOT part of Slice 1.** It is a
 Workstream D deliverable; slice 1 has no webhook receiver, no ERP
@@ -196,15 +247,66 @@ PENDING   -- default until QC is recorded; scan-back does NOT itself set
 2. `qc_result = 'PASSED'` — a `FAILED` or still-`PENDING` result blocks
    this transition outright; there is no path from `QC_FAILED` straight
    to `READY_FOR_ZOHO` (a fresh scan-back/QC cycle is required)
-3. Required device data present (imei, model, capacity/grade — same
-   fields OPR's `runExportValidation` already treats as mandatory
-   elsewhere, reused here rather than inventing a new rule set)
+3. Required device data present (imei, model, capacity/grade).
+   **Correction (2026-08-11 audit):** this was originally justified as
+   "same fields OPR's `runExportValidation` already treats as
+   mandatory elsewhere, reused here rather than inventing a new rule
+   set." That citation is false — `grep -c "model" src/lib/oprValidation.ts`
+   returns `0`; `runExportValidation` (full file read) never checks
+   `model`, `capacity`, or `grade` at all, only `imei`. There was no
+   existing rule being reused. **The real basis is a direct decision
+   by the owner**, made explicitly in this audit: a device must have a
+   known model before it can reach inventory via the Zoho queue,
+   independent of whatever OPR's export checks happen to require. The
+   requirement itself stands; only the false citation is removed.
+   Note also that this condition's grade half is currently vacuous —
+   see the sixth condition below for why, and for the check that
+   actually does the work grade/condition 3 was assumed to do.
 4. Valid SKU mapping exists (`received_devices.sku` resolves in
    `sku_catalog` — reusing the existing catalog, not a new table)
 5. No open conflicting movement: device is not currently on any DRAFT/
    open OPR consignment line, not already `SOLD`/`DESPATCHED`/`REJECTED`
+6. **(Added 2026-08-11.)** The SKU's grade is A, B, or C. Parsed as the
+   **final hyphen-separated segment of the SKU string**, not by a fixed
+   character position (SKUs are variable-length — see the catalog
+   entries in `migrations/0017_catalog_case_normalize_and_expand.sql`,
+   e.g. `SAM-ZFLIP7-256-BSH-A` vs `SMSG-S24-256-PBK`, which have
+   different segment counts before the trailing grade). Any final
+   segment that is not exactly `A`, `B`, or `C` — including `UG`
+   (ungraded) — is **rejected outright**, not defaulted to a
+   pass/fail-safe value.
 
-Any failure of 1–5 blocks the transition; the endpoint returns 409/422
+   **Why this condition exists, and why condition 3 above doesn't
+   cover it:** `received_devices.grade` is
+   `TEXT NOT NULL DEFAULT 'UG'` (`migrations/0021_repair_qc_zoho_status_enum.sql:27`).
+   Because of the `NOT NULL DEFAULT`, `!device.grade` in condition 3's
+   implementation is **always false** — every device has some value in
+   that column, so the "missing grade" branch of condition 3 can never
+   fire, and an ungraded (`UG`) device sails through condition 3
+   without complaint. Condition 6 is the check that actually keeps
+   ungraded stock out of the Zoho queue; condition 3's grade half is
+   present in the code but does no real work.
+
+   **Open question, not yet resolved:** does every SKU in the catalog
+   actually carry a trailing grade segment? The two examples above
+   both do, but this has not been verified across the full catalog
+   (`migrations/0001_initial_schema.sql`'s original seed rows and
+   `seed.sql`'s rows were not checked for a grade suffix at the time of
+   this note — some pre-date the grade-segment convention introduced
+   in migration 0017). If a legacy SKU lacks a trailing grade segment,
+   "parse the final segment and require A/B/C" will either reject it
+   outright (safe but may block real stock) or misparse a non-grade
+   segment as if it were one (unsafe). This needs checking before
+   condition 6 is implemented, not assumed to be fine.
+
+   **Regrading implication:** because grade lives in the SKU string
+   itself (not a separate column checked independently), regrading a
+   device changes its SKU. This must be a deliberate, explicit action —
+   never an implicit side effect of some other update — and the new
+   SKU must be validated against the catalog (condition 4) like any
+   other SKU change, not assumed valid because the old one was.
+
+Any failure of 1–6 blocks the transition; the endpoint returns 409/422
 with the specific unmet condition, mirroring the existing
 `runExportValidation`/`runImportValidation` pattern of explicit, named
 checks rather than a single opaque rejection.
@@ -279,10 +381,21 @@ No test in this list has been written yet.
     bookkeeping as above, gate conditions (SKU mapping etc.) verified
 24. QC `PASSED` but SKU mapping missing → transition blocked, explicit
     error naming the unmet gate condition, device stays `IN_HOUSE_REPAIR`
-25. Repair cost entered (parts + labour) → `repair_jobs.repair_cost`
-    correctly computed and linked to the correct `device_id`/`imei` —
-    confirm querying by IMEI returns exactly this job's cost, not another
-    device's
+25. Repair cost entered (parts + labour) → `repair_jobs.repair_cost_gbp`
+    correctly linked to the correct `device_id`/`imei` — confirm
+    querying by IMEI returns exactly this job's cost, not another
+    device's. **Correction (2026-08-11 audit):** this item originally
+    named the field `repair_jobs.repair_cost` and said it was
+    "correctly computed", both inconsistent with the CONFIRMED field
+    list above (`repair_cost_gbp`, not `repair_cost`) and with what the
+    field actually is — a manually-entered value (see Amendment 1
+    resolution above), not a computed one; "computed" here would wrongly
+    imply parts_cost_gbp + labour_cost_gbp are summed into it
+    automatically, which slice 1 does not do. Confirmed against the
+    actual test file: `test/repairWorkflow.spec.ts` uses
+    `repair_cost_gbp` throughout (lines 27, 240, 367, 380) and never
+    references a bare `repair_cost` field — the field name above is now
+    consistent with both the schema and the test file.
 26. `QC_FAILED` device can re-enter `IN_HOUSE_REPAIR` (re-open) but a
     fresh scan-back/QC cycle is required — cannot skip straight to
     `READY_FOR_ZOHO` from `QC_FAILED`
@@ -315,6 +428,110 @@ integration, Zoho API integration, OPR return-inspection states
 (`OPR_REPAIR_CANDIDATE`, `RETURN_INSPECTION`), generic `HOLD`, any
 `ACTIVE_INVENTORY` transition change beyond what's needed to remove the
 old direct `IN_HOUSE_REPAIR → ACTIVE_INVENTORY` edge.
+
+---
+
+## Item 3 — OPR cost model (forward scope, NOT STARTED)
+
+Recorded here per the 2026-08-11 instruction so the design record covers
+both workstreams' cost handling in one place. **Sequencing: does not
+start until Item 2 (this document's C15–D37 build) is complete and
+committed.** This item touches the OPR path exclusively and must have it
+to itself — no interleaving with the device-lifecycle build above.
+
+### Data structure and manual entry only — no calculation yet
+
+Three separate cost fields on the OPR shipment record, all GBP, all
+manually entered, all editable:
+- repair cost (the overseas repairer's invoice — see naming rule above;
+  never conflated with `repair_jobs.repair_cost_gbp`)
+- inbound freight
+- outbound freight
+
+A fourth field, insurance, is recorded but **explicitly excluded from the
+VAT base** — captured precisely so it is never accidentally swept in by
+a future calculation pass.
+
+Two derived-value fields, duty base and VAT base, are **manually entered
+for now** — not computed, not pre-filled, no suggested figure displayed.
+When calculation logic is added later (gated on FedEx confirming freight
+treatment), these become computed-with-manual-override; the override
+path must survive that change, not be removed by it.
+
+Each field (all six above) carries: value, source (quoted / actual /
+estimated), who entered it, when, and a free-text note. Every edit is a
+new audited entry, never an overwrite — same discipline as the
+goods-value delta trail in Ticket B.
+
+**The hard rule:** once a value has been used on a submitted customs
+declaration, it is frozen. Later corrections create a new record; they
+never rewrite what was declared. A declared value and a current value
+are two different things, and the schema must be able to hold both
+simultaneously.
+
+### C&E1154 wiring
+
+Box 3 (value for customs duty) currently draws from the repair cost. Per
+the form's Note A and entry A00, **box 3 must draw from the duty base
+field, not the VAT base** — duty and VAT bases are two different figures
+on this form and must not be conflated with each other. That single
+field-source change is the point of this item.
+
+This alters C&E1154 output, so it must follow the `a4a9e6b` pattern
+exactly: prove the diff is only the intended lines with everything else
+byte-identical, then deliberately recapture the golden fixture with a
+commit message declaring the change intentional. If the diff shows
+anything not intended, stop and report rather than recapturing.
+
+Also: `chief_number` is removed, with the existing 422 refusal re-keyed
+to the OPR authorisation number (`op_authorisation_number` —
+`src/lib/oprImport.ts:110-111` already refuses to proceed without it;
+this item re-points any remaining `chief_number` reference at that same
+field/check rather than adding a new one). The phrase "repair cost only"
+is removed from the clearance instruction template and replaced with the
+three-part breakdown (repair cost / inbound freight / outbound freight).
+
+### FedEx worksheet
+
+Recorded as an internal audited record per shipment (not derived,
+editable fields):
+- the NEU share
+- the VAT value adjustment
+- freight taken from the booking quote, with a variance flag against
+  FedEx's actual figure once available
+
+**Do not seed any inferred freight split as data, default, or test
+fixture.** No specific split values are recorded in this document for
+that reason.
+
+### What not to do (restated for this item specifically)
+
+- Do not hard-code any freight split.
+- Do not implement apportionment across returns yet.
+- Do not remove the manual entry path when calculation arrives later —
+  manual override must survive.
+- Do not compute or pre-fill duty base / VAT base yet.
+
+### Reference data confirmed this session (settled facts for Item 3, not to be re-derived)
+
+- Parties to transaction: Non-Related, fixed default, with a reasoned
+  override available (not a hard lock).
+- Signatory: Sagar Patel, Director — signed as a deliberate act each
+  time, never auto-signed.
+- Address on all customs output: 98 High Street, Wolverhampton,
+  WV11 1SZ.
+- Outbound sending address: customs@saigates.com.
+- Per-IMEI purchase cost is customs-critical: it is the origin of the
+  declared goods value, so its accuracy gates everything downstream of
+  it on the declaration.
+
+### Open items (not tasks — questions to resolve, not yet actioned)
+
+- Whether procedure code 2200 should still be accepted given HMRC's May
+  2026 replacement by 2100 — not yet decided, not yet checked against
+  `validateProcedureCodes`.
+- Tracker and README corrections are queued **after** Item 3 completes,
+  not before.
 
 ## Next step
 
