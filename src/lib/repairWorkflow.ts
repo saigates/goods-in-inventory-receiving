@@ -146,6 +146,25 @@ export async function checkReadyForZohoGate(
   ).bind(device.id).first<{ id: number }>()
   if (openLine) return 'Device is on an open (DRAFT) OPR consignment line'
 
+  // 6. (Added 2026-08-11.) The SKU's grade is A, B, or C. Parsed as the
+  // FINAL hyphen-separated segment of the SKU string — not by a fixed
+  // character position, since SKU segment counts vary (e.g.
+  // 'SAM-S26-256-CVT-A' vs 'APL-I17-256-BLK-UG'). Any final segment that
+  // is not exactly 'A', 'B', or 'C' — including 'UG' (ungraded) — is
+  // rejected outright, not defaulted to a pass/fail-safe value. This is
+  // deliberately independent of condition 3's capacity/grade presence
+  // check above: received_devices.grade defaults to 'UG'
+  // (migrations/0021_repair_qc_zoho_status_enum.sql:27) and is therefore
+  // always present, making condition 3's grade branch vacuous as a guard
+  // against ungraded stock — this condition is the real guard, and reads
+  // the SKU (the catalogue-assigned grade), not the device row's own
+  // grade column.
+  const skuSegments = String(device.sku).split('-')
+  const skuGrade = skuSegments[skuSegments.length - 1]
+  if (skuGrade !== 'A' && skuGrade !== 'B' && skuGrade !== 'C') {
+    return `SKU '${device.sku}' has grade '${skuGrade}' — only A, B, or C may reach Zoho`
+  }
+
   return null
 }
 
