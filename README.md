@@ -453,12 +453,18 @@ Current coverage (349 tests across 15 suites, run 2026-08-11: **342 passed, 7 sk
 
 ## Active Workstreams (as of 2026-08-11)
 
-**Deploy-hold posture**: production remains on commit `10f9544` (the last
-`gsk hosted deploy`, described in **Production deploy** above). Local `main`
-is pushed to `origin/main` on GitHub as of this pass (see commit history for
-the exact tip), but **nothing beyond `10f9544` has been deployed** —
-pushing source control is not a production deploy, and none is authorised by
-this pass. Two workstreams are active in parallel and are kept strictly
+**Deploy-hold posture**: production is on commit `6cbe4e2` (deployed
+2026-08-11 via an approved `gsk hosted deploy` action, 22/22 migrations
+applied — see **Production deploy** above). This paragraph previously said
+production "remains on `10f9544`" — that was stale: `10f9544` was the
+last-known-deployed commit as of the *prior* pass and was never corrected
+here after the 2026-08-11 deploy (the tracker's own equivalent claim was
+corrected in the same pass that produced this fix). Local `main` has since
+moved past `6cbe4e2` with `f51ad4f` and `59728d8` (migration-0021 file
+correction, condition-6 no-grade-segment path, migration-0018 template
+wording fix, and the tracker's stale-claim corrections) — both are pushed to
+`origin/main` on GitHub, but **neither is deployed**; no deploy is authorised
+by this pass. Two workstreams are active in parallel and are kept strictly
 separate (a change in one must never touch the other):
 
 1. **OPR Auth Batch** — CHIEF→OPR authorisation-number rename (migration
