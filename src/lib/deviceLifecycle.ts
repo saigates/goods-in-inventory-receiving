@@ -43,13 +43,21 @@ export const ALLOWED_TRANSITIONS: Record<DeviceStatus, DeviceStatus[]> = {
   ACTIVE_INVENTORY: [],
   IN_HOUSE_REPAIR: ['READY_FOR_ZOHO', 'QC_FAILED'],
   READY_FOR_EXPORT: ['IN_EXPORT_CONSIGNMENT'],
-  IN_EXPORT_CONSIGNMENT: ['READY_FOR_EXPORT', 'EXPORTED_UNDER_OPR'],
+  // IN_EXPORT_CONSIGNMENT is a SHARED precursor for both the OPR export
+  // flow and the TEMP_EXPORTED_STANDARD flow — only the finalise-time
+  // target diverges, keyed off shipment.shipment_type (see
+  // addDeviceToShipment/addDeviceToReturnShipment in src/routes/opr.ts).
+  IN_EXPORT_CONSIGNMENT: ['READY_FOR_EXPORT', 'EXPORTED_UNDER_OPR', 'TEMP_EXPORTED_STANDARD'],
   EXPORTED_UNDER_OPR: ['RETURNED_UNDER_OPR'],
   RETURNED_UNDER_OPR: ['ACTIVE_INVENTORY'],
   SOLD: [],
   REJECTED: [],
   QC_FAILED: ['IN_HOUSE_REPAIR'],
   READY_FOR_ZOHO: [],
+  // ── TEMP_EXPORTED_STANDARD consignment flow (migration 0023) ──
+  // Mirrors EXPORTED_UNDER_OPR/RETURNED_UNDER_OPR exactly.
+  TEMP_EXPORTED_STANDARD: ['RETURNED_UNDER_STANDARD'],
+  RETURNED_UNDER_STANDARD: ['ACTIVE_INVENTORY'],
 }
 
 // Statuses whose membership is DERIVED from consignment state (a device is
@@ -62,6 +70,10 @@ export const OPR_WORKFLOW_ONLY_STATUSES: readonly DeviceStatus[] = [
   'IN_EXPORT_CONSIGNMENT',
   'EXPORTED_UNDER_OPR',
   'RETURNED_UNDER_OPR',
+  // TEMP_EXPORTED_STANDARD/RETURNED_UNDER_STANDARD are consignment-driven
+  // identically to the 3 OPR statuses above — same desync risk, same guard.
+  'TEMP_EXPORTED_STANDARD',
+  'RETURNED_UNDER_STANDARD',
 ] as const
 
 // Device Lifecycle slice 1 — same pattern as OPR_WORKFLOW_ONLY_STATUSES

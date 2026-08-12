@@ -124,11 +124,12 @@ app.post('/grade', async (c) => {
   // an id belonging to another tenant is treated as not-found).
   const placeholders = ids.map(() => '?').join(',')
   const { results: current } = await c.env.DB.prepare(
-    `SELECT id, imei, grade FROM received_devices WHERE id IN (${placeholders}) AND organisation_id = ?`
-  ).bind(...(ids as unknown[]), orgId).all<{ id: number; imei: string; grade: string }>()
+    `SELECT id, imei, sku, grade, status FROM received_devices WHERE id IN (${placeholders}) AND organisation_id = ?`
+  ).bind(...(ids as unknown[]), orgId).all<{ id: number; imei: string; sku: string; grade: string; status: string }>()
 
   const updated: number[] = []
   const skipped: { id: number; reason: string }[] = []
+  const flaggedForRemoval: number[] = []
   const stmts = []
   const foundIds = new Set(current.map(r => r.id))
   for (const id of ids) {
@@ -153,6 +154,22 @@ app.post('/grade', async (c) => {
       ).bind(orgId, row.id, row.imei, row.grade, grade, actor, reason, bulkId, user.id)
     )
     updated.push(row.id)
+
+    // Regrade-fix 2: a device downgraded to UG while it is ACTIVE_INVENTORY
+    // (already on the shelf/for sale) needs manual pull-for-review —
+    // independent of any Zoho-batch state (no application code writes to
+    // zoho_batches today). Literal status check, not gated on grade_audit
+    // or repair state.
+    if (grade === 'UG' && row.status === 'ACTIVE_INVENTORY') {
+      stmts.push(
+        c.env.DB.prepare(
+          `INSERT INTO removal_flags
+           (organisation_id, received_device_id, imei, sku, old_grade, new_grade, reason, flagged_by_user_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(orgId, row.id, row.imei, row.sku, row.grade, grade, 'regrade_to_UG_while_active_inventory', user.id)
+      )
+      flaggedForRemoval.push(row.id)
+    }
   }
 
   if (stmts.length) await c.env.DB.batch(stmts)
@@ -174,7 +191,37 @@ app.post('/grade', async (c) => {
     updated_ids: updated,
     skipped,
     bulk_id: bulkId,
+    flagged_for_removal: flaggedForRemoval,
   })
+})
+
+// Removal-flag list (regrade-fix 2): devices downgraded to UG while
+// ACTIVE_INVENTORY, awaiting manual pull-from-shelf review.
+// GET /inventory/removal-flags?resolved=0|1 (default: open only)
+app.get('/removal-flags', async (c) => {
+  const user = currentUser(c)
+  const q = c.req.query()
+  const openOnly = q.resolved !== '1'
+  const sql = openOnly
+    ? `SELECT * FROM removal_flags WHERE organisation_id = ? AND resolved_at IS NULL ORDER BY flagged_at DESC LIMIT 200`
+    : `SELECT * FROM removal_flags WHERE organisation_id = ? ORDER BY flagged_at DESC LIMIT 200`
+  const { results } = await c.env.DB.prepare(sql).bind(user.organisation_id).all()
+  return c.json({ removal_flags: results || [] })
+})
+
+// Resolve a removal flag (device physically pulled / reviewed).
+app.post('/removal-flags/:id/resolve', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const note = cleanString((await c.req.json().catch(() => ({} as any))).note, 500)
+  const res = await c.env.DB.prepare(
+    `UPDATE removal_flags SET resolved_at = CURRENT_TIMESTAMP, resolved_by_user_id = ?, note = COALESCE(?, note)
+     WHERE id = ? AND organisation_id = ? AND resolved_at IS NULL`
+  ).bind(user.id, note, id, user.organisation_id).run()
+  if (!res.meta.changes) return c.json({ error: 'Flag not found or already resolved' }, 404)
+  const flag = await c.env.DB.prepare('SELECT * FROM removal_flags WHERE id = ?').bind(id).first()
+  return c.json({ ok: true, removal_flag: flag })
 })
 
 // Audit log for a single device's grade history (or for a bulk operation)

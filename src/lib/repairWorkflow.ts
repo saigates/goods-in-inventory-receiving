@@ -146,41 +146,21 @@ export async function checkReadyForZohoGate(
   ).bind(device.id).first<{ id: number }>()
   if (openLine) return 'Device is on an open (DRAFT) OPR consignment line'
 
-  // 6. (Added 2026-08-11.) The SKU's grade is A, B, or C. Parsed as the
-  // FINAL hyphen-separated segment of the SKU string — not by a fixed
-  // character position, since SKU segment counts vary (e.g.
-  // 'SAM-S26-256-CVT-A' vs 'APL-I17-256-BLK-UG'). Any final segment that
-  // is not exactly 'A', 'B', or 'C' — including 'UG' (ungraded) — is
-  // rejected outright, not defaulted to a pass/fail-safe value. This is
-  // deliberately independent of condition 3's capacity/grade presence
-  // check above: received_devices.grade defaults to 'UG'
-  // (migrations/0021_repair_qc_zoho_status_enum.sql:102) and is therefore
-  // always present, making condition 3's grade branch vacuous as a guard
-  // against ungraded stock — this condition is the real guard, and reads
-  // the SKU (the catalogue-assigned grade), not the device row's own
-  // grade column.
-  const skuSegments = String(device.sku).split('-')
-  const skuGrade = skuSegments[skuSegments.length - 1]
-
-  // 6a. (Added 2026-08-11 during evidentiary review of Item 7a.) Some
-  // catalogue SKUs use the 4-segment brand-model-capacity-colour shape and
-  // never carry a grade segment at all — confirmed against production's
-  // real sku_catalog (2781 rows): 9 rows, all Samsung (e.g.
-  // 'SMSG-S24-256-PBK'), are exactly 4 segments with the final segment a
-  // colour code (PBK/GRY/GRA/CLD), never a grade. Every other catalogue
-  // row is 5 segments with the final segment always A/B/C/UG. Without
-  // this branch, the generic check below would reject these devices with
-  // a message reading "...has grade 'PBK'...", falsely implying the
-  // colour code IS a (merely invalid) grade value, when in fact there is
-  // no grade position on this SKU shape to be wrong about — a distinct
-  // failure mode from "SKU has an unrecognised grade" and one that must
-  // say so explicitly, not overload the same wording.
-  if (skuSegments.length === 4) {
-    return `SKU '${device.sku}' has no grade segment (4-segment brand-model-capacity-colour SKU) — cannot determine A/B/C grade for Zoho`
-  }
-
-  if (skuGrade !== 'A' && skuGrade !== 'B' && skuGrade !== 'C') {
-    return `SKU '${device.sku}' has grade '${skuGrade}' — only A, B, or C may reach Zoho`
+  // 6. (Regrade-fix 1, this sprint.) AUTHORITY MOVED: the device's grade
+  // is validated against `received_devices.grade` — the stored column
+  // (CHECK-constrained to 'A'|'B'|'C'|'UG', migration 0021) — not by
+  // re-parsing the SKU's final hyphen segment. The prior SKU-suffix parse
+  // was a proxy for the actual grade and diverged from it whenever a
+  // device was regraded after receipt without also renaming its SKU (the
+  // regrade endpoint, POST /api/inventory/grade, only ever writes
+  // received_devices.grade — see src/routes/inventory.ts — it never
+  // touches sku). device.grade defaults to 'UG' and is always present, so
+  // this subsumes condition 3's capacity/grade branch as the real guard
+  // against ungraded stock reaching Zoho. Any grade that is not exactly
+  // 'A', 'B', or 'C' — including 'UG' — is rejected outright.
+  const grade = device.grade
+  if (grade !== 'A' && grade !== 'B' && grade !== 'C') {
+    return `Device has grade '${grade}' — only A, B, or C may reach Zoho`
   }
 
   return null

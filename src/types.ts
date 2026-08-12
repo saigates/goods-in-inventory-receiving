@@ -93,6 +93,13 @@ export const DEVICE_STATUSES = [
   // docs/plan/device-lifecycle-slice1.md) before it can join a Zoho batch.
   'QC_FAILED',
   'READY_FOR_ZOHO',
+  // ── TEMP_EXPORTED_STANDARD consignment flow ──
+  // Mirrors EXPORTED_UNDER_OPR / RETURNED_UNDER_OPR but for the non-customs
+  // 'temporary export, standard' shipment_type. READY_FOR_EXPORT and
+  // IN_EXPORT_CONSIGNMENT remain SHARED precursors for both flows; only the
+  // finalise-time transition diverges by shipment.shipment_type.
+  'TEMP_EXPORTED_STANDARD',
+  'RETURNED_UNDER_STANDARD',
 ] as const
 
 export type DeviceStatus = typeof DEVICE_STATUSES[number]
@@ -125,6 +132,9 @@ export type ReceivedDevice = {
   currency: string
   vat_type: VatType | null
   supplier_id: number | null
+  // Physical receipt time (migration 0023) — backdatable, distinct from
+  // created_at (row-insert time).
+  received_at: string | null
 }
 
 // ───────── Device event log (Priority 3) ─────────
@@ -140,6 +150,26 @@ export type DeviceEvent = {
   reference: string | null
   metadata: string | null // JSON-encoded
   created_at: string
+}
+
+// ───────── Removal flags (regrade-fix 2, migration 0023) ─────────
+// Written when POST /inventory/grade downgrades a device to UG while its
+// status is ACTIVE_INVENTORY \u2014 independent of any Zoho-batch state (no
+// application code writes to zoho_batches today).
+export type RemovalFlag = {
+  id: number
+  organisation_id: number
+  received_device_id: number
+  imei: string
+  sku: string | null
+  old_grade: string | null
+  new_grade: string
+  reason: string
+  flagged_by_user_id: number | null
+  flagged_at: string
+  resolved_at: string | null
+  resolved_by_user_id: number | null
+  note: string | null
 }
 
 export type SkuCatalog = {
@@ -201,10 +231,10 @@ export type Shipment = {
   organisation_id: number
   reference: string
   direction: ShipmentDirection
-  shipment_type: 'OPR_REPAIR'
+  shipment_type: 'OPR_REPAIR' | 'TEMP_EXPORT_STANDARD'
   status: ShipmentStatus
-  authorisation_id: number
-  procedure_code: string
+  authorisation_id: number | null
+  procedure_code: string | null
   additional_procedure_code: string | null
   consignee_name: string | null
   consignee_address: string | null

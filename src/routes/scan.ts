@@ -8,6 +8,7 @@ import type { CatalogLookup, CatalogRow } from '../lib/catalog'
 import { currentUser } from '../lib/auth'
 import { validateImei, validateBuyPrice, isValidCurrency, isValidVatType, normalizeCurrency, cleanString } from '../lib/validate'
 import { logDeviceEvent } from '../lib/deviceLifecycle'
+import { isValidIsoDate } from '../lib/opr'
 
 // SQLite raises 'UNIQUE constraint failed: received_devices.imei' if a
 // duplicate IMEI slips past the pre-check. Detect that so we can return
@@ -61,6 +62,25 @@ function parseValuation(
   }
 
   return { ok: true, buy_price: buyPrice, currency, vat_type: vatType }
+}
+
+// Validate the optional backdated `received_at` field shared by
+// /confirm, /bulk, /force-add and /manual (migration 0023). Mirrors the
+// shipment_replies.received_at validation pattern (src/routes/opr.ts):
+// accepts a date or datetime string, must not be in the future, defaults
+// to CURRENT_TIMESTAMP (via SQL COALESCE) when omitted/null/empty.
+function parseReceivedAt(
+  body: { received_at?: unknown },
+): { ok: true; received_at: string | null } | { ok: false; error: string } {
+  if (body.received_at == null || body.received_at === '') return { ok: true, received_at: null }
+  if (typeof body.received_at !== 'string' || !isValidIsoDate(body.received_at.slice(0, 10))) {
+    return { ok: false, error: 'received_at must be an ISO date/datetime' }
+  }
+  const nowIso = new Date().toISOString()
+  if (body.received_at > nowIso) {
+    return { ok: false, error: 'received_at cannot be in the future' }
+  }
+  return { ok: true, received_at: body.received_at }
 }
 
 // Scan an IMEI against an active manifest.
@@ -213,6 +233,7 @@ app.post('/confirm', async (c) => {
     currency?: string
     vat_type?: string
     supplier_id?: number
+    received_at?: string
   }>().catch(() => ({} as any))
 
   if (!body.expected_device_id || !body.sku) {
@@ -222,6 +243,9 @@ app.post('/confirm', async (c) => {
   // Valuation/VAT are required at goods-in confirm time (Priority 4).
   const valuation = parseValuation(body, { required: true })
   if (!valuation.ok) return c.json({ error: valuation.error }, 422)
+
+  const receivedAt = parseReceivedAt(body)
+  if (!receivedAt.ok) return c.json({ error: receivedAt.error }, 422)
 
   const expected = await c.env.DB.prepare(
     'SELECT * FROM expected_devices WHERE id = ? AND organisation_id = ?'
@@ -274,8 +298,8 @@ app.post('/confirm', async (c) => {
     insRecv = await c.env.DB.prepare(
       `INSERT INTO received_devices
        (organisation_id, uuid, imei, sku, brand, model, capacity, color, grade, source, manifest_id, expected_device_id, notes,
-        status, created_by_user_id, buy_price, currency, vat_type, supplier_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manifest', ?, ?, ?, 'RECEIVED', ?, ?, ?, ?, ?)`
+        status, created_by_user_id, buy_price, currency, vat_type, supplier_id, received_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manifest', ?, ?, ?, 'RECEIVED', ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))`
     ).bind(
       orgId,
       uuid,
@@ -294,6 +318,7 @@ app.post('/confirm', async (c) => {
       valuation.currency,
       valuation.vat_type,
       supplierId,
+      receivedAt.received_at,
     ).run()
   } catch (err) {
     if (isImeiUniqueError(err)) {
@@ -404,6 +429,7 @@ app.post('/bulk', async (c) => {
     vat_type?: string
     supplier_id?: number
     auto_print?: boolean
+    received_at?: string
   }>().catch(() => ({} as any))
 
   const manifestId = Number(body.manifest_id)
@@ -422,6 +448,10 @@ app.post('/bulk', async (c) => {
   // just come from one shared entry instead of a per-device modal).
   const valuation = parseValuation(body, { required: true })
   if (!valuation.ok) return c.json({ error: valuation.error }, 422)
+
+  // received_at is also shared across the whole batch, same rationale.
+  const receivedAt = parseReceivedAt(body)
+  if (!receivedAt.ok) return c.json({ error: receivedAt.error }, 422)
 
   let supplierId: number | null = null
   if (body.supplier_id) {
@@ -519,12 +549,12 @@ app.post('/bulk', async (c) => {
       insRecv = await c.env.DB.prepare(
         `INSERT INTO received_devices
          (organisation_id, uuid, imei, sku, brand, model, capacity, color, grade, source, manifest_id, expected_device_id,
-          status, created_by_user_id, buy_price, currency, vat_type, supplier_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manifest', ?, ?, 'RECEIVED', ?, ?, ?, ?, ?)`
+          status, created_by_user_id, buy_price, currency, vat_type, supplier_id, received_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manifest', ?, ?, 'RECEIVED', ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))`
       ).bind(
         orgId, uuid, imei, catalogRow.sku, catalogRow.brand, catalogRow.model, catalogRow.capacity, catalogRow.color,
         normalizeGrade(catalogRow.grade ?? grade), manifestId, expected.id, user.id,
-        valuation.buy_price, valuation.currency, valuation.vat_type, supplierId,
+        valuation.buy_price, valuation.currency, valuation.vat_type, supplierId, receivedAt.received_at,
       ).run()
     } catch (err) {
       if (isImeiUniqueError(err)) {
@@ -588,6 +618,7 @@ app.post('/force-add', async (c) => {
     buy_price?: number | string
     currency?: string
     vat_type?: string
+    received_at?: string
   }>().catch(() => ({} as any))
 
   const imeiCheck = validateImei(body.imei)
@@ -598,6 +629,9 @@ app.post('/force-add', async (c) => {
   // off-manifest exception branch must not be a bypass for required fields.
   const valuation = parseValuation(body, { required: true })
   if (!valuation.ok) return c.json({ error: valuation.error }, 422)
+
+  const receivedAt = parseReceivedAt(body)
+  if (!receivedAt.ok) return c.json({ error: receivedAt.error }, 422)
 
   const dup = await c.env.DB.prepare('SELECT id, uuid, sku FROM received_devices WHERE imei = ? AND organisation_id = ?')
     .bind(imei, orgId).first<{ id: number; uuid: string; sku: string }>()
@@ -616,13 +650,13 @@ app.post('/force-add', async (c) => {
     ins = await c.env.DB.prepare(
       `INSERT INTO received_devices
        (organisation_id, uuid, imei, sku, brand, model, capacity, color, grade, source, manifest_id, notes,
-        status, created_by_user_id, buy_price, currency, vat_type)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unreconciled', ?, ?, 'RECEIVED', ?, ?, ?, ?)`
+        status, created_by_user_id, buy_price, currency, vat_type, received_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unreconciled', ?, ?, 'RECEIVED', ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))`
     ).bind(
       orgId, uuid, imei, built.sku, built.brand, built.model, built.capacity, built.color,
       grade, body.manifest_id || null,
       cleanString(body.notes) || 'Force-added: not on manifest. Pending manager review.',
-      user.id, valuation.buy_price, valuation.currency, valuation.vat_type,
+      user.id, valuation.buy_price, valuation.currency, valuation.vat_type, receivedAt.received_at,
     ).run()
   } catch (err) {
     if (isImeiUniqueError(err)) {
@@ -677,6 +711,7 @@ app.post('/manual', async (c) => {
     buy_price?: number | string
     currency?: string
     vat_type?: string
+    received_at?: string
   }>().catch(() => ({} as any))
 
   const imeiCheck = validateImei(body.imei)
@@ -687,6 +722,9 @@ app.post('/manual', async (c) => {
   // other; "quick receive" must not mean "valuation-less receive".
   const valuation = parseValuation(body, { required: true })
   if (!valuation.ok) return c.json({ error: valuation.error }, 422)
+
+  const receivedAt = parseReceivedAt(body)
+  if (!receivedAt.ok) return c.json({ error: receivedAt.error }, 422)
 
   // Duplicate check — same friendly path as scan/confirm.
   const existing = await c.env.DB.prepare('SELECT id, uuid, sku FROM received_devices WHERE imei = ? AND organisation_id = ?')
@@ -736,12 +774,12 @@ app.post('/manual', async (c) => {
     ins = await c.env.DB.prepare(
       `INSERT INTO received_devices
        (organisation_id, uuid, imei, sku, brand, model, capacity, color, grade, source, notes,
-        status, created_by_user_id, buy_price, currency, vat_type)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, 'RECEIVED', ?, ?, ?, ?)`
+        status, created_by_user_id, buy_price, currency, vat_type, received_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, 'RECEIVED', ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))`
     ).bind(
       orgId, uuid, imei, sku, brand, model, capacity, color, grade,
       cleanString(body.notes),
-      user.id, valuation.buy_price, valuation.currency, valuation.vat_type,
+      user.id, valuation.buy_price, valuation.currency, valuation.vat_type, receivedAt.received_at,
     ).run()
   } catch (err) {
     if (isImeiUniqueError(err)) {

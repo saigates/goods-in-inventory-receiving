@@ -380,16 +380,42 @@ app.post('/shipments', async (c) => {
     return c.json({ error: 'reference may contain letters, numbers and spaces only (it flows onto customs declarations)' }, 422)
   }
 
-  // Authorisation must exist, belong to the org, and the linkage is NOT
-  // optional — an OPR shipment without an authorisation is meaningless.
-  const authId = Number(body.authorisation_id)
-  if (!authId) return c.json({ error: 'authorisation_id is required — every OPR shipment must link to an authorisation' }, 422)
-  const auth = await c.env.DB.prepare(
-    'SELECT id FROM opr_authorisations WHERE id = ? AND organisation_id = ?'
-  ).bind(authId, user.organisation_id).first()
-  if (!auth) return c.json({ error: `authorisation_id ${authId} not found for this organisation` }, 422)
+  // shipment_type: 'OPR_REPAIR' (default, existing customs-backed flow) or
+  // 'TEMP_EXPORT_STANDARD' (new, non-customs consignment flow — migration
+  // 0023). No C&E1154, no discharge clock, no procedure codes for the
+  // latter, so authorisation_id/procedure_code are only REQUIRED for
+  // OPR_REPAIR — this is a widening of the existing guarantee, not a
+  // removal of it (OPR_REPAIR creation is unaffected).
+  const shipmentType = body.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'TEMP_EXPORT_STANDARD' : 'OPR_REPAIR'
+  const isStandardTemp = shipmentType === 'TEMP_EXPORT_STANDARD'
 
-  const proc = validateProcedureCodes(direction, body.procedure_code, body.additional_procedure_code)
+  // Authorisation must exist and belong to the org for OPR_REPAIR — an OPR
+  // shipment without an authorisation is meaningless. TEMP_EXPORT_STANDARD
+  // has no customs authorisation concept at all.
+  let authId: number | null = null
+  if (!isStandardTemp) {
+    authId = Number(body.authorisation_id)
+    if (!authId) return c.json({ error: 'authorisation_id is required — every OPR shipment must link to an authorisation' }, 422)
+    const auth = await c.env.DB.prepare(
+      'SELECT id FROM opr_authorisations WHERE id = ? AND organisation_id = ?'
+    ).bind(authId, user.organisation_id).first()
+    if (!auth) return c.json({ error: `authorisation_id ${authId} not found for this organisation` }, 422)
+  } else if (body.authorisation_id != null) {
+    return c.json({ error: 'authorisation_id is not valid on a TEMP_EXPORT_STANDARD shipment (no customs authorisation)' }, 422)
+  }
+
+  // procedure_code / additional_procedure_code: customs-only, skipped
+  // entirely for TEMP_EXPORT_STANDARD per the confirmed skip list
+  // (validateProcedureCodes / PROCEDURE_CODE check).
+  let proc: { ok: true; procedure_code: string | null; additional_procedure_code: string | null } | { ok: false; error: string }
+  if (isStandardTemp) {
+    if (body.procedure_code != null || body.additional_procedure_code != null) {
+      return c.json({ error: 'procedure_code / additional_procedure_code are not valid on a TEMP_EXPORT_STANDARD shipment' }, 422)
+    }
+    proc = { ok: true, procedure_code: null, additional_procedure_code: null }
+  } else {
+    proc = validateProcedureCodes(direction, body.procedure_code, body.additional_procedure_code)
+  }
   if (!proc.ok) return c.json({ error: proc.error }, 422)
 
   const cur = validateShipmentCurrency(body.currency)
@@ -416,7 +442,12 @@ app.post('/shipments', async (c) => {
     if (!rel) return c.json({ error: `related_export_shipment_id ${relatedExportId} is not an export shipment of this organisation` }, 422)
   }
 
-  const repair = parseRepairFields(body, direction)
+  // repair_cost/etc are C&E1154 (repairer-invoice) inputs — not applicable
+  // to a TEMP_EXPORT_STANDARD shipment (no customs arithmetic in this flow).
+  if (isStandardTemp && ['repair_cost', 'repair_cost_currency', 'customs_exchange_rate', 'duty_rate_pct'].some(k => body[k] !== undefined)) {
+    return c.json({ error: 'repair_cost / repair_cost_currency / customs_exchange_rate / duty_rate_pct are not valid on a TEMP_EXPORT_STANDARD shipment' }, 422)
+  }
+  const repair = isStandardTemp ? { ok: true as const, fields: {} } : parseRepairFields(body, direction)
   if (!repair.ok) return c.json({ error: repair.error }, 422)
 
   try {
@@ -426,9 +457,9 @@ app.post('/shipments', async (c) => {
          procedure_code, additional_procedure_code, consignee_name, consignee_address,
          carrier, carrier_account, incoterm, currency, ship_date,
          related_export_shipment_id, notes, created_by_user_id)
-      VALUES (?, ?, ?, 'OPR_REPAIR', 'DRAFT', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
-      user.organisation_id, reference, direction, authId,
+      user.organisation_id, reference, direction, shipmentType, authId,
       proc.procedure_code, proc.additional_procedure_code,
       consigneeName, cleanString(body.consignee_address, 500),
       cleanString(body.carrier, 100), cleanString(body.carrier_account, 100),
@@ -580,6 +611,9 @@ async function addDeviceToShipment(
 
   // Status must follow the line. If the transition fails (it shouldn't —
   // status was just checked), undo the line so they can never diverge.
+  // IN_EXPORT_CONSIGNMENT is the SHARED precursor for both OPR_REPAIR and
+  // TEMP_EXPORT_STANDARD export consignments — the target here does not
+  // vary by shipment_type; only the finalise-time transition does.
   try {
     await transitionDevice(c.env.DB, deviceId, 'IN_EXPORT_CONSIGNMENT', {
       user,
@@ -622,8 +656,12 @@ async function addDeviceToReturnShipment(
     return c.json({ error: 'Import shipment has no related_export_shipment_id — link the return to the export it discharges before adding devices' }, 422)
   }
 
-  if (device.status !== 'EXPORTED_UNDER_OPR') {
-    return c.json({ error: `Device ${deviceId} (IMEI ${device.imei}) is ${device.status} — only EXPORTED_UNDER_OPR devices can join a return consignment` }, 409)
+  // Precondition status diverges by shipment_type — TEMP_EXPORT_STANDARD
+  // returns collect TEMP_EXPORTED_STANDARD devices, mirroring OPR_REPAIR's
+  // EXPORTED_UNDER_OPR precondition exactly.
+  const expectedStatus = shipment.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'TEMP_EXPORTED_STANDARD' : 'EXPORTED_UNDER_OPR'
+  if (device.status !== expectedStatus) {
+    return c.json({ error: `Device ${deviceId} (IMEI ${device.imei}) is ${device.status} — only ${expectedStatus} devices can join a return consignment` }, 409)
   }
 
   // The device must have been declared on THE related export — a device
@@ -1087,33 +1125,52 @@ async function finaliseImportShipment(
   const mrn = cleanProofRef(body.import_mrn, 'import_mrn')
   if (!mrn.ok) return c.json({ error: mrn.error }, 422)
 
+  // finalised_at is body-suppliable/backdatable (this sprint) so returns can
+  // be recorded against the date they actually happened, not the date the
+  // record was entered. Same validation pattern as shipment_replies.received_at.
+  let finalisedAt: string | null = null
+  if (body.finalised_at !== undefined && body.finalised_at !== null && body.finalised_at !== '') {
+    if (typeof body.finalised_at !== 'string' || !isValidIsoDate(body.finalised_at.slice(0, 10))) {
+      return c.json({ error: 'finalised_at must be an ISO date/datetime' }, 422)
+    }
+    const nowIso = new Date().toISOString()
+    if (body.finalised_at > nowIso) return c.json({ error: 'finalised_at cannot be in the future' }, 422)
+    finalisedAt = body.finalised_at
+  }
+
   const validation = runImportValidation(shipment, relatedExport, authorisation, lines)
   if (validation.result === 'red') {
     return c.json({ error: 'Receipt blocked — validation has red results', validation }, 422)
   }
 
-  // Devices must all still be EXPORTED_UNDER_OPR (returns don't move
-  // status while DRAFT, so anything else means out-of-band mutation).
+  // Devices must all still be at the export-side status matching this
+  // shipment's shipment_type (returns don't move status while DRAFT, so
+  // anything else means out-of-band mutation). Diverges by type exactly
+  // as the add-to-return-consignment precondition does.
+  const expectedExportedStatus = shipment.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'TEMP_EXPORTED_STANDARD' : 'EXPORTED_UNDER_OPR'
   const deviceIds = lines.map(l => l.received_device_id)
   for (const deviceId of deviceIds) {
     const d = await c.env.DB.prepare('SELECT status FROM received_devices WHERE id = ?')
       .bind(deviceId).first<{ status: DeviceStatus }>()
-    if (!d || d.status !== 'EXPORTED_UNDER_OPR') {
-      return c.json({ error: `Device ${deviceId} is ${d?.status ?? 'missing'} — every device on the return must be EXPORTED_UNDER_OPR to receive` }, 409)
+    if (!d || d.status !== expectedExportedStatus) {
+      return c.json({ error: `Device ${deviceId} is ${d?.status ?? 'missing'} — every device on the return must be ${expectedExportedStatus} to receive` }, 409)
     }
   }
 
   const upd = await c.env.DB.prepare(
     `UPDATE shipments SET status = 'FINALISED', import_mrn = COALESCE(?, import_mrn),
-       finalised_at = CURRENT_TIMESTAMP, finalised_by_user_id = ?, updated_at = CURRENT_TIMESTAMP
+       finalised_at = COALESCE(?, CURRENT_TIMESTAMP), finalised_by_user_id = ?, updated_at = CURRENT_TIMESTAMP
      WHERE id = ? AND organisation_id = ? AND status = 'DRAFT'`
-  ).bind(mrn.value, user.id, id, user.organisation_id).run()
+  ).bind(mrn.value, finalisedAt, user.id, id, user.organisation_id).run()
   if (!upd.meta.changes) {
     return c.json({ error: 'Shipment was modified concurrently — reload and retry' }, 409)
   }
 
+  // Finalise-time (receipt) transition diverges by shipment_type, mirroring
+  // the export-finalise divergence above.
+  const returnTarget = shipment.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'RETURNED_UNDER_STANDARD' : 'RETURNED_UNDER_OPR'
   for (const deviceId of deviceIds) {
-    await transitionDevice(c.env.DB, deviceId, 'RETURNED_UNDER_OPR', {
+    await transitionDevice(c.env.DB, deviceId, returnTarget, {
       user,
       reference: shipment.reference,
       metadata: { shipment_id: id, import_mrn: mrn.value, related_export_shipment_id: shipment.related_export_shipment_id },
@@ -1167,6 +1224,18 @@ app.post('/shipments/:id/finalise', async (c) => {
   const mucr = cleanProofRef(body.mucr, 'mucr')
   if (!mucr.ok) return c.json({ error: mucr.error }, 422)
 
+  // finalised_at is body-suppliable/backdatable (this sprint), same
+  // validation pattern as the import path above / shipment_replies.received_at.
+  let finalisedAt: string | null = null
+  if (body.finalised_at !== undefined && body.finalised_at !== null && body.finalised_at !== '') {
+    if (typeof body.finalised_at !== 'string' || !isValidIsoDate(body.finalised_at.slice(0, 10))) {
+      return c.json({ error: 'finalised_at must be an ISO date/datetime' }, 422)
+    }
+    const nowIso = new Date().toISOString()
+    if (body.finalised_at > nowIso) return c.json({ error: 'finalised_at cannot be in the future' }, 422)
+    finalisedAt = body.finalised_at
+  }
+
   // The gate: any red check blocks finalisation. Ambers pass but are
   // returned so the caller can surface them.
   const validation = runExportValidation(shipment, authorisation, lines)
@@ -1194,15 +1263,19 @@ app.post('/shipments/:id/finalise', async (c) => {
   const upd = await c.env.DB.prepare(
     `UPDATE shipments SET status = 'FINALISED', export_mrn = COALESCE(?, export_mrn),
        ducr = COALESCE(?, ducr), ead_mrn = COALESCE(?, ead_mrn), mucr = COALESCE(?, mucr),
-       finalised_at = CURRENT_TIMESTAMP, finalised_by_user_id = ?, updated_at = CURRENT_TIMESTAMP
+       finalised_at = COALESCE(?, CURRENT_TIMESTAMP), finalised_by_user_id = ?, updated_at = CURRENT_TIMESTAMP
      WHERE id = ? AND organisation_id = ? AND status = 'DRAFT'`
-  ).bind(mrn.value, ducr.value, ead.value, mucr.value, user.id, id, user.organisation_id).run()
+  ).bind(mrn.value, ducr.value, ead.value, mucr.value, finalisedAt, user.id, id, user.organisation_id).run()
   if (!upd.meta.changes) {
     return c.json({ error: 'Shipment was modified concurrently — reload and retry' }, 409)
   }
 
+  // Finalise-time transition diverges by shipment_type: OPR_REPAIR ->
+  // EXPORTED_UNDER_OPR, TEMP_EXPORT_STANDARD -> TEMP_EXPORTED_STANDARD.
+  // IN_EXPORT_CONSIGNMENT (checked above) was the shared precursor for both.
+  const exportTarget = shipment.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'TEMP_EXPORTED_STANDARD' : 'EXPORTED_UNDER_OPR'
   for (const deviceId of deviceIds) {
-    await transitionDevice(c.env.DB, deviceId, 'EXPORTED_UNDER_OPR', {
+    await transitionDevice(c.env.DB, deviceId, exportTarget, {
       user,
       reference: shipment.reference,
       metadata: { shipment_id: id, export_mrn: mrn.value },
