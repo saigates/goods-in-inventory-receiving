@@ -2,18 +2,57 @@
 // (approved draft list #15–37, see docs/plan/device-lifecycle-slice1.md
 // section "Test plan", C. and D., renumbered to insert four net-new items:
 // #22 QC-FAILED-needs-reason, #28 no-generic-HOLD, #37 ERP-webhook-absent,
-// and #25a–#25f (added 2026-08-11; #25f added later the same day after
-// production catalogue analysis surfaced the 4-segment colour-code SKU
-// shape) — six failing-path tests for gate condition 6 (SKU grade-suffix
-// parsing). #24/#25 only ever exercised the ACCEPT path for condition 6
-// (fixture default grade is '-A', which never trips the reject branch) —
-// a green suite around an untriggered branch proves the branch didn't
-// break anything, not that it works. #25a–#25f force the reject branch
-// itself, with assertions that check the *parsed* grade (or, for #25f,
-// the distinct "no grade segment" wording) appears in the error message
-// (not just any 409), so a hardcoded or fixed-position-parsed
-// implementation would fail these even though it might satisfy a looser
-// assertion.
+// and #25a/#25b (originally #25a–#25f, added 2026-08-11 against a
+// SKU-suffix-parsing implementation of gate condition 6; REWRITTEN
+// 2026-08-12 — see "Regrade-fix 1 superseded the SKU-suffix reject-path
+// tests" below for why four of the original six were deleted rather than
+// fixed).
+
+// Regrade-fix 1 superseded the SKU-suffix reject-path tests (2026-08-12).
+//
+// Condition 6 (src/lib/repairWorkflow.ts:149–164) was rewritten this
+// sprint to read `received_devices.grade` directly instead of re-parsing
+// the SKU string's trailing hyphen segment. The original #25a–#25f were
+// written against the OLD (SKU-parsing) implementation and asserted
+// exact wording/behaviour of that parser: #25c (unrecognised 'X'
+// suffix), #25d (no-hyphen / trailing-hyphen SKU shapes), #25e (lowercase
+// suffix case-sensitivity) and #25f (4-segment colour-code SKU, "no grade
+// segment" wording) all target malformed/atypical *SKU-string* shapes —
+// a scenario the new implementation never inspects at all.
+//
+// These four are not just failing, they are asserting behaviour against
+// an input that can no longer even reach a check: the grade values those
+// tests fabricate ('X', '', no-segment, lowercase 'a') can never exist in
+// `received_devices.grade` in the first place, because that column is
+// CHECK-constrained to exactly 'A'|'B'|'C'|'UG' (migrations/0004, 0023
+// line 73) — any INSERT/UPDATE attempting one of those values fails at
+// the D1 layer before checkReadyForZohoGate ever runs. Confirmed via
+// grep: zero matches for SKU-suffix-parsing or "no grade segment" logic
+// anywhere under src/ — the old parser (including its 4-segment "no
+// grade segment" branch) was deleted outright, not left dead-but-present.
+// Also confirmed: no other endpoint anywhere in the codebase performs a
+// SKU-shape/suffix validity check, so there is no "catalogue-shape check
+// that runs somewhere else" to relocate these four tests onto.
+//
+// DECISION (mine, per explicit instruction to pick and state it): DELETE
+// #25c/#25d/#25e/#25f outright rather than keep them as a relocated
+// catalogue-shape check — there is nothing left in the application for
+// them to describe, and inventing a new SKU-shape-validation feature
+// solely to keep four tests green would be scope the owner never asked
+// for. #25a and #25b are RE-PURPOSED (not deleted) into two tests that
+// assert the real contract regrade-fix 1 introduced: the grade COLUMN is
+// authoritative even when it diverges from what the SKU's own suffix
+// would suggest (the exact scenario named in the condition-6 comment —
+// a device regraded via POST /api/inventory/grade after receipt, without
+// its SKU being renamed to match).
+//
+// #24/#25 (above, unchanged) only ever exercised the ACCEPT path for
+// condition 6 — a green suite around an untriggered branch proves the
+// branch didn't break anything, not that it works. #25a/#25b force the
+// reject branch and its converse accept branch, specifically via a
+// SKU/grade MISMATCH, so a naive implementation that fell back to
+// re-reading the SKU suffix (instead of the grade column) would fail
+// both.
 //
 // Group D (#30–37) status: SKIPPED for #30–36 (see the two describe.skip
 // blocks below) — Zoho batch generation/confirmation was never built and
@@ -114,7 +153,7 @@ function newImei(): string {
 // case.
 async function seedDevice(
   status: DeviceStatus,
-  opts: { sku?: string; organisationId?: number; model?: string } = {},
+  opts: { sku?: string; organisationId?: number; model?: string; grade?: string } = {},
 ): Promise<number> {
   const imei = newImei()
   const uuid = `repair-test-uuid-${imei}`
@@ -125,13 +164,18 @@ async function seedDevice(
   // gate-condition tests exercise the SKU/movement checks (4-5) rather
   // than failing on the earlier, unrelated model check.
   const model = opts.model ?? 'Galaxy S24'
+  // grade defaults to 'A' — condition 6 (regrade-fix 1, this sprint) reads
+  // received_devices.grade directly, not the SKU suffix, so the default
+  // must clear the gate rather than rely on the received_devices.grade
+  // column's own schema default ('UG', which condition 6 rejects).
+  const grade = opts.grade ?? 'A'
   const result = await db()
     .prepare(
       `INSERT INTO received_devices
-         (organisation_id, uuid, imei, sku, model, source, status)
-       VALUES (?, ?, ?, ?, ?, 'manual', ?)`
+         (organisation_id, uuid, imei, sku, model, grade, source, status)
+       VALUES (?, ?, ?, ?, ?, ?, 'manual', ?)`
     )
-    .bind(organisationId, uuid, imei, sku, model, status)
+    .bind(organisationId, uuid, imei, sku, model, grade, status)
     .run()
   return result.meta.last_row_id as number
 }
@@ -167,21 +211,6 @@ async function repairJobsFor(deviceId: number) {
 async function repairJobsCount(): Promise<number> {
   const row = await db().prepare('SELECT COUNT(*) AS n FROM repair_jobs').first<{ n: number }>()
   return row!.n
-}
-
-// Test-local sku_catalog row, for condition-6 tests that need a SKU with a
-// malformed/atypical grade suffix to exist in the catalog (so the device
-// clears condition 4's existence check and actually reaches condition 6 —
-// an unmapped SKU would be rejected by condition 4 first, per #25, and
-// would never exercise condition 6 at all).
-async function seedCatalogSku(sku: string, organisationId = 1): Promise<void> {
-  await db()
-    .prepare(
-      `INSERT OR IGNORE INTO sku_catalog (sku, brand, model, organisation_id)
-       VALUES (?, 'TESTBRAND', 'TESTMODEL', ?)`
-    )
-    .bind(sku, organisationId)
-    .run()
 }
 
 async function tokenFor(user: AuthUser) {
@@ -413,19 +442,25 @@ describe('C. repair workflow — scan-back and QC (#20–25, incl. NEW #22)', ()
   })
 })
 
-// Gate condition 6 (src/lib/repairWorkflow.ts:149–183) — reject-path tests.
-// #24 and #25 only ever exercise the ACCEPT side of condition 6 (fixture
-// default grade '-A' never trips it, and #25 is blocked by condition 4
-// before condition 6 is ever reached). None of the six tests below are
-// duplicates of #24/#25: each forces the reject branch itself and checks
-// something the accept-path tests cannot prove.
-describe('C. repair workflow — gate condition 6, SKU grade-suffix reject-path (#25a–#25e, NEW)', () => {
-  it('#25a QC PASSED with SKU grade suffix -UG → 409, error message names the parsed grade (UG), device stays IN_HOUSE_REPAIR', async () => {
-    // 'SAM-S26-256-CVT-UG' already exists in the migrated catalog
-    // (migrations/0017_catalog_case_normalize_and_expand.sql:357) — no
-    // test-local catalog insert needed, so this device clears condition 4
-    // and reaches condition 6.
-    const deviceId = await seedDevice('SORTING', { sku: 'SAM-S26-256-CVT-UG' })
+// Gate condition 6 (src/lib/repairWorkflow.ts:149–164) — grade-column
+// authority, reject and accept paths.
+//
+// #24 and #25 (above) only ever exercise the ACCEPT side of condition 6
+// with a fixture whose SKU and grade column happen to agree (both imply
+// grade 'A'). That proves the happy path works but not that the grade
+// COLUMN — rather than the SKU string — is what's actually being
+// checked. #25a and #25b force a SKU/grade MISMATCH specifically so a
+// regression back to SKU-suffix parsing (or a fixed-position parse of
+// the SKU) would fail them even though it might satisfy a looser
+// "any 409" assertion.
+describe('C. repair workflow — gate condition 6, grade-column authority (#25a–#25b, REWRITTEN 2026-08-12)', () => {
+  it('#25a device graded UG via the regrade endpoint, but its SKU still ends in -A → 409, error names the actual grade (UG), not the stale SKU suffix', async () => {
+    // Seed with a SKU whose suffix says '-A' (would pass under the old
+    // SKU-parsing implementation) but an explicit grade column of 'UG' —
+    // this is exactly the divergence the condition-6 comment names: a
+    // device regraded via POST /api/inventory/grade after receipt,
+    // without its SKU being renamed to match.
+    const deviceId = await seedDevice('SORTING', { sku: 'SAM-S26-256-CVT-A', grade: 'UG' })
     await api(`/api/devices/${deviceId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
     await api(`/api/devices/${deviceId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
 
@@ -435,55 +470,19 @@ describe('C. repair workflow — gate condition 6, SKU grade-suffix reject-path 
     })
     expect(res.status).toBe(409)
     const body = await res.json() as { error: string }
-    // Must name the GRADE FOUND ('UG'), not just mention "sku" or "grade"
-    // generically — this is what proves the parsed value, not a hardcoded
-    // string, reached the message.
+    // Must name the GRADE COLUMN value ('UG'), proving the column — not
+    // the SKU's '-A' suffix — was read.
     expect(body.error).toContain('UG')
 
     expect(await deviceStatus(deviceId)).toBe('IN_HOUSE_REPAIR')
   })
 
-  it('#25b seven-segment SKU: -A passes, identical SKU ending -UG fails — the only test that distinguishes last-segment parsing from fixed-position parsing', async () => {
-    // No naturally-occurring 7-segment SKU exists in the migrated catalog
-    // (longest -A-ending rows are 5-segment, e.g. 'SAM-ZFOLD7-512-SSH-A' —
-    // confirmed via grep) — a fixed-position parser (e.g. "always take
-    // index 4") could accidentally pass a 5-segment suite while being
-    // wrong on this shape. Both custom SKUs are inserted test-locally.
-    const passSku = 'APL-I17-PRO-MAX-256-BLK-A'
-    const failSku = 'APL-I17-PRO-MAX-256-BLK-UG'
-    await seedCatalogSku(passSku)
-    await seedCatalogSku(failSku)
-
-    const passId = await seedDevice('SORTING', { sku: passSku })
-    await api(`/api/devices/${passId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
-    await api(`/api/devices/${passId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
-    const passRes = await apiAs(MANAGER_USER, `/api/devices/${passId}/repair/qc`, {
-      method: 'POST',
-      body: JSON.stringify({ result: 'PASSED' }),
-    })
-    expect(passRes.status).toBe(200)
-    expect(await deviceStatus(passId)).toBe('READY_FOR_ZOHO')
-
-    const failId = await seedDevice('SORTING', { sku: failSku })
-    await api(`/api/devices/${failId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
-    await api(`/api/devices/${failId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
-    const failRes = await apiAs(MANAGER_USER, `/api/devices/${failId}/repair/qc`, {
-      method: 'POST',
-      body: JSON.stringify({ result: 'PASSED' }),
-    })
-    expect(failRes.status).toBe(409)
-    const failBody = await failRes.json() as { error: string }
-    expect(failBody.error).toContain('UG')
-    expect(await deviceStatus(failId)).toBe('IN_HOUSE_REPAIR')
-  })
-
-  it('#25c unrecognised grade suffix (X) → 409, rejected rather than silently treated as A', async () => {
-    // Normalisation happens at scan-in (src/lib/grade.ts#normalizeGrade),
-    // so an 'X' suffix reaching this gate means something upstream
-    // leaked — the gate must say so, not absorb it as a pass.
-    const sku = 'TESTBRAND-MODEL-100-BLK-X'
-    await seedCatalogSku(sku)
-    const deviceId = await seedDevice('SORTING', { sku })
+  it('#25b device graded A via the regrade endpoint, but its SKU still ends in -UG → 200/READY_FOR_ZOHO, the stale SKU suffix does not block it', async () => {
+    // Converse of #25a: SKU suffix says '-UG' (would fail under the old
+    // SKU-parsing implementation) but the grade column is explicitly
+    // 'A' — proves the column is authoritative in the ACCEPT direction
+    // too, not just the reject direction.
+    const deviceId = await seedDevice('SORTING', { sku: 'SAM-S26-256-CVT-UG', grade: 'A' })
     await api(`/api/devices/${deviceId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
     await api(`/api/devices/${deviceId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
 
@@ -491,111 +490,8 @@ describe('C. repair workflow — gate condition 6, SKU grade-suffix reject-path 
       method: 'POST',
       body: JSON.stringify({ result: 'PASSED' }),
     })
-    expect(res.status).toBe(409)
-    const body = await res.json() as { error: string }
-    expect(body.error).toContain('X')
-
-    expect(await deviceStatus(deviceId)).toBe('IN_HOUSE_REPAIR')
-  })
-
-  it('#25d no grade segment at all, and a SKU with no hyphen at all — both rejected (409) without throwing (no 500)', async () => {
-    // Trailing hyphen: split('-') puts an empty string in the final
-    // position — "no grade segment" is a real, distinct input shape from
-    // "wrong grade segment" and must not throw or fall through to a pass.
-    const noGradeSku = 'TESTBRAND-MODEL-100-BLK-'
-    await seedCatalogSku(noGradeSku)
-    const noGradeId = await seedDevice('SORTING', { sku: noGradeSku })
-    await api(`/api/devices/${noGradeId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
-    await api(`/api/devices/${noGradeId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
-    const noGradeRes = await apiAs(MANAGER_USER, `/api/devices/${noGradeId}/repair/qc`, {
-      method: 'POST',
-      body: JSON.stringify({ result: 'PASSED' }),
-    })
-    expect(noGradeRes.status).toBe(409) // not 500 — proves split('-') on a
-    // trailing hyphen didn't throw and didn't fall through to a pass
-    expect(await deviceStatus(noGradeId)).toBe('IN_HOUSE_REPAIR')
-
-    // No hyphen at all: split('-') returns a single-element array, so
-    // "skuGrade" becomes the whole SKU string — must still be rejected,
-    // not throw on an out-of-bounds/undefined access.
-    const noHyphenSku = 'NOHYPHENSKUATALL'
-    await seedCatalogSku(noHyphenSku)
-    const noHyphenId = await seedDevice('SORTING', { sku: noHyphenSku })
-    await api(`/api/devices/${noHyphenId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
-    await api(`/api/devices/${noHyphenId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
-    const noHyphenRes = await apiAs(MANAGER_USER, `/api/devices/${noHyphenId}/repair/qc`, {
-      method: 'POST',
-      body: JSON.stringify({ result: 'PASSED' }),
-    })
-    expect(noHyphenRes.status).toBe(409) // not 500
-    expect(await deviceStatus(noHyphenId)).toBe('IN_HOUSE_REPAIR')
-  })
-
-  it('#25e lowercase grade suffix (a) → 409, rejected — DECISION: condition 6 is case-sensitive by design, unlike grade.ts#normalizeGrade', async () => {
-    // Decision (documented here, not inferred from whatever the code
-    // happened to do): condition 6 stays case-sensitive/strict. Two
-    // reasons, both from the actual code, not from convenience:
-    //   1. Condition 6's own stated intent is "rejected outright, not
-    //      defaulted to a pass/fail-safe value" (see the comment at
-    //      repairWorkflow.ts:149-161) — silently uppercasing a malformed
-    //      grade before that check would be exactly the kind of silent
-    //      default the condition exists to avoid.
-    //   2. No migration or insert-time hook anywhere normalises the `sku`
-    //      column's case (confirmed: zero-match grep for
-    //      "UPPER(sku)|SET sku" across migrations/*.sql) — a lowercase 'a'
-    //      reaching this gate indicates an upstream anomaly (bad manual
-    //      entry, bad import) that deserves investigation, not silent
-    //      accept. This is the opposite purpose from grade.ts's
-    //      normalizeGrade(), which exists to canonicalise
-    //      HUMAN/SUPPLIER-entered grades on the way IN, at scan-time —
-    //      not to validate the catalogue's authoritative, already-clean
-    //      SKU string on the way OUT to Zoho.
-    const sku = 'TESTBRAND-MODEL-100-BLK-a'
-    await seedCatalogSku(sku)
-    const deviceId = await seedDevice('SORTING', { sku })
-    await api(`/api/devices/${deviceId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
-    await api(`/api/devices/${deviceId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
-
-    const res = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/qc`, {
-      method: 'POST',
-      body: JSON.stringify({ result: 'PASSED' }),
-    })
-    expect(res.status).toBe(409)
-    const body = await res.json() as { error: string }
-    expect(body.error).toContain('a')
-
-    expect(await deviceStatus(deviceId)).toBe('IN_HOUSE_REPAIR')
-  })
-
-  it('#25f four-segment SKU ending in a colour code → 409, error says "no grade segment", does NOT name the colour as a grade', async () => {
-    // Real production shape, not synthetic: production's live sku_catalog
-    // (confirmed via gsk hosted d1_query against all 2781 rows) has 9
-    // SKUs that are exactly 4 segments — brand-model-capacity-colour,
-    // e.g. 'SMSG-S24-256-PBK' — with NO grade segment at all. Before this
-    // test, the generic reject branch below would have caught these too,
-    // but with a misleading message ("...has grade 'PBK'...") that
-    // implies PBK is a recognised-but-wrong grade value, when the real
-    // problem is there is no grade position on this SKU shape to begin
-    // with. This test locks in the distinct wording and proves the
-    // colour code itself is never quoted as if it were a grade.
-    const sku = 'SMSG-S24-256-PBK'
-    await seedCatalogSku(sku)
-    const deviceId = await seedDevice('SORTING', { sku })
-    await api(`/api/devices/${deviceId}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
-    await api(`/api/devices/${deviceId}/repair/scan-back`, { method: 'POST', body: JSON.stringify({}) })
-
-    const res = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/qc`, {
-      method: 'POST',
-      body: JSON.stringify({ result: 'PASSED' }),
-    })
-    expect(res.status).toBe(409)
-    const body = await res.json() as { error: string }
-    expect(body.error.toLowerCase()).toContain('no grade segment')
-    // Must NOT read as "has grade 'PBK'" — the colour code must never be
-    // presented as if it were a (merely invalid) grade value.
-    expect(body.error).not.toContain(`has grade 'PBK'`)
-
-    expect(await deviceStatus(deviceId)).toBe('IN_HOUSE_REPAIR')
+    expect(res.status).toBe(200)
+    expect(await deviceStatus(deviceId)).toBe('READY_FOR_ZOHO')
   })
 })
 
