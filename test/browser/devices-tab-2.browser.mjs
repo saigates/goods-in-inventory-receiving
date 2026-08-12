@@ -1,0 +1,239 @@
+// Browser-UI verification for the four device-lifecycle surfaces beyond
+// script 1: QC Failed, Ready for Zoho, Removal Flags (via the REAL
+// regrade-to-UG-while-ACTIVE_INVENTORY path, not a direct DB insert), and
+// BulkTransitionModal's mixed-outcome batch.
+//
+// Self-contained: seeds its own devices via the real API (manual receive +
+// transitions + repair/start + repair/qc), so this script has no
+// dependency on any external DB state. Same seed-and-clean pattern as
+// script 1 / temp-export-standard-lifecycle.mjs.
+//
+// IMEI namespace: 8604559 (next free after ...8604557 temp-export-standard,
+// 8604558 devices-tab-check).
+import { chromium } from 'playwright'
+
+const BASE = process.env.BASE || 'http://localhost:3000'
+let failures = 0
+function check(name, cond, detail = '') {
+  if (!cond) failures++
+  console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`)
+}
+function luhnDigit(b) {
+  let s = 0
+  for (let i = 0; i < 14; i++) {
+    let d = Number(b[i])
+    if (i % 2 === 1) { d *= 2; if (d > 9) d -= 9 }
+    s += d
+  }
+  return String((10 - (s % 10)) % 10)
+}
+const mkImei = (n) => {
+  const body = ('8604559' + String(Date.now() % 1000000).padStart(6, '0').slice(0, 5) + String(n).padStart(2, '0')).slice(0, 14)
+  return body + luhnDigit(body)
+}
+const IMEI_QC_FAILED = mkImei(1)      // driven to QC_FAILED via repair/start + repair/qc(FAILED)
+const IMEI_READY_ZOHO = mkImei(2)     // driven to READY_FOR_ZOHO via repair/start + repair/qc(PASSED)
+const IMEI_REGRADE_SRC = mkImei(3)    // ACTIVE_INVENTORY, regraded to UG through the real UI -> generates a removal flag
+const IMEI_BULK_LEGAL = mkImei(4)     // SORTING -> ACTIVE_INVENTORY: legal
+const IMEI_BULK_TARGET = mkImei(5)    // ACTIVE_INVENTORY already -> illegal self-transition (ALLOWED_TRANSITIONS['ACTIVE_INVENTORY']=[])
+const IMEI_BULK_ILLEGAL = mkImei(6)   // RECEIVED -> ACTIVE_INVENTORY: illegal for the map
+
+const tok = (await (await fetch(`${BASE}/api/auth/login`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ email: 'owner@saigates.com', password: 'local-owner-testpw' }),
+})).json()).token
+if (!tok) { console.log('BOOTSTRAP FAIL: no token — password_hash not applied?'); process.exit(2) }
+const api = async (method, path, body) => {
+  const r = await fetch(`${BASE}/api${path}`, {
+    method, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  return { status: r.status, data: await r.json().catch(() => null) }
+}
+const fail = (label, res) => { console.log('BOOTSTRAP FAIL', label, res.status, JSON.stringify(res.data)); process.exit(2) }
+const receiveDevice = async (imei, model, grade = 'A') => {
+  const rcv = await api('POST', '/scan/manual', {
+    imei, sku: 'SAM-S26-256-CVT-A', brand: 'Samsung', model, capacity: '256GB', grade,
+    buy_price: 120.0, currency: 'GBP', vat_type: 'margin', auto_print: false,
+  })
+  if (rcv.status !== 200 && rcv.status !== 201) fail(`receive ${imei}`, rcv)
+  return rcv.data.received?.id ?? rcv.data.device?.id ?? rcv.data.id
+}
+const transition = async (id, to, label) => {
+  const t = await api('POST', `/devices/${id}/transition`, { to_status: to })
+  if (t.status !== 200) fail(label || `transition ${id} -> ${to}`, t)
+}
+
+// QC_FAILED device: receive -> SORTING -> repair/start -> repair/qc(FAILED, reason)
+const qcFailedId = await receiveDevice(IMEI_QC_FAILED, 'Galaxy S26 (qc-failed test)')
+await transition(qcFailedId, 'SORTING')
+{
+  const start = await api('POST', `/devices/${qcFailedId}/repair/start`, { fault_code: 'Camera not focusing' })
+  if (start.status !== 201) fail('repair/start qcFailed', start)
+  const back = await api('POST', `/devices/${qcFailedId}/repair/scan-back`, {})
+  if (back.status !== 200) fail('scan-back qcFailed', back)
+  const qc = await api('POST', `/devices/${qcFailedId}/repair/qc`, { result: 'FAILED', reason: 'Camera still faulty after repair attempt' })
+  if (qc.status !== 200) fail('repair/qc FAILED', qc)
+}
+
+// READY_FOR_ZOHO device: receive (grade A, so it clears the gate) -> SORTING -> repair/start -> repair/qc(PASSED)
+const readyZohoId = await receiveDevice(IMEI_READY_ZOHO, 'Galaxy S26 (ready-zoho test)')
+await transition(readyZohoId, 'SORTING')
+{
+  const start = await api('POST', `/devices/${readyZohoId}/repair/start`, { fault_code: 'Battery swelling' })
+  if (start.status !== 201) fail('repair/start readyZoho', start)
+  const back = await api('POST', `/devices/${readyZohoId}/repair/scan-back`, {})
+  if (back.status !== 200) fail('scan-back readyZoho', back)
+  const qc = await api('POST', `/devices/${readyZohoId}/repair/qc`, { result: 'PASSED' })
+  if (qc.status !== 200) fail('repair/qc PASSED', qc)
+}
+
+// Regrade-source device: receive -> SORTING -> ACTIVE_INVENTORY (regrade to UG done via the UI, not the API, so the flag is generated by the real path exercised in-browser)
+const regradeSrcId = await receiveDevice(IMEI_REGRADE_SRC, 'Galaxy S26 (regrade test)')
+await transition(regradeSrcId, 'SORTING')
+await transition(regradeSrcId, 'ACTIVE_INVENTORY')
+
+// Bulk-transition trio
+const bulkLegalId = await receiveDevice(IMEI_BULK_LEGAL, 'Galaxy S26 (bulk legal)')
+await transition(bulkLegalId, 'SORTING')
+const bulkTargetId = await receiveDevice(IMEI_BULK_TARGET, 'Galaxy S26 (bulk target)')
+await transition(bulkTargetId, 'SORTING')
+await transition(bulkTargetId, 'ACTIVE_INVENTORY')
+const bulkIllegalId = await receiveDevice(IMEI_BULK_ILLEGAL, 'Galaxy S26 (bulk illegal)')
+// bulkIllegalId stays at RECEIVED — illegal target for ACTIVE_INVENTORY per ALLOWED_TRANSITIONS
+
+const allIds = [qcFailedId, readyZohoId, regradeSrcId, bulkLegalId, bulkTargetId, bulkIllegalId]
+console.log(`bootstrap device ids: qcFailed=${qcFailedId} readyZoho=${readyZohoId} regradeSrc=${regradeSrcId} bulkLegal=${bulkLegalId} bulkTarget=${bulkTargetId} bulkIllegal=${bulkIllegalId}`)
+
+const browser = await chromium.launch()
+const page = await browser.newPage()
+const consoleErrors = []
+page.on('console', (msg) => { if (msg.type() === 'error') consoleErrors.push(msg.text()) })
+page.on('pageerror', (err) => consoleErrors.push('pageerror: ' + err.message))
+
+await page.goto(BASE, { waitUntil: 'domcontentloaded' })
+await page.waitForSelector('#login-email', { timeout: 15000 })
+await page.fill('#login-email', 'owner@saigates.com')
+await page.fill('#login-password', 'local-owner-testpw')
+await page.click('#login-submit')
+await page.waitForSelector('.tab-btn', { timeout: 15000 })
+check('login succeeds and app shell loads', await page.isVisible('.tab-btn'))
+
+await page.click('.tab-btn:has-text("Devices")')
+await page.waitForSelector('h1:has-text("Devices")', { timeout: 8000 })
+
+// ───────── 1. QC Failed sub-view ─────────
+await page.click('button:has-text("QC Failed")')
+await page.waitForTimeout(500)
+let bodyText = await page.textContent('body')
+check('QC Failed shows seeded device', bodyText.includes(IMEI_QC_FAILED))
+const qcRow = page.locator('tr', { hasText: IMEI_QC_FAILED })
+const qcRowGradeText = await qcRow.innerText().catch(() => '')
+check('QC Failed row shows grade A', /\bA\b/.test(qcRowGradeText), qcRowGradeText)
+const gotoRepairBtn = qcRow.locator('button:has-text("Go to Repair Queue")')
+check('QC Failed row has "Go to Repair Queue" shortcut', await gotoRepairBtn.count() > 0)
+if (await gotoRepairBtn.count() > 0) {
+  await gotoRepairBtn.click()
+  await page.waitForTimeout(500)
+  const repairBody = await page.textContent('body')
+  check('shortcut navigates to Repair Queue and shows the same device', repairBody.includes(IMEI_QC_FAILED) && repairBody.includes('Camera not focusing'))
+}
+
+// ───────── 2. Ready for Zoho sub-view ─────────
+await page.click('.tab-btn:has-text("Devices")')
+await page.waitForTimeout(300)
+await page.click('button:has-text("Ready for Zoho")')
+await page.waitForTimeout(500)
+bodyText = await page.textContent('body')
+check('Ready for Zoho shows seeded device', bodyText.includes(IMEI_READY_ZOHO))
+check('Ready for Zoho row is read-only (no action buttons in that row)', (await page.locator('tr', { hasText: IMEI_READY_ZOHO }).locator('button').count()) === 0)
+
+// ───────── 3. Removal Flags — generate the flag via the REAL regrade path ─────────
+await page.click('.tab-btn:has-text("Inventory")')
+await page.waitForSelector('input[placeholder*="Search"]', { timeout: 8000 })
+await page.fill('input[placeholder*="Search"]', IMEI_REGRADE_SRC)
+await page.waitForTimeout(700)
+let invBody = await page.textContent('body')
+check('Inventory search finds the seeded ACTIVE_INVENTORY regrade-source device', invBody.includes(IMEI_REGRADE_SRC))
+
+const invRow = page.locator('tr', { hasText: IMEI_REGRADE_SRC })
+const gradeSelectEl = invRow.locator('select').first()
+check('regrade-source device row has a grade <select>', await gradeSelectEl.count() > 0)
+if (await gradeSelectEl.count() > 0) {
+  await gradeSelectEl.selectOption('UG')
+  await page.waitForTimeout(1000)
+  const toastTexts = await page.locator('.toast').allInnerTexts()
+  check('regrade toast confirms A -> Ungraded/UG', toastTexts.some(t => t.includes(IMEI_REGRADE_SRC) && /UG|Ungraded/.test(t)), toastTexts.join(' | '))
+}
+
+await page.click('.tab-btn:has-text("Devices")')
+await page.waitForTimeout(300)
+await page.click('button:has-text("Removal Flags")')
+await page.waitForTimeout(600)
+let flagsBody = await page.textContent('body')
+check('Removal Flags sub-view shows the flag generated by the real regrade action', flagsBody.includes(IMEI_REGRADE_SRC))
+check('Removal Flags shows the regrade reason', flagsBody.toLowerCase().includes('regrade_to_ug_while_active_inventory') || flagsBody.toLowerCase().includes('regrade'))
+
+const flagRow = page.locator('tr', { hasText: IMEI_REGRADE_SRC })
+const resolveBtn = flagRow.locator('button:has-text("Resolve")')
+check('flag row has a Resolve button', await resolveBtn.count() > 0)
+if (await resolveBtn.count() > 0) {
+  page.once('dialog', (d) => d.accept('Verified via browser-UI check, pulling for review'))
+  await resolveBtn.click()
+  await page.waitForTimeout(1000)
+  const toastTexts2 = await page.locator('.toast').allInnerTexts()
+  check('resolve toast confirms', toastTexts2.some(t => t.includes(IMEI_REGRADE_SRC) && t.toLowerCase().includes('resolved')), toastTexts2.join(' | '))
+  // Wait out the toast (default 2500ms) so the check below reads the table,
+  // not a still-visible toast that happens to also contain the IMEI text.
+  await page.waitForTimeout(2000)
+  const bodyAfterResolve = await page.locator('.card').innerText()
+  check('resolved flag disappears from default (open-only) view', !bodyAfterResolve.includes(IMEI_REGRADE_SRC))
+  // toggle "Show resolved" and confirm it reappears with a resolved badge
+  await page.click('text=Show resolved')
+  await page.waitForTimeout(600)
+  const bodyShowResolved = await page.textContent('body')
+  check('"Show resolved" reveals the resolved flag', bodyShowResolved.includes(IMEI_REGRADE_SRC))
+}
+
+// ───────── 4. BulkTransitionModal — mixed outcome batch ─────────
+// bulkLegal (SORTING) -> ACTIVE_INVENTORY: legal, should transition.
+// bulkTarget (ACTIVE_INVENTORY) -> ACTIVE_INVENTORY: already in target,
+//   ALLOWED_TRANSITIONS['ACTIVE_INVENTORY'] = [] so this is an illegal
+//   self-transition -> expect 'skipped'.
+// bulkIllegal (RECEIVED) -> ACTIVE_INVENTORY: RECEIVED can only go to
+//   SORTING/REJECTED -> illegal for the map -> expect 'skipped'.
+await page.click('button:has-text("All Devices")')
+await page.waitForTimeout(500)
+await page.click('button:has-text("Bulk transition by scan")')
+await page.waitForSelector('text=Bulk transition by scan', { timeout: 8000 })
+check('Bulk transition modal opens', await page.isVisible('#bulk-transition-textarea'))
+
+await page.selectOption('.modal select', 'ACTIVE_INVENTORY')
+await page.fill('#bulk-transition-textarea', `${IMEI_BULK_LEGAL}\n${IMEI_BULK_TARGET}\n${IMEI_BULK_ILLEGAL}`)
+await page.click('#bulk-transition-run-btn')
+await page.waitForTimeout(1500)
+const modalBody = await page.textContent('.modal')
+const toastTexts3 = await page.locator('.toast').allInnerTexts()
+check('mixed-batch run toast reports 1 transitioned, 2 not', toastTexts3.some(t => /1 transitioned/.test(t) && /2 not/.test(t)), toastTexts3.join(' | '))
+check('modal results panel lists all three IMEIs', modalBody.includes(IMEI_BULK_LEGAL) && modalBody.includes(IMEI_BULK_TARGET) && modalBody.includes(IMEI_BULK_ILLEGAL))
+check('modal shows a "transitioned" badge and at least one "skipped" badge', modalBody.includes('transitioned') && modalBody.includes('skipped'))
+// Per-row outcome check: each result row is a flex div containing the badge + the IMEI <code>.
+const resultRowFor = (imei) => page.locator('.modal .max-h-64 > div', { hasText: imei })
+const legalRowText = await resultRowFor(IMEI_BULK_LEGAL).innerText().catch(() => '')
+const targetRowText = await resultRowFor(IMEI_BULK_TARGET).innerText().catch(() => '')
+const illegalRowText = await resultRowFor(IMEI_BULK_ILLEGAL).innerText().catch(() => '')
+check('legal-transition IMEI (SORTING->ACTIVE_INVENTORY) row says "transitioned"', legalRowText.includes('transitioned'), legalRowText)
+check('already-in-target IMEI row says "skipped"', targetRowText.includes('skipped'), targetRowText)
+check('illegal-for-map IMEI (RECEIVED->ACTIVE_INVENTORY) row says "skipped"', illegalRowText.includes('skipped'), illegalRowText)
+
+await page.click('.modal button:has-text("Close")').catch(async () => { await page.keyboard.press('Escape').catch(() => {}) })
+
+check('no console errors observed during the whole run', consoleErrors.length === 0, consoleErrors.join(' || '))
+
+await browser.close()
+
+console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : failures + ' CHECK(S) FAILED'}`)
+console.log(`CLEANUP_HINT device_ids=${allIds.join(',')}`)
+const imeiList = [IMEI_QC_FAILED, IMEI_READY_ZOHO, IMEI_REGRADE_SRC, IMEI_BULK_LEGAL, IMEI_BULK_TARGET, IMEI_BULK_ILLEGAL].map(i => `'${i}'`).join(',')
+console.log(`Cleanup (respecting FK order): DELETE FROM device_events WHERE device_id IN (${allIds.join(',')}); DELETE FROM removal_flags WHERE received_device_id IN (${allIds.join(',')}); DELETE FROM repair_jobs WHERE device_id IN (${allIds.join(',')}); DELETE FROM scan_events WHERE imei IN (${imeiList}); DELETE FROM received_devices WHERE id IN (${allIds.join(',')});`)
+process.exit(failures === 0 ? 0 : 1)
