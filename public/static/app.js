@@ -101,6 +101,19 @@
     oprFinaliseOpen: false,      // finalise modal (export MRN capture)
     oprDraftDoc: null,           // { kind: 'prealert'|'clearance', data } text-draft panel
     oprBusy: false,              // in-flight guard for OPR mutations
+    // ───── Devices tab (status-movement / repair queue / QC / removal flags) ─────
+    devicesSubview: 'all',       // 'all' | 'repair' | 'qc-failed' | 'ready-zoho' | 'removal-flags'
+    deviceStatuses: null,        // { statuses, transitions } from GET /api/devices/meta/statuses
+    devicesAll: [],              // GET /api/devices?status=... rows for the current filter (All Devices sub-view)
+    devicesAllFilter: '',        // status filter for All Devices ('' = no filter, show a curated default set)
+    devicesAllSearch: '',        // q= search box for All Devices
+    repairQueue: [],             // GET /api/devices/repair-queue rows
+    qcFailedDevices: [],         // GET /api/devices?status=QC_FAILED
+    readyForZohoDevices: [],     // GET /api/devices?status=READY_FOR_ZOHO
+    removalFlags: [],            // GET /api/inventory/removal-flags
+    removalFlagsShowResolved: false,
+    devicesBusy: false,          // in-flight guard for device-lifecycle mutations
+    bulkTransitionOpen: false,   // bulk-transition-by-scan modal visibility
   };
   function setLabelSize(v) { state.labelSize = v; localStorage.setItem('labelSize.v2', v); }
   function setLabelRotate(on) { state.labelRotate = !!on; localStorage.setItem('labelRotate.v1', on ? '1' : '0'); }
@@ -284,6 +297,48 @@
     state.oprDischarge = await api.get('/opr/discharge');
   }
 
+  // ───── Devices tab refreshers ─────
+  async function refreshDeviceStatuses() {
+    if (state.deviceStatuses) return; // static for the session — fetch once
+    state.deviceStatuses = await api.get('/devices/meta/statuses');
+  }
+  // Curated default status set for "All Devices" when no explicit filter is
+  // chosen — the generic-transition-eligible statuses (excludes the
+  // OPR/repair-workflow-only statuses, which have their own sub-views/tabs,
+  // and terminal SOLD/REJECTED, which have nowhere left to go).
+  const ALL_DEVICES_DEFAULT_STATUSES = ['RECEIVED', 'SORTING', 'ACTIVE_INVENTORY', 'READY_FOR_EXPORT'];
+  async function refreshDevicesAll() {
+    const statusParam = state.devicesAllFilter || ALL_DEVICES_DEFAULT_STATUSES.join(',');
+    const params = new URLSearchParams({ status: statusParam, page_size: '200' });
+    if (state.devicesAllSearch) params.set('q', state.devicesAllSearch);
+    const r = await api.get(`/devices?${params.toString()}`);
+    state.devicesAll = r.devices || [];
+  }
+  async function refreshRepairQueue() {
+    const r = await api.get('/devices/repair-queue');
+    state.repairQueue = r.devices || [];
+  }
+  async function refreshQcFailedDevices() {
+    const r = await api.get('/devices?status=QC_FAILED&page_size=200');
+    state.qcFailedDevices = r.devices || [];
+  }
+  async function refreshReadyForZohoDevices() {
+    const r = await api.get('/devices?status=READY_FOR_ZOHO&page_size=200');
+    state.readyForZohoDevices = r.devices || [];
+  }
+  async function refreshRemovalFlags() {
+    const r = await api.get(`/inventory/removal-flags?resolved=${state.removalFlagsShowResolved ? '1' : '0'}`);
+    state.removalFlags = r.removal_flags || [];
+  }
+  async function refreshDevicesSubview() {
+    await refreshDeviceStatuses();
+    if (state.devicesSubview === 'all') await refreshDevicesAll();
+    else if (state.devicesSubview === 'repair') await refreshRepairQueue();
+    else if (state.devicesSubview === 'qc-failed') await refreshQcFailedDevices();
+    else if (state.devicesSubview === 'ready-zoho') await refreshReadyForZohoDevices();
+    else if (state.devicesSubview === 'removal-flags') await refreshRemovalFlags();
+  }
+
   // ───────── Layout / Shell ─────────
   function render() {
     const root = $('#app');
@@ -428,6 +483,7 @@
         : state.view === 'inventory' ? InventoryView()
         : state.view === 'catalog' ? CatalogView()
         : state.view === 'print' ? PrintView()
+        : state.view === 'devices' ? DevicesView()
         : state.view === 'opr' ? OprView()
         : state.view === 'settings' ? SettingsView()
         : h('div', {}, 'Not found')
@@ -442,6 +498,7 @@
       state.oprNewOpen ? OprNewShipmentModal() : null,
       state.oprFinaliseOpen ? OprFinaliseModal() : null,
       state.oprDraftDoc ? OprDraftDocModal() : null,
+      state.bulkTransitionOpen ? BulkTransitionModal() : null,
     );
   }
 
@@ -471,6 +528,7 @@
           Tab('inventory', 'Inventory', 'warehouse'),
           Tab('catalog', 'Catalog', 'tags'),
           Tab('print', 'Print Queue', 'print'),
+          Tab('devices', 'Devices', 'mobile-screen-button'),
           Tab('opr', 'OPR', 'plane-departure'),
           Tab('settings', 'Settings', 'gear'),
         ),
@@ -525,6 +583,7 @@
     else if (v === 'inventory') refreshInventory().then(render);
     else if (v === 'catalog') refreshCatalog().then(render);
     else if (v === 'print') refreshPrint().then(render);
+    else if (v === 'devices') refreshDevicesSubview().then(render);
     else if (v === 'opr') refreshOprAll().then(render);
     else if (v === 'settings') refreshSettings().then(render);
     render();
@@ -550,6 +609,455 @@
       : h('span', { class: 'badge badge-violet' }, h('i', { class: 'fas fa-plane-arrival mr-1' }), 'import');
   }
   const fmtMoney = (v, cur) => `${cur || 'GBP'} ${Number(v || 0).toFixed(2)}`;
+
+  // ───────── Devices (status-movement / repair queue / QC / removal flags) ─────────
+  // One Topbar tab, five sub-views (2026-08-12 placement decision — not five
+  // separate tabs). TEMP_EXPORT_STANDARD screens live under the OPR tab
+  // instead (reusing OprView's consignment UI), not here.
+  function isManagerOrAdmin() {
+    const role = state.authUser && state.authUser.role;
+    return role === 'manager' || role === 'admin';
+  }
+  function deviceStatusBadge(s) {
+    const cls = {
+      RECEIVED: 'badge-slate', SORTING: 'badge-slate', ACTIVE_INVENTORY: 'badge-green',
+      IN_HOUSE_REPAIR: 'badge-amber', QC_FAILED: 'badge-red', READY_FOR_ZOHO: 'badge-cyan',
+      READY_FOR_EXPORT: 'badge-violet', SOLD: 'badge-green', REJECTED: 'badge-red',
+    }[s] || 'badge-slate';
+    return h('span', { class: `badge ${cls} text-[10px]` }, s);
+  }
+  function deviceLabel(d) {
+    return [d.brand, d.model].filter(Boolean).join(' ') || d.sku || '—';
+  }
+
+  function DevicesView() {
+    const SubTab = (id, label, icon) => h('button', {
+      class: 'btn text-sm ' + (state.devicesSubview === id ? 'btn-primary' : 'btn-ghost'),
+      onclick: () => { state.devicesSubview = id; refreshDevicesSubview().then(render); },
+    }, h('i', { class: `fas fa-${icon}` }), label);
+    return h('div', { class: 'space-y-5' },
+      h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
+        h('div', {},
+          h('h1', { class: 'text-2xl font-bold' }, 'Devices'),
+          h('p', { class: 'text-slate-400 text-sm' }, 'Status movement, in-house repair queue, QC and removal-flag review.')
+        ),
+        h('div', { class: 'flex items-center gap-2 flex-wrap' },
+          SubTab('all', 'All Devices', 'layer-group'),
+          SubTab('repair', 'Repair Queue', 'screwdriver-wrench'),
+          SubTab('qc-failed', 'QC Failed', 'triangle-exclamation'),
+          SubTab('ready-zoho', 'Ready for Zoho', 'cloud-arrow-up'),
+          SubTab('removal-flags', 'Removal Flags', 'flag'),
+        )
+      ),
+      state.devicesSubview === 'all' ? AllDevicesSubview()
+        : state.devicesSubview === 'repair' ? RepairQueueSubview()
+        : state.devicesSubview === 'qc-failed' ? QcFailedSubview()
+        : state.devicesSubview === 'ready-zoho' ? ReadyForZohoSubview()
+        : state.devicesSubview === 'removal-flags' ? RemovalFlagsSubview()
+        : null
+    );
+  }
+
+  // ─── All Devices — status + legal transitions ───
+  async function doTransition(device, toStatus) {
+    if (state.devicesBusy) return;
+    state.devicesBusy = true; render();
+    try {
+      await api.post(`/devices/${device.id}/transition`, { to_status: toStatus });
+      toast(`<span class="mono">${device.imei}</span> · ${device.status} → ${toStatus}`, 'ok');
+      await refreshDevicesSubview(); render();
+    } catch (err) {
+      toast(err.response?.data?.error || err.message, 'err', 5000);
+    } finally {
+      state.devicesBusy = false; render();
+    }
+  }
+  async function doStartRepair(device) {
+    const fault = prompt(`Fault code for ${device.imei} (${deviceLabel(device)}):`);
+    if (fault == null) return; // cancelled
+    if (!fault.trim()) { toast('Fault code is required', 'warn'); return; }
+    try {
+      await api.post(`/devices/${device.id}/repair/start`, { fault_code: fault.trim() });
+      toast(`<span class="mono">${device.imei}</span> sent to in-house repair`, 'ok');
+      await refreshDevicesSubview(); render();
+    } catch (err) {
+      toast(err.response?.data?.error || err.message, 'err', 5000);
+    }
+  }
+
+  function AllDevicesSubview() {
+    const statuses = (state.deviceStatuses && state.deviceStatuses.statuses) || [];
+    const transitions = (state.deviceStatuses && state.deviceStatuses.transitions) || {};
+    const REPAIR_STARTABLE = ['SORTING', 'ACTIVE_INVENTORY'];
+
+    return h('div', { class: 'space-y-4' },
+      h('div', { class: 'flex items-center gap-2 flex-wrap' },
+        h('select', {
+          class: 'input text-sm w-auto',
+          onchange: (e) => { state.devicesAllFilter = e.target.value; refreshDevicesAll().then(render); },
+        },
+          h('option', { value: '', selected: !state.devicesAllFilter ? 'selected' : null }, 'Default (active statuses)'),
+          h('option', { value: statuses.join(','), selected: state.devicesAllFilter === statuses.join(',') ? 'selected' : null }, 'All statuses'),
+          statuses.map(s => h('option', { value: s, selected: state.devicesAllFilter === s ? 'selected' : null }, s)),
+        ),
+        h('input', {
+          class: 'input text-sm flex-1 max-w-xs', placeholder: 'Search IMEI / SKU / UUID',
+          value: state.devicesAllSearch,
+          oninput: (e) => { state.devicesAllSearch = e.target.value; refreshDevicesAll().then(render); },
+        }),
+        h('button', { class: 'btn btn-primary text-xs ml-auto', onclick: () => { state.bulkTransitionOpen = true; render(); } },
+          h('i', { class: 'fas fa-layer-group' }), 'Bulk transition by scan'),
+      ),
+      h('div', { class: 'card overflow-hidden' },
+        h('table', { class: 'w-full text-sm' },
+          h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+            h('tr', {},
+              h('th', { class: 'text-left px-4 py-3' }, 'IMEI'),
+              h('th', { class: 'text-left px-4 py-3' }, 'SKU / Device'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Status'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Move to'),
+            )
+          ),
+          h('tbody', { class: 'divide-y divide-slate-800' },
+            !state.devicesAll.length
+              ? h('tr', {}, h('td', { colspan: 4, class: 'text-center py-10 text-slate-500' }, 'No devices match this filter.'))
+              : state.devicesAll.map(d => {
+                  const nextStatuses = transitions[d.status] || [];
+                  const canStartRepair = REPAIR_STARTABLE.includes(d.status);
+                  return h('tr', { class: 'row-strip' },
+                    h('td', { class: 'px-4 py-2 mono text-xs' }, d.imei),
+                    h('td', { class: 'px-4 py-2 text-xs' },
+                      h('div', { class: 'font-medium text-cyan-300 mono' }, d.sku),
+                      h('div', { class: 'text-slate-500' }, deviceLabel(d))),
+                    h('td', { class: 'px-4 py-2' }, deviceStatusBadge(d.status)),
+                    h('td', { class: 'px-4 py-2 text-right' },
+                      h('div', { class: 'flex items-center justify-end gap-2' },
+                        canStartRepair ? h('button', {
+                          class: 'btn btn-ghost text-xs', title: 'Send to in-house repair',
+                          onclick: () => doStartRepair(d),
+                        }, h('i', { class: 'fas fa-screwdriver-wrench' }), 'Repair') : null,
+                        nextStatuses.length ? h('select', {
+                          class: 'input text-xs py-1 px-2 w-auto',
+                          onchange: (e) => { if (e.target.value) { doTransition(d, e.target.value); e.target.value = ''; } },
+                        },
+                          h('option', { value: '' }, 'Move to…'),
+                          nextStatuses.map(s => h('option', { value: s }, s))
+                        ) : (!canStartRepair ? h('span', { class: 'text-xs text-slate-600' }, 'No moves') : null)
+                      ))
+                  );
+                })
+          )
+        )
+      )
+    );
+  }
+
+  // ─── Repair Queue ───
+  async function doScanBack(device) {
+    try {
+      await api.post(`/devices/${device.id}/repair/scan-back`, {});
+      toast(`<span class="mono">${device.imei}</span> scanned back — awaiting QC`, 'ok');
+      await refreshRepairQueue(); render();
+    } catch (err) {
+      toast(err.response?.data?.error || err.message, 'err', 5000);
+    }
+  }
+  async function doRecordQc(device, result) {
+    let reason = null;
+    if (result === 'FAILED') {
+      reason = prompt(`Reason QC failed for ${device.imei}:`);
+      if (reason == null) return;
+      if (!reason.trim()) { toast('A reason is required for a FAILED result', 'warn'); return; }
+    }
+    try {
+      await api.post(`/devices/${device.id}/repair/qc`, { result, reason: reason ? reason.trim() : undefined });
+      toast(`<span class="mono">${device.imei}</span> QC ${result === 'PASSED' ? 'passed → Ready for Zoho' : 'failed'}`, result === 'PASSED' ? 'ok' : 'warn');
+      await refreshRepairQueue(); render();
+    } catch (err) {
+      toast(err.response?.data?.error || err.message, 'err', 5000);
+    }
+  }
+  async function doReopenRepair(device) {
+    try {
+      await api.post(`/devices/${device.id}/repair/reopen`, {});
+      toast(`<span class="mono">${device.imei}</span> reopened for repair`, 'ok');
+      await refreshRepairQueue(); render();
+    } catch (err) {
+      toast(err.response?.data?.error || err.message, 'err', 5000);
+    }
+  }
+  async function doRecordCost(device) {
+    const cost = prompt(`Repair cost (GBP) for ${device.imei}:`);
+    if (cost == null) return;
+    const n = Number(cost);
+    if (!Number.isFinite(n) || n < 0) { toast('Enter a valid non-negative number', 'warn'); return; }
+    try {
+      await api.post(`/devices/${device.id}/repair/cost`, { repair_cost_gbp: n, cost_source: 'in_house' });
+      toast(`Repair cost £${n.toFixed(2)} recorded for <span class="mono">${device.imei}</span>`, 'ok');
+      await refreshRepairQueue(); render();
+    } catch (err) {
+      toast(err.response?.data?.error || err.message, 'err', 5000);
+    }
+  }
+
+  function RepairQueueSubview() {
+    const managerOk = isManagerOrAdmin();
+    return h('div', { class: 'space-y-4' },
+      h('div', { class: 'text-sm text-slate-400' }, `${state.repairQueue.length} device${state.repairQueue.length === 1 ? '' : 's'} in the repair workflow`),
+      h('div', { class: 'card overflow-hidden' },
+        h('table', { class: 'w-full text-sm' },
+          h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+            h('tr', {},
+              h('th', { class: 'text-left px-4 py-3' }, 'IMEI'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Device'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Status'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Fault'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Job status'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Actions'),
+            )
+          ),
+          h('tbody', { class: 'divide-y divide-slate-800' },
+            !state.repairQueue.length
+              ? h('tr', {}, h('td', { colspan: 6, class: 'text-center py-10 text-slate-500' }, 'Repair queue is empty.'))
+              : state.repairQueue.map(d => h('tr', { class: 'row-strip' },
+                  h('td', { class: 'px-4 py-2 mono text-xs' }, d.imei),
+                  h('td', { class: 'px-4 py-2 text-xs' }, deviceLabel(d)),
+                  h('td', { class: 'px-4 py-2' }, deviceStatusBadge(d.status)),
+                  h('td', { class: 'px-4 py-2 text-xs text-slate-300' }, d.fault_code || '—'),
+                  h('td', { class: 'px-4 py-2' },
+                    h('span', { class: 'badge badge-slate text-[10px]' }, d.repair_job_status || '—'),
+                    d.repair_job_status === 'open' && d.status === 'QC_FAILED'
+                      ? h('div', { class: 'text-[11px] text-red-400 mt-0.5' }, d.qc_fail_reason || '') : null),
+                  h('td', { class: 'px-4 py-2 text-right' },
+                    h('div', { class: 'flex items-center justify-end gap-2 flex-wrap' },
+                      d.status === 'IN_HOUSE_REPAIR' && d.repair_job_status === 'open'
+                        ? h('button', { class: 'btn btn-ghost text-xs', onclick: () => doScanBack(d) }, h('i', { class: 'fas fa-rotate-left' }), 'Scan back') : null,
+                      d.status === 'IN_HOUSE_REPAIR' && d.repair_job_status === 'awaiting_qc' && managerOk
+                        ? [h('button', { class: 'btn text-xs !bg-green-600/20 !text-green-300', onclick: () => doRecordQc(d, 'PASSED') }, h('i', { class: 'fas fa-check' }), 'QC pass'),
+                           h('button', { class: 'btn text-xs !bg-red-600/20 !text-red-300', onclick: () => doRecordQc(d, 'FAILED') }, h('i', { class: 'fas fa-xmark' }), 'QC fail')] : null,
+                      d.status === 'IN_HOUSE_REPAIR' && d.repair_job_status === 'awaiting_qc' && !managerOk
+                        ? h('span', { class: 'text-[11px] text-slate-500' }, 'QC is manager-only') : null,
+                      d.status === 'QC_FAILED'
+                        ? h('button', { class: 'btn btn-ghost text-xs', onclick: () => doReopenRepair(d) }, h('i', { class: 'fas fa-arrow-rotate-right' }), 'Reopen') : null,
+                      managerOk ? h('button', { class: 'btn btn-ghost text-xs', title: 'Record repair cost', onclick: () => doRecordCost(d) }, h('i', { class: 'fas fa-sterling-sign' })) : null,
+                    ))
+                ))
+          )
+        )
+      )
+    );
+  }
+
+  // ─── QC Failed ───
+  function QcFailedSubview() {
+    return h('div', { class: 'space-y-4' },
+      h('div', { class: 'text-sm text-slate-400' }, `${state.qcFailedDevices.length} device${state.qcFailedDevices.length === 1 ? '' : 's'} failed QC`),
+      h('div', { class: 'card overflow-hidden' },
+        h('table', { class: 'w-full text-sm' },
+          h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+            h('tr', {},
+              h('th', { class: 'text-left px-4 py-3' }, 'IMEI'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Device'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Grade'),
+              h('th', { class: 'text-right px-4 py-3' }, ''),
+            )
+          ),
+          h('tbody', { class: 'divide-y divide-slate-800' },
+            !state.qcFailedDevices.length
+              ? h('tr', {}, h('td', { colspan: 4, class: 'text-center py-10 text-slate-500' }, 'Nothing here — no devices currently failed QC.'))
+              : state.qcFailedDevices.map(d => h('tr', { class: 'row-strip' },
+                  h('td', { class: 'px-4 py-2 mono text-xs' }, d.imei),
+                  h('td', { class: 'px-4 py-2 text-xs' }, deviceLabel(d)),
+                  h('td', { class: 'px-4 py-2' }, h('span', { class: gradeBadgeClass(d.grade) }, gradeLabel(d.grade))),
+                  h('td', { class: 'px-4 py-2 text-right' },
+                    h('button', { class: 'btn btn-ghost text-xs', onclick: () => { state.devicesSubview = 'repair'; refreshRepairQueue().then(render); } },
+                      h('i', { class: 'fas fa-screwdriver-wrench' }), 'Go to Repair Queue'))
+                ))
+          )
+        )
+      )
+    );
+  }
+
+  // ─── Ready for Zoho ───
+  function ReadyForZohoSubview() {
+    return h('div', { class: 'space-y-4' },
+      h('div', { class: 'text-sm text-slate-400' }, `${state.readyForZohoDevices.length} device${state.readyForZohoDevices.length === 1 ? '' : 's'} ready for Zoho upload`),
+      h('div', { class: 'card overflow-hidden' },
+        h('table', { class: 'w-full text-sm' },
+          h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+            h('tr', {},
+              h('th', { class: 'text-left px-4 py-3' }, 'IMEI'),
+              h('th', { class: 'text-left px-4 py-3' }, 'SKU / Device'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Grade'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Received'),
+            )
+          ),
+          h('tbody', { class: 'divide-y divide-slate-800' },
+            !state.readyForZohoDevices.length
+              ? h('tr', {}, h('td', { colspan: 4, class: 'text-center py-10 text-slate-500' }, 'No devices are ready for Zoho upload yet.'))
+              : state.readyForZohoDevices.map(d => h('tr', { class: 'row-strip' },
+                  h('td', { class: 'px-4 py-2 mono text-xs' }, d.imei),
+                  h('td', { class: 'px-4 py-2 text-xs' },
+                    h('div', { class: 'font-medium text-cyan-300 mono' }, d.sku),
+                    h('div', { class: 'text-slate-500' }, deviceLabel(d))),
+                  h('td', { class: 'px-4 py-2' }, h('span', { class: gradeBadgeClass(d.grade) }, gradeLabel(d.grade))),
+                  h('td', { class: 'px-4 py-2 text-xs text-slate-400' }, fmtDate(d.created_at)),
+                ))
+          )
+        )
+      )
+    );
+  }
+
+  // ─── Removal Flags ───
+  async function doResolveRemovalFlag(flag) {
+    const note = prompt(`Resolution note for ${flag.imei} (optional):`) || undefined;
+    try {
+      await api.post(`/inventory/removal-flags/${flag.id}/resolve`, { note });
+      toast(`<span class="mono">${flag.imei}</span> removal flag resolved`, 'ok');
+      await refreshRemovalFlags(); render();
+    } catch (err) {
+      toast(err.response?.data?.error || err.message, 'err', 5000);
+    }
+  }
+  function RemovalFlagsSubview() {
+    return h('div', { class: 'space-y-4' },
+      h('div', { class: 'flex items-center justify-between' },
+        h('div', { class: 'text-sm text-slate-400' }, `${state.removalFlags.length} ${state.removalFlagsShowResolved ? 'total' : 'open'} removal flag${state.removalFlags.length === 1 ? '' : 's'}`),
+        h('label', { class: 'flex items-center gap-2 text-xs text-slate-300 select-none' },
+          h('input', {
+            type: 'checkbox', class: 'accent-cyan-500', checked: state.removalFlagsShowResolved ? 'checked' : null,
+            onchange: (e) => { state.removalFlagsShowResolved = e.target.checked; refreshRemovalFlags().then(render); },
+          }),
+          'Show resolved'
+        )
+      ),
+      h('div', { class: 'card overflow-hidden' },
+        h('table', { class: 'w-full text-sm' },
+          h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+            h('tr', {},
+              h('th', { class: 'text-left px-4 py-3' }, 'IMEI'),
+              h('th', { class: 'text-left px-4 py-3' }, 'SKU'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Grade change'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Reason'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Flagged'),
+              h('th', { class: 'text-right px-4 py-3' }, '')
+            )
+          ),
+          h('tbody', { class: 'divide-y divide-slate-800' },
+            !state.removalFlags.length
+              ? h('tr', {}, h('td', { colspan: 6, class: 'text-center py-10 text-slate-500' }, 'No removal flags.'))
+              : state.removalFlags.map(f => h('tr', { class: 'row-strip' },
+                  h('td', { class: 'px-4 py-2 mono text-xs' }, f.imei),
+                  h('td', { class: 'px-4 py-2 mono text-xs text-cyan-300' }, f.sku),
+                  h('td', { class: 'px-4 py-2 text-xs' },
+                    h('span', { class: gradeBadgeClass(f.old_grade) }, gradeLabel(f.old_grade)), ' → ',
+                    h('span', { class: gradeBadgeClass(f.new_grade) }, gradeLabel(f.new_grade))),
+                  h('td', { class: 'px-4 py-2 text-xs text-slate-400' }, f.reason),
+                  h('td', { class: 'px-4 py-2 text-xs text-slate-400' }, fmtDate(f.flagged_at)),
+                  h('td', { class: 'px-4 py-2 text-right' },
+                    f.resolved_at
+                      ? h('span', { class: 'badge badge-green text-[10px]' }, 'resolved')
+                      : h('button', { class: 'btn btn-ghost text-xs', onclick: () => doResolveRemovalFlag(f) }, h('i', { class: 'fas fa-check' }), 'Resolve'))
+                ))
+          )
+        )
+      )
+    );
+  }
+
+  // ─── Bulk transition by scan ───
+  function BulkTransitionModal() {
+    const ctx = state._bulkTransCtx ||= {
+      raw: '', target_status: '', busy: false,
+      resultsByImei: new Map(),
+    };
+    const close = () => { state.bulkTransitionOpen = false; state._bulkTransCtx = null; render(); };
+    const parsedImeis = () => Array.from(new Set(ctx.raw.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean)));
+    const statuses = (state.deviceStatuses && state.deviceStatuses.statuses) || [];
+
+    const run = async () => {
+      const imeis = parsedImeis();
+      if (!ctx.target_status) { toast('Pick a target status first', 'warn'); return; }
+      if (imeis.length === 0) { toast('Nothing to scan — add an IMEI', 'warn'); return; }
+      if (imeis.length > 200) { toast(`${imeis.length} IMEIs — maximum is 200 per batch.`, 'warn'); return; }
+      ctx.busy = true; state._bulkTransCtx = ctx; render();
+      try {
+        const r = await api.post('/devices/bulk-transition', { target_status: ctx.target_status, imeis });
+        for (const row of r.results) ctx.resultsByImei.set(row.imei, row);
+        // drop settled (successfully transitioned) IMEIs so a retry only resends the outstanding ones
+        ctx.raw = parsedImeis().filter(i => ctx.resultsByImei.get(i)?.outcome !== 'transitioned').join('\n');
+        beep(r.failed === 0 ? 'ok' : (r.transitioned === 0 ? 'err' : 'warn'));
+        toast(`This run: ${r.transitioned} transitioned, ${r.failed} not (of ${r.requested} scanned)`, r.failed === 0 ? 'ok' : 'warn', 4000);
+        await refreshDevicesSubview();
+      } catch (err) {
+        toast(err.response?.data?.error || 'Bulk transition failed', 'err', 5000);
+      } finally {
+        ctx.busy = false; state._bulkTransCtx = ctx; render();
+      }
+    };
+
+    const outcomeCls = { transitioned: 'badge-green', skipped: 'badge-amber', error: 'badge-red' };
+    const allResults = Array.from(ctx.resultsByImei.values());
+    const totalOk = allResults.filter(r => r.outcome === 'transitioned').length;
+
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-2xl' },
+        h('div', { class: 'flex items-center gap-3 mb-1' },
+          h('div', { class: 'w-10 h-10 rounded-xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center' },
+            h('i', { class: 'fas fa-layer-group' })),
+          h('div', {},
+            h('h2', { class: 'text-lg font-semibold' }, 'Bulk transition by scan'),
+            h('p', { class: 'text-xs text-slate-400' }, 'Pick a target status, then scan or paste many IMEIs (one per line) — up to 200 per batch. Each device is validated against the allowed-transition map independently; one bad or ineligible IMEI never blocks the rest.')
+          )
+        ),
+        h('div', { class: 'mt-3' },
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Target status *'),
+          h('select', {
+            class: 'input', onchange: (e) => { ctx.target_status = e.target.value; state._bulkTransCtx = ctx; },
+          },
+            h('option', { value: '', selected: !ctx.target_status ? 'selected' : null }, '— select —'),
+            statuses.map(s => h('option', { value: s, selected: s === ctx.target_status ? 'selected' : null }, s))
+          )
+        ),
+        h('div', { class: 'mt-3' },
+          h('label', { class: 'text-xs text-slate-400 mb-1 block flex items-center justify-between' },
+            h('span', {}, 'IMEIs *'),
+            h('span', { class: 'text-slate-500' }, `${parsedImeis().length} unique IMEI${parsedImeis().length === 1 ? '' : 's'}`)
+          ),
+          h('textarea', {
+            id: 'bulk-transition-textarea', class: 'input mono text-sm', rows: 8, autofocus: 'true',
+            placeholder: 'Scan IMEIs here, one per line…', value: ctx.raw,
+            oninput: (e) => { ctx.raw = e.target.value; state._bulkTransCtx = ctx; render(); },
+          })
+        ),
+        allResults.length > 0 ? h('div', { class: 'mt-4 card p-3 bg-slate-900/40' },
+          h('div', { class: 'flex items-center justify-between mb-2' },
+            h('div', { class: 'text-[10px] uppercase tracking-wider text-slate-500' }, 'Progress (all runs this session)'),
+            h('div', { class: 'text-xs' },
+              h('span', { class: 'text-green-400 font-semibold' }, totalOk), ' transitioned · ',
+              h('span', { class: 'text-red-400 font-semibold' }, allResults.length - totalOk), ' outstanding')
+          ),
+          h('div', { class: 'max-h-64 overflow-y-auto divide-y divide-slate-800' },
+            allResults.map(r => h('div', { class: 'py-1.5 px-1 text-xs flex items-center gap-3' },
+              h('span', { class: 'badge ' + (outcomeCls[r.outcome] || 'badge-slate') }, r.outcome),
+              h('code', { class: 'mono flex-1' }, r.imei),
+              r.from_status ? h('span', { class: 'text-slate-500' }, r.from_status) : null,
+              r.message ? h('span', { class: 'text-slate-400 truncate max-w-xs' }, r.message) : null
+            ))
+          )
+        ) : null,
+        h('div', { class: 'mt-5 flex justify-end gap-2' },
+          h('button', { class: 'btn btn-ghost', onclick: close }, allResults.length > 0 ? 'Close' : 'Cancel'),
+          h('button', {
+            class: 'btn btn-primary' + (ctx.busy ? ' opacity-60 cursor-not-allowed' : ''),
+            id: 'bulk-transition-run-btn', onclick: run, disabled: ctx.busy ? 'disabled' : null,
+          }, ctx.busy ? [h('i', { class: 'fas fa-spinner fa-spin' }), 'Processing…'] : [h('i', { class: 'fas fa-check-double' }), 'Transition batch'])
+        )
+      )
+    );
+  }
 
   function OprView() {
     const TabBtn = (id, label, icon) => h('button', {
