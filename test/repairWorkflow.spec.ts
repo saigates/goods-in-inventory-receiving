@@ -771,3 +771,109 @@ describe('D. Zoho upload queue — ERP absence (#37, NEW)', () => {
     expect(results).toHaveLength(0)
   })
 })
+
+// ═══════════════════════════════════════════════════════════════════════
+// E. Device Lifecycle UI-layer sprint (2026-08-12) — bulk-transition +
+// repair-queue read endpoints (#38–#43, NEW)
+// ═══════════════════════════════════════════════════════════════════════
+describe('E. POST /api/devices/bulk-transition (#38–#42, NEW)', () => {
+  it('#38 transitions every IMEI in the batch and returns per-IMEI + summary counts', async () => {
+    const a = await seedDevice('RECEIVED')
+    const b = await seedDevice('RECEIVED')
+    const [imeiA, imeiB] = await Promise.all([
+      db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(a).first<{ imei: string }>(),
+      db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(b).first<{ imei: string }>(),
+    ])
+    const res = await api('/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'SORTING', imeis: [imeiA!.imei, imeiB!.imei] }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { transitioned: number; failed: number; requested: number; results: any[] }
+    expect(body.requested).toBe(2)
+    expect(body.transitioned).toBe(2)
+    expect(body.failed).toBe(0)
+    expect(await deviceStatus(a)).toBe('SORTING')
+    expect(await deviceStatus(b)).toBe('SORTING')
+    expect(body.results.every((r: any) => r.ok && r.outcome === 'transitioned')).toBe(true)
+  })
+
+  it('#39 a bad IMEI in the batch is reported per-row and does not block the rest (partial success)', async () => {
+    const a = await seedDevice('RECEIVED')
+    const imeiA = (await db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(a).first<{ imei: string }>())!.imei
+    const res = await api('/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'SORTING', imeis: [imeiA, '0000000000000000-NOT-A-DEVICE'] }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { transitioned: number; failed: number; results: any[] }
+    expect(body.transitioned).toBe(1)
+    expect(body.failed).toBe(1)
+    expect(await deviceStatus(a)).toBe('SORTING')
+    const badRow = body.results.find((r: any) => r.imei === '0000000000000000-NOT-A-DEVICE')
+    expect(badRow.ok).toBe(false)
+    expect(badRow.outcome).toBe('error')
+    expect(badRow.message).toContain('No device found')
+  })
+
+  it('#40 an illegal transition for one device is reported as skipped with the InvalidTransitionError message, other rows unaffected', async () => {
+    const legal = await seedDevice('RECEIVED')
+    const illegal = await seedDevice('ACTIVE_INVENTORY') // ACTIVE_INVENTORY has no outbound transitions
+    const [imeiLegal, imeiIllegal] = await Promise.all([
+      db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(legal).first<{ imei: string }>(),
+      db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(illegal).first<{ imei: string }>(),
+    ])
+    const res = await api('/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'SORTING', imeis: [imeiLegal!.imei, imeiIllegal!.imei] }),
+    })
+    const body = await res.json() as { transitioned: number; failed: number; results: any[] }
+    expect(body.transitioned).toBe(1)
+    expect(body.failed).toBe(1)
+    expect(await deviceStatus(legal)).toBe('SORTING')
+    expect(await deviceStatus(illegal)).toBe('ACTIVE_INVENTORY') // unchanged
+    const skippedRow = body.results.find((r: any) => r.imei === imeiIllegal!.imei)
+    expect(skippedRow.outcome).toBe('skipped')
+    expect(skippedRow.message).toContain('Cannot transition device from ACTIVE_INVENTORY to SORTING')
+  })
+
+  it('#41 target_status inside OPR_WORKFLOW_ONLY_STATUSES is refused outright (409), before any device is touched', async () => {
+    const a = await seedDevice('READY_FOR_EXPORT')
+    const imeiA = (await db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(a).first<{ imei: string }>())!.imei
+    const res = await api('/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'EXPORTED_UNDER_OPR', imeis: [imeiA] }),
+    })
+    expect(res.status).toBe(409)
+    expect(await deviceStatus(a)).toBe('READY_FOR_EXPORT') // unchanged
+  })
+
+  it('#42 target_status inside REPAIR_WORKFLOW_ONLY_STATUSES is refused outright (409) — bulk cannot bypass the repair-workflow gate', async () => {
+    const a = await seedDevice('SORTING')
+    const imeiA = (await db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(a).first<{ imei: string }>())!.imei
+    const res = await api('/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'IN_HOUSE_REPAIR', imeis: [imeiA] }),
+    })
+    expect(res.status).toBe(409)
+    expect(await deviceStatus(a)).toBe('SORTING') // unchanged
+  })
+})
+
+describe('E. GET /api/devices/repair-queue (#43, NEW)', () => {
+  it('#43 returns only IN_HOUSE_REPAIR / QC_FAILED devices, each joined with its latest repair_jobs row', async () => {
+    const inRepair = await seedDevice('SORTING')
+    await api(`/api/devices/${inRepair}/repair/start`, { method: 'POST', body: JSON.stringify({ fault_code: 'SCREEN_CRACKED' }) })
+    const notInQueue = await seedDevice('ACTIVE_INVENTORY')
+
+    const res = await api('/api/devices/repair-queue')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { devices: any[] }
+    const ids = body.devices.map((d: any) => d.id)
+    expect(ids).toContain(inRepair)
+    expect(ids).not.toContain(notInQueue)
+    const row = body.devices.find((d: any) => d.id === inRepair)
+    expect(row.repair_job_status).toBe('open')
+    expect(row.fault_code).toBe('SCREEN_CRACKED')
+  })
+})

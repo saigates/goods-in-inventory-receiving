@@ -65,6 +65,37 @@ app.get('/', async (c) => {
   })
 })
 
+// GET /api/devices/repair-queue — devices currently IN_HOUSE_REPAIR or
+// QC_FAILED, each joined with its most recent repair_jobs row so the
+// Repair Queue UI can render the right action (scan-back / QC / reopen /
+// cost) without a second round trip per device.
+//
+// MUST be registered before GET /:id — Hono resolves single-segment
+// literal and param routes by REGISTRATION ORDER, not specificity, so
+// "repair-queue" would otherwise be swallowed by /:id (Number("repair-
+// queue") is NaN → a 400, not a 404 — this exact failure mode was caught
+// by test #43 when the route was first added below /:id instead of above
+// it).
+app.get('/repair-queue', async (c) => {
+  const user = currentUser(c)
+  const { results } = await c.env.DB.prepare(`
+    SELECT rd.*,
+           rj.id AS repair_job_id, rj.status AS repair_job_status,
+           rj.fault_code, rj.qc_result, rj.qc_fail_reason,
+           rj.repair_cost_gbp, rj.parts_cost_gbp, rj.labour_cost_gbp,
+           rj.cost_source, rj.cost_source_reference,
+           rj.opened_at, rj.closed_at
+      FROM received_devices rd
+      LEFT JOIN repair_jobs rj ON rj.id = (
+        SELECT id FROM repair_jobs WHERE device_id = rd.id ORDER BY id DESC LIMIT 1
+      )
+     WHERE rd.organisation_id = ? AND rd.status IN ('IN_HOUSE_REPAIR', 'QC_FAILED')
+     ORDER BY rd.id DESC
+     LIMIT 500
+  `).bind(user.organisation_id).all()
+  return c.json({ devices: results })
+})
+
 // GET /api/devices/:id — full record with current status + event history.
 app.get('/:id', async (c) => {
   const user = currentUser(c)
@@ -191,6 +222,129 @@ app.get('/export/csv', async (c) => {
 // CRM/UI can render valid next-states without hardcoding the state machine.
 app.get('/meta/statuses', (c) => {
   return c.json({ statuses: DEVICE_STATUSES, transitions: ALLOWED_TRANSITIONS })
+})
+
+// POST /api/devices/bulk-transition — { target_status, imeis: string[] }
+// Bulk equivalent of POST /:id/transition, mirroring scan.ts's /bulk
+// pattern exactly: every IMEI is processed INDEPENDENTLY (a bad/missing/
+// blocked IMEI never stops the rest), capped at 200 per call, and the
+// response carries a per-IMEI outcome array plus summary counts so the
+// UI can show exactly what happened to each scanned unit.
+//
+// Same guardrails as the single-device endpoint: target_status (and a
+// device's CURRENT status) may never be one of the OPR/repair
+// workflow-only statuses — those must move exclusively through their own
+// dedicated routes, or shipment_lines/repair_jobs would desynchronise
+// from the device ledger. The target check is global (checked once,
+// before the loop); the current-status check is per-device.
+const BULK_TRANSITION_CAP = 200
+
+app.post('/bulk-transition', async (c) => {
+  const user = currentUser(c)
+  const body = await c.req.json<{ target_status?: string; imeis?: unknown[] }>().catch(() => ({} as any))
+
+  const targetStatus = String(body.target_status || '').toUpperCase() as DeviceStatus
+  if (!DEVICE_STATUSES.includes(targetStatus)) {
+    return c.json({ error: `target_status must be one of: ${DEVICE_STATUSES.join(', ')}` }, 400)
+  }
+  if (OPR_WORKFLOW_ONLY_STATUSES.includes(targetStatus)) {
+    return c.json({ error: `${targetStatus} is managed by the OPR consignment workflow — it cannot be set via bulk transition` }, 409)
+  }
+  if (REPAIR_WORKFLOW_ONLY_STATUSES.includes(targetStatus)) {
+    return c.json({ error: `${targetStatus} is managed by the repair workflow — it cannot be set via bulk transition` }, 409)
+  }
+
+  if (!Array.isArray(body.imeis)) return c.json({ error: 'Body must be { target_status, imeis: [...] }' }, 422)
+  if (!body.imeis.length) return c.json({ error: 'imeis is empty' }, 422)
+  if (body.imeis.length > BULK_TRANSITION_CAP) {
+    return c.json({ error: `Maximum ${BULK_TRANSITION_CAP} IMEIs per bulk-transition call` }, 422)
+  }
+
+  type BulkTransitionOutcome = {
+    imei: string
+    ok: boolean
+    outcome: 'transitioned' | 'skipped' | 'error'
+    message?: string
+    from_status?: string
+    device_id?: number
+  }
+  const results: BulkTransitionOutcome[] = []
+  const notifyPromises: Promise<unknown>[] = []
+
+  for (const raw of body.imeis) {
+    const imei = typeof raw === 'string' ? raw.trim() : String(raw ?? '').trim()
+    if (!imei) {
+      results.push({ imei: String(raw ?? ''), ok: false, outcome: 'error', message: 'Empty IMEI' })
+      continue
+    }
+
+    const device = await c.env.DB.prepare(
+      'SELECT id, status FROM received_devices WHERE imei = ? AND organisation_id = ?'
+    ).bind(imei, user.organisation_id).first<{ id: number; status: DeviceStatus }>()
+    if (!device) {
+      results.push({ imei, ok: false, outcome: 'error', message: 'No device found for this IMEI' })
+      continue
+    }
+
+    if (OPR_WORKFLOW_ONLY_STATUSES.includes(device.status)) {
+      results.push({
+        imei, ok: false, outcome: 'skipped', device_id: device.id, from_status: device.status,
+        message: `Device is ${device.status}, managed by the OPR consignment workflow — cannot bulk-transition`,
+      })
+      continue
+    }
+    if (REPAIR_WORKFLOW_ONLY_STATUSES.includes(device.status)) {
+      results.push({
+        imei, ok: false, outcome: 'skipped', device_id: device.id, from_status: device.status,
+        message: `Device is ${device.status}, managed by the repair workflow — cannot bulk-transition`,
+      })
+      continue
+    }
+
+    try {
+      const { device: updated, event } = await transitionDevice(c.env.DB, device.id, targetStatus, {
+        user,
+        eventType: 'STATUS_CHANGE',
+        metadata: { bulk: true },
+      })
+      results.push({ imei, ok: true, outcome: 'transitioned', device_id: device.id, from_status: device.status })
+      notifyPromises.push(dispatchDeviceStatusWebhooks(c.env.DB, {
+        event: 'device.status_changed',
+        organisation_id: user.organisation_id,
+        device_id: device.id,
+        imei: String((updated as any).imei),
+        uuid: String((updated as any).uuid),
+        from_status: (event as any).from_status ?? null,
+        to_status: targetStatus,
+        user_id: user.id,
+        occurred_at: new Date().toISOString(),
+      }))
+    } catch (err) {
+      if (err instanceof InvalidTransitionError) {
+        results.push({ imei, ok: false, outcome: 'skipped', device_id: device.id, from_status: device.status, message: err.message })
+      } else if (err instanceof DeviceNotFoundError) {
+        results.push({ imei, ok: false, outcome: 'error', message: err.message })
+      } else {
+        results.push({ imei, ok: false, outcome: 'error', message: err instanceof Error ? err.message : String(err) })
+      }
+    }
+  }
+
+  let execCtx: { waitUntil?: (p: Promise<unknown>) => void } | undefined
+  try { execCtx = c.executionCtx as any } catch { execCtx = undefined }
+  const allNotify = Promise.all(notifyPromises)
+  if (typeof execCtx?.waitUntil === 'function') execCtx.waitUntil(allNotify)
+  else await allNotify
+
+  const transitioned = results.filter(r => r.ok).length
+  return c.json({
+    ok: true,
+    target_status: targetStatus,
+    requested: results.length,
+    transitioned,
+    failed: results.length - transitioned,
+    results,
+  })
 })
 
 // POST /api/devices/:id/transition — the single API entry point for status
