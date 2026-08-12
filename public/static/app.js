@@ -1115,8 +1115,12 @@
                   h('td', { class: 'px-4 py-2 mono text-cyan-300 font-semibold' }, s.reference),
                   h('td', { class: 'px-4 py-2' }, oprDirBadge(s.direction)),
                   h('td', { class: 'px-4 py-2' }, oprStatusBadge(s.status)),
-                  h('td', { class: 'px-4 py-2 mono text-xs' },
-                    s.procedure_code + (s.additional_procedure_code ? ' + ' + s.additional_procedure_code : '')),
+                  h('td', { class: 'px-4 py-2 mono text-xs' + (s.procedure_code ? '' : ' text-slate-500') },
+                    // TEMP_EXPORT_STANDARD carries no procedure code (customs-only field) —
+                    // render the neutral "no customs declaration" label, not a literal "null".
+                    s.procedure_code
+                      ? s.procedure_code + (s.additional_procedure_code ? ' + ' + s.additional_procedure_code : '')
+                      : 'n/a — no customs declaration'),
                   h('td', { class: 'px-4 py-2 text-right mono' }, s.line_count),
                   h('td', { class: 'px-4 py-2 text-right mono text-xs' }, fmtMoney(s.total_value, s.currency)),
                   h('td', { class: 'px-4 py-2 mono text-xs text-slate-400' },
@@ -1135,19 +1139,36 @@
 
   // ─── New consignment modal ───
   function OprNewShipmentModal() {
-    const f = { direction: 'export', reference: '', authorisation_id: state.oprAuths[0]?.id || '',
+    const f = { direction: 'export', shipment_type: 'OPR_REPAIR', reference: '', authorisation_id: state.oprAuths[0]?.id || '',
                 procedure_code: '2100', additional_procedure_code: '', consignee_name: '',
                 related_export_shipment_id: '', ship_date: '' };
     const close = () => { state.oprNewOpen = false; render(); };
-    const finalisedExports = state.oprShipments.filter(s => s.direction === 'export' && s.status === 'FINALISED');
+    // A return can only usefully link to a FINALISED export of the SAME
+    // shipment_type — the backend has no such cross-check at creation
+    // time (link is accepted regardless), but scanning a device onto a
+    // mismatched return always 409s (the device's post-export status
+    // never matches what that return's shipment_type expects), so a
+    // cross-type link is a guaranteed dead end. Filtering it out of the
+    // picker avoids walking into that dead end. (Pick-and-note: a
+    // same-shipment_type guard at creation, mirroring the direction
+    // check already there, would be the tidier backend fix — left as a
+    // UI-side filter for this sprint, matching the scope of "screens".)
+    const finalisedExports = () => state.oprShipments.filter(s =>
+      s.direction === 'export' && s.status === 'FINALISED' && s.shipment_type === f.shipment_type);
     const doCreate = async () => {
+      const isStandardTemp = f.shipment_type === 'TEMP_EXPORT_STANDARD';
       const body = {
         direction: f.direction,
+        shipment_type: f.shipment_type,
         reference: f.reference.trim(),
-        authorisation_id: Number(f.authorisation_id) || null,
-        procedure_code: f.direction === 'import' ? '6121' : f.procedure_code,
       };
-      if (f.direction === 'export' && f.additional_procedure_code) body.additional_procedure_code = f.additional_procedure_code;
+      // authorisation_id / procedure_code are customs-only fields, 422-rejected
+      // by the backend on a TEMP_EXPORT_STANDARD shipment — omit entirely.
+      if (!isStandardTemp) {
+        body.authorisation_id = Number(f.authorisation_id) || null;
+        body.procedure_code = f.direction === 'import' ? '6121' : f.procedure_code;
+        if (f.direction === 'export' && f.additional_procedure_code) body.additional_procedure_code = f.additional_procedure_code;
+      }
       if (f.consignee_name.trim()) body.consignee_name = f.consignee_name.trim();
       if (f.ship_date) body.ship_date = f.ship_date;
       if (f.direction === 'import' && f.related_export_shipment_id) {
@@ -1167,6 +1188,7 @@
     };
     // Local re-render of the modal body on direction flip (keeps field state in f)
     let bodyWrap;
+    const isStandardTemp = () => f.shipment_type === 'TEMP_EXPORT_STANDARD';
     const fields = () => h('div', { class: 'space-y-3' },
       h('div', { class: 'grid grid-cols-2 gap-3' },
         h('div', {},
@@ -1176,19 +1198,29 @@
             h('option', { value: 'import', selected: f.direction === 'import' ? 'selected' : null }, 'Import (return from repair)'))
         ),
         h('div', {},
-          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Reference *'),
-          h('input', { id: 'opr-new-reference', class: 'input mono', placeholder: f.direction === 'export' ? 'EXP 2026 001' : 'IMP 2026 001',
-            value: f.reference, oninput: (e) => { f.reference = e.target.value; } })
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Shipment type'),
+          h('select', { id: 'opr-new-shipment-type', class: 'input', onchange: (e) => { f.shipment_type = e.target.value; bodyWrap.replaceChildren(fields()); } },
+            h('option', { value: 'OPR_REPAIR', selected: f.shipment_type === 'OPR_REPAIR' ? 'selected' : null }, 'OPR_REPAIR — customs outward processing'),
+            h('option', { value: 'TEMP_EXPORT_STANDARD', selected: f.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'selected' : null }, 'TEMP_EXPORT_STANDARD — no customs declaration'))
         )
       ),
       h('div', {},
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Reference *'),
+        h('input', { id: 'opr-new-reference', class: 'input mono', placeholder: f.direction === 'export' ? 'EXP 2026 001' : 'IMP 2026 001',
+          value: f.reference, oninput: (e) => { f.reference = e.target.value; } })
+      ),
+      // Authorisation and procedure-code fields are customs-only — TEMP_EXPORT_STANDARD
+      // has no customs declaration at all, and the backend 422-rejects these fields
+      // for that shipment_type, so they're omitted from the form entirely (not just
+      // disabled) rather than shown greyed-out.
+      isStandardTemp() ? null : h('div', {},
         h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'OPR authorisation *'),
         h('select', { class: 'input', onchange: (e) => { f.authorisation_id = e.target.value; } },
           state.oprAuths.map(a => h('option', { value: a.id, selected: String(f.authorisation_id) === String(a.id) ? 'selected' : null },
             `${a.holder_name} — ${a.cds_number}`)),
           !state.oprAuths.length ? h('option', { value: '' }, 'No authorisations — create one via the API first') : null)
       ),
-      f.direction === 'export' ? h('div', { class: 'grid grid-cols-2 gap-3' },
+      isStandardTemp() ? null : (f.direction === 'export' ? h('div', { class: 'grid grid-cols-2 gap-3' },
         h('div', {},
           h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Procedure code'),
           h('select', { class: 'input mono', onchange: (e) => { f.procedure_code = e.target.value; } },
@@ -1202,14 +1234,19 @@
             h('option', { value: 'B02', selected: f.additional_procedure_code === 'B02' ? 'selected' : null }, 'B02 — repair'),
             h('option', { value: 'B51', selected: f.additional_procedure_code === 'B51' ? 'selected' : null }, 'B51 — warranty (pairs with 2200)'))
         )
-      ) : h('div', {},
+      ) : null),
+      // "Discharges export consignment" applies to both shipment types (a
+      // TEMP_EXPORT_STANDARD return still needs to link to its export), but
+      // the "fixed at 6121" helper text only applies to OPR_REPAIR imports —
+      // TEMP_EXPORT_STANDARD has no procedure code at all.
+      f.direction === 'import' ? h('div', {},
         h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Discharges export consignment'),
         h('select', { class: 'input', onchange: (e) => { f.related_export_shipment_id = e.target.value; } },
           h('option', { value: '' }, '(none — link later)'),
-          finalisedExports.map(s => h('option', { value: s.id, selected: String(f.related_export_shipment_id) === String(s.id) ? 'selected' : null },
+          finalisedExports().map(s => h('option', { value: s.id, selected: String(f.related_export_shipment_id) === String(s.id) ? 'selected' : null },
             `${s.reference} (${s.line_count} devices)`))),
-        h('p', { class: 'text-[11px] text-slate-500 mt-1' }, 'Import procedure code is fixed at 6121 (re-import after OP repair).')
-      ),
+        isStandardTemp() ? null : h('p', { class: 'text-[11px] text-slate-500 mt-1' }, 'Import procedure code is fixed at 6121 (re-import after OP repair).')
+      ) : null,
       h('div', { class: 'grid grid-cols-2 gap-3' },
         h('div', {},
           h('label', { class: 'text-xs text-slate-400 mb-1 block' }, f.direction === 'export' ? 'Consignee (overseas repairer)' : 'Consignor label (optional)'),
@@ -1249,6 +1286,14 @@
     const s = b.shipment;
     const isDraft = s.status === 'DRAFT';
     const isExport = s.direction === 'export';
+    // TEMP_EXPORT_STANDARD has no customs declaration at all — no
+    // authorisation, no procedure code, no MRN/DUCR/EAD/MUCR, no C&E1154,
+    // no repair-cost/duty arithmetic. Every customs-only block in this
+    // screen is gated on this flag rather than removed from the backend
+    // (the backend already 422-rejects the fields; this is purely UI
+    // decluttering so an operator on this shipment_type never sees a
+    // field, button or document that doesn't apply to it).
+    const isStandardTemp = s.shipment_type === 'TEMP_EXPORT_STANDARD';
     const v = state.oprValidation;
 
     const backBtn = h('button', {
@@ -1335,8 +1380,11 @@
           oprDirBadge(s.direction), oprStatusBadge(s.status)
         ),
         h('div', { class: 'flex items-center gap-2 flex-wrap' },
-          // Documents: export → invoice/scan-out/prealert; import → ce1154/clearance
-          isExport
+          // Documents: export → invoice/scan-out/prealert; import → ce1154/clearance.
+          // None of these apply to TEMP_EXPORT_STANDARD (no customs declaration,
+          // no C&E1154 duty-relief basis) — hidden entirely rather than shown
+          // disabled, matching the "no customs arithmetic" constraint.
+          isStandardTemp ? null : (isExport
             ? [h('button', { class: 'btn btn-ghost text-xs', onclick: () => openDoc('invoice'), title: 'Print-ready commercial invoice (A4)' },
                  h('i', { class: 'fas fa-file-invoice' }), 'Invoice'),
                h('button', { class: 'btn btn-ghost text-xs', onclick: () => showDraftDoc('prealert'), title: 'Carrier customs pre-alert email draft' },
@@ -1350,24 +1398,36 @@
                  h('i', { class: 'fas fa-envelope-open-text' }), 'Clearance draft'),
                h('button', { id: 'opr-send-clearance', class: 'btn btn-amber text-xs' + (state.oprBusy ? ' opacity-60' : ''), onclick: () => sendEmail('clearance'),
                  title: 'Send the clearance instruction with C&E1154 attached (requires Gmail secrets)' },
-                 h('i', { class: 'fas fa-paper-plane' }), 'Send clearance')],
+                 h('i', { class: 'fas fa-paper-plane' }), 'Send clearance')]),
           isDraft ? h('button', {
             id: 'opr-finalise-btn',
             class: 'btn btn-primary text-xs' + (v && v.result === 'red' ? ' opacity-60' : ''),
-            title: v && v.result === 'red' ? 'Blocked — resolve the red validation results first' : (isExport ? 'Finalise the export (devices become EXPORTED_UNDER_OPR)' : 'Receive the return (devices become RETURNED_UNDER_OPR)'),
+            title: v && v.result === 'red' ? 'Blocked — resolve the red validation results first' :
+              (isExport
+                ? `Finalise the export (devices become ${isStandardTemp ? 'TEMP_EXPORTED_STANDARD' : 'EXPORTED_UNDER_OPR'})`
+                : `Receive the return (devices become ${isStandardTemp ? 'RETURNED_UNDER_STANDARD' : 'RETURNED_UNDER_OPR'})`),
             onclick: () => { state.oprFinaliseOpen = true; render(); },
           }, h('i', { class: 'fas fa-flag-checkered' }), isExport ? 'Finalise export' : 'Receive return') : null,
           !isDraft && !isExport ? h('button', { id: 'opr-restock-btn', class: 'btn btn-primary text-xs', onclick: doRestock,
-            title: 'Move RETURNED_UNDER_OPR devices back to ACTIVE_INVENTORY (idempotent)' },
+            title: `Move ${isStandardTemp ? 'RETURNED_UNDER_STANDARD' : 'RETURNED_UNDER_OPR'} devices back to ACTIVE_INVENTORY (idempotent)` },
             h('i', { class: 'fas fa-warehouse' }), 'Restock') : null
         )
       ),
 
-      // Header facts
+      // Header facts. Authorisation / Procedure / MRN are all customs-declaration
+      // facts that don't exist on a TEMP_EXPORT_STANDARD shipment — shown as a
+      // neutral "n/a" rather than blank/"null", consistent with the validation
+      // badges and the consignments-list Procedure column.
       h('div', { class: 'grid grid-cols-2 md:grid-cols-4 gap-4' },
-        OprFact('Authorisation', b.authorisation ? b.authorisation.holder_name : '—', 'id-card'),
-        OprFact('Procedure', s.procedure_code + (s.additional_procedure_code ? ' + ' + s.additional_procedure_code : ''), 'stamp'),
-        OprFact(isExport ? 'Export MRN' : 'Import MRN', (isExport ? s.export_mrn : s.import_mrn) || '—', 'barcode'),
+        isStandardTemp
+          ? OprFact('Authorisation', 'n/a — no customs declaration', 'id-card')
+          : OprFact('Authorisation', b.authorisation ? b.authorisation.holder_name : '—', 'id-card'),
+        isStandardTemp
+          ? OprFact('Procedure', 'n/a', 'stamp')
+          : OprFact('Procedure', s.procedure_code + (s.additional_procedure_code ? ' + ' + s.additional_procedure_code : ''), 'stamp'),
+        isStandardTemp
+          ? OprFact(isExport ? 'Export MRN' : 'Import MRN', 'n/a', 'barcode')
+          : OprFact(isExport ? 'Export MRN' : 'Import MRN', (isExport ? s.export_mrn : s.import_mrn) || '—', 'barcode'),
         OprFact('Declared value', fmtMoney(b.total_value, s.currency), 'coins'),
       ),
 
@@ -1375,31 +1435,52 @@
       // EAD / MUCR after the fact (e.g. when the carrier's declaration or
       // consolidation reference lands later). The only mutation a FINALISED
       // export accepts.
-      !isDraft && isExport ? OprExportProofCard(s) : null,
+      // Hidden for TEMP_EXPORT_STANDARD — MRN/DUCR/EAD/MUCR are all customs
+      // declaration references and this shipment_type has no declaration to
+      // reference (pick-and-note: hide entirely rather than keep-as-generic-
+      // tracking-ref or relabel, for consistency with every other customs-only
+      // block on this screen).
+      !isDraft && isExport && !isStandardTemp ? OprExportProofCard(s) : null,
 
-      // Validation traffic lights
-      v ? h('div', { class: 'card p-4', id: 'opr-validation' },
-        h('div', { class: 'flex items-center gap-2 mb-2' },
-          h('span', { class: 'badge ' + (v.result === 'green' ? 'badge-green' : v.result === 'amber' ? 'badge-amber' : 'badge-red') },
-            h('i', { class: 'fas fa-' + (v.result === 'green' ? 'check' : v.result === 'amber' ? 'triangle-exclamation' : 'ban') + ' mr-1' }),
-            v.result.toUpperCase()),
-          h('span', { class: 'text-xs text-slate-400' },
-            `${v.checks.length} checks — red blocks ${isExport ? 'finalisation' : 'receipt'}, amber passes with a warning`)
-        ),
-        h('div', { class: 'space-y-1' },
-          v.checks.filter(c2 => c2.level !== 'green').map(c2 =>
-            h('div', { class: 'flex items-start gap-2 text-xs' },
-              h('span', { class: 'badge ' + (c2.level === 'amber' ? 'badge-amber' : 'badge-red') + ' shrink-0' }, c2.level),
-              h('span', { class: 'text-slate-300' }, c2.message))),
-          v.checks.every(c2 => c2.level === 'green')
-            ? h('div', { class: 'text-xs text-slate-500' }, 'All checks green.')
-            : null
-        )
-      ) : null,
+      // Validation traffic lights. The backend reports customs-only checks
+      // that don't apply to this shipment_type (e.g. TEMP_EXPORT_STANDARD
+      // has no authorisation/procedure code) as level='green' with a
+      // "Not applicable — …" message, so a red/amber result never blocks
+      // on a field the shipment is forbidden from having. But a green tick
+      // reads as "customs check passed" to an operator — misleading on a
+      // shipment with no customs obligation at all. So in the UI (not the
+      // backend data) we re-badge those as a neutral grey "n/a" state,
+      // visually distinct from both pass (green) and fail (amber/red).
+      v ? (() => {
+        const isNotApplicable = (c2) => c2.message.startsWith('Not applicable');
+        const checkBadgeCls = (c2) => isNotApplicable(c2) ? 'badge-slate' : c2.level === 'amber' ? 'badge-amber' : 'badge-red';
+        const checkBadgeText = (c2) => isNotApplicable(c2) ? 'n/a' : c2.level;
+        const visibleChecks = v.checks.filter(c2 => c2.level !== 'green' || isNotApplicable(c2));
+        return h('div', { class: 'card p-4', id: 'opr-validation' },
+          h('div', { class: 'flex items-center gap-2 mb-2' },
+            h('span', { class: 'badge ' + (v.result === 'green' ? 'badge-green' : v.result === 'amber' ? 'badge-amber' : 'badge-red') },
+              h('i', { class: 'fas fa-' + (v.result === 'green' ? 'check' : v.result === 'amber' ? 'triangle-exclamation' : 'ban') + ' mr-1' }),
+              v.result.toUpperCase()),
+            h('span', { class: 'text-xs text-slate-400' },
+              `${v.checks.length} checks — red blocks ${isExport ? 'finalisation' : 'receipt'}, amber passes with a warning`)
+          ),
+          h('div', { class: 'space-y-1' },
+            visibleChecks.map(c2 =>
+              h('div', { class: 'flex items-start gap-2 text-xs' },
+                h('span', { class: 'badge ' + checkBadgeCls(c2) + ' shrink-0' }, checkBadgeText(c2)),
+                h('span', { class: isNotApplicable(c2) ? 'text-slate-500' : 'text-slate-300' }, c2.message))),
+            v.checks.every(c2 => c2.level === 'green' && !isNotApplicable(c2))
+              ? h('div', { class: 'text-xs text-slate-500' }, 'All checks green.')
+              : null
+          )
+        );
+      })() : null,
 
       // Repair-invoice / C&E1154 inputs (import DRAFT only) — receipt is
       // blocked server-side until repair_cost + duty_rate_pct are recorded.
-      isDraft && !isExport ? OprRepairInvoiceCard(s) : null,
+      // Mandatory hide for TEMP_EXPORT_STANDARD — no customs arithmetic
+      // (repair_cost/duty_rate_pct/exchange_rate) on this shipment_type at all.
+      isDraft && !isExport && !isStandardTemp ? OprRepairInvoiceCard(s) : null,
 
       // Scan-to-add (DRAFT only)
       isDraft ? h('div', { class: 'card p-4' },
@@ -1567,18 +1648,24 @@
     const b = state.oprBundle;
     const s = b.shipment;
     const isExport = s.direction === 'export';
+    // TEMP_EXPORT_STANDARD has no declaration references to capture here —
+    // the export target is TEMP_EXPORTED_STANDARD (not EXPORTED_UNDER_OPR)
+    // and the return target is RETURNED_UNDER_STANDARD (not RETURNED_UNDER_OPR).
+    const isStandardTemp = s.shipment_type === 'TEMP_EXPORT_STANDARD';
+    const exportTarget = isStandardTemp ? 'TEMP_EXPORTED_STANDARD' : 'EXPORTED_UNDER_OPR';
+    const returnTarget = isStandardTemp ? 'RETURNED_UNDER_STANDARD' : 'RETURNED_UNDER_OPR';
     const f = { export_mrn: '', ducr: '', ead_mrn: '', mucr: '', import_mrn: '' };
     const close = () => { state.oprFinaliseOpen = false; render(); };
     const doFinalise = async () => {
-      const body = isExport
+      const body = isStandardTemp ? {} : (isExport
         ? Object.fromEntries(Object.entries({ export_mrn: f.export_mrn, ducr: f.ducr, ead_mrn: f.ead_mrn, mucr: f.mucr }).filter(([, v2]) => v2.trim()))
-        : (f.import_mrn.trim() ? { import_mrn: f.import_mrn.trim() } : {});
+        : (f.import_mrn.trim() ? { import_mrn: f.import_mrn.trim() } : {}));
       try {
         const r = await api.post(`/opr/shipments/${s.id}/finalise`, body);
         state.oprFinaliseOpen = false;
         const ambers = (r.validation?.checks || []).filter(c2 => c2.level === 'amber');
         toast(
-          (isExport ? `Export finalised — ${r.devices_exported} devices EXPORTED_UNDER_OPR` : `Return received — ${r.devices_returned ?? b.lines.length} devices RETURNED_UNDER_OPR`) +
+          (isExport ? `Export finalised — ${r.devices_exported} devices ${exportTarget}` : `Return received — ${r.devices_returned ?? b.lines.length} devices ${returnTarget}`) +
           (ambers.length ? `<br><span class="text-xs">${ambers.length} amber warning${ambers.length === 1 ? '' : 's'} noted</span>` : ''),
           'ok', 4500);
         await refreshOprDetail(); await refreshOprShipments(); render();
@@ -1595,10 +1682,18 @@
     return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
       h('div', { class: 'modal p-6 max-w-md' },
         h('h2', { class: 'text-lg font-semibold mb-1' }, isExport ? 'Finalise export consignment' : 'Receive return consignment'),
-        h('p', { class: 'text-xs text-slate-400 mb-4' }, isExport
-          ? 'Declaration references are optional here — they can be recorded later via export proof. Red validation results block finalisation server-side.'
-          : 'Receipt moves every device to RETURNED_UNDER_OPR and freezes declared values. Import MRN is optional (record later via import proof).'),
-        h('div', { class: 'space-y-3' },
+        h('p', { class: 'text-xs text-slate-400 mb-4' },
+          isStandardTemp
+            ? (isExport
+                ? 'No customs declaration on TEMP_EXPORT_STANDARD — finalising moves every device straight to TEMP_EXPORTED_STANDARD.'
+                : 'No customs declaration on TEMP_EXPORT_STANDARD — receipt moves every device to RETURNED_UNDER_STANDARD and freezes declared values.')
+            : (isExport
+                ? 'Declaration references are optional here — they can be recorded later via export proof. Red validation results block finalisation server-side.'
+                : 'Receipt moves every device to RETURNED_UNDER_OPR and freezes declared values. Import MRN is optional (record later via import proof).')),
+        // Declaration-reference fields (MRN/DUCR/EAD/MUCR) don't apply to
+        // TEMP_EXPORT_STANDARD — hidden entirely, matching the OprExportProofCard
+        // pick-and-note decision (no declaration to reference on this shipment_type).
+        isStandardTemp ? null : h('div', { class: 'space-y-3' },
           isExport
             ? [Field('Export MRN', 'export_mrn', '26GB34F7Y1AB8CDE12'),
                Field('DUCR', 'ducr', '6GB369979995000-EXP2026001'),
