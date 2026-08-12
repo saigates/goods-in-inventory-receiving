@@ -348,6 +348,49 @@ describe('validation engine — coded green/amber/red', () => {
       expect(codes).toContain(code)
     }
   })
+
+  // TEMP_EXPORT_STANDARD (migration 0023) is a non-customs consignment
+  // type: no authorisation_id, no procedure_code — both are 422-rejected
+  // at shipment creation (routes/opr.ts). A TEMP_EXPORT_STANDARD shipment
+  // therefore has authorisation_id=null/procedure_code=null in the DB row,
+  // and MUST NOT be red-blocked by the customs-only checks that assume
+  // those fields exist.
+  it('TEMP_EXPORT_STANDARD shipment (no auth, no procedure code) is green — customs checks report not-applicable, not red', () => {
+    const s = baseShipment({
+      shipment_type: 'TEMP_EXPORT_STANDARD', authorisation_id: null,
+      procedure_code: null, additional_procedure_code: null,
+    })
+    const r = runExportValidation(s, null, [mkLine()])
+    expect(r.result).toBe('green')
+    expect(r.red_count).toBe(0)
+    expect(codeLevel(r, 'AUTH_VALID_ON_SHIP_DATE')).toBe('green')
+    expect(codeLevel(r, 'PROCEDURE_CODE')).toBe('green')
+    expect(codeLevel(r, 'COMMODITY_SCOPE')).toBe('green')
+  })
+
+  it('TEMP_EXPORT_STANDARD via the real endpoint is green with a null authorisation/procedure_code', async () => {
+    const res = await api('/api/opr/shipments', {
+      method: 'POST',
+      body: JSON.stringify({ direction: 'export', reference: `TES ENGINE ${shipmentSeq++}`, shipment_type: 'TEMP_EXPORT_STANDARD' }),
+    })
+    expect(res.status).toBe(201)
+    const created = ((await res.json()) as { shipment: { id: number } }).shipment
+    const device = await makeDevice()
+    await api(`/api/opr/shipments/${created.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: device.imei }) })
+
+    const valRes = await api(`/api/opr/shipments/${created.id}/validation`)
+    expect(valRes.status).toBe(200)
+    const data = await valRes.json() as { validation: { result: string; checks: Array<{ code: string; level: string }> } }
+    // No overall-green assertion here: this minimal shipment has no
+    // consignee_name/carrier/incoterm, so LOGISTICS_COMPLETE/DECLARATION_TEXT
+    // are legitimately amber — unrelated to shipment_type. The load-bearing
+    // assertion is that the customs-only checks are green (not red) despite
+    // authorisation_id/procedure_code being null.
+    expect(data.validation.result).not.toBe('red')
+    for (const code of ['AUTH_VALID_ON_SHIP_DATE', 'PROCEDURE_CODE', 'COMMODITY_SCOPE']) {
+      expect(data.validation.checks.find(c => c.code === code)?.level).toBe('green')
+    }
+  })
 })
 
 describe('documents — invoice, scan-out, pre-alert', () => {

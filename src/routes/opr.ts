@@ -1373,9 +1373,12 @@ app.post('/shipments/:id/import-proof', async (c) => {
 })
 
 // POST /shipments/:id/restock — move the received consignment's devices
-// RETURNED_UNDER_OPR → ACTIVE_INVENTORY. Deliberately a separate explicit
-// step after receipt (goods are checked in before going back on sale).
-// Idempotent-ish: already-restocked devices are skipped, not errors.
+// RETURNED_UNDER_OPR → ACTIVE_INVENTORY (or, for a TEMP_EXPORT_STANDARD
+// return, RETURNED_UNDER_STANDARD → ACTIVE_INVENTORY — same target,
+// shipment_type-divergent precursor status, mirroring the precursor
+// divergence already wired at finalise-time). Deliberately a separate
+// explicit step after receipt (goods are checked in before going back on
+// sale). Idempotent-ish: already-restocked devices are skipped, not errors.
 app.post('/shipments/:id/restock', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
@@ -1391,13 +1394,16 @@ app.post('/shipments/:id/restock', async (c) => {
     return c.json({ error: `Shipment is ${shipment.status} — receive the consignment (finalise) before restocking` }, 409)
   }
 
+  // Precursor status diverges by shipment_type, mirroring the
+  // finalise-time (receipt) divergence above.
+  const expectedReturnedStatus = shipment.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'RETURNED_UNDER_STANDARD' : 'RETURNED_UNDER_OPR'
   let restocked = 0
   const skipped: { device_id: number; status: string }[] = []
   for (const line of lines) {
     const d = await c.env.DB.prepare('SELECT id, status FROM received_devices WHERE id = ? AND organisation_id = ?')
       .bind(line.received_device_id, user.organisation_id).first<{ id: number; status: DeviceStatus }>()
     if (!d) { skipped.push({ device_id: line.received_device_id, status: 'missing' }); continue }
-    if (d.status !== 'RETURNED_UNDER_OPR') { skipped.push({ device_id: d.id, status: d.status }); continue }
+    if (d.status !== expectedReturnedStatus) { skipped.push({ device_id: d.id, status: d.status }); continue }
     await transitionDevice(c.env.DB, d.id, 'ACTIVE_INVENTORY', {
       user,
       reference: shipment.reference,

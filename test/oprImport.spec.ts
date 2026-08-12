@@ -700,6 +700,62 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     expect(noCost.status).toBe(422)
     expect(((await noCost.json()) as { error: string }).error).toMatch(/nothing to declare|repair_cost/)
   })
+
+  // TEMP_EXPORT_STANDARD (migration 0023) is a non-customs consignment
+  // type: no authorisation, no procedure code, no repair_cost/duty_rate —
+  // all 422-rejected at creation (routes/opr.ts). This is the load-bearing
+  // check for that type: the IMPORT validation engine must NOT red-block
+  // receipt on the customs-only checks (IMP_PROCEDURE_6121, IMP_REPAIR_COST,
+  // IMP_DUTY_RATE, IMP_OP_AUTH_NUMBER, IMP_AUTH_VALID, IMP_DISCHARGE_WINDOW,
+  // IMP_EXPORT_MRN) that assume fields this shipment type can never have.
+  it('TEMP_EXPORT_STANDARD full round trip: export finalise → TEMP_EXPORTED_STANDARD, receipt is GREEN with no customs fields set, restock → ACTIVE_INVENTORY', async () => {
+    const expRef = `TES EXP ${100 + shipmentSeq++}`
+    const expRes = await api('/api/opr/shipments', {
+      method: 'POST',
+      body: JSON.stringify({ reference: expRef, direction: 'export', shipment_type: 'TEMP_EXPORT_STANDARD' }),
+    })
+    expect(expRes.status).toBe(201)
+    const exp = ((await expRes.json()) as { shipment: { id: number } }).shipment
+
+    const device = await makeDevice()
+    const scan = await api(`/api/opr/shipments/${exp.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: device.imei }) })
+    expect(scan.status).toBe(201)
+
+    const expFin = await api(`/api/opr/shipments/${exp.id}/finalise`, { method: 'POST', body: JSON.stringify({}) })
+    expect(expFin.status).toBe(200)
+    expect(await deviceStatus(device.id)).toBe('TEMP_EXPORTED_STANDARD')
+
+    // Return (import) shipment — no authorisation_id/procedure_code/repair fields at all.
+    const retRes = await api('/api/opr/shipments', {
+      method: 'POST',
+      body: JSON.stringify({
+        reference: `TES RTN ${100 + shipmentSeq++}`, direction: 'import',
+        shipment_type: 'TEMP_EXPORT_STANDARD', related_export_shipment_id: exp.id,
+      }),
+    })
+    expect(retRes.status).toBe(201)
+    const ret = ((await retRes.json()) as { shipment: { id: number } }).shipment
+
+    const retScan = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: device.imei }) })
+    expect(retScan.status).toBe(201)
+
+    // Validation must be GREEN — the customs-only checks report not-applicable, not red.
+    const valRes = await api(`/api/opr/shipments/${ret.id}/validation`)
+    expect(valRes.status).toBe(200)
+    const valData = await valRes.json() as { validation: { result: string; checks: Array<{ code: string; level: string }> } }
+    expect(valData.validation.result).toBe('green')
+    for (const code of ['IMP_PROCEDURE_6121', 'IMP_REPAIR_COST', 'IMP_DUTY_RATE', 'IMP_OP_AUTH_NUMBER', 'IMP_EXPORT_MRN']) {
+      expect(valData.validation.checks.find(c => c.code === code)?.level).toBe('green')
+    }
+
+    const retFin = await api(`/api/opr/shipments/${ret.id}/finalise`, { method: 'POST', body: JSON.stringify({}) })
+    expect(retFin.status).toBe(200)
+    expect(await deviceStatus(device.id)).toBe('RETURNED_UNDER_STANDARD')
+
+    const restock = await api(`/api/opr/shipments/${ret.id}/restock`, { method: 'POST' })
+    expect(restock.status).toBe(200)
+    expect(await deviceStatus(device.id)).toBe('ACTIVE_INVENTORY')
+  })
 })
 
 // ═════════ Value reconciliation + delta trail (0019) ═════════

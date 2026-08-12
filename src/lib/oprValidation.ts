@@ -46,6 +46,13 @@ export function runExportValidation(
 ): ValidationResult {
   const checks: ValidationCheck[] = []
   const add = (code: string, level: CheckLevel, message: string) => checks.push({ code, level, message })
+  // TEMP_EXPORT_STANDARD is a non-customs consignment flow (migration 0023):
+  // no authorisation, no procedure code, no commodity-scope concept. Those
+  // checks are customs-declaration-specific and do not apply — they are
+  // reported green/"not applicable" rather than evaluated, so the traffic
+  // lights stay honest instead of red-blocking on fields the shipment is
+  // forbidden from ever having (enforced at creation in routes/opr.ts).
+  const isStandardTemp = shipment.shipment_type === 'TEMP_EXPORT_STANDARD'
 
   // ── SHIP_HAS_LINES ──
   if (lines.length === 0) {
@@ -65,7 +72,9 @@ export function runExportValidation(
   }
 
   // ── AUTH_VALID_ON_SHIP_DATE ──
-  if (!authorisation) {
+  if (isStandardTemp) {
+    add('AUTH_VALID_ON_SHIP_DATE', 'green', 'Not applicable — TEMP_EXPORT_STANDARD has no customs authorisation')
+  } else if (!authorisation) {
     add('AUTH_VALID_ON_SHIP_DATE', 'red', 'Shipment has no resolvable OPR authorisation')
   } else {
     const effective = shipment.ship_date || today
@@ -81,16 +90,22 @@ export function runExportValidation(
   }
 
   // ── PROCEDURE_CODE — defence in depth (also enforced at create/patch) ──
-  const proc = validateProcedureCodes('export', shipment.procedure_code, shipment.additional_procedure_code)
-  if (!proc.ok) {
-    add('PROCEDURE_CODE', 'red', proc.error)
+  if (isStandardTemp) {
+    add('PROCEDURE_CODE', 'green', 'Not applicable — TEMP_EXPORT_STANDARD carries no customs procedure code')
   } else {
-    add('PROCEDURE_CODE', 'green',
-      `Procedure code ${shipment.procedure_code}${shipment.additional_procedure_code ? ' + ' + shipment.additional_procedure_code : ''} is valid for OPR export`)
+    const proc = validateProcedureCodes('export', shipment.procedure_code, shipment.additional_procedure_code)
+    if (!proc.ok) {
+      add('PROCEDURE_CODE', 'red', proc.error)
+    } else {
+      add('PROCEDURE_CODE', 'green',
+        `Procedure code ${shipment.procedure_code}${shipment.additional_procedure_code ? ' + ' + shipment.additional_procedure_code : ''} is valid for OPR export`)
+    }
   }
 
   // ── COMMODITY_SCOPE ──
-  if (!authorisation) {
+  if (isStandardTemp) {
+    add('COMMODITY_SCOPE', 'green', 'Not applicable — TEMP_EXPORT_STANDARD has no customs commodity scope to verify')
+  } else if (!authorisation) {
     add('COMMODITY_SCOPE', 'red', 'Cannot check commodity scope without an authorisation')
   } else if (!authorisation.commodity_codes) {
     add('COMMODITY_SCOPE', 'amber',

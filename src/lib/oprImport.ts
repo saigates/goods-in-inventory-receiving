@@ -301,13 +301,22 @@ export function runImportValidation(
 ): ValidationResult {
   const checks: ValidationCheck[] = []
   const add = (code: string, level: CheckLevel, message: string) => checks.push({ code, level, message })
+  // TEMP_EXPORT_STANDARD is a non-customs consignment flow (migration
+  // 0023): no procedure code, no authorisation, no C&E1154, no discharge
+  // clock. Those checks are customs-specific and do not apply — reported
+  // green/"not applicable" so a TEMP_EXPORT_STANDARD return isn't
+  // red-blocked on fields it is forbidden from ever having set (enforced
+  // at shipment creation in routes/opr.ts).
+  const isStandardTemp = importShipment.shipment_type === 'TEMP_EXPORT_STANDARD'
 
   // ── IMP_HAS_LINES ──
   if (!lines.length) add('IMP_HAS_LINES', 'red', 'Import consignment has no device lines — nothing to receive')
   else add('IMP_HAS_LINES', 'green', `${lines.length} returning device line(s) on the consignment`)
 
   // ── IMP_PROCEDURE_6121 ──
-  if (importShipment.procedure_code !== '6121') {
+  if (isStandardTemp) {
+    add('IMP_PROCEDURE_6121', 'green', 'Not applicable — TEMP_EXPORT_STANDARD carries no customs procedure code')
+  } else if (importShipment.procedure_code !== '6121') {
     add('IMP_PROCEDURE_6121', 'red', `procedure_code '${importShipment.procedure_code}' — re-import after outward processing must be 6121`)
   } else {
     add('IMP_PROCEDURE_6121', 'green', 'Procedure code 6121 (re-import after outward processing)')
@@ -327,7 +336,9 @@ export function runImportValidation(
     add('IMP_RELATED_EXPORT', 'red', `Related export shipment ${exportShipment.reference} is ${exportShipment.status} — only a FINALISED export can be discharged`)
   } else {
     add('IMP_RELATED_EXPORT', 'green', `Discharges export ${exportShipment.reference}`)
-    if (!exportShipment.export_mrn) {
+    if (isStandardTemp) {
+      add('IMP_EXPORT_MRN', 'green', 'Not applicable — TEMP_EXPORT_STANDARD has no export MRN to quote')
+    } else if (!exportShipment.export_mrn) {
       add('IMP_EXPORT_MRN', 'red', 'Related export has no export MRN — the re-import declaration must quote it')
     } else {
       add('IMP_EXPORT_MRN', 'green', `Quotes original export MRN ${exportShipment.export_mrn}`)
@@ -335,32 +346,42 @@ export function runImportValidation(
   }
 
   // ── IMP_REPAIR_COST (C&E1154 inputs) ──
-  const cost = Number(importShipment.repair_cost)
-  const costCur = (importShipment.repair_cost_currency || 'GBP').toUpperCase()
-  const costProblems: string[] = []
-  if (importShipment.repair_cost == null) costProblems.push('repair_cost is missing (the repairer invoice amount)')
-  else if (Number.isNaN(cost) || cost <= 0) costProblems.push(`repair_cost ${importShipment.repair_cost} must be positive`)
-  else if (!isPenceExact(cost)) costProblems.push(`repair_cost ${cost} is not expressible in minor units (2dp)`)
-  if (!isValidCurrency(costCur)) costProblems.push(`repair_cost_currency '${costCur}' is not a valid ISO 4217 code`)
-  if (costCur !== 'GBP') {
-    const rate = Number(importShipment.customs_exchange_rate)
-    if (importShipment.customs_exchange_rate == null || Number.isNaN(rate) || rate <= 0) {
-      costProblems.push(`customs_exchange_rate is required to convert the ${costCur} repair cost to GBP`)
+  if (isStandardTemp) {
+    add('IMP_REPAIR_COST', 'green', 'Not applicable — no customs arithmetic on a TEMP_EXPORT_STANDARD shipment')
+  } else {
+    const cost = Number(importShipment.repair_cost)
+    const costCur = (importShipment.repair_cost_currency || 'GBP').toUpperCase()
+    const costProblems: string[] = []
+    if (importShipment.repair_cost == null) costProblems.push('repair_cost is missing (the repairer invoice amount)')
+    else if (Number.isNaN(cost) || cost <= 0) costProblems.push(`repair_cost ${importShipment.repair_cost} must be positive`)
+    else if (!isPenceExact(cost)) costProblems.push(`repair_cost ${cost} is not expressible in minor units (2dp)`)
+    if (!isValidCurrency(costCur)) costProblems.push(`repair_cost_currency '${costCur}' is not a valid ISO 4217 code`)
+    if (costCur !== 'GBP') {
+      const rate = Number(importShipment.customs_exchange_rate)
+      if (importShipment.customs_exchange_rate == null || Number.isNaN(rate) || rate <= 0) {
+        costProblems.push(`customs_exchange_rate is required to convert the ${costCur} repair cost to GBP`)
+      }
     }
+    if (costProblems.length) add('IMP_REPAIR_COST', 'red', costProblems.join('; '))
+    else add('IMP_REPAIR_COST', 'green', `Repair cost ${cost.toFixed(2)} ${costCur} with usable conversion inputs`)
   }
-  if (costProblems.length) add('IMP_REPAIR_COST', 'red', costProblems.join('; '))
-  else add('IMP_REPAIR_COST', 'green', `Repair cost ${cost.toFixed(2)} ${costCur} with usable conversion inputs`)
 
   // ── IMP_DUTY_RATE ──
-  const dutyPct = Number(importShipment.duty_rate_pct)
-  if (importShipment.duty_rate_pct == null || Number.isNaN(dutyPct) || dutyPct < 0 || dutyPct > 100) {
-    add('IMP_DUTY_RATE', 'red', 'duty_rate_pct is required (0–100; 0 is valid for duty-free commodities)')
+  if (isStandardTemp) {
+    add('IMP_DUTY_RATE', 'green', 'Not applicable — no customs duty on a TEMP_EXPORT_STANDARD shipment')
   } else {
-    add('IMP_DUTY_RATE', 'green', `Duty rate ${dutyPct}%`)
+    const dutyPct = Number(importShipment.duty_rate_pct)
+    if (importShipment.duty_rate_pct == null || Number.isNaN(dutyPct) || dutyPct < 0 || dutyPct > 100) {
+      add('IMP_DUTY_RATE', 'red', 'duty_rate_pct is required (0–100; 0 is valid for duty-free commodities)')
+    } else {
+      add('IMP_DUTY_RATE', 'green', `Duty rate ${dutyPct}%`)
+    }
   }
 
   // ── IMP_OP_AUTH_NUMBER — the C&E1154 needs the OPR Authorisation Number ──
-  if (!authorisation) {
+  if (isStandardTemp) {
+    add('IMP_OP_AUTH_NUMBER', 'green', 'Not applicable — TEMP_EXPORT_STANDARD has no customs authorisation')
+  } else if (!authorisation) {
     add('IMP_OP_AUTH_NUMBER', 'red', 'Import shipment has no resolvable OPR authorisation')
   } else if (!authorisation.op_authorisation_number) {
     add('IMP_OP_AUTH_NUMBER', 'red', 'Authorisation has no OPR Authorisation Number — the C&E1154 authorisation field requires it (the CDS Authorisation Number must NOT be substituted)')
@@ -369,7 +390,7 @@ export function runImportValidation(
   }
 
   // ── IMP_AUTH_VALID — authorisation valid on receipt date ──
-  if (authorisation) {
+  if (!isStandardTemp && authorisation) {
     const effective = importShipment.ship_date || today
     if (effective < authorisation.valid_from || effective > authorisation.valid_to) {
       add('IMP_AUTH_VALID', 'red', `Authorisation ${authorisation.cds_number} is valid ${authorisation.valid_from} → ${authorisation.valid_to}; ${importShipment.ship_date ? 'ship date' : 'today'} ${effective} is outside that window`)
@@ -382,8 +403,10 @@ export function runImportValidation(
 
   // ── IMP_DISCHARGE_WINDOW — advisory: returning after the discharge
   // deadline is a compliance problem HMRC must be told about, but blocking
-  // the receipt would strand the physical goods, so this stays amber. ──
-  if (exportShipment && authorisation) {
+  // the receipt would strand the physical goods, so this stays amber.
+  // Not applicable to TEMP_EXPORT_STANDARD — no authorisation means no
+  // discharge_period_months to compute a deadline from. ──
+  if (!isStandardTemp && exportShipment && authorisation) {
     const exportDate = exportShipment.ship_date
       || (exportShipment.finalised_at ? String(exportShipment.finalised_at).slice(0, 10) : null)
     if (exportDate) {
