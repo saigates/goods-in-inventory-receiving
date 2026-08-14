@@ -23,7 +23,7 @@ import { env } from 'cloudflare:workers'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import app from '../src/index'
 import { signAuthToken } from '../src/lib/auth'
-import { computeCe1154, addMonths, computeDischargeRow, runImportValidation } from '../src/lib/oprImport'
+import { computeCe1154, addMonths, computeDischargeRow, runImportValidation, round2 } from '../src/lib/oprImport'
 import type { Shipment, ShipmentLine, OprAuthorisation } from '../src/types'
 
 const JWT_SECRET = 'test-secret-opr-import'
@@ -119,7 +119,13 @@ async function makeReturnShipment(relatedExportId: number, overrides: Record<str
       authorisation_id: authId, procedure_code: '6121',
       related_export_shipment_id: relatedExportId,
       ship_date: '2026-09-01',
+      // Full FedEx OPR worksheet chain present by default (the 'computed'
+      // path) so existing tests get a real computeCe1154() result without
+      // each needing its own worksheet-input overrides. duty_rate_pct: 0
+      // needs duty_override_claimed: true to avoid the OVR01 refusal.
       repair_cost: 500, repair_cost_currency: 'GBP', duty_rate_pct: 0,
+      inbound_freight_gbp: 20, non_eu_freight_share_gbp: 10, export_freight_gbp: 20,
+      duty_override_claimed: true,
       ...overrides,
     }),
   })
@@ -348,16 +354,32 @@ describe('OPR 3 — computeCe1154', () => {
     rate_of_yield: '1:1', discharge_period_months: 6, notes: null,
     prealert_email: null, prealert_cutoff: null, created_at: '', updated_at: null,
   }
+  // Full FedEx OPR worksheet chain present by default (the 'computed'
+  // path) — tests that want the 'entry_pending' fallback null the 4
+  // worksheet-input fields out explicitly. Process charge: 1000 USD /
+  // 1.25 = £800. Duty 2% is nonzero so duty_override_claimed doesn't
+  // gate these by default; tests targeting the 0%-duty/override
+  // interaction override duty_rate_pct and duty_override_claimed together.
   const mkImport = (over: Partial<Shipment> = {}): Shipment => ({
     id: 2, organisation_id: 1, reference: 'IMP X', direction: 'import',
     shipment_type: 'OPR_REPAIR', status: 'DRAFT', authorisation_id: 1,
     procedure_code: '6121', additional_procedure_code: null,
     consignee_name: null, consignee_address: null, carrier: null, carrier_account: null,
     incoterm: null, currency: 'GBP', ship_date: '2026-09-01',
-    related_export_shipment_id: 1, export_mrn: null, ducr: null, ead_mrn: null,
+    related_export_shipment_id: 1, export_mrn: null, ducr: null, ead_mrn: null, mucr: null,
     finalised_at: null, finalised_by_user_id: null,
     repair_cost: 1000, repair_cost_currency: 'USD', customs_exchange_rate: 1.25,
     duty_rate_pct: 2, import_mrn: null,
+    reconciled_value_gbp: null,
+    customs_entry_ref: null, vat_evidence_ref: null,
+    repair_cost_confirmed_at: null, repair_cost_confirmed_by_user_id: null,
+    inbound_freight_gbp: 100, non_eu_freight_share_gbp: 40, export_freight_gbp: 100,
+    insurance_gbp: null, value_adjustment_gbp: null,
+    commodity_code: null, duty_override_claimed: 0,
+    entry_accepted_at: null, entry_cleared_at: null, supplementary_units: null,
+    entry_duty_base_gbp: null, entry_vat_base_gbp: null, entry_duty_gbp: null, entry_vat_gbp: null,
+    declared_invoice_total_gbp: null, declared_piece_count: null, declared_gross_weight_kg: null,
+    misdeclaration_ack_at: null, misdeclaration_ack_by_user_id: null,
     notes: null, created_by_user_id: null, created_at: '', updated_at: null,
     ...over,
   })
@@ -365,6 +387,7 @@ describe('OPR 3 — computeCe1154', () => {
     id: 1, reference: 'EXP X', direction: 'export', procedure_code: '2100',
     related_export_shipment_id: null, export_mrn: '26GB1111111111XX01', status: 'FINALISED',
     repair_cost: null, repair_cost_currency: null, customs_exchange_rate: null, duty_rate_pct: null,
+    inbound_freight_gbp: null, non_eu_freight_share_gbp: null, export_freight_gbp: null,
     ship_date: '2026-07-01',
     ...over,
   })
@@ -375,9 +398,16 @@ describe('OPR 3 — computeCe1154', () => {
     added_by_user_id: null, created_at: '',
   })
 
-  it('computes conversion, relief and net duty; OPR Authorisation Number in the auth field, CDS only in the statement', () => {
-    // 1000 USD / 1.25 = £800 repair. Duty 2%.
-    // Without OPR: (300 + 800) * 2% = £22. Net (repair only): 800 * 2% = £16. Relief £6.
+  it('computes the full FedEx OPR worksheet chain: compensatory value, duty base, VAT base, duty, VAT (PVA); OPR Authorisation Number in the auth field, CDS only in the statement', () => {
+    // Process charge 1000 USD / 1.25 = £800. Inbound freight £100,
+    // non-EU share £40, export freight £100, insurance defaults to 0,
+    // value adjustment defaults to £1.31. Device value = 150+150 = £300
+    // (computed from lines — NEVER a typed-in field).
+    //   compensatory value = 300 + 800 + 100 + 0            = 1200
+    //   duty base           = 800 + 40 (non-EU share only) + 0 =  840
+    //   duty                = 840 * 2%                        =   16.80
+    //   VAT base            = 800 + 100 + 100 + 16.80 + 1.31  = 1018.11
+    //   VAT (PVA)           = 1018.11 * 20%                   =  203.62
     const r = computeCe1154(mkImport(), mkExport(), baseAuth, [mkLine(150, 1), mkLine(150, 2)])
     expect(r.ok).toBe(true)
     if (!r.ok) return
@@ -386,19 +416,25 @@ describe('OPR 3 — computeCe1154', () => {
     expect(r.ce1154.cross_reference_statement).toContain('GBOPO36997999500020260226105539')
     expect(r.ce1154.export_mrn).toBe('26GB1111111111XX01')
     expect(r.ce1154.quantity).toBe(2)
-    expect(r.ce1154.exported_goods_value_gbp).toBe(300)
-    expect(r.ce1154.repair_cost_gbp).toBe(800)
-    expect(r.ce1154.duty_without_relief_gbp).toBe(22)
-    expect(r.ce1154.duty_on_repair_cost_gbp).toBe(16)
-    expect(r.ce1154.opr_relief_gbp).toBe(6)
+    expect(r.ce1154.worksheet_source).toBe('computed')
+    expect(r.ce1154.device_value_gbp).toBe(300)
+    expect(r.ce1154.process_charge_gbp).toBe(800)
+    expect(r.ce1154.compensatory_value_gbp).toBe(1200)
+    expect(r.ce1154.duty_base_gbp).toBe(840)
+    expect(r.ce1154.duty_gbp).toBe(16.80)
+    expect(r.ce1154.vat_base_gbp).toBe(1018.11)
+    expect(r.ce1154.pva_amount_gbp).toBe(203.62)
+    expect(r.ce1154.value_adjustment_gbp).toBe(1.31)
+    expect(r.ce1154.value_adjustment_is_default).toBe(true)
+    expect(r.ce1154.vat_note).toMatch(/POSTPONED/)
   })
 
-  it('partial return: exported-goods value counts the RETURNING units only', () => {
+  it('partial return: device value (computed) counts the RETURNING units only, never the whole export', () => {
     // Export had many devices, but only one £150 line is returning.
     const r = computeCe1154(mkImport(), mkExport(), baseAuth, [mkLine(150)])
     expect(r.ok).toBe(true)
     if (!r.ok) return
-    expect(r.ce1154.exported_goods_value_gbp).toBe(150)
+    expect(r.ce1154.device_value_gbp).toBe(150)
     expect(r.ce1154.quantity).toBe(1)
   })
 
@@ -409,17 +445,31 @@ describe('OPR 3 — computeCe1154', () => {
     expect(r.error).toMatch(/does not equal the consignment quantity/)
   })
 
-  it('GBP repair cost needs no exchange rate; duty 0% is valid (net duty £0)', () => {
+  it('duty computing to £0.00 without duty_override_claimed is refused — a zero duty is never silently implied', () => {
     const r = computeCe1154(
       mkImport({ repair_cost: 500, repair_cost_currency: 'GBP', customs_exchange_rate: null, duty_rate_pct: 0 }),
       mkExport(), baseAuth, [mkLine(150)],
     )
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error).toMatch(/duty_override_claimed/)
+    expect(r.error).toMatch(/OVR01/)
+  })
+
+  it('GBP process charge needs no exchange rate; duty 0% is valid once duty_override_claimed is set', () => {
+    const r = computeCe1154(
+      mkImport({
+        repair_cost: 500, repair_cost_currency: 'GBP', customs_exchange_rate: null,
+        duty_rate_pct: 0, duty_override_claimed: 1,
+      }),
+      mkExport(), baseAuth, [mkLine(150)],
+    )
     expect(r.ok).toBe(true)
     if (!r.ok) return
-    expect(r.ce1154.repair_cost_gbp).toBe(500)
+    expect(r.ce1154.process_charge_gbp).toBe(500)
     expect(r.ce1154.customs_exchange_rate).toBeNull()
-    expect(r.ce1154.duty_on_repair_cost_gbp).toBe(0)
-    expect(r.ce1154.opr_relief_gbp).toBe(0)
+    expect(r.ce1154.duty_gbp).toBe(0)
+    expect(r.ce1154.duty_override_claimed).toBe(true)
   })
 
   it('refuses without an OPR Authorisation Number — the CDS Authorisation Number must NOT be substituted', () => {
@@ -430,7 +480,7 @@ describe('OPR 3 — computeCe1154', () => {
     expect(r.error).toMatch(/must NOT be substituted/)
   })
 
-  it('refuses a non-GBP repair cost without a customs exchange rate', () => {
+  it('refuses a non-GBP process charge without a customs exchange rate', () => {
     const r = computeCe1154(mkImport({ customs_exchange_rate: null }), mkExport(), baseAuth, [mkLine(150)])
     expect(r.ok).toBe(false)
     if (r.ok) return
@@ -442,6 +492,240 @@ describe('OPR 3 — computeCe1154', () => {
     expect(r.ok).toBe(false)
     if (r.ok) return
     expect(r.error).toMatch(/export MRN/)
+  })
+
+  // ── entry_pending fallback (R2's real-world handling: worksheet inputs
+  // not yet supplied by FedEx, CDS entry's own declared bases/taxes used) ──
+  it('falls back to the CDS entry-declared bases/taxes when FedEx worksheet inputs are missing (entry_pending)', () => {
+    const r = computeCe1154(
+      mkImport({
+        repair_cost: null, repair_cost_currency: null, customs_exchange_rate: null, duty_rate_pct: null,
+        inbound_freight_gbp: null, non_eu_freight_share_gbp: null, export_freight_gbp: null,
+        duty_override_claimed: 1,
+        entry_duty_base_gbp: 1390.81, entry_vat_base_gbp: 1555.99, entry_duty_gbp: 0, entry_vat_gbp: 311.20,
+      }),
+      mkExport(), baseAuth, [mkLine(150)],
+    )
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ce1154.worksheet_source).toBe('entry_pending')
+    expect(r.ce1154.worksheet_pending_note).toMatch(/pending/i)
+    expect(r.ce1154.duty_base_gbp).toBe(1390.81)
+    expect(r.ce1154.vat_base_gbp).toBe(1555.99)
+    expect(r.ce1154.duty_gbp).toBe(0)
+    expect(r.ce1154.pva_amount_gbp).toBe(311.20)
+    expect(r.ce1154.process_charge).toBeNull()
+    expect(r.ce1154.process_charge_gbp).toBeNull()
+  })
+
+  it('refuses when neither FedEx worksheet inputs nor CDS entry-declared bases/taxes are recorded', () => {
+    const r = computeCe1154(
+      mkImport({
+        repair_cost: null, repair_cost_currency: null, customs_exchange_rate: null, duty_rate_pct: null,
+        inbound_freight_gbp: null, non_eu_freight_share_gbp: null, export_freight_gbp: null,
+      }),
+      mkExport(), baseAuth, [mkLine(150)],
+    )
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error).toMatch(/Neither the FedEx OPR worksheet inputs nor the CDS entry-declared/)
+  })
+
+  // ── Anti-misdeclaration structural gate (checkMisdeclaration, embedded) ──
+  it('flags declared vs. computed device-value variance, side by side, and requires acknowledgement', () => {
+    // Real discrepancy shape: broker-declared invoice total differs from
+    // the true line-value sum (never the other way — device value is
+    // ALWAYS the computed sum, never the declared figure).
+    const r = computeCe1154(
+      mkImport({ declared_invoice_total_gbp: 22588.00 }),
+      mkExport(), baseAuth, [mkLine(150, 1), mkLine(150, 2)],
+    )
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ce1154.device_value_gbp).toBe(300) // computed — unaffected by the declared figure
+    expect(r.ce1154.misdeclaration.value.declared_gbp).toBe(22588.00)
+    expect(r.ce1154.misdeclaration.value.computed_gbp).toBe(300)
+    expect(r.ce1154.misdeclaration.value.variance_gbp).toBe(22288)
+    expect(r.ce1154.misdeclaration.value.misdeclared).toBe(true)
+    expect(r.ce1154.misdeclaration.any_misdeclared).toBe(true)
+    expect(r.ce1154.misdeclaration.requires_acknowledgement).toBe(true)
+  })
+
+  it('does not flag value misdeclaration when declared matches computed to the penny', () => {
+    const r = computeCe1154(
+      mkImport({ declared_invoice_total_gbp: 300 }),
+      mkExport(), baseAuth, [mkLine(150, 1), mkLine(150, 2)],
+    )
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ce1154.misdeclaration.value.misdeclared).toBe(false)
+    expect(r.ce1154.misdeclaration.any_misdeclared).toBe(false)
+  })
+
+  it('flags piece count / gross weight carried forward from a sibling leg despite a different quantity (better catch than a bare declared-value check)', () => {
+    // R2 carried forward R1's "two boxes / 40kg" despite 18 fewer devices.
+    const r = computeCe1154(
+      mkImport({ declared_piece_count: 2, declared_gross_weight_kg: 40 }),
+      mkExport(), baseAuth, [mkLine(150, 1), mkLine(150, 2)],
+      undefined,
+      [{ reference: 'IMP RTN R1', quantity: 90, declared_piece_count: 2, declared_gross_weight_kg: 40 }],
+    )
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ce1154.misdeclaration.piece_count.misdeclared).toBe(true)
+    expect(r.ce1154.misdeclaration.piece_count.suspect_carried_forward_from).toBe('IMP RTN R1')
+    expect(r.ce1154.misdeclaration.gross_weight.misdeclared).toBe(true)
+    expect(r.ce1154.misdeclaration.gross_weight.suspect_carried_forward_from).toBe('IMP RTN R1')
+    expect(r.ce1154.misdeclaration.any_misdeclared).toBe(true)
+  })
+
+  it('does not flag piece count / gross weight when a sibling leg has the same quantity too (not a carry-forward, a real match)', () => {
+    const r = computeCe1154(
+      mkImport({ declared_piece_count: 2, declared_gross_weight_kg: 40 }),
+      mkExport(), baseAuth, [mkLine(150, 1), mkLine(150, 2)],
+      undefined,
+      [{ reference: 'IMP RTN SAME', quantity: 2, declared_piece_count: 2, declared_gross_weight_kg: 40 }],
+    )
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ce1154.misdeclaration.piece_count.misdeclared).toBe(false)
+    expect(r.ce1154.misdeclaration.gross_weight.misdeclared).toBe(false)
+  })
+})
+
+// ═════════ R1 / R2 real-shipment fixtures (Item C, assert to the penny) ═════════
+//
+// R1 (AWB 874874338764, import MRN 26GB8ILNEI7EFJPAR1, 90 units) has a
+// FULL FedEx OPR worksheet — the whole computation chain is exercised and
+// every intermediate/final figure is asserted to the penny.
+//
+// R2 (AWB 875147276207, import MRN 26GB8JRJW1IQOR7AR0, 72 units) has ONLY
+// the CDS entry — FedEx's "OP WS 875147276207" worksheet has been
+// requested and is still outstanding. Only the 4 CDS-declared output
+// figures are asserted; the input breakdown is left `entry_pending`,
+// which is the REAL state, not a placeholder.
+describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
+  const auth: OprAuthorisation = {
+    id: 1, organisation_id: 1, holder_name: 'Saigates Limited', eori: 'GB369979995000',
+    cds_number: 'GBOPO36997999500020260226105539', op_authorisation_number: 'OP/0922/601/31',
+    valid_from: '2026-03-01', valid_to: '2031-02-28',
+    supervising_office_name: 'HMRC S1756 IP-OP Customs Liverpool', supervising_office_code: 'GBLIV002',
+    commodity_scope: 'Smartphones', commodity_codes: '8517130000',
+    rate_of_yield: '1:1', discharge_period_months: 6, notes: null,
+    prealert_email: null, prealert_cutoff: null, created_at: '', updated_at: null,
+  }
+  const mkBase = (over: Partial<Shipment> = {}): Shipment => ({
+    id: 2, organisation_id: 1, reference: 'R1', direction: 'import',
+    shipment_type: 'OPR_REPAIR', status: 'DRAFT', authorisation_id: 1,
+    procedure_code: '6121', additional_procedure_code: null,
+    consignee_name: null, consignee_address: null, carrier: 'FedEx', carrier_account: null,
+    incoterm: null, currency: 'GBP', ship_date: '2026-09-01',
+    related_export_shipment_id: 1, export_mrn: null, ducr: null, ead_mrn: null, mucr: null,
+    finalised_at: null, finalised_by_user_id: null,
+    repair_cost: null, repair_cost_currency: null, customs_exchange_rate: null,
+    duty_rate_pct: null, import_mrn: null,
+    reconciled_value_gbp: null,
+    customs_entry_ref: null, vat_evidence_ref: null,
+    repair_cost_confirmed_at: null, repair_cost_confirmed_by_user_id: null,
+    inbound_freight_gbp: null, non_eu_freight_share_gbp: null, export_freight_gbp: null,
+    insurance_gbp: null, value_adjustment_gbp: null,
+    commodity_code: '8517130000', duty_override_claimed: 1, // OVR01|DUTY OVERRIDE CLAIMED — stored fact
+    entry_accepted_at: null, entry_cleared_at: null, supplementary_units: null,
+    entry_duty_base_gbp: null, entry_vat_base_gbp: null, entry_duty_gbp: null, entry_vat_gbp: null,
+    declared_invoice_total_gbp: null, declared_piece_count: null, declared_gross_weight_kg: null,
+    misdeclaration_ack_at: null, misdeclaration_ack_by_user_id: null,
+    notes: null, created_by_user_id: null, created_at: '', updated_at: null,
+    ...over,
+  })
+  const mkExport = (mrn: string): Shipment => mkBase({
+    id: 1, reference: `EXP ${mrn}`, direction: 'export', procedure_code: '2100',
+    related_export_shipment_id: null, export_mrn: mrn, status: 'FINALISED',
+    duty_override_claimed: 0,
+  })
+
+  it('R1 (874874338764, import MRN 26GB8ILNEI7EFJPAR1, 90 units) — full worksheet chain asserted to the penny', () => {
+    // Device value is NOT part of the fixture table (only the worksheet
+    // and bases/taxes figures are specified in Item C) — 90 synthetic
+    // £1.00 lines stand in for the real IMEI-level values so the
+    // quantity (90) is exact while compensatory_value_gbp is checked
+    // structurally against the formula rather than to an invented penny
+    // figure. Pick-and-note: real per-device values await the IMEI-level
+    // export/return manifests, not part of this table.
+    const lines: ShipmentLine[] = Array.from({ length: 90 }, (_, i) => ({
+      id: i + 1, organisation_id: 1, shipment_id: 2, received_device_id: i + 1,
+      imei: `860455190001${String(i).padStart(2, '0')}`, sku: null, brand: 'Samsung', model: 'S23',
+      capacity: null, color: null, grade: 'A', unit_value: 1, currency: 'GBP',
+      added_by_user_id: null, created_at: '',
+    }))
+    const importShipment = mkBase({
+      reference: 'R1', import_mrn: '26GB8ILNEI7EFJPAR1', supplementary_units: 90,
+      repair_cost: 1556.09, repair_cost_currency: 'GBP',
+      inbound_freight_gbp: 101.70, non_eu_freight_share_gbp: 43.73, export_freight_gbp: 101.70,
+      insurance_gbp: 0, duty_rate_pct: 0,
+    })
+    const r = computeCe1154(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, lines)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ce1154.worksheet_source).toBe('computed')
+    expect(r.ce1154.quantity).toBe(90)
+    expect(r.ce1154.supplementary_units).toBe(90)
+    expect(r.ce1154.process_charge_gbp).toBe(1556.09)
+    expect(r.ce1154.inbound_freight_gbp).toBe(101.70)
+    expect(r.ce1154.non_eu_freight_share_gbp).toBe(43.73)
+    expect(r.ce1154.export_freight_gbp).toBe(101.70)
+    expect(r.ce1154.value_adjustment_gbp).toBe(1.31)
+    expect(r.ce1154.value_adjustment_is_default).toBe(true)
+    // Table figures, asserted to the penny:
+    expect(r.ce1154.duty_base_gbp).toBe(1599.82)
+    expect(r.ce1154.vat_base_gbp).toBe(1760.80)
+    expect(r.ce1154.duty_gbp).toBe(0)
+    expect(r.ce1154.pva_amount_gbp).toBe(352.16)
+    expect(r.ce1154.duty_override_claimed).toBe(true)
+    // Structural check on compensatory value (not a table figure):
+    expect(r.ce1154.compensatory_value_gbp).toBe(round2(90 + 1556.09 + 101.70 + 0))
+  })
+
+  it('R2 (875147276207, import MRN 26GB8JRJW1IQOR7AR0, 72 units) — entry_pending: bases/taxes asserted, input breakdown pending (FedEx worksheet "OP WS 875147276207" outstanding)', () => {
+    const lines: ShipmentLine[] = Array.from({ length: 72 }, (_, i) => ({
+      id: i + 1, organisation_id: 1, shipment_id: 2, received_device_id: i + 1,
+      imei: `860455190002${String(i).padStart(2, '0')}`, sku: null, brand: 'Samsung', model: 'S23',
+      capacity: null, color: null, grade: 'A', unit_value: 1, currency: 'GBP',
+      added_by_user_id: null, created_at: '',
+    }))
+    const importShipment = mkBase({
+      reference: 'R2', import_mrn: '26GB8JRJW1IQOR7AR0', supplementary_units: 72,
+      // Worksheet inputs pending — FedEx has not yet supplied OP WS 875147276207.
+      repair_cost: null, repair_cost_currency: null, customs_exchange_rate: null, duty_rate_pct: null,
+      inbound_freight_gbp: null, non_eu_freight_share_gbp: null, export_freight_gbp: null,
+      // CDS entry's own declared bases/taxes — the only figures we have for R2.
+      entry_duty_base_gbp: 1390.81, entry_vat_base_gbp: 1555.99, entry_duty_gbp: 0, entry_vat_gbp: 311.20,
+    })
+    const r = computeCe1154(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, lines)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ce1154.worksheet_source).toBe('entry_pending')
+    expect(r.ce1154.worksheet_pending_note).toMatch(/pending/i)
+    expect(r.ce1154.quantity).toBe(72)
+    expect(r.ce1154.supplementary_units).toBe(72)
+    expect(r.ce1154.process_charge).toBeNull() // input breakdown genuinely pending
+    // Table figures, asserted to the penny:
+    expect(r.ce1154.duty_base_gbp).toBe(1390.81)
+    expect(r.ce1154.vat_base_gbp).toBe(1555.99)
+    expect(r.ce1154.duty_gbp).toBe(0)
+    expect(r.ce1154.pva_amount_gbp).toBe(311.20)
+    expect(r.ce1154.duty_override_claimed).toBe(true)
+  })
+
+  it('discharge worked example: R1 (90) + R2 (72) supplementary units against export MRN 26GB7LKWO3QHFLCAA0 sum to exactly 162', () => {
+    // Confirms the fixture data itself is internally consistent with the
+    // Item C discharge worked example (90 + 72 = 162, fully discharged,
+    // 10 Jan 2027 deadline met). The AGGREGATION logic across legs citing
+    // a shared export MRN is separate application code (Step 3, not yet
+    // wired into computeDischargeRow()/GET /discharge) — this test only
+    // pins the arithmetic identity the fixtures must satisfy.
+    const r1SupplementaryUnits = 90
+    const r2SupplementaryUnits = 72
+    expect(r1SupplementaryUnits + r2SupplementaryUnits).toBe(162)
   })
 })
 
@@ -552,12 +836,12 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
       expect(s.status).toBe(201)
     }
 
-    // C&E1154 JSON: value counts the 2 returning units (2 × 150).
+    // C&E1154 JSON: device value (computed) counts the 2 returning units (2 × 150).
     const ceRes = await api(`/api/opr/shipments/${ret.id}/ce1154?format=json`)
     expect(ceRes.status).toBe(200)
-    const ce = ((await ceRes.json()) as { ce1154: { quantity: number; exported_goods_value_gbp: number; opr_authorisation_number: string } }).ce1154
+    const ce = ((await ceRes.json()) as { ce1154: { quantity: number; device_value_gbp: number; opr_authorisation_number: string } }).ce1154
     expect(ce.quantity).toBe(2)
-    expect(ce.exported_goods_value_gbp).toBe(300)
+    expect(ce.device_value_gbp).toBe(300)
     expect(ce.opr_authorisation_number).toBe('OP/0922/601/31')
 
     // C&E1154 HTML: OPR Authorisation Number present; CDS Authorisation
@@ -569,19 +853,20 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     const statementStart = html.indexOf('id="ce1154-statement"')
     expect(html.indexOf('GBOPO36997999500020260226105539')).toBeGreaterThan(statementStart)
 
-    // Clearance draft: quotes the export MRN, three-part cost-breakdown
-    // wording (repair cost / inbound freight / outbound freight — see
-    // docs/plan/device-lifecycle-slice1.md:486-492; "repair cost only" was
-    // replaced with this breakdown so the template no longer implies
-    // freight is out of scope of the customs assessment).
+    // Clearance draft: quotes the export MRN, full FedEx OPR worksheet-chain
+    // wording (process/repair charge, inbound freight, duty base/VAT base
+    // asymmetry — Item C superseded the old "repair cost only" framing so
+    // the template no longer implies freight is out of scope of the
+    // customs assessment).
     const clr = await api(`/api/opr/shipments/${ret.id}/clearance`)
     expect(clr.status).toBe(200)
     const clearance = ((await clr.json()) as { clearance: { body: string; export_mrn_present: boolean; note: string } }).clearance
     expect(clearance.export_mrn_present).toBe(true)
     expect(clearance.body).toContain('26GB0000000000AA09')
-    expect(clearance.body).toContain('repair cost')
+    expect(clearance.body).toContain('Process (repair) charge')
     expect(clearance.body).toContain('inbound freight')
-    expect(clearance.body).toContain('outbound freight')
+    expect(clearance.body).toContain('Duty base')
+    expect(clearance.body).toContain('POSTPONED')
     expect(clearance.body).not.toContain('repair cost only')
     expect(clearance.note).toMatch(/no email is sent/)
 
