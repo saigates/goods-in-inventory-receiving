@@ -690,6 +690,52 @@ export function runImportValidation(
     }
   }
 
+  // ── IMP_DUTY_OVERRIDE + IMP_MISDECLARATION_CHECK — both derived from the
+  // SAME computeCe1154() run that produces the actual C&E1154, rather than
+  // re-implementing its refusal/misdeclaration logic a second time here.
+  // Not applicable to TEMP_EXPORT_STANDARD (no customs arithmetic at all);
+  // deferred (amber, not red) when the consignment has no lines yet or
+  // computeCe1154() cannot yet run for an unrelated reason already covered
+  // by an earlier check above (e.g. missing repair cost/duty rate) — that
+  // earlier check is what should red-block in that case, not this one
+  // reporting the same gap twice under a different code.
+  if (isStandardTemp) {
+    add('IMP_DUTY_OVERRIDE', 'green', 'Not applicable — no customs duty on a TEMP_EXPORT_STANDARD shipment')
+    add('IMP_MISDECLARATION_CHECK', 'green', 'Not applicable — no customs value comparison on a TEMP_EXPORT_STANDARD shipment')
+  } else if (!lines.length) {
+    add('IMP_DUTY_OVERRIDE', 'amber', 'Cannot check yet — consignment has no device lines')
+    add('IMP_MISDECLARATION_CHECK', 'amber', 'Cannot check yet — consignment has no device lines')
+  } else {
+    const ce = computeCe1154(importShipment, exportShipment, authorisation, lines, undefined, siblingLegs)
+    if (!ce.ok) {
+      if (/duty_override_claimed/.test(ce.error)) {
+        // The one refusal reason this check exists to catch: duty computes
+        // to £0.00 but OVR01|DUTY OVERRIDE CLAIMED is not recorded.
+        add('IMP_DUTY_OVERRIDE', 'red', ce.error)
+      } else {
+        add('IMP_DUTY_OVERRIDE', 'amber', `Cannot check yet — ${ce.error}`)
+      }
+      add('IMP_MISDECLARATION_CHECK', 'amber', `Cannot check yet — ${ce.error}`)
+    } else {
+      add('IMP_DUTY_OVERRIDE', 'green', ce.ce1154.duty_gbp === 0
+        ? 'Duty computes to £0.00 and duty_override_claimed (OVR01|DUTY OVERRIDE CLAIMED) is recorded'
+        : `Duty £${ce.ce1154.duty_gbp.toFixed(2)} is non-zero — no override required`)
+
+      const m = ce.ce1154.misdeclaration
+      if (m.any_misdeclared && !importShipment.misdeclaration_ack_at) {
+        const parts: string[] = []
+        if (m.value.misdeclared) parts.push(`declared invoice total £${m.value.declared_gbp} vs. computed device value £${m.value.computed_gbp} (variance £${m.value.variance_gbp})`)
+        if (m.piece_count.misdeclared) parts.push(`piece count ${m.piece_count.declared} matches leg ${m.piece_count.suspect_carried_forward_from} despite a different quantity`)
+        if (m.gross_weight.misdeclared) parts.push(`gross weight ${m.gross_weight.declared}kg matches leg ${m.gross_weight.suspect_carried_forward_from} despite a different quantity`)
+        add('IMP_MISDECLARATION_CHECK', 'red', `Declared-vs-computed variance requires acknowledgement before receipt: ${parts.join('; ')}`)
+      } else if (m.any_misdeclared) {
+        add('IMP_MISDECLARATION_CHECK', 'amber', `Declared-vs-computed variance was acknowledged at ${importShipment.misdeclaration_ack_at}`)
+      } else {
+        add('IMP_MISDECLARATION_CHECK', 'green', 'Declared figures (where present) match the computed device value; no carried-forward piece count/gross weight detected against sibling legs')
+      }
+    }
+  }
+
   const red_count = checks.filter(x => x.level === 'red').length
   const amber_count = checks.filter(x => x.level === 'amber').length
   return {
