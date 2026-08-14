@@ -266,6 +266,32 @@ export type Shipment = {
   vat_evidence_ref: string | null               // generic VAT evidence ref — NOT PVA/C79-specific (awaiting agent)
   repair_cost_confirmed_at: string | null
   repair_cost_confirmed_by_user_id: number | null
+  // ── C&E1154 worksheet rewrite (0024, Item C) — FedEx OPR worksheet chain ──
+  // process charge reuses repair_cost/repair_cost_currency/customs_exchange_rate
+  // above (same figure, renamed conceptually — not duplicated as a column).
+  inbound_freight_gbp: number | null
+  non_eu_freight_share_gbp: number | null
+  export_freight_gbp: number | null
+  insurance_gbp: number | null
+  value_adjustment_gbp: number | null           // operator-entered, DEFAULTS to 1.31 (both real legs) — never a hardcoded constant
+  commodity_code: string | null                 // tariff/commodity code for this entry
+  duty_override_claimed: number                 // 0/1 — OVR01|DUTY OVERRIDE CLAIMED must be an explicit recorded fact, even at 0% duty
+  entry_accepted_at: string | null
+  entry_cleared_at: string | null
+  supplementary_units: number | null            // customs-declared quantity for discharge tracking; falls back to line count when NULL
+  // CDS-entry-declared bases/taxes — the cross-check/fallback when our own
+  // worksheet inputs above are still NULL (e.g. R2: entry known, worksheet
+  // pending). See migration 0024 comment for the exact relationship.
+  entry_duty_base_gbp: number | null
+  entry_vat_base_gbp: number | null
+  entry_duty_gbp: number | null
+  entry_vat_gbp: number | null
+  // ── Anti-misdeclaration structural gate (0024) ──
+  declared_invoice_total_gbp: number | null     // broker-declared value (e.g. FedEx) — NEVER used as the customs value; compared against sumLineValues()
+  declared_piece_count: number | null
+  declared_gross_weight_kg: number | null
+  misdeclaration_ack_at: string | null          // explicit operator acknowledgement of a declared-vs-computed variance; NULL blocks finalise while a variance exists
+  misdeclaration_ack_by_user_id: number | null
   notes: string | null
   created_by_user_id: number | null
   created_at: string
