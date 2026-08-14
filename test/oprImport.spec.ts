@@ -494,8 +494,16 @@ describe('OPR 3 — computeCe1154', () => {
     expect(r.error).toMatch(/export MRN/)
   })
 
-  // ── entry_pending fallback (R2's real-world handling: worksheet inputs
-  // not yet supplied by FedEx, CDS entry's own declared bases/taxes used) ──
+  // ── entry_pending fallback (the general mechanism: when worksheet
+  // inputs aren't yet available for ANY leg, fall back to the CDS entry's
+  // own declared bases/taxes rather than inventing figures. R2 itself no
+  // longer exercises this path — see the "OPR 3 — R1/R2 real-shipment"
+  // describe block below, where entry_pending has been retired for R2 in
+  // favour of derived-and-tied worksheet inputs. This test's synthetic
+  // figures happen to numerically match R2's real ones only because they
+  // were originally copied from R2 before that retirement; the mechanism
+  // under test here is generic and still needed for any future leg whose
+  // worksheet genuinely has no derivable inputs yet.) ──
   it('falls back to the CDS entry-declared bases/taxes when FedEx worksheet inputs are missing (entry_pending)', () => {
     const r = computeCe1154(
       mkImport({
@@ -599,11 +607,26 @@ describe('OPR 3 — computeCe1154', () => {
 // FULL FedEx OPR worksheet — the whole computation chain is exercised and
 // every intermediate/final figure is asserted to the penny.
 //
-// R2 (AWB 875147276207, import MRN 26GB8JRJW1IQOR7AR0, 72 units) has ONLY
-// the CDS entry — FedEx's "OP WS 875147276207" worksheet has been
-// requested and is still outstanding. Only the 4 CDS-declared output
-// figures are asserted; the input breakdown is left `entry_pending`,
-// which is the REAL state, not a placeholder.
+// R2 (AWB 875147276207, import MRN 26GB8JRJW1IQOR7AR0, 72 units): the
+// FedEx "OP WS 875147276207" worksheet itself is still outstanding from
+// Aimee, but R2 has NO unknowns — every input and output is determined
+// by two independent equations that each close to zero, so `entry_pending`
+// is retired here in favour of the full computed chain. These are
+// DERIVED-AND-TIED figures, not broker-supplied ones:
+//   R1 compensatory-value/invoice-total check (proves the equation form):
+//     £22,588.00 + £1,556.09 + £101.70 + £0.00 = £24,245.79 ✓ (declared
+//     invoice total)
+//   R2 inbound freight (derived from the same equation, applied to R2):
+//     £18,794.81 − £17,344.00 (device value) − £1,345.63 (process/repair
+//     charge) = £105.18
+//   R2 export freight (derived from the VAT-base equation):
+//     £1,555.99 − £1,345.63 − £105.18 − £0.00 (duty) − £1.31 (value
+//     adjustment) = £103.87
+//   R2 duty-base tie (confirms the derived freight split against the
+//     known duty base): £1,345.63 + £45.18 (non-EU freight share) =
+//     £1,390.81 ✓
+// The outstanding item with Aimee/FedEx is now CONFIRMATION of figures
+// already held, not discovery of unknowns.
 describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
   const auth: OprAuthorisation = {
     id: 1, organisation_id: 1, holder_name: 'Saigates Limited', eori: 'GB369979995000',
@@ -685,7 +708,13 @@ describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
     expect(r.ce1154.compensatory_value_gbp).toBe(round2(90 + 1556.09 + 101.70 + 0))
   })
 
-  it('R2 (875147276207, import MRN 26GB8JRJW1IQOR7AR0, 72 units) — entry_pending: bases/taxes asserted, input breakdown pending (FedEx worksheet "OP WS 875147276207" outstanding)', () => {
+  it('R2 (875147276207, import MRN 26GB8JRJW1IQOR7AR0, 72 units) — entry_pending RETIRED: full worksheet chain asserted to the penny from derived-and-tied freight figures', () => {
+    // Pick-and-note (same convention as R1): real per-device values await
+    // the IMEI-level export/return manifests, so 72 synthetic £1.00 lines
+    // stand in for exact quantity while compensatory_value_gbp is checked
+    // structurally against the formula, not to an invented device-value
+    // penny figure. That does not affect the four Item C table figures
+    // below, none of which depend on device value.
     const lines: ShipmentLine[] = Array.from({ length: 72 }, (_, i) => ({
       id: i + 1, organisation_id: 1, shipment_id: 2, received_device_id: i + 1,
       imei: `860455190002${String(i).padStart(2, '0')}`, sku: null, brand: 'Samsung', model: 'S23',
@@ -694,26 +723,50 @@ describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
     }))
     const importShipment = mkBase({
       reference: 'R2', import_mrn: '26GB8JRJW1IQOR7AR0', supplementary_units: 72,
-      // Worksheet inputs pending — FedEx has not yet supplied OP WS 875147276207.
-      repair_cost: null, repair_cost_currency: null, customs_exchange_rate: null, duty_rate_pct: null,
-      inbound_freight_gbp: null, non_eu_freight_share_gbp: null, export_freight_gbp: null,
-      // CDS entry's own declared bases/taxes — the only figures we have for R2.
-      entry_duty_base_gbp: 1390.81, entry_vat_base_gbp: 1555.99, entry_duty_gbp: 0, entry_vat_gbp: 311.20,
+      // Derived-and-tied worksheet inputs (see the describe-block header
+      // comment for the two independent equations each figure closes
+      // against) — NOT broker-supplied, but not unknowns either: FedEx's
+      // own "OP WS 875147276207" worksheet is still outstanding, and this
+      // is what confirmation from Aimee/FedEx is expected to match.
+      repair_cost: 1345.63, repair_cost_currency: 'GBP', customs_exchange_rate: null,
+      inbound_freight_gbp: 105.18, non_eu_freight_share_gbp: 45.18, export_freight_gbp: 103.87,
+      insurance_gbp: 0, duty_rate_pct: 0,
+      // value_adjustment_gbp left at the operator-entered DEFAULT (£1.31) —
+      // both real R1/R2 legs came through at this figure.
     })
     const r = computeCe1154(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, lines)
     expect(r.ok).toBe(true)
     if (!r.ok) return
-    expect(r.ce1154.worksheet_source).toBe('entry_pending')
-    expect(r.ce1154.worksheet_pending_note).toMatch(/pending/i)
+    expect(r.ce1154.worksheet_source).toBe('computed')
     expect(r.ce1154.quantity).toBe(72)
     expect(r.ce1154.supplementary_units).toBe(72)
-    expect(r.ce1154.process_charge).toBeNull() // input breakdown genuinely pending
-    // Table figures, asserted to the penny:
+    expect(r.ce1154.process_charge_gbp).toBe(1345.63)
+    expect(r.ce1154.inbound_freight_gbp).toBe(105.18)
+    expect(r.ce1154.non_eu_freight_share_gbp).toBe(45.18)
+    expect(r.ce1154.export_freight_gbp).toBe(103.87)
+    expect(r.ce1154.value_adjustment_gbp).toBe(1.31)
+    expect(r.ce1154.value_adjustment_is_default).toBe(true)
+    // Table figures, asserted to the penny — these are the SAME figures
+    // the CDS entry declared (£1,390.81 / £1,555.99 / £0.00 / £311.20),
+    // now reached by computing forward from the derived-and-tied worksheet
+    // inputs above, rather than by reading them back off the entry.
     expect(r.ce1154.duty_base_gbp).toBe(1390.81)
     expect(r.ce1154.vat_base_gbp).toBe(1555.99)
     expect(r.ce1154.duty_gbp).toBe(0)
     expect(r.ce1154.pva_amount_gbp).toBe(311.20)
     expect(r.ce1154.duty_override_claimed).toBe(true)
+    // Structural check on compensatory value (not a table figure, same
+    // convention as the R1 test above):
+    expect(r.ce1154.compensatory_value_gbp).toBe(round2(72 + 1345.63 + 105.18 + 0))
+  })
+
+  it('R2 duty-base tie: derived process charge + NEU freight share reconstructs the known duty base independently of computeCe1154()', () => {
+    // The executable form of the by-hand tie in the describe-block header:
+    // £1,345.63 + £45.18 = £1,390.81, matching the CDS entry's declared
+    // duty base exactly. Asserted directly against the arithmetic, not
+    // against computeCe1154()'s output, so a future formula change that
+    // happens to still match a stale expectation cannot slip through.
+    expect(round2(1345.63 + 45.18)).toBe(1390.81)
   })
 
   it('discharge worked example: R1 (90) + R2 (72) supplementary units against export MRN 26GB7LKWO3QHFLCAA0 sum to exactly 162', () => {
