@@ -1,20 +1,58 @@
 {
   "form": "C&E1154",
   "opr_authorisation_number": "OP/0922/601/31",
-  "cross_reference_statement": "Goods re-imported after outward processing under CDS authorisation GBOPO36997999500020260226105539 held by Saigates Limited (EORI GB123456789000); original export MRN 26GB1111111111XX01",
-  "supervising_office_name": "IP-OP Customs Liverpool",
-  "export_mrn": "26GB1111111111XX01",
+  "cross_reference_statement": "Goods re-imported after outward processing under CDS authorisation GBOPO36997999500020260226105539 held by Saigates Limited (EORI GB369979995000); original export MRN 26GB7LKWO3QHFLCAA0",
+  "supervising_office_name": "HMRC S1756 IP-OP Customs Liverpool",
+  "export_mrn": "26GB7LKWO3QHFLCAA0",
+  "import_mrn": "26GB8ILNEI7EFJPAR1",
+  "procedure_code": "6121",
+  "additional_procedure_code": null,
+  "commodity_code": "8517130000",
   "quantity": 2,
-  "exported_goods_value_gbp": 300,
-  "repair_cost": {
-    "amount": 800,
-    "currency": "USD"
+  "supplementary_units": 2,
+  "entry_accepted_at": null,
+  "entry_cleared_at": null,
+  "worksheet_source": "computed",
+  "worksheet_pending_note": null,
+  "device_value_gbp": 300,
+  "process_charge": {
+    "amount": 1556.09,
+    "currency": "GBP"
   },
-  "customs_exchange_rate": 1.25,
-  "repair_cost_gbp": 640,
-  "duty_rate_pct": 2,
-  "duty_without_relief_gbp": 18.8,
-  "duty_on_repair_cost_gbp": 12.8,
-  "opr_relief_gbp": 6,
-  "vat_note": "Import VAT is assessed on the repair cost (plus any duty and return freight) only — never on the full value of the goods"
+  "customs_exchange_rate": null,
+  "process_charge_gbp": 1556.09,
+  "inbound_freight_gbp": 101.7,
+  "non_eu_freight_share_gbp": 43.73,
+  "export_freight_gbp": 101.7,
+  "insurance_gbp": 0,
+  "value_adjustment_gbp": 1.31,
+  "value_adjustment_is_default": true,
+  "tariff_duty_rate_pct": 0,
+  "compensatory_value_gbp": 1957.79,
+  "duty_base_gbp": 1599.82,
+  "vat_base_gbp": 1760.8,
+  "duty_gbp": 0,
+  "pva_amount_gbp": 352.16,
+  "vat_note": "VAT is POSTPONED (PVA — Postponed VAT Accounting) — it goes on the VAT return, not a cash charge at the border",
+  "duty_override_claimed": true,
+  "misdeclaration": {
+    "value": {
+      "declared_gbp": null,
+      "computed_gbp": 300,
+      "variance_gbp": null,
+      "misdeclared": false
+    },
+    "piece_count": {
+      "declared": null,
+      "suspect_carried_forward_from": null,
+      "misdeclared": false
+    },
+    "gross_weight": {
+      "declared": null,
+      "suspect_carried_forward_from": null,
+      "misdeclared": false
+    },
+    "any_misdeclared": false,
+    "requires_acknowledgement": false
+  }
 }

@@ -170,7 +170,13 @@ async function makeReturnShipment(relatedExportId: number, overrides: Record<str
       authorisation_id: authId, procedure_code: '6121',
       related_export_shipment_id: relatedExportId,
       ship_date: '2026-09-01',
+      // Full FedEx OPR worksheet chain present by default (the 'computed'
+      // path) so computeCe1154() succeeds for these OPR-4 automation tests
+      // without each needing its own worksheet-input overrides. duty_rate_pct:
+      // 0 needs duty_override_claimed: true to avoid the OVR01 refusal.
       repair_cost: 500, repair_cost_currency: 'GBP', duty_rate_pct: 0,
+      inbound_freight_gbp: 20, non_eu_freight_share_gbp: 10, export_freight_gbp: 20,
+      duty_override_claimed: true,
       ...overrides,
     }),
   })

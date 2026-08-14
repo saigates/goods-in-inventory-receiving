@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>C&amp;E1154 — IMP-GOLDEN-0001</title>
+<title>C&amp;E1154 — IMP RTN R1 (AWB 874874338764)</title>
 <style>
   @page { size: A4; margin: 18mm; }
   body { font-family: Arial, Helvetica, sans-serif; font-size: 11pt; color: #111; }
@@ -13,36 +13,48 @@
   .num { text-align: right; }
   .kv td:first-child { width: 42%; font-weight: bold; background: #f6f6f6; }
   .statement { margin-top: 4mm; padding: 3mm; border: 1px solid #999; background: #fafafa; font-size: 9.5pt; }
+  .warn { background: #fff3cd; }
 </style>
 </head>
 <body>
   <header id="ce1154-header">
     <h1>C&amp;E1154 — Outward Processing Relief duty calculation</h1>
-    <p>Returning consignment: <strong>IMP-GOLDEN-0001</strong> · Procedure code <strong>2100</strong></p>
+    <p>Returning consignment: <strong>IMP RTN R1 (AWB 874874338764)</strong> · Procedure code <strong>6121</strong></p>
   </header>
   <section id="ce1154-authorisation">
     <h2>Authorisation &amp; export reference</h2>
     <table class="kv">
       <tr><td>OPR authorisation number (this form)</td><td>OP/0922/601/31</td></tr>
-      <tr><td>Issued by</td><td>IP-OP Customs Liverpool</td></tr>
-      <tr><td>Original export MRN</td><td>26GB1111111111XX01</td></tr>
+      <tr><td>Issued by</td><td>HMRC S1756 IP-OP Customs Liverpool</td></tr>
+      <tr><td>Original export MRN</td><td>26GB7LKWO3QHFLCAA0</td></tr>
+      <tr><td>Import MRN</td><td>26GB8ILNEI7EFJPAR1</td></tr>
     </table>
   </section>
   <section id="ce1154-calculation">
-    <h2>Duty calculation</h2>
+    <h2>Duty &amp; VAT calculation — FedEx OPR worksheet chain</h2>
     <table class="kv">
       <tr><td>Quantity of exported goods (this consignment)</td><td>2</td></tr>
-      <tr><td>Value of exported goods (returning units only)</td><td>£300.00</td></tr>
-      <tr><td>Repair cost (as invoiced)</td><td>800.00 USD</td></tr>
-      <tr><td>Customs exchange rate (USD per £1)</td><td>1.25</td></tr>
-      <tr><td>Repair cost in GBP</td><td>£640.00</td></tr>
-      <tr><td>Duty rate</td><td>2%</td></tr>
-      <tr><td>Duty without OPR (full value + repair)</td><td>£18.80</td></tr>
-      <tr><td>OPR relief</td><td>£6.00</td></tr>
-      <tr><td><strong>Net duty payable (repair cost only)</strong></td><td><strong>£12.80</strong></td></tr>
+      <tr><td>Device value (computed — sum of returning line values)</td><td>£300.00</td></tr>
+      <tr><td>Process (repair) charge (as invoiced)</td><td>1556.09 GBP</td></tr>
+      
+      <tr><td>Process charge in GBP</td><td>£1556.09</td></tr>
+      <tr><td>Inbound freight</td><td>£101.70</td></tr>
+      <tr><td>Non-EU inbound freight share</td><td>£43.73</td></tr>
+      <tr><td>Export freight</td><td>£101.70</td></tr>
+      <tr><td>Insurance</td><td>£0.00</td></tr>
+      <tr><td>Value adjustment</td><td>£1.31</td></tr>
+      <tr><td>Compensatory value</td><td>£1957.79</td></tr>
+      <tr><td><strong>Duty base</strong></td><td><strong>£1599.82</strong></td></tr>
+      <tr><td>Tariff duty rate</td><td>0%</td></tr>
+      <tr><td><strong>Duty</strong></td><td><strong>£0.00</strong></td></tr>
+      <tr><td><strong>VAT base</strong></td><td><strong>£1760.80</strong></td></tr>
+      <tr><td><strong>VAT (postponed — PVA)</strong></td><td><strong>£352.16</strong></td></tr>
+      <tr><td>Duty override claimed (OVR01)</td><td>YES</td></tr>
     </table>
-    <p>Import VAT is assessed on the repair cost (plus any duty and return freight) only — never on the full value of the goods.</p>
+    <p>VAT is POSTPONED (PVA — Postponed VAT Accounting) — it goes on the VAT return, not a cash charge at the border.</p>
+    
   </section>
+  
   <section id="ce1154-lines">
     <h2>Returning devices</h2>
     <table>
@@ -50,20 +62,20 @@
       <tbody>
         <tr>
           <td>1</td>
-          <td>860455101000012</td>
+          <td>860455190001200</td>
           <td>Samsung Galaxy S23 128GB Black</td>
           <td class="num">£150.00</td>
         </tr>
         <tr>
           <td>2</td>
-          <td>860455101000029</td>
+          <td>860455190001217</td>
           <td>Samsung Galaxy S23 128GB Black</td>
           <td class="num">£150.00</td>
         </tr></tbody>
     </table>
   </section>
   <section id="ce1154-statement" class="statement">
-    <strong>Cross-referenced statement:</strong> Goods re-imported after outward processing under CDS authorisation GBOPO36997999500020260226105539 held by Saigates Limited (EORI GB123456789000); original export MRN 26GB1111111111XX01
+    <strong>Cross-referenced statement:</strong> Goods re-imported after outward processing under CDS authorisation GBOPO36997999500020260226105539 held by Saigates Limited (EORI GB369979995000); original export MRN 26GB7LKWO3QHFLCAA0
   </section>
 </body>
 </html>
