@@ -94,6 +94,8 @@ import {
   computeValueDelta,
   round2,
   type SiblingLegLite,
+  type MisdeclarationAckLite,
+  type MisdeclarationVarianceType,
 } from '../lib/oprImport'
 import { computeFollowUpStatus, computeOutstandingChecklist, type SentEmailLite, type ShipmentReplyLite } from '../lib/oprComms'
 import { gmailConfigFromEnv, sendGmail, type EmailAttachment } from '../lib/email'
@@ -963,6 +965,38 @@ async function loadSiblingLegs(
   }))
 }
 
+// Latest acknowledgement per variance_type from shipment_misdeclaration_acks
+// (migration 0025) — feeds checkMisdeclaration()'s lapse-aware acknowledged/
+// fully_acknowledged fields. The log is append-only; "latest" is simply the
+// highest id (== most recent acknowledged_at) per variance_type, which is
+// also the only row whose frozen figures are worth comparing against the
+// current computed state — an earlier ack for the same type is superseded,
+// not additive.
+async function loadMisdeclarationAcks(
+  c: OprContext,
+  user: AuthUser,
+  shipmentId: number,
+): Promise<MisdeclarationAckLite[]> {
+  const { results } = await c.env.DB.prepare(`
+    SELECT a.variance_type, a.declared_gbp, a.computed_gbp, a.declared_count, a.declared_weight_kg, a.acknowledged_at
+      FROM shipment_misdeclaration_acks a
+     WHERE a.organisation_id = ? AND a.shipment_id = ?
+       AND a.id = (
+         SELECT MAX(b.id) FROM shipment_misdeclaration_acks b
+          WHERE b.shipment_id = a.shipment_id AND b.variance_type = a.variance_type
+       )
+  `).bind(user.organisation_id, shipmentId)
+    .all<{ variance_type: MisdeclarationVarianceType; declared_gbp: number | null; computed_gbp: number | null; declared_count: number | null; declared_weight_kg: number | null; acknowledged_at: string }>()
+  return (results || []).map(r => ({
+    variance_type: r.variance_type,
+    declared_gbp: r.declared_gbp,
+    computed_gbp: r.computed_gbp,
+    declared_count: r.declared_count,
+    declared_weight_kg: r.declared_weight_kg,
+    acknowledged_at: r.acknowledged_at,
+  }))
+}
+
 // GET /shipments/:id/validation — run the green/amber/red engine.
 // Direction-aware: exports run the OPR 2 export engine, imports the OPR 3
 // import engine (procedure 6121, related export + MRN, C&E1154 inputs,
@@ -974,7 +1008,7 @@ app.get('/shipments/:id/validation', async (c) => {
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
   const validation = bundle.shipment.direction === 'import'
-    ? runImportValidation(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, await loadSiblingLegs(c, user, bundle.shipment))
+    ? runImportValidation(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, await loadSiblingLegs(c, user, bundle.shipment), await loadMisdeclarationAcks(c, user, bundle.shipment.id))
     : runExportValidation(bundle.shipment, bundle.authorisation, bundle.lines)
   return c.json({ shipment_id: id, status: bundle.shipment.status, direction: bundle.shipment.direction, validation })
 })
@@ -1037,7 +1071,8 @@ app.get('/shipments/:id/ce1154', async (c) => {
     return c.json({ error: 'The C&E1154 is generated for IMPORT (re-import) shipments — exports have the commercial invoice' }, 409)
   }
   const siblingLegs = await loadSiblingLegs(c, user, bundle.shipment)
-  const ce = computeCe1154(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, siblingLegs)
+  const acks = await loadMisdeclarationAcks(c, user, bundle.shipment.id)
+  const ce = computeCe1154(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, siblingLegs, acks)
   if (!ce.ok) return c.json({ error: ce.error }, 422)
   if (c.req.query('format') === 'json') {
     return c.json({ ce1154: ce.ce1154 })
@@ -1059,7 +1094,8 @@ app.get('/shipments/:id/clearance', async (c) => {
   if (!bundle.authorisation) return c.json({ error: 'Shipment has no resolvable authorisation' }, 422)
   if (!bundle.lines.length) return c.json({ error: 'Import consignment has no lines — nothing to clear' }, 422)
   const clearanceSiblingLegs = await loadSiblingLegs(c, user, bundle.shipment)
-  const ce = computeCe1154(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, clearanceSiblingLegs)
+  const clearanceAcks = await loadMisdeclarationAcks(c, user, bundle.shipment.id)
+  const ce = computeCe1154(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, clearanceSiblingLegs, clearanceAcks)
   return c.json({
     clearance: buildClearanceInstructionDraft(
       bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines,
@@ -1196,6 +1232,107 @@ app.get('/shipments/:id/value-deltas', async (c) => {
   return c.json({ deltas: results || [] })
 })
 
+const MISDECLARATION_VARIANCE_TYPES: MisdeclarationVarianceType[] = ['value', 'piece_count', 'gross_weight']
+
+// POST /shipments/:id/misdeclaration-ack { variance_type, reason } —
+// acknowledge ONE of the three independently-arising declared-vs-computed
+// variances that IMP_MISDECLARATION_CHECK can red-block finalise on. This
+// is the clearing side of that gate (previously missing entirely — the
+// block could trigger but nothing could clear it). Value, piece_count and
+// gross_weight acknowledge SEPARATELY: R2 carries both a value variance
+// (£18,794.81 declared vs £19,231.00 computed) and a packaging variance
+// (carried-forward "two boxes, 40kg" from R1 despite 18 fewer devices) —
+// two distinct broker errors, acknowledging one must never silently clear
+// the other.
+//
+// Declared/computed/difference figures are FROZEN into the log row at
+// acknowledgement time (never re-read live afterwards) — see
+// checkMisdeclaration()'s lapse detection: if the line set later changes
+// and the computed device value moves, a fresh computeCe1154() run's
+// figures no longer match this frozen row, the ack no longer applies, and
+// IMP_MISDECLARATION_CHECK goes red again until a NEW acknowledgement is
+// recorded reflecting the new figures.
+app.post('/shipments/:id/misdeclaration-ack', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+  const { shipment, lines, authorisation, relatedExport } = bundle
+  if (shipment.direction !== 'import') {
+    return c.json({ error: 'Misdeclaration acknowledgement applies to IMPORT (re-import) shipments only' }, 409)
+  }
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>))
+  const varianceType = body.variance_type
+  if (typeof varianceType !== 'string' || !MISDECLARATION_VARIANCE_TYPES.includes(varianceType as MisdeclarationVarianceType)) {
+    return c.json({ error: `variance_type must be one of: ${MISDECLARATION_VARIANCE_TYPES.join(', ')}` }, 422)
+  }
+  const reason = cleanString(body.reason, 500)
+  if (!reason) return c.json({ error: 'reason is required — a free-text explanation of why this variance is being acknowledged' }, 422)
+
+  // Compute the CURRENT figures (not the caller's say-so) so what gets
+  // frozen is what the app itself just derived — same principle as device
+  // value always being sumLineValues(), never typed in. Sibling legs are
+  // needed for the piece_count/gross_weight comparison exactly as the
+  // validation engine uses them.
+  const siblingLegs = await loadSiblingLegs(c, user, shipment)
+  const existingAcks = await loadMisdeclarationAcks(c, user, id)
+  const ce = computeCe1154(shipment, relatedExport, authorisation, lines, undefined, siblingLegs, existingAcks)
+  if (!ce.ok) {
+    return c.json({ error: `Cannot acknowledge — the C&E1154 cannot currently be computed: ${ce.error}` }, 422)
+  }
+  const m = ce.ce1154.misdeclaration
+  const component = varianceType === 'value' ? m.value : varianceType === 'piece_count' ? m.piece_count : m.gross_weight
+  if (!component.misdeclared) {
+    return c.json({ error: `No ${varianceType} variance is currently detected on this shipment — nothing to acknowledge` }, 409)
+  }
+
+  const ins = await c.env.DB.prepare(`
+    INSERT INTO shipment_misdeclaration_acks
+      (organisation_id, shipment_id, variance_type, reason,
+       declared_gbp, computed_gbp, difference_gbp, declared_count, declared_weight_kg,
+       suspect_carried_forward_from, acknowledged_by_user_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    user.organisation_id, id, varianceType, reason,
+    varianceType === 'value' ? m.value.declared_gbp : null,
+    varianceType === 'value' ? m.value.computed_gbp : null,
+    varianceType === 'value' ? m.value.variance_gbp : null,
+    varianceType === 'piece_count' ? m.piece_count.declared : null,
+    varianceType === 'gross_weight' ? m.gross_weight.declared : null,
+    varianceType === 'piece_count' ? m.piece_count.suspect_carried_forward_from
+      : varianceType === 'gross_weight' ? m.gross_weight.suspect_carried_forward_from : null,
+    user.id,
+  ).run()
+
+  const ackRow = await c.env.DB.prepare('SELECT * FROM shipment_misdeclaration_acks WHERE id = ?')
+    .bind(ins.meta.last_row_id).first()
+
+  // Re-run with the new ack included so the caller sees the resulting
+  // state immediately (e.g. fully_acknowledged flipping to true once every
+  // misdeclared component has a matching ack).
+  const refreshedAcks = await loadMisdeclarationAcks(c, user, id)
+  const ceAfter = computeCe1154(shipment, relatedExport, authorisation, lines, undefined, siblingLegs, refreshedAcks)
+  return c.json({
+    ok: true,
+    ack: ackRow,
+    misdeclaration: ceAfter.ok ? ceAfter.ce1154.misdeclaration : null,
+  }, 201)
+})
+
+// GET /shipments/:id/misdeclaration-acks — full, permanent acknowledgement
+// history (mirrors GET .../value-deltas).
+app.get('/shipments/:id/misdeclaration-acks', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM shipment_misdeclaration_acks WHERE shipment_id = ? AND organisation_id = ? ORDER BY id ASC'
+  ).bind(id, user.organisation_id).all()
+  return c.json({ acks: results || [] })
+})
+
 // Proof-of-export fields share one validator: declaration-safe-ish refs
 // (letters/digits/spaces and the dash used in MRN/DUCR formats).
 function cleanProofRef(raw: unknown, label: string):
@@ -1238,7 +1375,7 @@ async function finaliseImportShipment(
     finalisedAt = body.finalised_at
   }
 
-  const validation = runImportValidation(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment))
+  const validation = runImportValidation(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment), await loadMisdeclarationAcks(c, user, shipment.id))
   if (validation.result === 'red') {
     return c.json({ error: 'Receipt blocked — validation has red results', validation }, 422)
   }
@@ -1635,7 +1772,7 @@ app.post('/shipments/:id/clearance/mark-sent', async (c) => {
     return c.json({ error: 'No recipient — supply `to` (or configure prealert_email on the authorisation)' }, 422)
   }
 
-  const ce = computeCe1154(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment))
+  const ce = computeCe1154(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment), await loadMisdeclarationAcks(c, user, shipment.id))
   const draft = buildClearanceInstructionDraft(shipment, relatedExport, authorisation, lines, ce.ok ? ce.ce1154 : null)
 
   const emailId = await recordEmail(c, {
@@ -1721,7 +1858,7 @@ app.post('/shipments/:id/clearance/send', async (c) => {
     return c.json({ error: 'A valid recipient is required — pass { to } or configure prealert_email on the authorisation' }, 422)
   }
 
-  const ce = computeCe1154(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment))
+  const ce = computeCe1154(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment), await loadMisdeclarationAcks(c, user, shipment.id))
   const draft = buildClearanceInstructionDraft(shipment, relatedExport, authorisation, lines, ce.ok ? ce.ce1154 : null)
   const attachments: EmailAttachment[] = ce.ok
     ? [{ filename: `ce1154-${shipment.reference.replace(/\s+/g, '-')}.html`, contentType: 'text/html', content: buildCe1154Html(ce.ce1154, shipment, lines) }]

@@ -108,12 +108,38 @@ export type SiblingLegLite = {
   declared_gross_weight_kg: number | null
 }
 
+// The three independently-arising variance kinds. Value (declared invoice
+// total vs. computed line-sum) and piece_count/gross_weight (carried-forward
+// packaging figures vs. a sibling leg) are DIFFERENT broker errors — R2
+// exhibits both simultaneously (an £18,794.81 vs £19,231.00 value variance
+// AND a carried-forward "two boxes, 40kg" from R1 despite 18 fewer devices)
+// — so each acknowledges separately (migration 0025: shipment_misdeclaration_acks,
+// one row per acknowledgement, keyed by variance_type).
+export type MisdeclarationVarianceType = 'value' | 'piece_count' | 'gross_weight'
+
+// The latest acknowledgement row per variance_type, as loaded by the
+// caller (route layer) from shipment_misdeclaration_acks. Only the latest
+// row per type is relevant — checkMisdeclaration() decides whether it
+// still matches the CURRENT figures (i.e. has not lapsed).
+export type MisdeclarationAckLite = {
+  variance_type: MisdeclarationVarianceType
+  declared_gbp: number | null
+  computed_gbp: number | null
+  declared_count: number | null
+  declared_weight_kg: number | null
+  acknowledged_at: string
+}
+
 export type MisdeclarationCheckResult = {
-  value: { declared_gbp: number | null; computed_gbp: number; variance_gbp: number | null; misdeclared: boolean }
-  piece_count: { declared: number | null; suspect_carried_forward_from: string | null; misdeclared: boolean }
-  gross_weight: { declared: number | null; suspect_carried_forward_from: string | null; misdeclared: boolean }
+  value: { declared_gbp: number | null; computed_gbp: number; variance_gbp: number | null; misdeclared: boolean; acknowledged: boolean; acknowledged_at: string | null }
+  piece_count: { declared: number | null; suspect_carried_forward_from: string | null; misdeclared: boolean; acknowledged: boolean; acknowledged_at: string | null }
+  gross_weight: { declared: number | null; suspect_carried_forward_from: string | null; misdeclared: boolean; acknowledged: boolean; acknowledged_at: string | null }
   any_misdeclared: boolean
   requires_acknowledgement: boolean
+  // true only once EVERY currently-misdeclared component has a matching,
+  // non-lapsed acknowledgement — this is what gates finalise (red iff false
+  // and any_misdeclared).
+  fully_acknowledged: boolean
 }
 
 export function checkMisdeclaration(input: {
@@ -123,12 +149,18 @@ export function checkMisdeclaration(input: {
   declared_piece_count: number | null
   declared_gross_weight_kg: number | null
   sibling_legs?: SiblingLegLite[]
+  // Latest ack per variance_type (caller loads via
+  // GET .../misdeclaration-ack or the same query finalise uses).
+  acks?: MisdeclarationAckLite[]
 }): MisdeclarationCheckResult {
+  const computedGbp = round2(input.computed_device_value_gbp)
   const variance = input.declared_invoice_total_gbp != null
-    ? round2(input.declared_invoice_total_gbp - input.computed_device_value_gbp)
+    ? round2(input.declared_invoice_total_gbp - computedGbp)
     : null
   const valueMisdeclared = variance != null && Math.abs(variance) >= 0.005
   const siblings = input.sibling_legs ?? []
+  const acks = input.acks ?? []
+  const latestAck = (type: MisdeclarationVarianceType) => acks.find(a => a.variance_type === type) ?? null
 
   let pieceSuspect: string | null = null
   if (input.declared_piece_count != null) {
@@ -145,12 +177,32 @@ export function checkMisdeclaration(input: {
   const weightMisdeclared = weightSuspect != null
   const anyMisdeclared = valueMisdeclared || pieceMisdeclared || weightMisdeclared
 
+  // An ack is valid for the CURRENT state only if the figures it froze
+  // still match — otherwise the line set (or the declared figures) moved
+  // since the acknowledgement and it has LAPSED. A lapsed ack counts as
+  // not-acknowledged; a fresh one is required (never silently re-validated).
+  const valueAck = latestAck('value')
+  const valueAcknowledged = valueMisdeclared && valueAck != null
+    && valueAck.declared_gbp === input.declared_invoice_total_gbp && valueAck.computed_gbp === computedGbp
+  const pieceAck = latestAck('piece_count')
+  const pieceAcknowledged = pieceMisdeclared && pieceAck != null
+    && pieceAck.declared_count === input.declared_piece_count
+  const weightAck = latestAck('gross_weight')
+  const weightAcknowledged = weightMisdeclared && weightAck != null
+    && weightAck.declared_weight_kg === input.declared_gross_weight_kg
+
+  const fullyAcknowledged =
+    (!valueMisdeclared || valueAcknowledged) &&
+    (!pieceMisdeclared || pieceAcknowledged) &&
+    (!weightMisdeclared || weightAcknowledged)
+
   return {
-    value: { declared_gbp: input.declared_invoice_total_gbp, computed_gbp: round2(input.computed_device_value_gbp), variance_gbp: variance, misdeclared: valueMisdeclared },
-    piece_count: { declared: input.declared_piece_count, suspect_carried_forward_from: pieceSuspect, misdeclared: pieceMisdeclared },
-    gross_weight: { declared: input.declared_gross_weight_kg, suspect_carried_forward_from: weightSuspect, misdeclared: weightMisdeclared },
+    value: { declared_gbp: input.declared_invoice_total_gbp, computed_gbp: computedGbp, variance_gbp: variance, misdeclared: valueMisdeclared, acknowledged: valueAcknowledged, acknowledged_at: valueAcknowledged ? valueAck!.acknowledged_at : null },
+    piece_count: { declared: input.declared_piece_count, suspect_carried_forward_from: pieceSuspect, misdeclared: pieceMisdeclared, acknowledged: pieceAcknowledged, acknowledged_at: pieceAcknowledged ? pieceAck!.acknowledged_at : null },
+    gross_weight: { declared: input.declared_gross_weight_kg, suspect_carried_forward_from: weightSuspect, misdeclared: weightMisdeclared, acknowledged: weightAcknowledged, acknowledged_at: weightAcknowledged ? weightAck!.acknowledged_at : null },
     any_misdeclared: anyMisdeclared,
     requires_acknowledgement: anyMisdeclared,
+    fully_acknowledged: fullyAcknowledged,
   }
 }
 
@@ -230,6 +282,12 @@ export function computeCe1154(
   returningLines: ShipmentLine[],
   declaredQuantity?: number,
   siblingLegs: SiblingLegLite[] = [],
+  // Latest acknowledgement per variance_type (migration 0025). Optional and
+  // additive — omitting it just means every existing call site keeps
+  // reporting any_misdeclared/requires_acknowledgement exactly as before,
+  // with fully_acknowledged always false while a variance exists (the
+  // safe default: unacknowledged until proven otherwise).
+  misdeclarationAcks: MisdeclarationAckLite[] = [],
 ): Ce1154Result {
   if (importShipment.direction !== 'import') {
     return { ok: false, error: 'C&E1154 is generated for IMPORT (re-import) shipments only' }
@@ -368,6 +426,7 @@ export function computeCe1154(
     quantity,
     declared_piece_count: importShipment.declared_piece_count,
     declared_gross_weight_kg: importShipment.declared_gross_weight_kg,
+    acks: misdeclarationAcks,
     sibling_legs: siblingLegs,
   })
 
@@ -568,6 +627,7 @@ export function runImportValidation(
   lines: ShipmentLine[],
   today = new Date().toISOString().slice(0, 10),
   siblingLegs: SiblingLegLite[] = [],
+  misdeclarationAcks: MisdeclarationAckLite[] = [],
 ): ValidationResult {
   const checks: ValidationCheck[] = []
   const add = (code: string, level: CheckLevel, message: string) => checks.push({ code, level, message })
@@ -706,7 +766,7 @@ export function runImportValidation(
     add('IMP_DUTY_OVERRIDE', 'amber', 'Cannot check yet — consignment has no device lines')
     add('IMP_MISDECLARATION_CHECK', 'amber', 'Cannot check yet — consignment has no device lines')
   } else {
-    const ce = computeCe1154(importShipment, exportShipment, authorisation, lines, undefined, siblingLegs)
+    const ce = computeCe1154(importShipment, exportShipment, authorisation, lines, undefined, siblingLegs, misdeclarationAcks)
     if (!ce.ok) {
       if (/duty_override_claimed/.test(ce.error)) {
         // The one refusal reason this check exists to catch: duty computes
@@ -721,15 +781,25 @@ export function runImportValidation(
         ? 'Duty computes to £0.00 and duty_override_claimed (OVR01|DUTY OVERRIDE CLAIMED) is recorded'
         : `Duty £${ce.ce1154.duty_gbp.toFixed(2)} is non-zero — no override required`)
 
+      // Red iff a variance exists AND is not (fully, freshly) acknowledged —
+      // fully_acknowledged already accounts for lapsing (a stale ack whose
+      // frozen figures no longer match the current computed value/declared
+      // packaging counts as not-acknowledged). Value, piece-count and
+      // gross-weight variances are reported individually so a partial
+      // acknowledgement (e.g. value ack'd, packaging not) is visible.
       const m = ce.ce1154.misdeclaration
-      if (m.any_misdeclared && !importShipment.misdeclaration_ack_at) {
+      if (m.any_misdeclared && !m.fully_acknowledged) {
         const parts: string[] = []
-        if (m.value.misdeclared) parts.push(`declared invoice total £${m.value.declared_gbp} vs. computed device value £${m.value.computed_gbp} (variance £${m.value.variance_gbp})`)
-        if (m.piece_count.misdeclared) parts.push(`piece count ${m.piece_count.declared} matches leg ${m.piece_count.suspect_carried_forward_from} despite a different quantity`)
-        if (m.gross_weight.misdeclared) parts.push(`gross weight ${m.gross_weight.declared}kg matches leg ${m.gross_weight.suspect_carried_forward_from} despite a different quantity`)
+        if (m.value.misdeclared && !m.value.acknowledged) parts.push(`declared invoice total £${m.value.declared_gbp} vs. computed device value £${m.value.computed_gbp} (variance £${m.value.variance_gbp}) — not acknowledged`)
+        if (m.piece_count.misdeclared && !m.piece_count.acknowledged) parts.push(`piece count ${m.piece_count.declared} matches leg ${m.piece_count.suspect_carried_forward_from} despite a different quantity — not acknowledged`)
+        if (m.gross_weight.misdeclared && !m.gross_weight.acknowledged) parts.push(`gross weight ${m.gross_weight.declared}kg matches leg ${m.gross_weight.suspect_carried_forward_from} despite a different quantity — not acknowledged`)
         add('IMP_MISDECLARATION_CHECK', 'red', `Declared-vs-computed variance requires acknowledgement before receipt: ${parts.join('; ')}`)
       } else if (m.any_misdeclared) {
-        add('IMP_MISDECLARATION_CHECK', 'amber', `Declared-vs-computed variance was acknowledged at ${importShipment.misdeclaration_ack_at}`)
+        const acked: string[] = []
+        if (m.value.misdeclared) acked.push(`value variance acknowledged at ${m.value.acknowledged_at}`)
+        if (m.piece_count.misdeclared) acked.push(`piece-count variance acknowledged at ${m.piece_count.acknowledged_at}`)
+        if (m.gross_weight.misdeclared) acked.push(`gross-weight variance acknowledged at ${m.gross_weight.acknowledged_at}`)
+        add('IMP_MISDECLARATION_CHECK', 'amber', `Declared-vs-computed variance was acknowledged: ${acked.join('; ')}`)
       } else {
         add('IMP_MISDECLARATION_CHECK', 'green', 'Declared figures (where present) match the computed device value; no carried-forward piece count/gross weight detected against sibling legs')
       }

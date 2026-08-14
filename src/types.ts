@@ -290,7 +290,15 @@ export type Shipment = {
   declared_invoice_total_gbp: number | null     // broker-declared value (e.g. FedEx) — NEVER used as the customs value; compared against sumLineValues()
   declared_piece_count: number | null
   declared_gross_weight_kg: number | null
-  misdeclaration_ack_at: string | null          // explicit operator acknowledgement of a declared-vs-computed variance; NULL blocks finalise while a variance exists
+  // SUPERSEDED by migration 0025's shipment_misdeclaration_acks log table:
+  // a single timestamp/actor pair cannot represent value vs. piece-count vs.
+  // gross-weight variances acknowledging independently (R2 has both at
+  // once), nor detect an ack lapsing when the line set changes after the
+  // fact. Columns remain (harmless, unused by application logic — see
+  // checkMisdeclaration()'s `acks` parameter) rather than a DROP COLUMN
+  // migration, which is out of step with this schema's additive-only
+  // convention.
+  misdeclaration_ack_at: string | null
   misdeclaration_ack_by_user_id: number | null
   notes: string | null
   created_by_user_id: number | null
