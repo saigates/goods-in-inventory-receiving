@@ -93,6 +93,7 @@ import {
   computeDischargeRow,
   computeValueDelta,
   round2,
+  type SiblingLegLite,
 } from '../lib/oprImport'
 import { computeFollowUpStatus, computeOutstandingChecklist, type SentEmailLite, type ShipmentReplyLite } from '../lib/oprComms'
 import { gmailConfigFromEnv, sendGmail, type EmailAttachment } from '../lib/email'
@@ -313,26 +314,45 @@ app.get('/shipments/:id', async (c) => {
 
 type ShipmentBody = Record<string, unknown>
 
-// ───── C&E1154 input fields (OPR 3) ─────
-// repair_cost / repair_cost_currency / customs_exchange_rate /
-// duty_rate_pct are IMPORT-shipment data (they describe the repairer
-// invoice and the duty position of the returning goods). Rejected on
-// export shipments so junk can't accumulate silently.
+// ───── C&E1154 / FedEx OPR worksheet input fields (OPR 3, Item C) ─────
+// repair_cost / repair_cost_currency / customs_exchange_rate carry the
+// "process (repair) charge" domain concept (reused column names — see
+// oprImport.ts header). duty_rate_pct is the tariff duty rate.
+// inbound_freight_gbp / non_eu_freight_share_gbp / export_freight_gbp /
+// insurance_gbp / value_adjustment_gbp / commodity_code /
+// duty_override_claimed / entry_accepted_at / entry_cleared_at /
+// supplementary_units / entry_duty_base_gbp / entry_vat_base_gbp /
+// entry_duty_gbp / entry_vat_gbp / declared_invoice_total_gbp /
+// declared_piece_count / declared_gross_weight_kg are all IMPORT-shipment
+// data (they describe the returning goods' worksheet/entry facts).
+// Rejected on export shipments so junk can't accumulate silently.
+const NON_NEGATIVE_MONEY_FIELDS = [
+  'inbound_freight_gbp', 'non_eu_freight_share_gbp', 'export_freight_gbp',
+  'insurance_gbp', 'value_adjustment_gbp', 'entry_duty_base_gbp',
+  'entry_vat_base_gbp', 'entry_duty_gbp', 'entry_vat_gbp',
+  'declared_invoice_total_gbp', 'declared_gross_weight_kg',
+] as const
+
 function parseRepairFields(body: ShipmentBody, direction: string):
   | { ok: true; fields: Record<string, unknown> }
   | { ok: false; error: string } {
   const fields: Record<string, unknown> = {}
-  const provided = ['repair_cost', 'repair_cost_currency', 'customs_exchange_rate', 'duty_rate_pct']
-    .filter(k => body[k] !== undefined)
+  const allKeys = [
+    'repair_cost', 'repair_cost_currency', 'customs_exchange_rate', 'duty_rate_pct',
+    ...NON_NEGATIVE_MONEY_FIELDS,
+    'commodity_code', 'duty_override_claimed', 'entry_accepted_at', 'entry_cleared_at',
+    'supplementary_units', 'declared_piece_count',
+  ]
+  const provided = allKeys.filter(k => body[k] !== undefined)
   if (!provided.length) return { ok: true, fields }
   if (direction !== 'import') {
-    return { ok: false, error: `${provided.join(', ')} are import-shipment fields (C&E1154 inputs) — not valid on an export shipment` }
+    return { ok: false, error: `${provided.join(', ')} are import-shipment fields (C&E1154 / worksheet inputs) — not valid on an export shipment` }
   }
   if (body.repair_cost !== undefined) {
     if (body.repair_cost === null) fields.repair_cost = null
     else {
       const v = Number(body.repair_cost)
-      if (Number.isNaN(v) || v <= 0) return { ok: false, error: 'repair_cost must be a positive number (the repairer invoice amount)' }
+      if (Number.isNaN(v) || v <= 0) return { ok: false, error: 'repair_cost must be a positive number (the process/repair charge)' }
       if (Math.abs(v * 100 - Math.round(v * 100)) > 1e-6) return { ok: false, error: `repair_cost ${v} is not expressible in minor units (2dp)` }
       fields.repair_cost = v
     }
@@ -359,6 +379,51 @@ function parseRepairFields(body: ShipmentBody, direction: string):
       const v = Number(body.duty_rate_pct)
       if (Number.isNaN(v) || v < 0 || v > 100) return { ok: false, error: 'duty_rate_pct must be between 0 and 100 (0 is valid for duty-free commodities)' }
       fields.duty_rate_pct = v
+    }
+  }
+  // Non-negative money/quantity worksheet + entry-fact fields — generic loop.
+  for (const key of NON_NEGATIVE_MONEY_FIELDS) {
+    if (body[key] === undefined) continue
+    if (body[key] === null) { fields[key] = null; continue }
+    const v = Number(body[key])
+    if (Number.isNaN(v) || v < 0) return { ok: false, error: `${key} must be a non-negative number` }
+    fields[key] = v
+  }
+  if (body.commodity_code !== undefined) {
+    fields.commodity_code = body.commodity_code === null ? null : cleanString(body.commodity_code, 20)
+  }
+  if (body.duty_override_claimed !== undefined) {
+    if (typeof body.duty_override_claimed !== 'boolean') {
+      return { ok: false, error: 'duty_override_claimed must be a boolean — it records OVR01|DUTY OVERRIDE CLAIMED as an explicit fact, never an implied default' }
+    }
+    fields.duty_override_claimed = body.duty_override_claimed ? 1 : 0
+  }
+  if (body.entry_accepted_at !== undefined) {
+    if (body.entry_accepted_at === null) fields.entry_accepted_at = null
+    else if (typeof body.entry_accepted_at !== 'string' || !isValidIsoDate(body.entry_accepted_at.slice(0, 10))) {
+      return { ok: false, error: 'entry_accepted_at must be an ISO date/datetime' }
+    } else fields.entry_accepted_at = body.entry_accepted_at
+  }
+  if (body.entry_cleared_at !== undefined) {
+    if (body.entry_cleared_at === null) fields.entry_cleared_at = null
+    else if (typeof body.entry_cleared_at !== 'string' || !isValidIsoDate(body.entry_cleared_at.slice(0, 10))) {
+      return { ok: false, error: 'entry_cleared_at must be an ISO date/datetime' }
+    } else fields.entry_cleared_at = body.entry_cleared_at
+  }
+  if (body.supplementary_units !== undefined) {
+    if (body.supplementary_units === null) fields.supplementary_units = null
+    else {
+      const v = Number(body.supplementary_units)
+      if (Number.isNaN(v) || v < 0 || !Number.isInteger(v)) return { ok: false, error: 'supplementary_units must be a non-negative integer' }
+      fields.supplementary_units = v
+    }
+  }
+  if (body.declared_piece_count !== undefined) {
+    if (body.declared_piece_count === null) fields.declared_piece_count = null
+    else {
+      const v = Number(body.declared_piece_count)
+      if (Number.isNaN(v) || v < 0 || !Number.isInteger(v)) return { ok: false, error: 'declared_piece_count must be a non-negative integer' }
+      fields.declared_piece_count = v
     }
   }
   return { ok: true, fields }
@@ -442,10 +507,16 @@ app.post('/shipments', async (c) => {
     if (!rel) return c.json({ error: `related_export_shipment_id ${relatedExportId} is not an export shipment of this organisation` }, 422)
   }
 
-  // repair_cost/etc are C&E1154 (repairer-invoice) inputs — not applicable
-  // to a TEMP_EXPORT_STANDARD shipment (no customs arithmetic in this flow).
-  if (isStandardTemp && ['repair_cost', 'repair_cost_currency', 'customs_exchange_rate', 'duty_rate_pct'].some(k => body[k] !== undefined)) {
-    return c.json({ error: 'repair_cost / repair_cost_currency / customs_exchange_rate / duty_rate_pct are not valid on a TEMP_EXPORT_STANDARD shipment' }, 422)
+  // repair_cost/etc are C&E1154 / FedEx OPR worksheet inputs — not
+  // applicable to a TEMP_EXPORT_STANDARD shipment (no customs arithmetic
+  // in this flow).
+  const WORKSHEET_FIELD_NAMES = [
+    'repair_cost', 'repair_cost_currency', 'customs_exchange_rate', 'duty_rate_pct',
+    ...NON_NEGATIVE_MONEY_FIELDS, 'commodity_code', 'duty_override_claimed',
+    'entry_accepted_at', 'entry_cleared_at', 'supplementary_units', 'declared_piece_count',
+  ]
+  if (isStandardTemp && WORKSHEET_FIELD_NAMES.some(k => body[k] !== undefined)) {
+    return c.json({ error: 'C&E1154 / FedEx OPR worksheet fields are not valid on a TEMP_EXPORT_STANDARD shipment' }, 422)
   }
   const repair = isStandardTemp ? { ok: true as const, fields: {} } : parseRepairFields(body, direction)
   if (!repair.ok) return c.json({ error: repair.error }, 422)
@@ -865,6 +936,33 @@ async function loadShipmentBundle(
   return { ok: true, shipment, lines, authorisation: authorisation ?? null, relatedExport }
 }
 
+// Sibling return legs discharging the SAME export MRN as `shipment` (all
+// OTHER import shipments with the same related_export_shipment_id) — feeds
+// checkMisdeclaration()'s carried-forward-figure comparison (the R1→R2
+// "two boxes and 40kg" failure mode: identical declared packaging figures
+// across legs whose quantities differ). Quantity is each leg's line count.
+async function loadSiblingLegs(
+  c: OprContext,
+  user: AuthUser,
+  shipment: Shipment,
+): Promise<SiblingLegLite[]> {
+  if (!shipment.related_export_shipment_id) return []
+  const { results } = await c.env.DB.prepare(`
+    SELECT s.reference, s.declared_piece_count, s.declared_gross_weight_kg,
+           (SELECT COUNT(*) FROM shipment_lines sl WHERE sl.shipment_id = s.id) AS quantity
+      FROM shipments s
+     WHERE s.organisation_id = ? AND s.direction = 'import'
+       AND s.related_export_shipment_id = ? AND s.id != ?
+  `).bind(user.organisation_id, shipment.related_export_shipment_id, shipment.id)
+    .all<{ reference: string; declared_piece_count: number | null; declared_gross_weight_kg: number | null; quantity: number }>()
+  return (results || []).map(r => ({
+    reference: r.reference,
+    quantity: Number(r.quantity),
+    declared_piece_count: r.declared_piece_count,
+    declared_gross_weight_kg: r.declared_gross_weight_kg,
+  }))
+}
+
 // GET /shipments/:id/validation — run the green/amber/red engine.
 // Direction-aware: exports run the OPR 2 export engine, imports the OPR 3
 // import engine (procedure 6121, related export + MRN, C&E1154 inputs,
@@ -876,7 +974,7 @@ app.get('/shipments/:id/validation', async (c) => {
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
   const validation = bundle.shipment.direction === 'import'
-    ? runImportValidation(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines)
+    ? runImportValidation(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, await loadSiblingLegs(c, user, bundle.shipment))
     : runExportValidation(bundle.shipment, bundle.authorisation, bundle.lines)
   return c.json({ shipment_id: id, status: bundle.shipment.status, direction: bundle.shipment.direction, validation })
 })
@@ -938,7 +1036,8 @@ app.get('/shipments/:id/ce1154', async (c) => {
   if (bundle.shipment.direction !== 'import') {
     return c.json({ error: 'The C&E1154 is generated for IMPORT (re-import) shipments — exports have the commercial invoice' }, 409)
   }
-  const ce = computeCe1154(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines)
+  const siblingLegs = await loadSiblingLegs(c, user, bundle.shipment)
+  const ce = computeCe1154(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, siblingLegs)
   if (!ce.ok) return c.json({ error: ce.error }, 422)
   if (c.req.query('format') === 'json') {
     return c.json({ ce1154: ce.ce1154 })
@@ -959,7 +1058,8 @@ app.get('/shipments/:id/clearance', async (c) => {
   }
   if (!bundle.authorisation) return c.json({ error: 'Shipment has no resolvable authorisation' }, 422)
   if (!bundle.lines.length) return c.json({ error: 'Import consignment has no lines — nothing to clear' }, 422)
-  const ce = computeCe1154(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines)
+  const clearanceSiblingLegs = await loadSiblingLegs(c, user, bundle.shipment)
+  const ce = computeCe1154(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, clearanceSiblingLegs)
   return c.json({
     clearance: buildClearanceInstructionDraft(
       bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines,
@@ -1138,7 +1238,7 @@ async function finaliseImportShipment(
     finalisedAt = body.finalised_at
   }
 
-  const validation = runImportValidation(shipment, relatedExport, authorisation, lines)
+  const validation = runImportValidation(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment))
   if (validation.result === 'red') {
     return c.json({ error: 'Receipt blocked — validation has red results', validation }, 422)
   }
@@ -1535,7 +1635,7 @@ app.post('/shipments/:id/clearance/mark-sent', async (c) => {
     return c.json({ error: 'No recipient — supply `to` (or configure prealert_email on the authorisation)' }, 422)
   }
 
-  const ce = computeCe1154(shipment, relatedExport, authorisation, lines)
+  const ce = computeCe1154(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment))
   const draft = buildClearanceInstructionDraft(shipment, relatedExport, authorisation, lines, ce.ok ? ce.ce1154 : null)
 
   const emailId = await recordEmail(c, {
@@ -1621,7 +1721,7 @@ app.post('/shipments/:id/clearance/send', async (c) => {
     return c.json({ error: 'A valid recipient is required — pass { to } or configure prealert_email on the authorisation' }, 422)
   }
 
-  const ce = computeCe1154(shipment, relatedExport, authorisation, lines)
+  const ce = computeCe1154(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment))
   const draft = buildClearanceInstructionDraft(shipment, relatedExport, authorisation, lines, ce.ok ? ce.ce1154 : null)
   const attachments: EmailAttachment[] = ce.ok
     ? [{ filename: `ce1154-${shipment.reference.replace(/\s+/g, '-')}.html`, contentType: 'text/html', content: buildCe1154Html(ce.ce1154, shipment, lines) }]
