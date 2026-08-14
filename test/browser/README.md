@@ -29,6 +29,43 @@ the file the editor thinks it wrote is the file actually on disk. Catching
 this after a handful of edits is fine; catching it after a full batch means
 re-diffing everything to find which edit was the culprit.
 
+## Process note (2026-08-14, second occurrence): the same corruption happened
+## again on the same file, and `tsc` only caught it by luck
+
+Wiring `loadMisdeclarationAcks()` into `opr.ts`'s 6 pre-existing
+`computeCe1154()`/`runImportValidation()` call sites reproduced the exact
+failure mode above: a multi-site edit session on `opr.ts` left duplicate,
+garbled bytes after the real `export default app` at end of file. This
+time `tsc` caught it too (`Declaration or statement expected` at the last
+two line numbers), but only because the corruption happened to land after
+the file's final syntactic construct, where a stray token is guaranteed to
+be a parse error. A corruption that instead duplicated or garbled a
+mid-file statement — still syntactically valid TypeScript, just wrong —
+would NOT make `tsc` fail, and would ship silently.
+
+**The rule this adds**: after any edit that touches more than one call
+site in a file (whether via several `Edit` calls in sequence or one
+`MultiEdit`), check the file's tail explicitly (`tail -20 file` or
+`wc -l` compared against the expected line count) in addition to running
+`tsc`. Do not rely on `tsc` alone to catch structural corruption; it only
+catches the subset that happens to be syntactically invalid.
+
+**Tooling degradation observed alongside this, worth flagging on its own**:
+- `MultiEdit` failed atomically with `"Edit N: missing 'new_string'"` and
+  applied NONE of its edits, including several that were individually
+  well-formed — this is documented tool behavior, but it is easy to
+  mis-diagnose as "the other edits probably went through."
+- `Read` (on this same file, mid-session) hard-failed after repeated
+  identical-argument calls with "This tool is not working reliably. You
+  MUST stop retrying" — no content was returned at all.
+- What actually recovered from both: never trusting a prior edit attempt's
+  intent, and instead re-deriving the current, authoritative state of the
+  6 call sites via a fresh `grep -n` before touching the file again, then
+  falling back to `sed -n` for read access once `Read` degraded. Re-query
+  the source of truth (the file itself, via a tool that is still working)
+  rather than reasoning from what an earlier tool call was *supposed* to
+  have done.
+
 ## What it proves (22 checks)
 1. **Login click-through end to end** — cold load shows the login screen,
    an unknown email fails loudly with a visible error, blank-email sign-in

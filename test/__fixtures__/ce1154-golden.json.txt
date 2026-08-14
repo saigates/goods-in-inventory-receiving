@@ -40,19 +40,26 @@
       "declared_gbp": null,
       "computed_gbp": 300,
       "variance_gbp": null,
-      "misdeclared": false
+      "misdeclared": false,
+      "acknowledged": false,
+      "acknowledged_at": null
     },
     "piece_count": {
       "declared": null,
       "suspect_carried_forward_from": null,
-      "misdeclared": false
+      "misdeclared": false,
+      "acknowledged": false,
+      "acknowledged_at": null
     },
     "gross_weight": {
       "declared": null,
       "suspect_carried_forward_from": null,
-      "misdeclared": false
+      "misdeclared": false,
+      "acknowledged": false,
+      "acknowledged_at": null
     },
     "any_misdeclared": false,
-    "requires_acknowledgement": false
+    "requires_acknowledgement": false,
+    "fully_acknowledged": true
   }
 }

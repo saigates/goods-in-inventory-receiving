@@ -56,6 +56,23 @@
 // update it to make this test pass. And when you do: derive the expected
 // VALUES from an independent source of truth first (as above), not from
 // the function's own output for arbitrary/synthetic inputs.
+//
+// REGENERATED 2026-08-14 (Sprint A, ack-log wiring): the JSON fixture was
+// regenerated to add three new fields — `acknowledged`, `acknowledged_at`
+// (per component: value/piece_count/gross_weight) and `fully_acknowledged`
+// (top level) — introduced by extending MisdeclarationCheckResult and
+// checkMisdeclaration() to accept the migration-0025 acknowledgement log.
+// Before applying the regenerated fixture, it was diffed against the prior
+// frozen copy and confirmed the ONLY differences were those three field
+// types; every existing field — including every monetary/quantity figure
+// (£1,556.09 process charge, £43.73 non-EU freight share, £101.70 inbound/
+// export freight, £1,957.79 compensatory value, £1,599.82 duty base,
+// £1,760.80 VAT base, £0.00 duty, £352.16 PVA) — is byte-identical to the
+// pre-regeneration fixture. The HTML fixture required NO change at all
+// (byte-identical diff) since buildCe1154Html() does not render the ack
+// fields. This preserves the property the file header above establishes:
+// the numeric chain was checked against the real R1 worksheet, not against
+// this codebase, and this regeneration did not touch that chain.
 import { describe, it, expect } from 'vitest'
 // Tests run inside workerd (no `fs`/`node:fs`) — fixtures are bundled as
 // raw text via Vite's `?raw` import suffix, not read at runtime.
