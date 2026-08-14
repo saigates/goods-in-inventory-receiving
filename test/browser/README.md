@@ -6,6 +6,29 @@ vitest suite (deliberately named `.browser.mjs` so vitest's `*.spec.*` glob
 ignores it), because it needs a live server + Chromium rather than the
 workerd test pool.
 
+## Process note (2026-08-14): a tool's own success/failure signal is not proof — `tsc` is
+
+While wiring `siblingLegs` through the last few `computeCe1154()` /
+`runImportValidation()` call sites in `src/routes/opr.ts`, one `Edit` call
+reported `Failed to verify file write operation`. That error string turned
+out to be an unreliable signal in both directions: a second edit that
+reported the *same* error had actually applied cleanly, while the first one
+had left the file with a duplicate trailing fragment (an old `export default
+app` plus a few stray lines re-appended after the real end of the file).
+Nothing about the diff or a plain read made this obvious — the corruption
+was only surfaced when `npx tsc --noEmit -p .` failed with `Declaration or
+statement expected` at the last two line numbers in the file.
+
+**The rule this sets**: run `npx tsc --noEmit -p .` after *every* individual
+`Edit` / `MultiEdit` / `Write`, not once at the end of a batch of edits —
+and treat it as mandatory, not optional, immediately after any edit call
+that reports an error or an ambiguous status, since that is exactly when
+the tool's own signal cannot be trusted. `tsc` is doing more than type
+checking here: a clean `--noEmit` run is the cheapest available proof that
+the file the editor thinks it wrote is the file actually on disk. Catching
+this after a handful of edits is fine; catching it after a full batch means
+re-diffing everything to find which edit was the culprit.
+
 ## What it proves (22 checks)
 1. **Login click-through end to end** — cold load shows the login screen,
    an unknown email fails loudly with a visible error, blank-email sign-in
