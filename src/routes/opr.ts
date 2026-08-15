@@ -2093,11 +2093,21 @@ app.post('/shipments/:id/checklist', async (c) => {
 // ───────── OPR 4: bulk endpoint for downstream consumers ─────────
 //
 // POST /shipments/:id/scan-bulk — add MANY devices to a DRAFT consignment
-// in one call (body: { imeis: [...] }, max 200). Per-IMEI outcomes: each
-// entry succeeds or fails INDEPENDENTLY through exactly the same
-// direction-aware gate as single /scan — a bad IMEI never blocks the rest,
-// and a failed entry provably leaves no line/status/event side-effects
-// (same guarantees, same code path).
+// in one call (body: { imeis: [...] }, max BULK_SCAN_CAP). Per-IMEI
+// outcomes: each entry succeeds or fails INDEPENDENTLY through exactly the
+// same direction-aware gate as single /scan — a bad IMEI never blocks the
+// rest, and a failed entry provably leaves no line/status/event
+// side-effects (same guarantees, same code path).
+//
+// Cap history (2026-08-15): raised 200 -> 500, same change and same
+// rationale as devices.ts's BULK_TRANSITION_CAP and scan.ts's
+// BULK_SCAN_CAP — see the writeup on BULK_TRANSITION_CAP in
+// src/routes/devices.ts for the full root-cause investigation. This cap
+// was never the actual production defect (explicit 422 on overflow, never
+// a silent truncation); the real bug was client-side dedup running before
+// the client-side cap check, now fixed in public/static/app.js.
+const BULK_SCAN_CAP = 500
+
 app.post('/shipments/:id/scan-bulk', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
@@ -2111,7 +2121,7 @@ app.post('/shipments/:id/scan-bulk', async (c) => {
     return c.json({ error: 'Body must be { imeis: […] }' }, 422)
   }
   if (!body.imeis.length) return c.json({ error: 'imeis is empty' }, 422)
-  if (body.imeis.length > 200) return c.json({ error: 'Maximum 200 IMEIs per bulk call' }, 422)
+  if (body.imeis.length > BULK_SCAN_CAP) return c.json({ error: `Maximum ${BULK_SCAN_CAP} IMEIs per bulk call` }, 422)
 
   const results: { imei: string; ok: boolean; status: number; error?: string; line_id?: number }[] = []
   for (const raw of body.imeis) {

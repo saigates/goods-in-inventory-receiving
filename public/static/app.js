@@ -28,6 +28,29 @@
   };
   const fmtDate = (s) => s ? new Date(s.replace(' ', 'T') + 'Z').toLocaleString() : '—';
 
+  // ───────── Bulk-paste IMEI parsing (shared by BulkTransitionModal and
+  // BulkScanModal) ─────────
+  // Bug fix (2026-08-15): both bulk modals used to dedupe pasted/scanned
+  // IMEIs via a Set BEFORE checking the batch-size cap. If an operator
+  // pasted e.g. 205 lines where 5 were duplicates, the unique count came
+  // out to 200 — under the cap — so the cap warning never fired AND the
+  // UI only ever displayed the post-dedup "200 unique" count, with zero
+  // indication that 5 lines had been silently merged away. This is the
+  // exact defect reported in production: "205 scanned, 200 shown, five
+  // silently dropped." The backend never deduplicates (confirmed:
+  // zero-match grep for `new Set` in src/routes/*.ts) — the count
+  // mismatch was purely a client-side rendering gap.
+  //
+  // Fix: return both the raw (non-empty, trimmed) token count and the
+  // deduped list, so callers can surface a duplicate-removal notice
+  // whenever the two counts differ — never silently.
+  const BULK_IMEI_CAP = 500;
+  function parseBulkImeis(raw) {
+    const tokens = raw.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean);
+    const unique = Array.from(new Set(tokens));
+    return { raw: tokens.length, unique, duplicates: tokens.length - unique.length };
+  }
+
   // ───────── Grade helpers (strict A | B | C | UG) ─────────
   // UG is stored as 'UG' but displayed as 'Ungraded' in human-facing copy.
   const GRADES = ['A', 'B', 'C', 'UG'];
@@ -974,14 +997,18 @@
       resultsByImei: new Map(),
     };
     const close = () => { state.bulkTransitionOpen = false; state._bulkTransCtx = null; render(); };
-    const parsedImeis = () => Array.from(new Set(ctx.raw.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean)));
+    const parsedImeis = () => parseBulkImeis(ctx.raw).unique;
     const statuses = (state.deviceStatuses && state.deviceStatuses.statuses) || [];
 
     const run = async () => {
-      const imeis = parsedImeis();
+      const parsed = parseBulkImeis(ctx.raw);
+      const imeis = parsed.unique;
       if (!ctx.target_status) { toast('Pick a target status first', 'warn'); return; }
       if (imeis.length === 0) { toast('Nothing to scan — add an IMEI', 'warn'); return; }
-      if (imeis.length > 200) { toast(`${imeis.length} IMEIs — maximum is 200 per batch.`, 'warn'); return; }
+      if (imeis.length > BULK_IMEI_CAP) { toast(`${imeis.length} unique IMEIs — maximum is ${BULK_IMEI_CAP} per batch.`, 'warn'); return; }
+      if (parsed.duplicates > 0) {
+        toast(`${parsed.raw} lines pasted/scanned, ${parsed.duplicates} duplicate${parsed.duplicates === 1 ? '' : 's'} removed — sending ${imeis.length} unique IMEI${imeis.length === 1 ? '' : 's'}`, 'warn', 5000);
+      }
       ctx.busy = true; state._bulkTransCtx = ctx; render();
       try {
         const r = await api.post('/devices/bulk-transition', { target_status: ctx.target_status, imeis });
@@ -1009,7 +1036,7 @@
             h('i', { class: 'fas fa-layer-group' })),
           h('div', {},
             h('h2', { class: 'text-lg font-semibold' }, 'Bulk transition by scan'),
-            h('p', { class: 'text-xs text-slate-400' }, 'Pick a target status, then scan or paste many IMEIs (one per line) — up to 200 per batch. Each device is validated against the allowed-transition map independently; one bad or ineligible IMEI never blocks the rest.')
+            h('p', { class: 'text-xs text-slate-400' }, `Pick a target status, then scan or paste many IMEIs (one per line) — up to ${BULK_IMEI_CAP} unique per batch. Each device is validated against the allowed-transition map independently; one bad or ineligible IMEI never blocks the rest. Duplicate lines are merged and always reported, never silently dropped.`)
           )
         ),
         h('div', { class: 'mt-3' },
@@ -1024,7 +1051,12 @@
         h('div', { class: 'mt-3' },
           h('label', { class: 'text-xs text-slate-400 mb-1 block flex items-center justify-between' },
             h('span', {}, 'IMEIs *'),
-            h('span', { class: 'text-slate-500' }, `${parsedImeis().length} unique IMEI${parsedImeis().length === 1 ? '' : 's'}`)
+            (() => {
+              const p = parseBulkImeis(ctx.raw);
+              return p.duplicates > 0
+                ? h('span', { class: 'text-amber-400' }, `${p.raw} pasted, ${p.duplicates} duplicate${p.duplicates === 1 ? '' : 's'} removed — ${p.unique.length} unique`)
+                : h('span', { class: 'text-slate-500' }, `${p.unique.length} unique IMEI${p.unique.length === 1 ? '' : 's'}`);
+            })()
           ),
           h('textarea', {
             id: 'bulk-transition-textarea', class: 'input mono text-sm', rows: 8, autofocus: 'true',
@@ -3916,9 +3948,7 @@ how many rows fell into each Condition, each VAT Type, and each Currency.`;
     };
     const close = () => { state.bulkScanOpen = false; state._bulkCtx = null; render(); };
 
-    const parsedImeis = () => Array.from(new Set(
-      ctx.raw.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean)
-    ));
+    const parsedImeis = () => parseBulkImeis(ctx.raw).unique;
 
     // Outcomes that mean "nothing left to do here" — stripped from the
     // textarea after a run so a follow-up click only resends IMEIs that
@@ -3928,7 +3958,13 @@ how many rows fell into each Condition, each VAT Type, and each Currency.`;
     const run = async (imeisOverride) => {
       const imeis = imeisOverride || parsedImeis();
       if (imeis.length === 0) { toast('Nothing to scan — add an IMEI or you\u2019re all done', 'warn'); return; }
-      if (imeis.length > 200) { toast(`${imeis.length} IMEIs — maximum is 200 per batch. Split into smaller batches.`, 'warn'); return; }
+      if (imeis.length > BULK_IMEI_CAP) { toast(`${imeis.length} unique IMEIs — maximum is ${BULK_IMEI_CAP} per batch. Split into smaller batches.`, 'warn'); return; }
+      if (!imeisOverride) {
+        const parsed = parseBulkImeis(ctx.raw);
+        if (parsed.duplicates > 0) {
+          toast(`${parsed.raw} lines pasted/scanned, ${parsed.duplicates} duplicate${parsed.duplicates === 1 ? '' : 's'} removed — sending ${imeis.length} unique IMEI${imeis.length === 1 ? '' : 's'}`, 'warn', 5000);
+        }
+      }
       if (ctx.buy_price === '' || ctx.buy_price == null) { toast('Buy price is required — it applies to every device received in this batch', 'warn'); return; }
       if (!ctx.vat_type) { toast('VAT type is required', 'warn'); return; }
       ctx.busy = true; state._bulkCtx = ctx; render();
@@ -4040,14 +4076,19 @@ how many rows fell into each Condition, each VAT Type, and each Currency.`;
           h('div', {},
             h('h2', { class: 'text-lg font-semibold' }, 'Bulk scan'),
             h('p', { class: 'text-xs text-slate-400' },
-              'Scan or paste many IMEIs (one per line) — up to 200 per batch. IMEIs that resolve to exactly one catalogue SKU are received automatically. Anything else appears below with suggested SKUs you can apply to the whole batch — pick one and the outstanding IMEIs are re-scanned automatically.')
+              `Scan or paste many IMEIs (one per line) — up to ${BULK_IMEI_CAP} unique per batch. IMEIs that resolve to exactly one catalogue SKU are received automatically. Anything else appears below with suggested SKUs you can apply to the whole batch — pick one and the outstanding IMEIs are re-scanned automatically. Duplicate lines are merged and always reported, never silently dropped.`)
           )
         ),
 
         h('div', { class: 'mt-3' },
           h('label', { class: 'text-xs text-slate-400 mb-1 block flex items-center justify-between' },
             h('span', {}, 'IMEIs *'),
-            h('span', { class: 'text-slate-500' }, `${parsedImeis().length} unique IMEI${parsedImeis().length === 1 ? '' : 's'}`)
+            (() => {
+              const p = parseBulkImeis(ctx.raw);
+              return p.duplicates > 0
+                ? h('span', { class: 'text-amber-400' }, `${p.raw} pasted, ${p.duplicates} duplicate${p.duplicates === 1 ? '' : 's'} removed — ${p.unique.length} unique`)
+                : h('span', { class: 'text-slate-500' }, `${p.unique.length} unique IMEI${p.unique.length === 1 ? '' : 's'}`);
+            })()
           ),
           h('textarea', {
             id: 'bulk-scan-textarea',

@@ -858,6 +858,17 @@ describe('E. POST /api/devices/bulk-transition (#38–#42, NEW)', () => {
     expect(res.status).toBe(409)
     expect(await deviceStatus(a)).toBe('SORTING') // unchanged
   })
+
+  it('#42b caps at 500 IMEIs with an explicit 422 (raised 2026-08-15 from 200 — the cap itself was never the production silent-drop defect, see BULK_TRANSITION_CAP comment)', async () => {
+    const tooMany = Array.from({ length: 501 }, (_, i) => String(100000000000000 + i))
+    const res = await api('/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'SORTING', imeis: tooMany }),
+    })
+    expect(res.status).toBe(422)
+    const body = await res.json() as { error: string }
+    expect(body.error).toContain('500')
+  })
 })
 
 describe('E. GET /api/devices/repair-queue (#43, NEW)', () => {

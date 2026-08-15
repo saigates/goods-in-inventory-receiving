@@ -227,9 +227,9 @@ app.get('/meta/statuses', (c) => {
 // POST /api/devices/bulk-transition — { target_status, imeis: string[] }
 // Bulk equivalent of POST /:id/transition, mirroring scan.ts's /bulk
 // pattern exactly: every IMEI is processed INDEPENDENTLY (a bad/missing/
-// blocked IMEI never stops the rest), capped at 200 per call, and the
-// response carries a per-IMEI outcome array plus summary counts so the
-// UI can show exactly what happened to each scanned unit.
+// blocked IMEI never stops the rest), capped at BULK_TRANSITION_CAP per
+// call, and the response carries a per-IMEI outcome array plus summary
+// counts so the UI can show exactly what happened to each scanned unit.
 //
 // Same guardrails as the single-device endpoint: target_status (and a
 // device's CURRENT status) may never be one of the OPR/repair
@@ -237,7 +237,25 @@ app.get('/meta/statuses', (c) => {
 // dedicated routes, or shipment_lines/repair_jobs would desynchronise
 // from the device ledger. The target check is global (checked once,
 // before the loop); the current-status check is per-device.
-const BULK_TRANSITION_CAP = 200
+//
+// Cap history (2026-08-15): raised 200 -> 500. The 200-item cap itself
+// was never the actual production defect (it rejects overflow explicitly
+// with a 422, it never truncates silently) — the real bug was client-side
+// (public/static/app.js): both this endpoint's modal and the /scan/bulk
+// modal deduped pasted/scanned IMEIs via a Set BEFORE checking the count
+// against the cap, so e.g. 205 pasted lines with 5 duplicates produced
+// 200 unique IMEIs, silently under the cap, with the UI only ever
+// showing the post-dedup count and no indication 5 lines had been merged
+// away ("205 scanned, 200 shown, five silently dropped" — the exact
+// production report). That silent-merge gap is fixed on the client
+// (parseBulkImeis() now always surfaces raw-vs-unique counts). 500 here
+// is a genuine, separate improvement so the owner has real headroom
+// above their observed real-world batch sizes (162-item backfill,
+// 200+-item scans) without needing to split runs — still bounded because
+// this loop makes several sequential D1 round trips per IMEI (a lookup
+// SELECT plus everything transitionDevice() itself does), and an
+// unbounded per-request loop risks the platform's subrequest/CPU limits.
+const BULK_TRANSITION_CAP = 500
 
 app.post('/bulk-transition', async (c) => {
   const user = currentUser(c)

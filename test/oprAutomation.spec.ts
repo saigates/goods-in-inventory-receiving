@@ -562,9 +562,9 @@ describe('POST /shipments/:id/scan-bulk', () => {
     expect(lines!.n).toBe(2)
   })
 
-  it('caps at 200 IMEIs and validates the body shape', async () => {
+  it('caps at 500 IMEIs (raised 2026-08-15 from 200 — see BULK_TRANSITION_CAP writeup in src/routes/devices.ts) and validates the body shape', async () => {
     const shipment = await makeExportShipment()
-    const tooMany = Array.from({ length: 201 }, (_, i) => String(100000000000000 + i))
+    const tooMany = Array.from({ length: 501 }, (_, i) => String(100000000000000 + i))
     const res = await api(`/api/opr/shipments/${shipment.id}/scan-bulk`, { method: 'POST', body: JSON.stringify({ imeis: tooMany }) })
     expect(res.status).toBe(422)
     const bad = await api(`/api/opr/shipments/${shipment.id}/scan-bulk`, { method: 'POST', body: JSON.stringify({ imeis: 'not-an-array' }) })

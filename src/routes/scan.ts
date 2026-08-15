@@ -380,8 +380,8 @@ app.post('/confirm', async (c) => {
 //
 // POST /scan/bulk — process MANY IMEIs against one manifest in a single
 // call, instead of the operator scanning + confirming one at a time through
-// the modal. Body: { manifest_id, imeis: [...] } (max 200, mirroring the
-// OPR 4 scan-bulk cap in src/routes/opr.ts). Optional shared valuation
+// the modal. Body: { manifest_id, imeis: [...] } (max BULK_SCAN_CAP,
+// mirroring the OPR 4 scan-bulk cap in src/routes/opr.ts). Optional shared valuation
 // fields (buy_price, currency, vat_type, supplier_id) apply to every IMEI
 // in the batch that reaches a receivable outcome — this is the natural
 // complement to "use this SKU for all other lines in this batch": once a
@@ -414,9 +414,19 @@ app.post('/confirm', async (c) => {
 //
 // The catalog is loaded ONCE for the whole batch and matched in memory
 // (matchCatalogRows) — the same "load once, match in memory" discipline
-// that fixed the 197-IMEI production bug (see README) — so a 200-IMEI
-// batch against a several-thousand-row catalog is O(1) catalog round
-// trips, not O(imeis).
+// that fixed the 197-IMEI production bug (see README) — so a large batch
+// against a several-thousand-row catalog is O(1) catalog round trips,
+// not O(imeis).
+//
+// Cap history (2026-08-15): raised 200 -> 500, same as devices.ts's
+// bulk-transition and opr.ts's scan-bulk (see BULK_TRANSITION_CAP comment
+// in src/routes/devices.ts for the full root-cause writeup). The 200 cap
+// itself was never the production defect — it rejects overflow with an
+// explicit 422, never a silent truncation — the real bug was client-side
+// dedup running before the client-side cap check in public/static/app.js,
+// now fixed there. Raised here anyway as a genuine headroom improvement.
+const BULK_SCAN_CAP = 500
+
 app.post('/bulk', async (c) => {
   const user = currentUser(c)
   const orgId = user.organisation_id
@@ -436,7 +446,7 @@ app.post('/bulk', async (c) => {
   if (!manifestId) return c.json({ error: 'manifest_id is required' }, 400)
   if (!Array.isArray(body.imeis)) return c.json({ error: 'Body must be { manifest_id, imeis: [...] }' }, 422)
   if (!body.imeis.length) return c.json({ error: 'imeis is empty' }, 422)
-  if (body.imeis.length > 200) return c.json({ error: 'Maximum 200 IMEIs per bulk call' }, 422)
+  if (body.imeis.length > BULK_SCAN_CAP) return c.json({ error: `Maximum ${BULK_SCAN_CAP} IMEIs per bulk call` }, 422)
 
   const manifest = await c.env.DB.prepare(
     'SELECT id, status FROM manifests WHERE id = ? AND organisation_id = ?'
