@@ -202,6 +202,8 @@ beforeAll(async () => {
       cds_number: 'GBOPO11122233344420260101000000',
       op_authorisation_number: 'OP/1111/222/33',
       valid_from: '2026-01-01', valid_to: '2031-01-01',
+      supervising_office_name: 'HMRC S1756 IP-OP Customs Liverpool',
+      supervising_office_code: 'GBLIV002',
       commodity_codes: '8517130000', discharge_period_months: 6,
       prealert_email: 'prealert-test@example.com', prealert_cutoff: '16:00',
     }),

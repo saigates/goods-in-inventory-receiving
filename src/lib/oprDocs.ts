@@ -166,6 +166,7 @@ export function buildPreAlertDraft(
     `  Exporter: ${authorisation.holder_name} (EORI ${authorisation.eori})`,
     `  OPR authorisation (CDS): ${authorisation.cds_number}`,
     `  Customs procedure code: ${shipment.procedure_code}${shipment.additional_procedure_code ? ' + ' + shipment.additional_procedure_code : ''}`,
+    `  Supervising office: ${authorisation.supervising_office_name ?? 'see authorisation'}${authorisation.supervising_office_code ? ' (' + authorisation.supervising_office_code + ')' : ''}`,
     `  Commodity code(s): ${authorisation.commodity_codes ?? 'see invoice'}`,
     `  Consignee: ${shipment.consignee_name ?? 'TBC'}`,
     `  Carrier: ${shipment.carrier ?? 'TBC'}${shipment.carrier_account ? ' (account ' + shipment.carrier_account + ')' : ''}`,

@@ -28,6 +28,20 @@ export type ValidationResult = {
   amber_count: number
 }
 
+// Resolved row from export_procedure_policy_defaults (migration 0026),
+// "Lite" DB-row-projection type — mirrors SiblingLegLite/MisdeclarationAckLite
+// in oprImport.ts. Loaded by routes/opr.ts's loadExportProcedurePolicy,
+// keyed by organisation + the SHIPMENT'S OWN DATE (ship_date, falling back
+// to created_at — never today), same effective-dated-default mechanism as
+// value_adjustment_defaults (0025).
+export type ExportProcedurePolicyLite = {
+  procedure_code: string
+  additional_procedure_code: string | null
+  supervising_office_name: string | null
+  supervising_office_code: string
+  effective_from: string
+}
+
 // Money rule: declared unit values must be expressible in pence — a value
 // like 33.333 makes document totals ambiguous between rounding schemes.
 function isPenceExact(v: number): boolean {
@@ -43,6 +57,7 @@ export function runExportValidation(
   authorisation: OprAuthorisation | null,
   lines: ShipmentLine[],
   today = new Date().toISOString().slice(0, 10),
+  procedurePolicy: ExportProcedurePolicyLite | null = null,
 ): ValidationResult {
   const checks: ValidationCheck[] = []
   const add = (code: string, level: CheckLevel, message: string) => checks.push({ code, level, message })
@@ -99,6 +114,51 @@ export function runExportValidation(
     } else {
       add('PROCEDURE_CODE', 'green',
         `Procedure code ${shipment.procedure_code}${shipment.additional_procedure_code ? ' + ' + shipment.additional_procedure_code : ''} is valid for OPR export`)
+    }
+  }
+
+  // ── EXP_PROCEDURE_CODE / EXP_SUPERVISING_OFFICE ──
+  // Effective-dated policy (migration 0026, export_procedure_policy_defaults):
+  // OPR export shipments must declare 2100 + 000 and supervising office
+  // GBLIV002. Forward-only: resolved by the SHIPMENT'S OWN DATE (ship_date,
+  // falling back to created_at — NEVER today, so the result cannot change
+  // over time while the record is unchanged), and only evaluated for
+  // shipments still DRAFT at/after the policy's effective_from. Anything
+  // already FINALISED, or whose own date predates effective_from, is
+  // reported green regardless of its actual values — those shipments (the
+  // real 10 July export + both return legs) were filed correctly under
+  // the policy in force at the time and are never retro-flagged.
+  const policyEffectiveDate = shipment.ship_date || shipment.created_at.slice(0, 10)
+  const policyApplies = !isStandardTemp && shipment.status !== 'FINALISED'
+    && !!procedurePolicy && policyEffectiveDate >= procedurePolicy.effective_from
+
+  if (isStandardTemp) {
+    add('EXP_PROCEDURE_CODE', 'green', 'Not applicable — TEMP_EXPORT_STANDARD carries no customs procedure code')
+    add('EXP_SUPERVISING_OFFICE', 'green', 'Not applicable — TEMP_EXPORT_STANDARD has no supervising office')
+  } else if (!policyApplies) {
+    add('EXP_PROCEDURE_CODE', 'green', procedurePolicy
+      ? `Ship date ${policyEffectiveDate} predates the ${procedurePolicy.effective_from} procedure-code policy (or shipment is already finalised) — not evaluated`
+      : 'No export procedure-code policy is in effect for this organisation yet — not evaluated')
+    add('EXP_SUPERVISING_OFFICE', 'green', procedurePolicy
+      ? `Ship date ${policyEffectiveDate} predates the ${procedurePolicy.effective_from} supervising-office policy (or shipment is already finalised) — not evaluated`
+      : 'No supervising-office policy is in effect for this organisation yet — not evaluated')
+  } else {
+    if (shipment.procedure_code === procedurePolicy!.procedure_code && shipment.additional_procedure_code === procedurePolicy!.additional_procedure_code) {
+      add('EXP_PROCEDURE_CODE', 'green',
+        `Procedure code ${procedurePolicy!.procedure_code} ${procedurePolicy!.additional_procedure_code} matches the policy in effect from ${procedurePolicy!.effective_from}`)
+    } else {
+      add('EXP_PROCEDURE_CODE', 'red',
+        `Procedure code must be ${procedurePolicy!.procedure_code} ${procedurePolicy!.additional_procedure_code} (policy effective ${procedurePolicy!.effective_from}) — got ${shipment.procedure_code ?? '(missing)'} ${shipment.additional_procedure_code ?? '(missing)'}`)
+    }
+
+    if (!authorisation) {
+      add('EXP_SUPERVISING_OFFICE', 'red', 'Cannot check supervising office without an authorisation')
+    } else if (authorisation.supervising_office_code === procedurePolicy!.supervising_office_code) {
+      add('EXP_SUPERVISING_OFFICE', 'green',
+        `Supervising office ${procedurePolicy!.supervising_office_code} matches the policy in effect from ${procedurePolicy!.effective_from}`)
+    } else {
+      add('EXP_SUPERVISING_OFFICE', 'red',
+        `Authorisation supervising office must be ${procedurePolicy!.supervising_office_code} (policy effective ${procedurePolicy!.effective_from}) — got ${authorisation.supervising_office_code ?? '(missing)'}`)
     }
   }
 

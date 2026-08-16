@@ -290,7 +290,13 @@ describe('validation engine — coded green/amber/red', () => {
   })
 
   it('ship date outside authorisation validity → red AUTH_VALID_ON_SHIP_DATE', () => {
-    const r = runExportValidation(baseShipment({ ship_date: '2032-01-01' }), baseAuth, [mkLine()])
+    // 2032-01-01 postdates the export-procedure-code policy's effective_from
+    // (2026-08-16) — carry 2100 + 000 explicitly so this fixture only fails
+    // on the check it's meant to exercise (AUTH_VALID_ON_SHIP_DATE), not
+    // incidentally on EXP_PROCEDURE_CODE too. Not a retro-flag: a
+    // synthetic future-dated shipment correctly reflecting the policy in
+    // force on its own ship date.
+    const r = runExportValidation(baseShipment({ ship_date: '2032-01-01', additional_procedure_code: '000' }), baseAuth, [mkLine()])
     expect(codeLevel(r, 'AUTH_VALID_ON_SHIP_DATE')).toBe('red')
   })
 
@@ -366,6 +372,86 @@ describe('validation engine — coded green/amber/red', () => {
     expect(codeLevel(r, 'AUTH_VALID_ON_SHIP_DATE')).toBe('green')
     expect(codeLevel(r, 'PROCEDURE_CODE')).toBe('green')
     expect(codeLevel(r, 'COMMODITY_SCOPE')).toBe('green')
+  })
+
+  // ── Export procedure code / supervising office policy (migration 0026) ──
+  it('OPR export on/after the policy effective date requires 2100 + 000 and GBLIV002 — both present and correct is green', () => {
+    const s = baseShipment({ ship_date: '2026-09-01', additional_procedure_code: '000' })
+    const r = runExportValidation(s, baseAuth, [mkLine()], undefined, {
+      procedure_code: '2100', additional_procedure_code: '000',
+      supervising_office_name: 'HMRC S1756 IP-OP Customs Liverpool', supervising_office_code: 'GBLIV002',
+      effective_from: '2026-08-16',
+    })
+    expect(codeLevel(r, 'EXP_PROCEDURE_CODE')).toBe('green')
+    expect(codeLevel(r, 'EXP_SUPERVISING_OFFICE')).toBe('green')
+    expect(r.result).toBe('green')
+  })
+
+  it('OPR export on/after the policy effective date missing 000 or the wrong supervising office is red', () => {
+    const policy = {
+      procedure_code: '2100', additional_procedure_code: '000',
+      supervising_office_name: 'HMRC S1756 IP-OP Customs Liverpool', supervising_office_code: 'GBLIV002',
+      effective_from: '2026-08-16',
+    }
+    // additional_procedure_code left null (bare 2100) → red.
+    const missingAdditional = runExportValidation(baseShipment({ ship_date: '2026-09-01' }), baseAuth, [mkLine()], undefined, policy)
+    expect(codeLevel(missingAdditional, 'EXP_PROCEDURE_CODE')).toBe('red')
+    expect(missingAdditional.result).toBe('red')
+
+    // Right procedure code, wrong supervising office on the authorisation → red.
+    const wrongOffice = runExportValidation(
+      baseShipment({ ship_date: '2026-09-01', additional_procedure_code: '000' }),
+      { ...baseAuth, supervising_office_code: 'GBSOU001' }, [mkLine()], undefined, policy,
+    )
+    expect(codeLevel(wrongOffice, 'EXP_SUPERVISING_OFFICE')).toBe('red')
+    expect(wrongOffice.result).toBe('red')
+  })
+
+  // TEMP_EXPORT_STANDARD must never be red-blocked by EXP_PROCEDURE_CODE/
+  // EXP_SUPERVISING_OFFICE (same bug class as pre-39c892b hardcoding — a
+  // check that doesn't consult shipment_type). Non-vacuous: this shipment
+  // is dated AFTER the policy's effective_from and carries no procedure
+  // code/authorisation at all, so if the isStandardTemp guard were ever
+  // removed, this would immediately go red (missing policy.procedure_code
+  // match, no authorisation for the office check) — the assertion only
+  // passes today because the guard is actually being consulted.
+  it('TEMP_EXPORT_STANDARD is silent (green) on EXP_PROCEDURE_CODE/EXP_SUPERVISING_OFFICE even after the policy effective date', () => {
+    const s = baseShipment({
+      shipment_type: 'TEMP_EXPORT_STANDARD', authorisation_id: null,
+      procedure_code: null, additional_procedure_code: null,
+      ship_date: '2026-09-01', // after effective_from — would fail the gate if the guard were missing
+    })
+    const r = runExportValidation(s, null, [mkLine()], undefined, {
+      procedure_code: '2100', additional_procedure_code: '000',
+      supervising_office_name: 'HMRC S1756 IP-OP Customs Liverpool', supervising_office_code: 'GBLIV002',
+      effective_from: '2026-08-16',
+    })
+    expect(codeLevel(r, 'EXP_PROCEDURE_CODE')).toBe('green')
+    expect(codeLevel(r, 'EXP_SUPERVISING_OFFICE')).toBe('green')
+    expect(r.result).toBe('green')
+  })
+
+  it('a shipment whose own ship_date predates the policy effective_from is NOT retro-flagged, even with a bare procedure code', () => {
+    const s = baseShipment({ ship_date: '2026-07-10', additional_procedure_code: null }) // real 10 July export shape
+    const r = runExportValidation(s, baseAuth, [mkLine()], undefined, {
+      procedure_code: '2100', additional_procedure_code: '000',
+      supervising_office_name: 'HMRC S1756 IP-OP Customs Liverpool', supervising_office_code: 'GBLIV002',
+      effective_from: '2026-08-16',
+    })
+    expect(codeLevel(r, 'EXP_PROCEDURE_CODE')).toBe('green')
+    expect(codeLevel(r, 'EXP_SUPERVISING_OFFICE')).toBe('green')
+    expect(r.result).toBe('green')
+  })
+
+  it('a FINALISED shipment is not retro-flagged even if dated after the effective_from and missing 000', () => {
+    const s = baseShipment({ status: 'FINALISED', ship_date: '2026-09-01', additional_procedure_code: null, finalised_at: '2026-09-02' })
+    const r = runExportValidation(s, baseAuth, [mkLine()], undefined, {
+      procedure_code: '2100', additional_procedure_code: '000',
+      supervising_office_name: 'HMRC S1756 IP-OP Customs Liverpool', supervising_office_code: 'GBLIV002',
+      effective_from: '2026-08-16',
+    })
+    expect(codeLevel(r, 'EXP_PROCEDURE_CODE')).toBe('green')
+    expect(codeLevel(r, 'EXP_SUPERVISING_OFFICE')).toBe('green')
   })
 
   it('TEMP_EXPORT_STANDARD via the real endpoint is green with a null authorisation/procedure_code', async () => {
@@ -493,7 +579,13 @@ describe('finalisation', () => {
 
   it('happy path: locks the shipment, devices → EXPORTED_UNDER_OPR (event-logged), proof refs captured; amber does not block', async () => {
     // No ship_date → AUTH_VALID_ON_SHIP_DATE is amber: proves amber passes.
-    const shipment = await makeShipment({ ship_date: null })
+    // created_at (today, on/after the 2026-08-16 procedure-code policy)
+    // resolves the EXP_PROCEDURE_CODE/EXP_SUPERVISING_OFFICE gate via the
+    // ship_date-fallback-to-created_at rule — carry additional_procedure_code
+    // explicitly so this shipment stays policy-compliant and the amber
+    // stays isolated to AUTH_VALID_ON_SHIP_DATE, which is what this test
+    // is actually about.
+    const shipment = await makeShipment({ ship_date: null, additional_procedure_code: '000' })
     const d1 = await makeDevice({ buy_price: 100 })
     const d2 = await makeDevice({ buy_price: 200 })
     for (const d of [d1, d2]) {

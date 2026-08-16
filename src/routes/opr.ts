@@ -83,7 +83,7 @@ import type { Bindings, AuthUser, Shipment, ShipmentLine, OprAuthorisation, Devi
 import { currentUser } from '../lib/auth'
 import { cleanString, isValidCurrency } from '../lib/validate'
 import { transitionDevice, logDeviceEvent } from '../lib/deviceLifecycle'
-import { runExportValidation, sumLineValues } from '../lib/oprValidation'
+import { runExportValidation, sumLineValues, type ExportProcedurePolicyLite } from '../lib/oprValidation'
 import { buildCommercialInvoiceHtml, buildScanOutList, buildPreAlertDraft } from '../lib/oprDocs'
 import {
   computeCe1154,
@@ -997,6 +997,37 @@ async function loadMisdeclarationAcks(
   }))
 }
 
+// Effective-dated procedure-code / supervising-office policy (migration
+// 0026) — same "resolve by the RECORD'S OWN DATE, never today" mechanism
+// as value_adjustment_defaults (0025). Resolved by the shipment's own
+// ship_date, falling back to created_at when ship_date is null — NEVER
+// falling back to today, so a shipment's validation result cannot change
+// over time while the record itself is unchanged (see EXP_PROCEDURE_CODE /
+// EXP_SUPERVISING_OFFICE in oprValidation.ts, which consume this).
+async function loadExportProcedurePolicy(
+  c: OprContext,
+  user: AuthUser,
+  shipment: Shipment,
+): Promise<ExportProcedurePolicyLite | null> {
+  const effectiveDate = shipment.ship_date || shipment.created_at.slice(0, 10)
+  const row = await c.env.DB.prepare(`
+    SELECT procedure_code, additional_procedure_code, supervising_office_name, supervising_office_code, effective_from
+      FROM export_procedure_policy_defaults
+     WHERE organisation_id = ? AND effective_from <= ?
+     ORDER BY effective_from DESC, id DESC
+     LIMIT 1
+  `).bind(user.organisation_id, effectiveDate)
+    .first<{ procedure_code: string; additional_procedure_code: string | null; supervising_office_name: string | null; supervising_office_code: string; effective_from: string }>()
+  if (!row) return null
+  return {
+    procedure_code: row.procedure_code,
+    additional_procedure_code: row.additional_procedure_code,
+    supervising_office_name: row.supervising_office_name,
+    supervising_office_code: row.supervising_office_code,
+    effective_from: row.effective_from,
+  }
+}
+
 // GET /shipments/:id/validation — run the green/amber/red engine.
 // Direction-aware: exports run the OPR 2 export engine, imports the OPR 3
 // import engine (procedure 6121, related export + MRN, C&E1154 inputs,
@@ -1009,7 +1040,7 @@ app.get('/shipments/:id/validation', async (c) => {
   if (!bundle.ok) return bundle.response
   const validation = bundle.shipment.direction === 'import'
     ? runImportValidation(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, await loadSiblingLegs(c, user, bundle.shipment), await loadMisdeclarationAcks(c, user, bundle.shipment.id))
-    : runExportValidation(bundle.shipment, bundle.authorisation, bundle.lines)
+    : runExportValidation(bundle.shipment, bundle.authorisation, bundle.lines, undefined, await loadExportProcedurePolicy(c, user, bundle.shipment))
   return c.json({ shipment_id: id, status: bundle.shipment.status, direction: bundle.shipment.direction, validation })
 })
 
@@ -1475,7 +1506,7 @@ app.post('/shipments/:id/finalise', async (c) => {
 
   // The gate: any red check blocks finalisation. Ambers pass but are
   // returned so the caller can surface them.
-  const validation = runExportValidation(shipment, authorisation, lines)
+  const validation = runExportValidation(shipment, authorisation, lines, undefined, await loadExportProcedurePolicy(c, user, shipment))
   if (validation.result === 'red') {
     return c.json({
       error: 'Finalisation blocked — validation has red results',

@@ -26,25 +26,52 @@ export function validateShipmentCurrency(raw: unknown): { ok: true; value: 'GBP'
 // From the authorisation reference notes:
 //   export: 2100 (standard OPR export), 2200 (warranty/free-of-charge)
 //   import: 6121 (re-import after outward processing)
-// Additional procedure codes: B51 / B02 pair with 2200 (warranty).
+// Additional procedure codes: B51 / B02 pair with 2200 (warranty); 000
+// means "no special additional procedure" — a real HMRC convention
+// distinct from null, and the correct pairing for standard chargeable OP
+// exports (rendered '2100 000', never a bare '2100' with additional_code
+// left null — see runExportValidation's EXP_PROCEDURE_CODE check).
 // Critical constraint: 2100 + B51 is NOT a permitted combination.
 export const EXPORT_PROCEDURE_CODES = ['2100', '2200'] as const
 export const IMPORT_PROCEDURE_CODES = ['6121'] as const
-export const ADDITIONAL_PROCEDURE_CODES = ['B51', 'B02'] as const
+export const ADDITIONAL_PROCEDURE_CODES = ['B51', 'B02', '000'] as const
 
 export type ProcedureValidation =
   | { ok: true; procedure_code: string; additional_procedure_code: string | null }
   | { ok: false; error: string }
+
+// Accepts the additional-procedure-code portion in any of the forms an
+// operator might type or paste it in, and the combined portion too:
+// '000' / '2100 000' / '2100000' (proc+additional glued with no
+// separator) all normalise the SAME as passing proc='2100',
+// additional='000' separately. Storage stays two fields (never one
+// space-separated string — that bites the first time something needs to
+// read the additional code back out on its own); only the render layer
+// joins them with a space.
+function normaliseAdditional(rawProc: string, rawAdditional: unknown): string | null {
+  if (rawAdditional != null && String(rawAdditional).trim() !== '') {
+    return String(rawAdditional).trim().toUpperCase()
+  }
+  // No separate additional_procedure_code supplied — check whether it was
+  // glued onto rawProc instead ('2100 000' or '2100000').
+  const glued = rawProc.trim().toUpperCase()
+  const spaced = glued.match(/^(\d{4})\s+(\S+)$/)
+  if (spaced) return spaced[2]
+  const packed = glued.match(/^(\d{4})(\d{3})$/)
+  if (packed) return packed[2]
+  return null
+}
 
 export function validateProcedureCodes(
   direction: 'export' | 'import',
   rawProc: unknown,
   rawAdditional: unknown,
 ): ProcedureValidation {
-  const proc = String(rawProc ?? '').trim()
-  const additional = rawAdditional == null || String(rawAdditional).trim() === ''
-    ? null
-    : String(rawAdditional).trim().toUpperCase()
+  const rawProcStr = String(rawProc ?? '').trim()
+  // Strip a glued additional code off rawProc itself before matching
+  // against the allowed base codes ('2100 000' / '2100000' → '2100').
+  const proc = (rawProcStr.match(/^(\d{4})[\s]*\d{0,3}$/) || [null, rawProcStr])[1] || rawProcStr
+  const additional = normaliseAdditional(rawProcStr, rawAdditional)
 
   const allowed: readonly string[] = direction === 'export' ? EXPORT_PROCEDURE_CODES : IMPORT_PROCEDURE_CODES
   if (!allowed.includes(proc)) {
