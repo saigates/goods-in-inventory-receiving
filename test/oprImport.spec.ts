@@ -374,7 +374,7 @@ describe('OPR 3 — computeCe1154', () => {
     customs_entry_ref: null, vat_evidence_ref: null,
     repair_cost_confirmed_at: null, repair_cost_confirmed_by_user_id: null,
     inbound_freight_gbp: 100, non_eu_freight_share_gbp: 40, export_freight_gbp: 100,
-    insurance_gbp: null, value_adjustment_gbp: null,
+    insurance_gbp: null, value_adjustment_gbp: null, worksheet_input_provenance: null,
     commodity_code: null, duty_override_claimed: 0,
     entry_accepted_at: null, entry_cleared_at: null, supplementary_units: null,
     entry_duty_base_gbp: null, entry_vat_base_gbp: null, entry_duty_gbp: null, entry_vat_gbp: null,
@@ -651,7 +651,7 @@ describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
     customs_entry_ref: null, vat_evidence_ref: null,
     repair_cost_confirmed_at: null, repair_cost_confirmed_by_user_id: null,
     inbound_freight_gbp: null, non_eu_freight_share_gbp: null, export_freight_gbp: null,
-    insurance_gbp: null, value_adjustment_gbp: null,
+    insurance_gbp: null, value_adjustment_gbp: null, worksheet_input_provenance: null,
     commodity_code: '8517130000', duty_override_claimed: 1, // OVR01|DUTY OVERRIDE CLAIMED — stored fact
     entry_accepted_at: null, entry_cleared_at: null, supplementary_units: null,
     entry_duty_base_gbp: null, entry_vat_base_gbp: null, entry_duty_gbp: null, entry_vat_gbp: null,

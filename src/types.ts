@@ -274,6 +274,15 @@ export type Shipment = {
   export_freight_gbp: number | null
   insurance_gbp: number | null
   value_adjustment_gbp: number | null           // operator-entered, DEFAULTS to 1.31 (both real legs) — never a hardcoded constant
+  // Provenance tags for worksheet inputs (0027) — nullable JSON TEXT blob,
+  // e.g. {"non_eu_freight_share_gbp":"derived","inbound_freight_gbp":"derived"}.
+  // Keys absent from the blob (including a fully-NULL blob) default to
+  // 'broker-supplied'. See computeCe1154()'s residual-solving guard in
+  // oprImport.ts: an input may only be SOLVED from an equation if every
+  // other input feeding that equation is 'broker-supplied' — never
+  // 'derived' or 'solved' — or the gap is reported honestly as
+  // unattributed_variance_gbp instead of a fabricated figure.
+  worksheet_input_provenance: string | null
   commodity_code: string | null                 // tariff/commodity code for this entry
   duty_override_claimed: number                 // 0/1 — OVR01|DUTY OVERRIDE CLAIMED must be an explicit recorded fact, even at 0% duty
   entry_accepted_at: string | null

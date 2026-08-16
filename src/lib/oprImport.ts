@@ -212,6 +212,47 @@ export type Ce1154Result =
   | { ok: true; ce1154: Ce1154 }
   | { ok: false; error: string }
 
+// ───────── Provenance-gated residual solving (migration 0027) ─────────
+//
+// Problem this closes: R2's freight figures (inbound/non-EU-share/export)
+// were derived BY HAND from an equation that itself assumed
+// value_adjustment_gbp = £1.31 (see the R1/R2 describe-block header
+// comment in oprImport.spec.ts). "Solving" value_adjustment back out of
+// those same figures is guaranteed to return £1.31 — it is the assumption
+// reproducing itself, not independent confirmation, and reporting that as
+// a clean solve would misrepresent a customs-document figure as
+// corroborated when it is not.
+//
+// The guard: value_adjustment_gbp may only be SOLVED from the VAT-base
+// equation (entry_vat_base_gbp = process charge + inbound freight +
+// export freight + duty + value adjustment) if every OTHER term in that
+// equation is 'broker-supplied' — a document fact (FedEx worksheet, CDS
+// entry), never itself 'derived' or 'solved'. If any other term is
+// 'derived' or 'solved', refuse to solve and report the honest remainder
+// as unattributed_variance_gbp instead of a fabricated figure.
+export type WorksheetInputProvenance = 'broker-supplied' | 'derived' | 'solved'
+
+// Keys mirror migration 0027's worksheet_input_provenance JSON blob.
+export type WorksheetInputProvenanceMap = Partial<Record<
+  'process_charge' | 'inbound_freight_gbp' | 'non_eu_freight_share_gbp' | 'export_freight_gbp' | 'insurance_gbp',
+  WorksheetInputProvenance
+>>
+
+// A key absent from the blob (including a fully-null blob) defaults to
+// 'broker-supplied' — this is what keeps every pre-existing shipment
+// (nothing on R1 was ever derived) behaving exactly as before, with no
+// migration of historical data required. Malformed JSON is treated the
+// same as absent (defensive: never let a bad blob crash the C&E1154).
+export function parseWorksheetInputProvenance(raw: string | null): WorksheetInputProvenanceMap {
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed as WorksheetInputProvenanceMap : {}
+  } catch {
+    return {}
+  }
+}
+
 // 'computed' — the full FedEx OPR worksheet chain ran from first
 // principles (all worksheet inputs present on the shipment).
 // 'entry_pending' — worksheet inputs are not yet recorded; the bases/taxes
@@ -256,6 +297,21 @@ export type Ce1154 = {
   insurance_gbp: number | null
   value_adjustment_gbp: number | null
   value_adjustment_is_default: boolean
+  // Provenance of value_adjustment_gbp specifically: 'broker-supplied' when
+  // it came straight off the worksheet/entry (the operator-entered field
+  // was set, or is null and the default is being used as a document
+  // convention rather than a solve); 'solved' when the guard below
+  // computed it from the VAT-base equation because every other input was
+  // broker-supplied; null when neither applies (entry_pending mode, or no
+  // solve was attempted because inputs weren't all broker-supplied AND the
+  // shipment's own value_adjustment_gbp was set explicitly).
+  value_adjustment_provenance: WorksheetInputProvenance | null
+  // The honest gap when a solve was REFUSED (some other VAT-base input is
+  // 'derived'/'solved'): entry_vat_base_gbp minus every non-adjustment
+  // term that IS known (process charge, freight actually recorded, duty).
+  // Null whenever a solve was not refused (nothing to report) — never 0 as
+  // a stand-in for "not applicable".
+  unattributed_variance_gbp: number | null
   tariff_duty_rate_pct: number | null
 
   // compensatory value = device value + process charge + inbound freight + insurance
@@ -344,6 +400,8 @@ export function computeCe1154(
   let pvaAmountGbp: number
   let worksheetSource: Ce1154WorksheetSource
   let worksheetPendingNote: string | null
+  let valueAdjustmentProvenanceResult: WorksheetInputProvenance | null = null
+  let unattributedVarianceGbpResult: number | null = null
 
   if (hasWorksheetInputs) {
     // Process (repair) charge → GBP at the HMRC customs rate.
@@ -372,7 +430,6 @@ export function computeCe1154(
     }
 
     insuranceGbp = importShipment.insurance_gbp ?? 0
-    valueAdjustmentGbp = importShipment.value_adjustment_gbp ?? DEFAULT_VALUE_ADJUSTMENT_GBP
     const inboundFreight = importShipment.inbound_freight_gbp as number
     const nonEuShare = importShipment.non_eu_freight_share_gbp as number
     const exportFreight = importShipment.export_freight_gbp as number
@@ -384,6 +441,79 @@ export function computeCe1154(
     dutyBaseGbp = round2(processChargeGbp + nonEuShare + insuranceGbp)
     // duty = duty base × tariff rate
     dutyGbp = round2(dutyBaseGbp * dutyPct / 100)
+
+    // ── Provenance-gated residual solving for value_adjustment_gbp ──
+    // (migration 0027; see the type comments on WorksheetInputProvenance
+    // and Ce1154.unattributed_variance_gbp above for the full rationale.)
+    //
+    // IMPORTANT: this block only ever DIAGNOSES — it never changes the
+    // forward arithmetic that was already correct. If the shipment has an
+    // explicit value_adjustment_gbp, that figure is used exactly as
+    // before. If it is null, the existing DEFAULT_VALUE_ADJUSTMENT_GBP
+    // fallback is used for the arithmetic exactly as before — this is
+    // what keeps R1's chain byte-identical (R1 has no entry_vat_base_gbp
+    // to solve/refuse against, so this whole block is a no-op for it) and
+    // what keeps R2's four Item C table figures byte-identical (the
+    // guard REFUSES to solve because R2's freight is 'derived', so the
+    // £1.31 default still drives vat_base_gbp/pva_amount_gbp exactly as
+    // before). The only NEW thing a refused solve produces is the
+    // additional unattributed_variance_gbp diagnostic field.
+    const provenanceMap = parseWorksheetInputProvenance(importShipment.worksheet_input_provenance)
+    const provenanceOf = (key: keyof WorksheetInputProvenanceMap): WorksheetInputProvenance =>
+      provenanceMap[key] ?? 'broker-supplied'
+    let unattributedVarianceGbp: number | null = null
+    let valueAdjustmentProvenance: WorksheetInputProvenance | null = null
+
+    if (importShipment.value_adjustment_gbp != null) {
+      // Operator-entered figure — a document fact by definition, nothing solved.
+      valueAdjustmentGbp = importShipment.value_adjustment_gbp
+      valueAdjustmentProvenance = 'broker-supplied'
+    } else if (importShipment.entry_vat_base_gbp == null) {
+      // Nothing to solve/refuse against (e.g. R1: no CDS entry-declared
+      // VAT base recorded) — use the existing default exactly as before.
+      valueAdjustmentGbp = DEFAULT_VALUE_ADJUSTMENT_GBP
+      valueAdjustmentProvenance = 'broker-supplied'
+    } else {
+      // entry_vat_base_gbp IS a document fact (the CDS entry's own
+      // declared VAT base) — implicitly 'broker-supplied' by virtue of
+      // coming straight off the entry, never itself derived/solved.
+      const entryVatBaseGbp = importShipment.entry_vat_base_gbp
+      const processChargeProvenance = provenanceOf('process_charge')
+      const inboundFreightProvenance = provenanceOf('inbound_freight_gbp')
+      const exportFreightProvenance = provenanceOf('export_freight_gbp')
+      const allOtherInputsBrokerSupplied =
+        processChargeProvenance === 'broker-supplied' &&
+        inboundFreightProvenance === 'broker-supplied' &&
+        exportFreightProvenance === 'broker-supplied'
+
+      if (allOtherInputsBrokerSupplied) {
+        // Guard passes: every other term in the VAT-base equation is a
+        // document fact, so solving value_adjustment out of the CDS
+        // entry's declared VAT base is genuine corroboration, not
+        // circularity. Use the SOLVED figure in the arithmetic itself.
+        valueAdjustmentGbp = round2(entryVatBaseGbp - processChargeGbp - inboundFreight - exportFreight - dutyGbp)
+        valueAdjustmentProvenance = 'solved'
+      } else {
+        // Guard refuses: at least one other input is 'derived' or
+        // 'solved' (e.g. R2's freight figures, hand-derived from an
+        // equation that itself assumed £1.31). Solving here would just
+        // reproduce that assumption, not confirm it. Keep the existing
+        // default-fallback arithmetic UNCHANGED, and report the honest
+        // gap separately: the CDS entry's declared VAT base minus every
+        // term that IS a document fact (process charge always; freight
+        // terms only if broker-supplied) minus duty. This lump therefore
+        // covers whichever freight terms are derived, plus the
+        // adjustment itself, jointly and undecomposably.
+        valueAdjustmentGbp = DEFAULT_VALUE_ADJUSTMENT_GBP
+        valueAdjustmentProvenance = null
+        const brokerSuppliedFreightSum =
+          (inboundFreightProvenance === 'broker-supplied' ? inboundFreight : 0) +
+          (exportFreightProvenance === 'broker-supplied' ? exportFreight : 0)
+        const brokerSuppliedProcessCharge = processChargeProvenance === 'broker-supplied' ? processChargeGbp : 0
+        unattributedVarianceGbp = round2(entryVatBaseGbp - brokerSuppliedProcessCharge - brokerSuppliedFreightSum - dutyGbp)
+      }
+    }
+
     // VAT base = process charge + inbound freight + export freight + duty + value adjustment
     // (ASYMMETRY: FULL inbound freight + export freight, unlike duty base)
     vatBaseGbp = round2(processChargeGbp + inboundFreight + exportFreight + dutyGbp + valueAdjustmentGbp)
@@ -391,6 +521,8 @@ export function computeCe1154(
     pvaAmountGbp = round2(vatBaseGbp * 0.20)
     worksheetSource = 'computed'
     worksheetPendingNote = null
+    valueAdjustmentProvenanceResult = valueAdjustmentProvenance
+    unattributedVarianceGbpResult = unattributedVarianceGbp
   } else {
     // Worksheet inputs not yet recorded — fall back to the CDS entry's OWN
     // declared bases/taxes (e.g. R2: entry known, "OP WS 875147276207"
@@ -460,6 +592,8 @@ export function computeCe1154(
       insurance_gbp: insuranceGbp,
       value_adjustment_gbp: valueAdjustmentGbp,
       value_adjustment_is_default: valueAdjustmentGbp === DEFAULT_VALUE_ADJUSTMENT_GBP,
+      value_adjustment_provenance: valueAdjustmentProvenanceResult,
+      unattributed_variance_gbp: unattributedVarianceGbpResult,
       tariff_duty_rate_pct: dutyPct,
       compensatory_value_gbp: compensatoryValueGbp,
       duty_base_gbp: dutyBaseGbp,

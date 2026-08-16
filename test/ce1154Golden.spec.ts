@@ -153,6 +153,7 @@ const exportShipment: Shipment = {
   export_freight_gbp: null,
   insurance_gbp: null,
   value_adjustment_gbp: null,
+  worksheet_input_provenance: null,
   commodity_code: null,
   duty_override_claimed: 0,
   entry_accepted_at: null,

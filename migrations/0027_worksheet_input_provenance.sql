@@ -1,0 +1,38 @@
+-- Migration 0027: worksheet-input provenance tagging (Item C follow-up,
+-- Sprint A 2a — per-entry value adjustment with residual solving).
+--
+-- Problem this closes: computeCe1154() previously treated every worksheet
+-- input (process charge, inbound freight, non-EU freight share, export
+-- freight, insurance) as equally trustworthy, whether it came straight off
+-- the FedEx worksheet or was backed out BY HAND from an equation (as R2's
+-- freight figures were, before its own "OP WS 875147276207" worksheet
+-- arrived — see oprImport.spec.ts's R2 fixture comment). That is a real
+-- circularity risk: if a figure was itself derived by assuming a value for
+-- value_adjustment_gbp, then later "solving" value_adjustment_gbp back out
+-- of that same figure cannot fail — it returns the assumed value by
+-- construction, not independent confirmation. A tie produced this way and
+-- silently reported as a clean solve would read as corroboration when it
+-- is none.
+--
+-- The guard: an input may be SOLVED from an equation only if every OTHER
+-- input in that equation is 'broker-supplied' (a document fact — the
+-- FedEx worksheet, the CDS entry — never itself derived or solved). If any
+-- other input is 'derived' or 'solved', refuse to solve and report the gap
+-- honestly as `unattributed_variance_gbp` instead of a fabricated figure.
+--
+-- worksheet_input_provenance is a nullable JSON TEXT blob (same convention
+-- as the existing metadata TEXT JSON-blob columns on device_events —
+-- 0008/0021/0023), keyed by a subset of {process_charge, inbound_freight_gbp,
+-- non_eu_freight_share_gbp, export_freight_gbp, insurance_gbp}, each valued
+-- 'broker-supplied' | 'derived'. Any field absent from the blob (including
+-- a NULL blob entirely) defaults to 'broker-supplied' — this is what keeps
+-- every existing shipment (R1 included: nothing here was ever derived)
+-- behaving exactly as before with no migration of historical data needed.
+-- 'solved' and 'unattributed_variance' are OUTCOMES computeCe1154() itself
+-- assigns to value_adjustment — never something an operator tags directly
+-- on this column.
+--
+-- (No explicit transaction wrapper: remote D1 rejects BEGIN/COMMIT
+-- [CF 7500]; wrangler applies this file as a single batch.)
+
+ALTER TABLE shipments ADD COLUMN worksheet_input_provenance TEXT;
