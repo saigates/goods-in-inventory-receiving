@@ -244,6 +244,31 @@ describe('shipments — procedure codes', () => {
     })
     expect(res.status).toBe(422)
   })
+
+  // normaliseAdditional() (src/lib/opr.ts) accepts the additional-procedure
+  // portion glued or spaced onto procedure_code, not just as a separate
+  // field. Demonstrated ad-hoc during the export-procedure-code work but
+  // never committed as a test — closing that gap here via the real
+  // endpoint (the same code path validateProcedureCodes runs on create).
+  it('accepts additional_procedure_code glued or spaced onto procedure_code ("2100000" / "2100 000"), normalising to the same two-field pair as sending 000 separately', async () => {
+    const glued = await api('/api/opr/shipments', {
+      method: 'POST',
+      body: JSON.stringify(base({ procedure_code: '2100000', additional_procedure_code: null })),
+    })
+    expect(glued.status).toBe(201)
+    const gluedShipment = ((await glued.json()) as { shipment: Record<string, unknown> }).shipment
+    expect(gluedShipment.procedure_code).toBe('2100')
+    expect(gluedShipment.additional_procedure_code).toBe('000')
+
+    const spaced = await api('/api/opr/shipments', {
+      method: 'POST',
+      body: JSON.stringify(base({ procedure_code: '2100 000', additional_procedure_code: null })),
+    })
+    expect(spaced.status).toBe(201)
+    const spacedShipment = ((await spaced.json()) as { shipment: Record<string, unknown> }).shipment
+    expect(spacedShipment.procedure_code).toBe('2100')
+    expect(spacedShipment.additional_procedure_code).toBe('000')
+  })
 })
 
 describe('shipments — declaration charset & linkage', () => {

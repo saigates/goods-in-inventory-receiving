@@ -443,6 +443,28 @@ describe('validation engine — coded green/amber/red', () => {
     expect(r.result).toBe('green')
   })
 
+  it('null ship_date resolves EXP_PROCEDURE_CODE against created_at, never today: a post-effective-date created_at with a missing additional code is red even when "today" is spoofed to predate the policy', () => {
+    // This is the committed version of the ad-hoc probe used to demonstrate
+    // the determinism rule (ship_date -> created_at -> never today). The
+    // 2032-01-01 AUTH_VALID_ON_SHIP_DATE fixture doesn't assert r.result,
+    // so it's not a canary for the date gate; this test is — it fails red
+    // if someone widens policyApplies to consult `today` instead of the
+    // shipment's own date, or removes the created_at fallback.
+    const policy = {
+      procedure_code: '2100', additional_procedure_code: '000',
+      supervising_office_name: 'HMRC S1756 IP-OP Customs Liverpool', supervising_office_code: 'GBLIV002',
+      effective_from: '2026-08-16',
+    }
+    const s = baseShipment({
+      ship_date: null, created_at: '2026-09-01T00:00:00.000Z', additional_procedure_code: null,
+    })
+    // today is spoofed to predate effective_from — must be ignored; only
+    // created_at (the record's own date) may decide whether the policy applies.
+    const r = runExportValidation(s, baseAuth, [mkLine()], '2020-01-01', policy)
+    expect(codeLevel(r, 'EXP_PROCEDURE_CODE')).toBe('red')
+    expect(r.result).toBe('red')
+  })
+
   it('a FINALISED shipment is not retro-flagged even if dated after the effective_from and missing 000', () => {
     const s = baseShipment({ status: 'FINALISED', ship_date: '2026-09-01', additional_procedure_code: null, finalised_at: '2026-09-02' })
     const r = runExportValidation(s, baseAuth, [mkLine()], undefined, {
