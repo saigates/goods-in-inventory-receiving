@@ -23,7 +23,7 @@ import { env } from 'cloudflare:workers'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import app from '../src/index'
 import { signAuthToken } from '../src/lib/auth'
-import { computeCe1154, addMonths, computeDischargeRow, runImportValidation, round2, parseBox47, reconcileBox47 } from '../src/lib/oprImport'
+import { computeCe1154, addMonths, computeDischargeRow, runImportValidation, round2, parseBox47, reconcileBox47, buildCe1154Html, buildClearanceInstructionDraft } from '../src/lib/oprImport'
 import type { Shipment, ShipmentLine, OprAuthorisation } from '../src/types'
 
 const JWT_SECRET = 'test-secret-opr-import'
@@ -956,6 +956,170 @@ describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
     const r1SupplementaryUnits = 90
     const r2SupplementaryUnits = 72
     expect(r1SupplementaryUnits + r2SupplementaryUnits).toBe(162)
+  })
+})
+
+// ═════════ Owner finding (2026-08-17, "first item of the next pass") ═════════
+// "The provenance sweep gives a clean negative result, but it surfaces
+// something worth acting on before Sprint B... Check whether
+// unattributed_variance_gbp appears on the rendered C&E1154 and the
+// clearance instruction at all; if it doesn't, surface both it and the
+// provenance — at minimum, mark default-unverified and solved figures
+// visibly, and state the unattributed amount where one exists."
+//
+// Prior state (confirmed by exhaustive grep before this fix): neither
+// buildCe1154Html() nor buildClearanceInstructionDraft() referenced
+// value_adjustment_provenance or unattributed_variance_gbp anywhere —
+// only value_adjustment_gbp/value_adjustment_is_default (a pure numeric
+// check, true for both a genuinely broker-supplied £1.31 and an
+// unverified assumed £1.31) were rendered. buildClearanceInstructionDraft
+// had ZERO prior test coverage at all; these are new tests, not updates.
+describe('OPR 3 — provenance/variance surfaced on broker-facing documents (owner finding, first item of next pass)', () => {
+  const auth: OprAuthorisation = {
+    id: 1, organisation_id: 1, holder_name: 'Saigates Limited', eori: 'GB369979995000',
+    cds_number: 'GBOPO36997999500020260226105539', op_authorisation_number: 'OP/0922/601/31',
+    valid_from: '2026-03-01', valid_to: '2031-02-28',
+    supervising_office_name: 'HMRC S1756 IP-OP Customs Liverpool', supervising_office_code: 'GBLIV002',
+    commodity_scope: 'Smartphones', commodity_codes: '8517130000',
+    rate_of_yield: '1:1', discharge_period_months: 6, notes: null,
+    prealert_email: null, prealert_cutoff: null, created_at: '', updated_at: null,
+  }
+  const mkBase = (over: Partial<Shipment> = {}): Shipment => ({
+    id: 2, organisation_id: 1, reference: 'R1', direction: 'import',
+    shipment_type: 'OPR_REPAIR', status: 'DRAFT', authorisation_id: 1,
+    procedure_code: '6121', additional_procedure_code: null,
+    consignee_name: null, consignee_address: null, carrier: 'FedEx', carrier_account: null,
+    incoterm: null, currency: 'GBP', ship_date: '2026-09-01',
+    related_export_shipment_id: 1, export_mrn: null, ducr: null, ead_mrn: null, mucr: null,
+    finalised_at: null, finalised_by_user_id: null,
+    repair_cost: null, repair_cost_currency: null, customs_exchange_rate: null,
+    duty_rate_pct: null, import_mrn: null,
+    reconciled_value_gbp: null,
+    customs_entry_ref: null, vat_evidence_ref: null,
+    repair_cost_confirmed_at: null, repair_cost_confirmed_by_user_id: null,
+    inbound_freight_gbp: null, non_eu_freight_share_gbp: null, export_freight_gbp: null,
+    insurance_gbp: null, value_adjustment_gbp: null, worksheet_input_provenance: null,
+    commodity_code: '8517130000', duty_override_claimed: 1,
+    entry_accepted_at: null, entry_cleared_at: null, supplementary_units: null,
+    entry_duty_base_gbp: null, entry_vat_base_gbp: null, entry_duty_gbp: null, entry_vat_gbp: null,
+    declared_invoice_total_gbp: null, declared_piece_count: null, declared_gross_weight_kg: null,
+    misdeclaration_ack_at: null, misdeclaration_ack_by_user_id: null,
+    notes: null, created_by_user_id: null, created_at: '', updated_at: null,
+    ...over,
+  })
+  const mkExport = (mrn: string): Shipment => mkBase({
+    id: 1, reference: `EXP ${mrn}`, direction: 'export', procedure_code: '2100',
+    related_export_shipment_id: null, export_mrn: mrn, status: 'FINALISED',
+    duty_override_claimed: 0,
+  })
+  const oneLine: ShipmentLine[] = [{
+    id: 1, organisation_id: 1, shipment_id: 2, received_device_id: 1,
+    imei: '860455190001200', sku: null, brand: 'Samsung', model: 'S23',
+    capacity: null, color: null, grade: 'A', unit_value: 150, currency: 'GBP',
+    added_by_user_id: null, created_at: '',
+  }]
+
+  it("R1's real case (default-unverified, no variance): C&E1154 marks the value adjustment UNVERIFIED, and shows no unattributed-variance row", () => {
+    const importShipment = mkBase({
+      reference: 'R1', import_mrn: '26GB8ILNEI7EFJPAR1',
+      repair_cost: 1556.09, repair_cost_currency: 'GBP',
+      inbound_freight_gbp: 101.70, non_eu_freight_share_gbp: 43.73, export_freight_gbp: 101.70,
+      insurance_gbp: 0, duty_rate_pct: 0,
+    })
+    const r = computeCe1154(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, oneLine)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ce1154.value_adjustment_provenance).toBe('default-unverified')
+    expect(r.ce1154.unattributed_variance_gbp).toBeNull()
+    const html = buildCe1154Html(r.ce1154, importShipment, oneLine)
+    expect(html).toContain('UNVERIFIED (default assumption, not confirmed by any document)')
+    expect(html).not.toContain('Unattributed variance')
+    expect(html).not.toContain('SOLVED')
+    const draft = buildClearanceInstructionDraft(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, oneLine, r.ce1154)
+    expect(draft.body).toContain('UNVERIFIED — a default assumption, not confirmed by any document')
+    expect(draft.body).not.toContain('unattributed variance')
+    expect(draft.body).not.toContain('SOLVED')
+  })
+
+  it("R2's real case (default-unverified, £210.36 unattributed variance): C&E1154 and the clearance instruction both surface the mark AND the amount — this is the exact gap the owner's finding identified", () => {
+    const importShipment = mkBase({
+      reference: 'R2', import_mrn: '26GB8JRJW1IQOR7AR0',
+      repair_cost: 1345.63, repair_cost_currency: 'GBP', customs_exchange_rate: null,
+      inbound_freight_gbp: 105.18, non_eu_freight_share_gbp: 45.18, export_freight_gbp: 103.87,
+      insurance_gbp: 0, duty_rate_pct: 0,
+      worksheet_input_provenance: JSON.stringify({
+        process_charge: 'broker-supplied',
+        inbound_freight_gbp: 'derived',
+        non_eu_freight_share_gbp: 'derived',
+        export_freight_gbp: 'derived',
+      }),
+      entry_duty_base_gbp: 1390.81, entry_vat_base_gbp: 1555.99, entry_duty_gbp: 0, entry_vat_gbp: 311.20,
+    })
+    const r = computeCe1154(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, oneLine)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ce1154.value_adjustment_provenance).toBe('default-unverified')
+    expect(r.ce1154.unattributed_variance_gbp).toBe(210.36)
+    const html = buildCe1154Html(r.ce1154, importShipment, oneLine)
+    expect(html).toContain('UNVERIFIED (default assumption, not confirmed by any document)')
+    expect(html).toContain('Unattributed variance')
+    expect(html).toContain('£210.36')
+    const draft = buildClearanceInstructionDraft(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, oneLine, r.ce1154)
+    expect(draft.body).toContain('UNVERIFIED — a default assumption, not confirmed by any document')
+    expect(draft.body).toContain('unattributed variance £210.36')
+  })
+
+  it("guard's positive-solve path ('solved', no variance): C&E1154 and the clearance instruction mark the value adjustment SOLVED, not UNVERIFIED, and show no unattributed-variance row", () => {
+    const importShipment = mkBase({
+      reference: 'R2', import_mrn: '26GB8JRJW1IQOR7AR0',
+      repair_cost: 1345.63, repair_cost_currency: 'GBP', customs_exchange_rate: null,
+      inbound_freight_gbp: 105.18, non_eu_freight_share_gbp: 45.18, export_freight_gbp: 103.87,
+      insurance_gbp: 0, duty_rate_pct: 0,
+      worksheet_input_provenance: JSON.stringify({
+        process_charge: 'broker-supplied',
+        inbound_freight_gbp: 'broker-supplied',
+        non_eu_freight_share_gbp: 'broker-supplied',
+        export_freight_gbp: 'broker-supplied',
+      }),
+      entry_duty_base_gbp: 1390.81, entry_vat_base_gbp: 1555.99, entry_duty_gbp: 0, entry_vat_gbp: 311.20,
+    })
+    const r = computeCe1154(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, oneLine)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ce1154.value_adjustment_provenance).toBe('solved')
+    expect(r.ce1154.unattributed_variance_gbp).toBeNull()
+    const html = buildCe1154Html(r.ce1154, importShipment, oneLine)
+    expect(html).toContain('SOLVED (derived from the entry VAT base; not directly supplied)')
+    expect(html).not.toContain('UNVERIFIED')
+    expect(html).not.toContain('Unattributed variance')
+    const draft = buildClearanceInstructionDraft(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, oneLine, r.ce1154)
+    expect(draft.body).toContain('SOLVED — derived from the entry VAT base, not directly supplied')
+    expect(draft.body).not.toContain('UNVERIFIED')
+    expect(draft.body).not.toContain('unattributed variance')
+  })
+
+  it("genuinely broker-supplied value adjustment: NEITHER document shows any UNVERIFIED/SOLVED marker or a warn-highlighted row — the baseline document-fact case is left unmarked", () => {
+    const importShipment = mkBase({
+      reference: 'R1', import_mrn: '26GB8ILNEI7EFJPAR1',
+      repair_cost: 1556.09, repair_cost_currency: 'GBP',
+      inbound_freight_gbp: 101.70, non_eu_freight_share_gbp: 43.73, export_freight_gbp: 101.70,
+      insurance_gbp: 0, duty_rate_pct: 0,
+      value_adjustment_gbp: 1.31, // explicitly supplied — a document fact
+    })
+    const r = computeCe1154(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, oneLine)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ce1154.value_adjustment_provenance).toBe('broker-supplied')
+    expect(r.ce1154.unattributed_variance_gbp).toBeNull()
+    const html = buildCe1154Html(r.ce1154, importShipment, oneLine)
+    expect(html).not.toContain('UNVERIFIED')
+    expect(html).not.toContain('SOLVED')
+    expect(html).not.toContain('Unattributed variance')
+    expect(html).toContain('<tr><td>Value adjustment</td><td>£1.31</td></tr>')
+    const draft = buildClearanceInstructionDraft(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, oneLine, r.ce1154)
+    expect(draft.body).not.toContain('UNVERIFIED')
+    expect(draft.body).not.toContain('SOLVED')
+    expect(draft.body).not.toContain('unattributed variance')
   })
 })
 

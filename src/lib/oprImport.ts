@@ -655,6 +655,20 @@ export function computeCe1154(
 // Print-ready A4 rendering of the computed C&E1154 figures.
 export function buildCe1154Html(ce: Ce1154, importShipment: Shipment, lines: ShipmentLine[]): string {
   const money = (v: number | null) => v == null ? '—' : `£${v.toFixed(2)}`
+  // Owner finding (2026-08-17, "first item of the next pass"): this document
+  // is what a filing party actually reads, and it previously rendered
+  // value_adjustment_is_default — a pure numeric check, true for BOTH a
+  // genuinely broker-supplied £1.31 and an unverified assumed £1.31 — with
+  // no trace of value_adjustment_provenance or unattributed_variance_gbp at
+  // all. 'broker-supplied' and 'solved' are document facts / genuine
+  // corroboration and need no marker; 'default-unverified' must be visibly
+  // flagged so nobody downstream mistakes the assumption for a fact.
+  const valueAdjustmentProvenanceMarker =
+    ce.value_adjustment_provenance === 'default-unverified'
+      ? ' — UNVERIFIED (default assumption, not confirmed by any document)'
+      : ce.value_adjustment_provenance === 'solved'
+        ? ' — SOLVED (derived from the entry VAT base; not directly supplied)'
+        : ''
   const rows = lines.map((l, i) => `
         <tr>
           <td>${i + 1}</td>
@@ -717,8 +731,9 @@ export function buildCe1154Html(ce: Ce1154, importShipment: Shipment, lines: Shi
       ${ce.non_eu_freight_share_gbp != null ? `<tr><td>Non-EU inbound freight share</td><td>${money(ce.non_eu_freight_share_gbp)}</td></tr>` : ''}
       ${ce.export_freight_gbp != null ? `<tr><td>Export freight</td><td>${money(ce.export_freight_gbp)}</td></tr>` : ''}
       ${ce.insurance_gbp != null ? `<tr><td>Insurance</td><td>${money(ce.insurance_gbp)}</td></tr>` : ''}
-      ${ce.value_adjustment_gbp != null ? `<tr><td>Value adjustment${ce.value_adjustment_is_default ? '' : ' (differs from the £1.31 default)'}</td><td>${money(ce.value_adjustment_gbp)}</td></tr>` : ''}
+      ${ce.value_adjustment_gbp != null ? `<tr${valueAdjustmentProvenanceMarker ? ' class="warn"' : ''}><td>Value adjustment${ce.value_adjustment_is_default ? '' : ' (differs from the £1.31 default)'}${valueAdjustmentProvenanceMarker}</td><td>${money(ce.value_adjustment_gbp)}</td></tr>` : ''}
       ${ce.compensatory_value_gbp != null ? `<tr><td>Compensatory value</td><td>${money(ce.compensatory_value_gbp)}</td></tr>` : ''}
+      ${ce.unattributed_variance_gbp != null ? `<tr class="warn"><td>Unattributed variance (VAT base minus confirmed inputs)</td><td>${money(ce.unattributed_variance_gbp)} — not decomposed into freight/value-adjustment; solve refused because at least one other input is unconfirmed</td></tr>` : ''}
       <tr><td><strong>Duty base</strong></td><td><strong>${money(ce.duty_base_gbp)}</strong></td></tr>
       ${ce.tariff_duty_rate_pct != null ? `<tr><td>Tariff duty rate</td><td>${ce.tariff_duty_rate_pct}%</td></tr>` : ''}
       <tr><td><strong>Duty</strong></td><td><strong>${money(ce.duty_gbp)}</strong></td></tr>
@@ -777,6 +792,21 @@ export function buildClearanceInstructionDraft(
     ce1154
       ? `  Duty base £${ce1154.duty_base_gbp.toFixed(2)}, duty £${ce1154.duty_gbp.toFixed(2)}; VAT base £${ce1154.vat_base_gbp.toFixed(2)}, VAT £${ce1154.pva_amount_gbp.toFixed(2)} (POSTPONED — PVA, not payable at the border)`
       : '  C&E1154 figures: NOT YET AVAILABLE — supply worksheet inputs before lodging',
+    // Owner finding (2026-08-17, "first item of the next pass"): this draft
+    // previously never referenced value_adjustment_provenance or
+    // unattributed_variance_gbp at all — the same gap as buildCe1154Html
+    // above, on the document actually sent to a broker/filing party.
+    // 'broker-supplied'/'solved' are document facts / genuine corroboration
+    // and need no marker; 'default-unverified' must be flagged.
+    ce1154 && ce1154.value_adjustment_provenance === 'default-unverified'
+      ? `  NOTE: value adjustment £${ce1154.value_adjustment_gbp?.toFixed(2)} is UNVERIFIED — a default assumption, not confirmed by any document`
+      : '',
+    ce1154 && ce1154.value_adjustment_provenance === 'solved'
+      ? `  NOTE: value adjustment £${ce1154.value_adjustment_gbp?.toFixed(2)} is SOLVED — derived from the entry VAT base, not directly supplied`
+      : '',
+    ce1154 && ce1154.unattributed_variance_gbp != null
+      ? `  NOTE: unattributed variance £${ce1154.unattributed_variance_gbp.toFixed(2)} in the VAT base is not decomposed into freight/value-adjustment — solve refused because at least one other input is unconfirmed`
+      : '',
     ce1154 && ce1154.worksheet_pending_note ? `  NOTE: ${ce1154.worksheet_pending_note}` : '',
     '',
     'IMPORTANT: duty and VAT are assessed on the FULL FedEx OPR worksheet',

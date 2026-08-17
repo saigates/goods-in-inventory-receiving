@@ -42,8 +42,9 @@
       <tr><td>Non-EU inbound freight share</td><td>£43.73</td></tr>
       <tr><td>Export freight</td><td>£101.70</td></tr>
       <tr><td>Insurance</td><td>£0.00</td></tr>
-      <tr><td>Value adjustment</td><td>£1.31</td></tr>
+      <tr class="warn"><td>Value adjustment — UNVERIFIED (default assumption, not confirmed by any document)</td><td>£1.31</td></tr>
       <tr><td>Compensatory value</td><td>£1957.79</td></tr>
+      
       <tr><td><strong>Duty base</strong></td><td><strong>£1599.82</strong></td></tr>
       <tr><td>Tariff duty rate</td><td>0%</td></tr>
       <tr><td><strong>Duty</strong></td><td><strong>£0.00</strong></td></tr>

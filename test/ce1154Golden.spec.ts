@@ -103,6 +103,27 @@
 // the same underlying conflation that produced R2's null-provenance/
 // non-null-value divergence. No other field changed; every monetary
 // figure above remains byte-identical.
+//
+// REGENERATED 2026-08-17 (owner finding, "first item of the next pass" —
+// see the describe block below): the HTML fixture was regenerated because
+// buildCe1154Html() now surfaces value_adjustment_provenance on the
+// rendered document itself. Before this change, neither buildCe1154Html()
+// nor buildClearanceInstructionDraft() referenced
+// value_adjustment_provenance or unattributed_variance_gbp anywhere — the
+// documents a filing party actually reads carried only
+// value_adjustment_is_default, a pure numeric check that reads true for
+// both a genuinely broker-supplied £1.31 and an unverified assumed £1.31,
+// so the two could never be told apart on the page. R1's provenance is
+// `"default-unverified"`, so its "Value adjustment" row now carries a
+// `class="warn"` highlight and the suffix " — UNVERIFIED (default
+// assumption, not confirmed by any document)"; R1's
+// unattributed_variance_gbp is null, so no variance row is added. The
+// regenerated fixture was diffed against the prior frozen copy (see the
+// JSON fixture, unchanged by this pass) and confirmed the ONLY difference
+// is that one row plus one blank line for the (empty, since null)
+// unattributed-variance placeholder — every monetary/quantity figure is
+// byte-identical. The JSON fixture required NO change (this pass only
+// touches rendering, not computeCe1154()'s output shape).
 import { describe, it, expect } from 'vitest'
 // Tests run inside workerd (no `fs`/`node:fs`) — fixtures are bundled as
 // raw text via Vite's `?raw` import suffix, not read at runtime.
