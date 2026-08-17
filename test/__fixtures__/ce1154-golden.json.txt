@@ -27,7 +27,7 @@
   "insurance_gbp": 0,
   "value_adjustment_gbp": 1.31,
   "value_adjustment_is_default": true,
-  "value_adjustment_provenance": "broker-supplied",
+  "value_adjustment_provenance": "default-unverified",
   "unattributed_variance_gbp": null,
   "tariff_duty_rate_pct": 0,
   "compensatory_value_gbp": 1957.79,

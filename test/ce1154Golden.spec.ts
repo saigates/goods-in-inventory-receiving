@@ -92,6 +92,17 @@
 // £1,599.82 duty base, £1,760.80 VAT base, £0.00 duty, £352.16 PVA) is
 // byte-identical to the pre-regeneration fixture. HTML fixture unchanged
 // (buildCe1154Html() does not render these fields either).
+//
+// UPDATED 2026-08-17 (Sprint A follow-up, owner review of the 2a
+// demonstration): `value_adjustment_provenance` for R1 changed from
+// `"broker-supplied"` to `"default-unverified"`. The owner correctly
+// identified that R1's £1.31 is a document CONVENTION being applied (no
+// entry_vat_base_gbp exists to check it against at all), not a figure the
+// operator/worksheet actually supplied — labelling it identically to a
+// genuinely operator-entered figure overstated how solid it is, and is
+// the same underlying conflation that produced R2's null-provenance/
+// non-null-value divergence. No other field changed; every monetary
+// figure above remains byte-identical.
 import { describe, it, expect } from 'vitest'
 // Tests run inside workerd (no `fs`/`node:fs`) — fixtures are bundled as
 // raw text via Vite's `?raw` import suffix, not read at runtime.

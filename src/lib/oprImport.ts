@@ -230,7 +230,28 @@ export type Ce1154Result =
 // entry), never itself 'derived' or 'solved'. If any other term is
 // 'derived' or 'solved', refuse to solve and report the honest remainder
 // as unattributed_variance_gbp instead of a fabricated figure.
+//
+// 'default-unverified' (added in this pass, per owner review of the 2a
+// demonstration): distinct from 'broker-supplied' specifically for
+// value_adjustment_provenance's OWN output field (never a valid tag inside
+// worksheet_input_provenance's input blob — the freight/process-charge
+// inputs keep their existing three-value meaning unchanged). Before this,
+// value_adjustment_provenance was tagged 'broker-supplied' in TWO
+// genuinely different situations: (a) importShipment.value_adjustment_gbp
+// was actually set — an operator or the FedEx worksheet supplied a real
+// figure — and (b) it was left null and the £1.31 convention default was
+// used with NOTHING to check it against (e.g. real R1: no
+// entry_vat_base_gbp recorded at all). Case (b) is not a document fact; it
+// is an unverified assumption, and labelling it identically to case (a)
+// let a caller reading value_adjustment_provenance alone believe R1's
+// £1.31 was as solid as a genuinely operator-entered figure. The field and
+// value_adjustment_gbp must never diverge in verifiability: a
+// 'default-unverified' tag keeps the arithmetic unchanged (still uses
+// DEFAULT_VALUE_ADJUSTMENT_GBP) while making the status explicit on the
+// SAME field, rather than requiring a caller to separately check
+// value_adjustment_is_default to know the number isn't corroborated.
 export type WorksheetInputProvenance = 'broker-supplied' | 'derived' | 'solved'
+export type ValueAdjustmentProvenance = WorksheetInputProvenance | 'default-unverified'
 
 // Keys mirror migration 0027's worksheet_input_provenance JSON blob.
 export type WorksheetInputProvenanceMap = Partial<Record<
@@ -297,15 +318,30 @@ export type Ce1154 = {
   insurance_gbp: number | null
   value_adjustment_gbp: number | null
   value_adjustment_is_default: boolean
-  // Provenance of value_adjustment_gbp specifically: 'broker-supplied' when
-  // it came straight off the worksheet/entry (the operator-entered field
-  // was set, or is null and the default is being used as a document
-  // convention rather than a solve); 'solved' when the guard below
-  // computed it from the VAT-base equation because every other input was
-  // broker-supplied; null when neither applies (entry_pending mode, or no
-  // solve was attempted because inputs weren't all broker-supplied AND the
-  // shipment's own value_adjustment_gbp was set explicitly).
-  value_adjustment_provenance: WorksheetInputProvenance | null
+  // Provenance of value_adjustment_gbp specifically:
+  //   'broker-supplied' — importShipment.value_adjustment_gbp was actually
+  //     set (operator/worksheet figure); a genuine document fact.
+  //   'default-unverified' — value_adjustment_gbp was left null and
+  //     DEFAULT_VALUE_ADJUSTMENT_GBP (£1.31) is being used because there is
+  //     no entry_vat_base_gbp to check it against at all. The number in
+  //     the field is unverified, not a document fact — never conflate this
+  //     with 'broker-supplied' (that was the pre-existing defect: R1's
+  //     real record hits exactly this branch, and calling it
+  //     'broker-supplied' overstated how solid its £1.31 is).
+  //   'solved' — the guard below computed it from the VAT-base equation
+  //     because every other input was broker-supplied; a genuine
+  //     corroboration, not a repeat of the default.
+  //   null — worksheet_source is 'entry_pending' (no worksheet chain
+  //     computed at all), OR a solve was attempted and REFUSED because some
+  //     other VAT-base input was 'derived'/'solved' (see
+  //     unattributed_variance_gbp below for the honest gap in that case).
+  //     value_adjustment_gbp still holds the £1.31 default in the refused
+  //     case, but it is UNVERIFIED — same reasoning as the
+  //     'default-unverified' case above, distinguished only by whether an
+  //     entry base existed to refuse against. Both null and
+  //     'default-unverified' therefore mean "do not treat this figure as a
+  //     document fact"; only 'broker-supplied' and 'solved' do.
+  value_adjustment_provenance: ValueAdjustmentProvenance | null
   // The honest gap when a solve was REFUSED (some other VAT-base input is
   // 'derived'/'solved'): entry_vat_base_gbp minus every non-adjustment
   // term that IS known (process charge, freight actually recorded, duty).
@@ -400,7 +436,7 @@ export function computeCe1154(
   let pvaAmountGbp: number
   let worksheetSource: Ce1154WorksheetSource
   let worksheetPendingNote: string | null
-  let valueAdjustmentProvenanceResult: WorksheetInputProvenance | null = null
+  let valueAdjustmentProvenanceResult: ValueAdjustmentProvenance | null = null
   let unattributedVarianceGbpResult: number | null = null
 
   if (hasWorksheetInputs) {
@@ -462,7 +498,7 @@ export function computeCe1154(
     const provenanceOf = (key: keyof WorksheetInputProvenanceMap): WorksheetInputProvenance =>
       provenanceMap[key] ?? 'broker-supplied'
     let unattributedVarianceGbp: number | null = null
-    let valueAdjustmentProvenance: WorksheetInputProvenance | null = null
+    let valueAdjustmentProvenance: ValueAdjustmentProvenance | null = null
 
     if (importShipment.value_adjustment_gbp != null) {
       // Operator-entered figure — a document fact by definition, nothing solved.
@@ -470,9 +506,11 @@ export function computeCe1154(
       valueAdjustmentProvenance = 'broker-supplied'
     } else if (importShipment.entry_vat_base_gbp == null) {
       // Nothing to solve/refuse against (e.g. R1: no CDS entry-declared
-      // VAT base recorded) — use the existing default exactly as before.
+      // VAT base recorded) — use the existing default exactly as before,
+      // but tag it 'default-unverified': there is nothing here to check
+      // £1.31 against, so it must never be read as a document fact.
       valueAdjustmentGbp = DEFAULT_VALUE_ADJUSTMENT_GBP
-      valueAdjustmentProvenance = 'broker-supplied'
+      valueAdjustmentProvenance = 'default-unverified'
     } else {
       // entry_vat_base_gbp IS a document fact (the CDS entry's own
       // declared VAT base) — implicitly 'broker-supplied' by virtue of
@@ -504,8 +542,15 @@ export function computeCe1154(
         // terms only if broker-supplied) minus duty. This lump therefore
         // covers whichever freight terms are derived, plus the
         // adjustment itself, jointly and undecomposably.
+        //
+        // 'default-unverified', not null: the field must never diverge
+        // from the fact that £1.31 is still sitting in
+        // value_adjustment_gbp unverified — unattributed_variance_gbp
+        // records the honest gap, but the provenance tag on THIS field
+        // must say the same thing whether or not there was something to
+        // refuse against (see the branch above).
         valueAdjustmentGbp = DEFAULT_VALUE_ADJUSTMENT_GBP
-        valueAdjustmentProvenance = null
+        valueAdjustmentProvenance = 'default-unverified'
         const brokerSuppliedFreightSum =
           (inboundFreightProvenance === 'broker-supplied' ? inboundFreight : 0) +
           (exportFreightProvenance === 'broker-supplied' ? exportFreight : 0)

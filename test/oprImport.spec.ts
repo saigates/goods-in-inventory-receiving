@@ -700,10 +700,14 @@ describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
     expect(r.ce1154.value_adjustment_is_default).toBe(true)
     // Sprint A 2a (migration 0027, provenance-gated residual solving): R1
     // has no entry_vat_base_gbp recorded, so the solve/refuse guard never
-    // activates — value_adjustment_gbp is broker-supplied (the £1.31
-    // default is a document convention here, not a solve) and nothing is
-    // unattributed. This is what keeps R1's chain untouched by 2a.
-    expect(r.ce1154.value_adjustment_provenance).toBe('broker-supplied')
+    // activates — the £1.31 default is used exactly as before, but there
+    // is nothing here to check it against, so it is tagged
+    // 'default-unverified' (owner follow-up review of the 2a
+    // demonstration), NOT 'broker-supplied': it is a document convention
+    // being applied, not a figure the operator/worksheet actually
+    // supplied. Nothing is unattributed either way. This is what keeps
+    // R1's chain untouched by 2a.
+    expect(r.ce1154.value_adjustment_provenance).toBe('default-unverified')
     expect(r.ce1154.unattributed_variance_gbp).toBeNull()
     // Table figures, asserted to the penny:
     expect(r.ce1154.duty_base_gbp).toBe(1599.82)
@@ -779,9 +783,17 @@ describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
     // the load-bearing assertion of 2a: solving here would just reproduce
     // the £1.31 the freight figures were derived FROM (see the
     // describe-block header comment) — not confirm it.
+    //
+    // Provenance is 'default-unverified', not null (owner follow-up review
+    // of the 2a demonstration): a caller reading value_adjustment_gbp
+    // alone must never be able to mistake this refused-solve default for a
+    // document fact. null previously meant exactly the same thing here as
+    // it does in the no-entry-base branch above, but looked different —
+    // both now use the same explicit tag so the field and its provenance
+    // can never diverge.
     expect(r.ce1154.value_adjustment_gbp).toBe(1.31)
     expect(r.ce1154.value_adjustment_is_default).toBe(true)
-    expect(r.ce1154.value_adjustment_provenance).toBeNull()
+    expect(r.ce1154.value_adjustment_provenance).toBe('default-unverified')
     // £1,555.99 (entry_vat_base_gbp) − £1,345.63 (broker-supplied process
     // charge) − £0 (both freight terms derived, so excluded) − £0 (duty)
     // = £210.36 — the portion covering inbound freight, export freight and
@@ -854,6 +866,75 @@ describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
     expect(r.ce1154.vat_base_gbp).toBe(1555.99)
     expect(r.ce1154.duty_gbp).toBe(0)
     expect(r.ce1154.pva_amount_gbp).toBe(311.20)
+  })
+
+  it('Sprint A 2a guard branch order: an explicitly-supplied value_adjustment_gbp is NEVER overwritten by a solve, even when entry_vat_base_gbp is also present and every other input is broker-supplied', () => {
+    // Owner follow-up (post-2a acceptance): "Supplied always wins over
+    // solved. Confirm which way round it is; if it's the wrong way,
+    // that's a one-line fix plus a test." Investigation (throwaway
+    // untracked scratch script, since deleted) confirmed the code is
+    // already correct — the `value_adjustment_gbp != null` check is the
+    // FIRST branch in the guard and short-circuits unconditionally,
+    // before entry_vat_base_gbp or any provenance tag is even inspected.
+    // This test makes that guarantee permanent rather than a one-off
+    // scratch confirmation: it constructs the one shape that would catch
+    // a regression if the branch order were ever reversed — an
+    // R1/R2-style shipment that has BOTH an explicit
+    // value_adjustment_gbp AND an entry_vat_base_gbp that would otherwise
+    // let the guard's solve path fire (every other worksheet input tagged
+    // broker-supplied, entry base ties exactly to the supplied figure).
+    // If the guard ever reached for a solve here, it would silently
+    // overwrite a genuine worksheet figure with a re-derived one.
+    const lines: ShipmentLine[] = Array.from({ length: 72 }, (_, i) => ({
+      id: i + 1, organisation_id: 1, shipment_id: 2, received_device_id: i + 1,
+      imei: `860455190002${String(i).padStart(2, '0')}`, sku: null, brand: 'Samsung', model: 'S23',
+      capacity: null, color: null, grade: 'A', unit_value: 1, currency: 'GBP',
+      added_by_user_id: null, created_at: '',
+    }))
+    const importShipment = mkBase({
+      reference: 'R2', import_mrn: '26GB8JRJW1IQOR7AR0', supplementary_units: 72,
+      repair_cost: 1345.63, repair_cost_currency: 'GBP', customs_exchange_rate: null,
+      inbound_freight_gbp: 105.18, non_eu_freight_share_gbp: 45.18, export_freight_gbp: 103.87,
+      insurance_gbp: 0, duty_rate_pct: 0,
+      // Explicitly supplied — a document fact. The guard must stop here
+      // and never proceed to consider entry_vat_base_gbp at all.
+      value_adjustment_gbp: 1.31,
+      // Every other input broker-supplied — the exact condition that
+      // would make the solve path fire if it were ever consulted first.
+      worksheet_input_provenance: JSON.stringify({
+        process_charge: 'broker-supplied',
+        inbound_freight_gbp: 'broker-supplied',
+        non_eu_freight_share_gbp: 'broker-supplied',
+        export_freight_gbp: 'broker-supplied',
+      }),
+      // Ties exactly to the supplied £1.31, so a wrongly-ordered guard
+      // would reproduce 1.31 and this test would pass for the wrong
+      // reason if it only checked the value. The provenance and
+      // unattributed_variance_gbp assertions below are what actually
+      // prove the branch order, independent of whether the numbers
+      // happen to agree.
+      entry_duty_base_gbp: 1390.81, entry_vat_base_gbp: 1555.99, entry_duty_gbp: 0, entry_vat_gbp: 311.20,
+    })
+    const r = computeCe1154(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, lines)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    // Value is exactly the supplied figure, untouched. (value_adjustment_is_default
+    // is a pure numeric-equality check against the £1.31 convention default,
+    // not a provenance check — it is deliberately true here too, since the
+    // supplied figure happens to equal the default; that coincidence is
+    // exactly why this test relies on provenance, not the value, to prove
+    // the branch order below.)
+    expect(r.ce1154.value_adjustment_gbp).toBe(1.31)
+    expect(r.ce1154.value_adjustment_is_default).toBe(true)
+    // Provenance proves this was never solved, only accepted as supplied
+    // — a wrongly-ordered guard would report 'solved' here instead.
+    expect(r.ce1154.value_adjustment_provenance).toBe('broker-supplied')
+    // No solve was attempted, so no honest gap to report either — a
+    // wrongly-ordered guard would still leave this null (the solve
+    // succeeds cleanly when everything ties), so this assertion alone
+    // would not catch the bug; it is the provenance check above that
+    // does the real work here.
+    expect(r.ce1154.unattributed_variance_gbp).toBeNull()
   })
 
   it('R2 duty-base tie: derived process charge + NEU freight share reconstructs the known duty base independently of computeCe1154()', () => {
