@@ -23,7 +23,7 @@ import { env } from 'cloudflare:workers'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import app from '../src/index'
 import { signAuthToken } from '../src/lib/auth'
-import { computeCe1154, addMonths, computeDischargeRow, runImportValidation, round2 } from '../src/lib/oprImport'
+import { computeCe1154, addMonths, computeDischargeRow, runImportValidation, round2, parseBox47, reconcileBox47 } from '../src/lib/oprImport'
 import type { Shipment, ShipmentLine, OprAuthorisation } from '../src/types'
 
 const JWT_SECRET = 'test-secret-opr-import'
@@ -1517,5 +1517,316 @@ describe('OPR — value reconciliation: isolation from the C&E1154 VAT/duty basi
     }
     const balance = isValueBalanced(500, [200, 300])
     expect(Object.keys(balance).sort()).toEqual(['balanced', 'outstanding_value_gbp', 'returned_value_gbp'].sort())
+  })
+})
+
+// ═════════ Sprint A 2c — Box 47 dual-format parser ═════════
+
+describe('OPR 3 — parseBox47 / reconcileBox47', () => {
+  // Verbatim box 47 excerpts from the two real CDS entries on file (PDF
+  // text extraction artefacts — '##' prefixes and blank lines between
+  // every fragment — preserved exactly as the source renders them, since
+  // that noise is exactly what the parser must tolerate).
+  const r1Box47Text = `
+[44] Documents, certificates and authorisations [2/3] Code|Id and part|Status|Reason|Issuing authority|Validity date|Units|Quantity
+
+C019|GBOPO36997999500020260226105539
+
+## C505|GBCGUGUARANTEENOTREQUIRED |XW|WAIVER
+
+C506|GBDPO9088874
+
+## 9WKS|WORKSHEET ATTACHED |AC
+
+## Y900|CITES PERMITS NOT REQUIRED |-|CITES PERMITS NOT REQUIRED [47] Calculation of taxes
+
+Type [4/3]
+
+## Tax base [4/4] Meas.
+
+## Unit
+
+## Tax rate [4/5]
+
+## Curr
+
+Payable amount [4/6]
+
+MoP [4/8]
+
+## Deduct (relief) amount
+
+Total tax assessed [4/7]
+
+A00
+
+1599.82 GBP
+
+0.00 E
+
+0.00
+
+B00
+
+1760.80 GBP
+
+0.00 E
+
+0.00
+
+## Acceptance date/time
+
+2026-08-03 13:43:33
+`
+
+  const r2Box47Text = `
+[44] Documents, certificates and authorisations [2/3] Code|Id and part|Status|Reason|Issuing authority|Validity date|Units|Quantity
+
+C019|GBOPO36997999500020260226105539
+
+## C505|GBCGUGUARANTEENOTREQUIRED |XW|WAIVER
+
+C506|GBDPO9088874
+
+## 9WKS|WORKSHEET ATTACHED |AC
+
+## Y900|CITES PERMITS NOT REQUIRED |-|CITES PERMITS NOT REQUIRED [47] Calculation of taxes
+
+Type [4/3]
+
+## Tax base [4/4] Meas.
+
+## Unit
+
+## Tax rate [4/5]
+
+## Curr
+
+Payable amount [4/6]
+
+MoP [4/8]
+
+## Deduct (relief) amount
+
+Total tax assessed [4/7]
+
+A00
+
+1390.81 GBP
+
+0.00 E
+
+0.00
+
+B00
+
+1555.99 GBP
+
+0.00 E
+
+0.00
+
+## Acceptance date/time
+
+2026-08-04 09:16:33
+`
+
+  it('parses R1 (entry 874874338764): A00 duty base £1,599.82, B00 VAT base £1,760.80, both "total tax assessed" 0.00 (PVA)', () => {
+    const r = parseBox47(r1Box47Text)
+    expect(r.duty_found).toBe(true)
+    expect(r.vat_found).toBe(true)
+    expect(r.duty).toEqual({ tax_type: 'A00', tax_base_gbp: 1599.82, tax_rate_pct: 0, total_tax_assessed_gbp: 0 })
+    expect(r.vat).toEqual({ tax_type: 'B00', tax_base_gbp: 1760.80, tax_rate_pct: 0, total_tax_assessed_gbp: 0 })
+  })
+
+  it('parses R2 (entry 875147276207): A00 duty base £1,390.81, B00 VAT base £1,555.99, both "total tax assessed" 0.00 (PVA)', () => {
+    const r = parseBox47(r2Box47Text)
+    expect(r.duty_found).toBe(true)
+    expect(r.vat_found).toBe(true)
+    expect(r.duty).toEqual({ tax_type: 'A00', tax_base_gbp: 1390.81, tax_rate_pct: 0, total_tax_assessed_gbp: 0 })
+    expect(r.vat).toEqual({ tax_type: 'B00', tax_base_gbp: 1555.99, tax_rate_pct: 0, total_tax_assessed_gbp: 0 })
+  })
+
+  it('B00 "total tax assessed" is 0.00 on BOTH real entries (PVA never a cash charge) — the parser reports this verbatim, it does not infer VAT liability from it', () => {
+    // This is the fact the whole parser exists to protect: a reader who
+    // took "total tax assessed" at face value would conclude VAT payable
+    // is nil on every entry, always. It never is — VAT is postponed, not
+    // waived. The real liability is tax_base x 20%, computed separately
+    // (see computeCe1154's pva_amount_gbp), never read off this field.
+    const r1 = parseBox47(r1Box47Text)
+    const r2 = parseBox47(r2Box47Text)
+    expect(r1.vat!.total_tax_assessed_gbp).toBe(0)
+    expect(r2.vat!.total_tax_assessed_gbp).toBe(0)
+    expect(round2(r1.vat!.tax_base_gbp! * 0.2)).toBe(352.16) // R1's real PVA amount
+    expect(round2(r2.vat!.tax_base_gbp! * 0.2)).toBe(311.20) // R2's real PVA amount
+  })
+
+  it('reconcileBox47: R1 matches computeCe1154()\'s own duty/VAT bases exactly', () => {
+    const parsed = parseBox47(r1Box47Text)
+    const rec = reconcileBox47(parsed, 1599.82, 1760.80)
+    expect(rec.ok).toBe(true)
+    if (!rec.ok) return
+    expect(rec.duty_base_matches).toBe(true)
+    expect(rec.vat_base_matches).toBe(true)
+  })
+
+  it('reconcileBox47: flags a genuine mismatch rather than silently reporting a match', () => {
+    const parsed = parseBox47(r1Box47Text)
+    // Deliberately wrong computed figures — the reconciliation must say so.
+    const rec = reconcileBox47(parsed, 1600.00, 1760.80)
+    expect(rec.ok).toBe(true)
+    if (!rec.ok) return
+    expect(rec.duty_base_matches).toBe(false)
+    expect(rec.vat_base_matches).toBe(true)
+  })
+
+  it('reconcileBox47: refuses to reconcile (ok:false) when a tax type is entirely absent from the text, rather than reporting a fabricated false match', () => {
+    const noVat = parseBox47(`A00\n\n1390.81 GBP\n\n0.00 E\n\n0.00\n`)
+    const rec = reconcileBox47(noVat, 1390.81, 1555.99)
+    expect(rec.ok).toBe(false)
+    if (rec.ok) return
+    expect(rec.error).toMatch(/B00/)
+  })
+
+  // ── Dual-format / future-format resilience (the actual defect this
+  // unit exists to close) ──
+  //
+  // The filing party's warning: an upcoming HMRC change may alter the
+  // NUMBER or ORDER of tax-type blocks in box 47. A parser hard-coded to
+  // "block 1 is duty, block 2 is VAT" or "there are always exactly two
+  // blocks" would misread a reordered/added entry. These tests construct
+  // synthetic box 47 texts in shapes the real entries have NEVER shown,
+  // and confirm the code-keyed parser still finds the right figures by
+  // tax-type code, never by position.
+  it('future-format resilience: B00 (VAT) appearing BEFORE A00 (duty) is still parsed correctly by code, not position', () => {
+    const reordered = `
+[47] Calculation of taxes
+
+B00
+
+1555.99 GBP
+
+0.00 E
+
+0.00
+
+A00
+
+1390.81 GBP
+
+0.00 E
+
+0.00
+`
+    const r = parseBox47(reordered)
+    expect(r.duty_found).toBe(true)
+    expect(r.vat_found).toBe(true)
+    // Still correctly assigned to A00/B00 despite the swapped order —
+    // proof this is a code lookup, not "first block = duty".
+    expect(r.duty!.tax_base_gbp).toBe(1390.81)
+    expect(r.vat!.tax_base_gbp).toBe(1555.99)
+  })
+
+  it('future-format resilience: a THIRD tax-type block (e.g. an excise code future entries might add) does not confuse duty/VAT extraction, and is preserved rather than dropped', () => {
+    const withExcise = `
+[47] Calculation of taxes
+
+A00
+
+1390.81 GBP
+
+0.00 E
+
+0.00
+
+E00
+
+50.00 GBP
+
+10.00 %
+
+5.00
+
+B00
+
+1555.99 GBP
+
+0.00 E
+
+0.00
+`
+    const r = parseBox47(withExcise)
+    expect(r.lines.length).toBe(3)
+    expect(r.duty!.tax_base_gbp).toBe(1390.81)
+    expect(r.vat!.tax_base_gbp).toBe(1555.99)
+    const excise = r.lines.find(l => l.tax_type === 'E00')
+    expect(excise).toEqual({ tax_type: 'E00', tax_base_gbp: 50, tax_rate_pct: 10, total_tax_assessed_gbp: 5 })
+  })
+
+  it('future-format resilience: A00 with a NON-ZERO "total tax assessed" (the specific HMRC-change scenario named by the filing party) is read correctly, not clamped or ignored', () => {
+    // The filing party's exact scenario: "future entries [may] show duty
+    // only against A00 tax amount" — i.e. A00's total tax assessed goes
+    // non-zero while B00 stays postponed. A position/shape-naive parser
+    // that assumed "total tax assessed is always 0.00" could silently
+    // drop a real duty liability here.
+    const dutyPayable = `
+[47] Calculation of taxes
+
+A00
+
+1390.81 GBP
+
+5.00 %
+
+69.54
+
+B00
+
+1555.99 GBP
+
+0.00 E
+
+0.00
+`
+    const r = parseBox47(dutyPayable)
+    expect(r.duty!.total_tax_assessed_gbp).toBe(69.54)
+    expect(r.duty!.tax_rate_pct).toBe(5)
+    expect(r.vat!.total_tax_assessed_gbp).toBe(0)
+  })
+
+  it('future-format resilience: a MISSING optional "Deduct (relief) amount" line does not shift which figure is read as the total', () => {
+    // Some entries carry an extra deduct/relief line between rate and
+    // total; the two real entries on file happen not to render one
+    // (their amounts array is [base, rate] then jumps straight to
+    // total). This test constructs the OTHER shape — base, rate, a
+    // relief amount, THEN total — confirming the last collected amount
+    // (not a fixed "3rd line") is always the one read as the total.
+    const withRelief = `
+[47] Calculation of taxes
+
+A00
+
+1390.81 GBP
+
+10.00 %
+
+20.00
+
+119.08
+`
+    const r = parseBox47(withRelief)
+    expect(r.duty!.tax_base_gbp).toBe(1390.81)
+    expect(r.duty!.tax_rate_pct).toBe(10)
+    // 119.08, not the 20.00 relief line in between.
+    expect(r.duty!.total_tax_assessed_gbp).toBe(119.08)
+  })
+
+  it('duty_found / vat_found are false (never a fabricated zero) when box 47 is entirely absent from the text', () => {
+    const r = parseBox47('No box 47 content here at all — just other declaration text.\nSomething else.\n')
+    expect(r.duty_found).toBe(false)
+    expect(r.vat_found).toBe(false)
+    expect(r.duty).toBeNull()
+    expect(r.vat).toBeNull()
+    expect(r.lines).toEqual([])
   })
 })

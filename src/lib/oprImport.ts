@@ -1078,3 +1078,185 @@ export function isValueBalanced(exportedValueGbp: number, returnedLegsValueGbp: 
   const outstanding = round2(exportedValueGbp - returnedTotal)
   return { balanced: outstanding <= 0, returned_value_gbp: returnedTotal, outstanding_value_gbp: outstanding }
 }
+
+// ───────── Box 47 dual-format parser (Sprint A 2c) ─────────
+//
+// Both real CDS entries on file (R1 26GB8JRJW1IQOR7AR0 / R2
+// 26GB8JRJW1IQOR7AR0's sibling) render box 47 ("[47] Calculation of
+// taxes") as a sequence of TAX-TYPE-CODED lines, not fixed columns:
+//   A00           <- duty
+//   1390.81 GBP   <- tax base
+//   0.00 E        <- tax rate (E = exempt/relieved; 0.00 here, OPR duty override)
+//   0.00          <- total tax assessed (payable, box [4/7])
+//   B00           <- import VAT
+//   1555.99 GBP
+//   0.00 E
+//   0.00
+// A00 = customs duty, B00 = import VAT (HMRC tax type codes; see CDS
+// declaration completion guide). The KEY FACT this parser exists to
+// protect: "Total tax assessed" for B00 is 0.00 in BOTH real entries on
+// file, because VAT is POSTPONED (PVA) — it is never a paid-at-the-
+// border cash amount, so it can NEVER be read literally off box 47 as
+// the VAT liability. The real PVA amount only ever comes from applying
+// the standard rate to B00's own TAX BASE line (£1,555.99 x 20% =
+// £311.20), independently of what "total tax assessed" says.
+//
+// The dual-format risk (flagged by the filing party): an upcoming HMRC
+// change may alter which tax-type block carries a non-zero figure, or
+// how many blocks are present, or their order. A parser that assumes a
+// FIXED POSITION or a FIXED COUNT of blocks (e.g. "block 1 is always
+// duty, block 2 is always VAT" or "there are always exactly two blocks")
+// would silently misread a reordered/added/removed block as zero VAT on
+// a real liability. This parser is therefore CODE-KEYED, never
+// position-keyed: it walks the text looking for the tax-type codes
+// (A00/B00) themselves and reads the four lines that follow each one
+// (tax base, tax rate, [deduct/relief — optional], total tax assessed),
+// however many blocks are present and in whatever order they appear.
+//
+// It NEVER defaults a missing tax type to zero. If A00 (duty) or B00
+// (VAT) cannot be found in the text at all, that is reported as
+// `duty_found: false` / `vat_found: false` rather than a fabricated 0 —
+// silently treating "not found" as "nil" is exactly the failure mode
+// this guard exists to close off.
+export type Box47TaxLine = {
+  tax_type: string
+  tax_base_gbp: number | null
+  tax_rate_pct: number | null
+  total_tax_assessed_gbp: number | null
+}
+
+export type Box47ParseResult = {
+  // Every tax-type block found, in the order encountered in the text —
+  // not filtered down to just A00/B00, so a future third tax type (e.g.
+  // an excise code) is preserved rather than silently dropped.
+  lines: Box47TaxLine[]
+  duty_found: boolean
+  vat_found: boolean
+  duty: Box47TaxLine | null
+  vat: Box47TaxLine | null
+}
+
+// One tax-type code followed by up to 4 numeric-ish lines: tax base
+// ("1390.81 GBP"), tax rate ("0.00 E" or "20.00 %"), an optional
+// deduct/relief line (also "N.NN" or "N.NN GBP", present in some entry
+// renderings between rate and total — skipped, never mistaken for the
+// total), and total tax assessed ("0.00"). We deliberately parse
+// LINE-BY-LINE from the tax-type code forward rather than assuming a
+// fixed line count, so an extra/missing optional line does not shift
+// which figure is read as the total.
+const TAX_TYPE_CODE_RE = /^([A-Z]\d{2})$/
+const MONEY_LINE_RE = /^(-?\d+(?:\.\d+)?)(?:\s*(GBP|%|E))?$/i
+
+function parseAmountLine(line: string): { amount: number; unit: string | null } | null {
+  const m = MONEY_LINE_RE.exec(line.trim())
+  if (!m) return null
+  return { amount: Number(m[1]), unit: m[2] ? m[2].toUpperCase() : null }
+}
+
+// Parses the raw text of a CDS entry (or just its box 47 excerpt) into
+// per-tax-type lines. Pure, no I/O — text in, structure out.
+export function parseBox47(rawText: string): Box47ParseResult {
+  // Normalise: split on newlines, strip markdown artefacts ('##', list
+  // markers) and blank lines — the hub's PDF-to-text extraction emits
+  // '##' prefixes on some lines and blank lines between every fragment.
+  const rawLines = rawText
+    .split(/\r?\n/)
+    .map(l => l.replace(/^#+\s*/, '').trim())
+    .filter(l => l.length > 0)
+
+  const lines: Box47TaxLine[] = []
+  for (let i = 0; i < rawLines.length; i++) {
+    const codeMatch = TAX_TYPE_CODE_RE.exec(rawLines[i])
+    if (!codeMatch) continue
+    const taxType = codeMatch[1]
+
+    // Collect subsequent parseable amount lines until the next tax-type
+    // code or a non-amount line ends the block. First amount = tax base,
+    // last amount collected (up to 3) = total tax assessed; a middle
+    // "rate" line is kept as tax_rate_pct when its unit is '%' or 'E' (E
+    // = a 0.00 exempt/relief rate in these entries — recorded as 0, not
+    // treated as a missing rate).
+    const amounts: { amount: number; unit: string | null }[] = []
+    let j = i + 1
+    while (j < rawLines.length && amounts.length < 4) {
+      if (TAX_TYPE_CODE_RE.test(rawLines[j])) break
+      const parsed = parseAmountLine(rawLines[j])
+      if (!parsed) break
+      amounts.push(parsed)
+      j++
+    }
+    i = j - 1
+
+    const taxBase = amounts[0] ?? null
+    // The rate line is whichever collected amount carries a '%' or 'E'
+    // unit (found by unit, not position — an entry that drops the
+    // optional deduct/relief line still has its rate line correctly
+    // identified even though its position shifts).
+    const rateEntry = amounts.find(a => a.unit === '%' || a.unit === 'E') ?? null
+    // Total tax assessed is the LAST collected amount that is NOT the
+    // tax base and NOT the rate line — i.e. the final numeric line in
+    // the block, which is always "total tax assessed" per the box 47
+    // layout regardless of how many optional lines precede it.
+    const totalEntry = amounts.length > 1 ? amounts[amounts.length - 1] : null
+    const totalIsRate = totalEntry != null && rateEntry != null && totalEntry === rateEntry
+    lines.push({
+      tax_type: taxType,
+      tax_base_gbp: taxBase ? round2(taxBase.amount) : null,
+      tax_rate_pct: rateEntry ? round2(rateEntry.amount) : null,
+      total_tax_assessed_gbp: (totalEntry && !totalIsRate) ? round2(totalEntry.amount) : null,
+    })
+  }
+
+  const duty = lines.find(l => l.tax_type === 'A00') ?? null
+  const vat = lines.find(l => l.tax_type === 'B00') ?? null
+  return {
+    lines,
+    duty_found: duty != null,
+    vat_found: vat != null,
+    duty,
+    vat,
+  }
+}
+
+export type Box47ReconciliationResult =
+  | {
+      ok: true
+      duty_base_matches: boolean
+      vat_base_matches: boolean
+      parsed_duty_base_gbp: number | null
+      parsed_vat_base_gbp: number | null
+      computed_duty_base_gbp: number
+      computed_vat_base_gbp: number
+    }
+  | { ok: false; error: string }
+
+// Cross-checks a parsed box 47 against our own computeCe1154() output —
+// the point of parsing box 47 at all is to catch OUR arithmetic
+// diverging from what customs actually assessed, not just to display the
+// entry's own figures back. Returns ok:false (never a fabricated match)
+// when either tax type could not be located in the text at all — a
+// silent "duty_base_matches: false" would be indistinguishable from a
+// genuine mismatch, so the two failure modes are kept separate.
+export function reconcileBox47(
+  parsed: Box47ParseResult,
+  computedDutyBaseGbp: number,
+  computedVatBaseGbp: number,
+): Box47ReconciliationResult {
+  if (!parsed.duty_found) {
+    return { ok: false, error: 'Box 47 has no A00 (duty) line — cannot reconcile the duty base' }
+  }
+  if (!parsed.vat_found) {
+    return { ok: false, error: 'Box 47 has no B00 (VAT) line — cannot reconcile the VAT base' }
+  }
+  const parsedDutyBase = parsed.duty!.tax_base_gbp
+  const parsedVatBase = parsed.vat!.tax_base_gbp
+  return {
+    ok: true,
+    duty_base_matches: parsedDutyBase != null && round2(parsedDutyBase) === round2(computedDutyBaseGbp),
+    vat_base_matches: parsedVatBase != null && round2(parsedVatBase) === round2(computedVatBaseGbp),
+    parsed_duty_base_gbp: parsedDutyBase,
+    parsed_vat_base_gbp: parsedVatBase,
+    computed_duty_base_gbp: round2(computedDutyBaseGbp),
+    computed_vat_base_gbp: round2(computedVatBaseGbp),
+  }
+}
