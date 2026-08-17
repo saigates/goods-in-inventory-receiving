@@ -66,6 +66,59 @@ catches the subset that happens to be syntactically invalid.
   rather than reasoning from what an earlier tool call was *supposed* to
   have done.
 
+## Process note (2026-08-17): a file can contain literal `\uXXXX` text, and the
+## `Read` tool's decoded view will not tell you
+
+While correcting `public/tracker/index.html`'s metadata (Sprint A 2d), a
+`MultiEdit` call reported success but produced no visible change on
+re-read — a silent no-op, distinct from the two `Failed to verify file
+write operation` cases above but with the same root lesson: a tool's own
+success signal is not proof the bytes on disk match what you intended.
+
+The cause here was different from the earlier two notes. This file's
+inline `<script>` DATA object does not contain real Unicode punctuation
+(em dashes, curly quotes) — it contains the LITERAL SIX-CHARACTER TEXT
+`\u2014`, `\u2019`, `\u201c` etc., i.e. an actual backslash, `u`, and four
+hex digits sitting in the file as plain ASCII bytes, not a JS string
+escape that has already been evaluated into a dash or a quote. The `Read`
+tool renders these bytes' *intended* character to the screen (so a `—`
+appears where the file literally holds `\u2014`), which means an
+`old_string` built by copy-pasting what `Read` displayed will contain the
+real Unicode character — and will never match the file's actual raw
+bytes, which hold the six-character escape sequence instead. `MultiEdit`
+correctly reports "no match found" in the strict sense of `old_string`
+not being present, but with matching text visible on both sides of the
+diff to a human eye, this reads as a baffling silent failure rather than
+the string-mismatch it actually is.
+
+**How this was diagnosed**: `Read`'s decoded view was abandoned in favour
+of tools that show raw bytes — `od -c` and `sed -n` — which immediately
+showed the six literal characters `\`, `u`, `2`, `0`, `1`, `4` in
+sequence, not a single em-dash byte (or its UTF-8 multi-byte sequence).
+`grep -n` against the literal string `\\u2014` (escaped for the shell)
+confirmed exactly which lines carried this pattern.
+
+**The workaround that worked**: construct `old_string`/`new_string` from
+the raw-byte tool output (`grep -n` / `sed -n` / `od -c`), never from
+`Read`'s rendered view, whenever a file is suspected of holding literal
+`\uXXXX` escapes rather than evaluated Unicode. For a full-line rewrite
+spanning a `\uXXXX`-heavy line (as `commitNote` and `figuresSource` were
+here), the most reliable approach was a short Python script operating on
+exact 0-indexed line numbers (`open(path).readlines()`, replace by index,
+write back) rather than any string-match-based edit at all — a line
+index cannot be thrown off by an invisible escape-sequence mismatch the
+way `old_string` matching can.
+
+**The rule this adds**: before trusting `Read`'s output to build an
+`old_string` against any file, especially one that embeds JSON-like
+string literals inside a `<script>` block, check for literal `\uXXXX`
+sequences with `grep -n '\\\\u[0-9a-fA-F]\{4\}'` (or the JS-embedding
+equivalent) first. If present, treat that file the same way a binary
+file would be treated for editing purposes: raw-byte tools or an
+index-based script only, never a `Read`-sourced `old_string`. A single
+silent no-op from `MultiEdit`/`Edit` on a file that visually appears to
+contain ordinary punctuation is itself the tell.
+
 ## What it proves (22 checks)
 1. **Login click-through end to end** — cold load shows the login screen,
    an unknown email fails loudly with a visible error, blank-email sign-in
