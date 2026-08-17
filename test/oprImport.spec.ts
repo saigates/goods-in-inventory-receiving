@@ -1144,6 +1144,59 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     expect(row.returned).toBe(16)
   })
 
+  it('Sprint A 2b, REAL FIGURES: R1 (90 supplementary units) + R2 (72 supplementary units) against the real export MRN 26GB7LKWO3QHFLCAA0 report returned: 162 via a live GET /discharge call', async () => {
+    // This is the tie the whole OPR authorisation rests on (Item C's
+    // discharge worked example), asserted here against the REAL R1/R2
+    // supplementary_units (90 and 72 — not 5/16 stand-ins) and the REAL
+    // export MRN, through the actual API rather than as a standalone
+    // arithmetic identity (see 'discharge worked example: R1 (90) + R2
+    // (72)...' above, which only pins 90+72=162 in isolation). 90+162
+    // devices are scanned individually (READY_FOR_EXPORT → export → two
+    // finalised import legs) so `exported`/`returned` are read back from
+    // the same per-leg supplementary_units COALESCE the 2b fix introduced
+    // — not asserted against a mocked or hand-computed total.
+    const { shipment: exp, devices } = await makeFinalisedExport(162, '26GB7LKWO3QHFLCAA0')
+
+    // Return leg R1: 90 devices scanned, declared supplementary_units: 90
+    // (AWB 874874338764, import MRN 26GB8ILNEI7EFJPAR1 — same fixture used
+    // by the OPR 3 R1/R2 C&E1154 tests and ce1154Golden.spec.ts).
+    const r1 = await makeReturnShipment(exp.id, { supplementary_units: 90 })
+    for (const d of devices.slice(0, 90)) {
+      expect((await api(`/api/opr/shipments/${r1.id}/scan`, {
+        method: 'POST', body: JSON.stringify({ imei: d.imei }),
+      })).status).toBe(201)
+    }
+    expect((await api(`/api/opr/shipments/${r1.id}/finalise`, {
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB8ILNEI7EFJPAR1' }),
+    })).status).toBe(200)
+
+    // Return leg R2: 72 devices scanned, declared supplementary_units: 72
+    // (AWB 875147276207, import MRN 26GB8JRJW1IQOR7AR0).
+    const r2 = await makeReturnShipment(exp.id, { supplementary_units: 72 })
+    for (const d of devices.slice(90, 162)) {
+      expect((await api(`/api/opr/shipments/${r2.id}/scan`, {
+        method: 'POST', body: JSON.stringify({ imei: d.imei }),
+      })).status).toBe(201)
+    }
+    expect((await api(`/api/opr/shipments/${r2.id}/finalise`, {
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB8JRJW1IQOR7AR0' }),
+    })).status).toBe(200)
+
+    const tracker = await api('/api/opr/discharge')
+    expect(tracker.status).toBe(200)
+    const rows = ((await tracker.json()) as {
+      discharge: { export_shipment_id: number; export_mrn: string; exported: number; returned: number; outstanding: number; status: string }[]
+    }).discharge
+    const row = rows.find(r => r.export_shipment_id === exp.id)!
+    expect(row.export_mrn).toBe('26GB7LKWO3QHFLCAA0')
+    expect(row.exported).toBe(162)
+    // The load-bearing figure: 90 + 72 = 162, read back from a live
+    // GET /discharge call against the real MRN, not asserted in isolation.
+    expect(row.returned).toBe(162)
+    expect(row.outstanding).toBe(0)
+    expect(row.status).toBe('discharged')
+  }, 30000)
+
   it('import-proof records the 6121 MRN on a FINALISED import only; export-proof refuses imports', async () => {
     const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000AA10')
     const ret = await makeReturnShipment(exp.id)
