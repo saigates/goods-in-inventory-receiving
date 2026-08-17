@@ -73,6 +73,25 @@
 // fields. This preserves the property the file header above establishes:
 // the numeric chain was checked against the real R1 worksheet, not against
 // this codebase, and this regeneration did not touch that chain.
+//
+// REGENERATED 2026-08-17 (Sprint A 2a, provenance-gated value-adjustment
+// solving, migration 0027): the JSON fixture was regenerated to add two
+// new fields — `value_adjustment_provenance` and `unattributed_variance_gbp`
+// — introduced by computeCe1154()'s new residual-solving guard (see
+// oprImport.ts). R1 has no entry_vat_base_gbp recorded, so the guard's
+// solve/refuse branch never activates for it: value_adjustment_gbp stays
+// at the £1.31 default exactly as before, now explicitly labelled
+// `value_adjustment_provenance: "broker-supplied"`, with
+// `unattributed_variance_gbp: null` (nothing to report — no solve was
+// refused). Before applying, the regenerated fixture was diffed against
+// the prior frozen copy (via a throwaway scratch test file, deleted after
+// use — never by editing this tracked fixture's generation source
+// in-place) and confirmed the ONLY differences were those two new fields;
+// every existing figure (£1,556.09 process charge, £43.73 non-EU freight
+// share, £101.70 inbound/export freight, £1,957.79 compensatory value,
+// £1,599.82 duty base, £1,760.80 VAT base, £0.00 duty, £352.16 PVA) is
+// byte-identical to the pre-regeneration fixture. HTML fixture unchanged
+// (buildCe1154Html() does not render these fields either).
 import { describe, it, expect } from 'vitest'
 // Tests run inside workerd (no `fs`/`node:fs`) — fixtures are bundled as
 // raw text via Vite's `?raw` import suffix, not read at runtime.

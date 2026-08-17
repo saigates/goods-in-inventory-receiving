@@ -698,6 +698,13 @@ describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
     expect(r.ce1154.export_freight_gbp).toBe(101.70)
     expect(r.ce1154.value_adjustment_gbp).toBe(1.31)
     expect(r.ce1154.value_adjustment_is_default).toBe(true)
+    // Sprint A 2a (migration 0027, provenance-gated residual solving): R1
+    // has no entry_vat_base_gbp recorded, so the solve/refuse guard never
+    // activates — value_adjustment_gbp is broker-supplied (the £1.31
+    // default is a document convention here, not a solve) and nothing is
+    // unattributed. This is what keeps R1's chain untouched by 2a.
+    expect(r.ce1154.value_adjustment_provenance).toBe('broker-supplied')
+    expect(r.ce1154.unattributed_variance_gbp).toBeNull()
     // Table figures, asserted to the penny:
     expect(r.ce1154.duty_base_gbp).toBe(1599.82)
     expect(r.ce1154.vat_base_gbp).toBe(1760.80)
@@ -733,6 +740,27 @@ describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
       insurance_gbp: 0, duty_rate_pct: 0,
       // value_adjustment_gbp left at the operator-entered DEFAULT (£1.31) —
       // both real R1/R2 legs came through at this figure.
+      //
+      // Sprint A 2a (migration 0027, provenance-gated residual solving):
+      // repair charge (process_charge) is broker-supplied (straight off
+      // the FedEx invoice); the three freight figures are 'derived' (hand-
+      // derived from the equations in the describe-block header comment,
+      // themselves assuming £1.31) — this is EXACTLY the circularity the
+      // guard exists to catch, so the guard must REFUSE to solve
+      // value_adjustment here, not silently confirm £1.31 by re-deriving
+      // it from figures that already assumed it.
+      worksheet_input_provenance: JSON.stringify({
+        process_charge: 'broker-supplied',
+        inbound_freight_gbp: 'derived',
+        non_eu_freight_share_gbp: 'derived',
+        export_freight_gbp: 'derived',
+      }),
+      // The CDS entry's own declared bases/taxes — document facts,
+      // implicitly broker-supplied (not part of the provenance blob's key
+      // set; they come straight off the entry, never derived/solved).
+      // entry_vat_base_gbp is what the guard's refuse-branch measures the
+      // unattributed_variance_gbp gap against.
+      entry_duty_base_gbp: 1390.81, entry_vat_base_gbp: 1555.99, entry_duty_gbp: 0, entry_vat_gbp: 311.20,
     })
     const r = computeCe1154(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, lines)
     expect(r.ok).toBe(true)
@@ -744,12 +772,29 @@ describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
     expect(r.ce1154.inbound_freight_gbp).toBe(105.18)
     expect(r.ce1154.non_eu_freight_share_gbp).toBe(45.18)
     expect(r.ce1154.export_freight_gbp).toBe(103.87)
+    // The guard REFUSES to solve value_adjustment here (inbound/export
+    // freight are 'derived', not 'broker-supplied') — value_adjustment_gbp
+    // stays at the £1.31 default, exactly as before 2a, and the honest gap
+    // is surfaced separately via unattributed_variance_gbp below. This is
+    // the load-bearing assertion of 2a: solving here would just reproduce
+    // the £1.31 the freight figures were derived FROM (see the
+    // describe-block header comment) — not confirm it.
     expect(r.ce1154.value_adjustment_gbp).toBe(1.31)
     expect(r.ce1154.value_adjustment_is_default).toBe(true)
+    expect(r.ce1154.value_adjustment_provenance).toBeNull()
+    // £1,555.99 (entry_vat_base_gbp) − £1,345.63 (broker-supplied process
+    // charge) − £0 (both freight terms derived, so excluded) − £0 (duty)
+    // = £210.36 — the portion covering inbound freight, export freight and
+    // the value adjustment jointly, which cannot be decomposed from the
+    // documents currently held. Reported honestly, not as a fabricated
+    // £1.31 solve and not as a silent zero.
+    expect(r.ce1154.unattributed_variance_gbp).toBe(210.36)
     // Table figures, asserted to the penny — these are the SAME figures
     // the CDS entry declared (£1,390.81 / £1,555.99 / £0.00 / £311.20),
     // now reached by computing forward from the derived-and-tied worksheet
     // inputs above, rather than by reading them back off the entry.
+    // UNCHANGED by 2a — the regression guard holds trivially here rather
+    // than by luck, because the guard refused to touch the arithmetic.
     expect(r.ce1154.duty_base_gbp).toBe(1390.81)
     expect(r.ce1154.vat_base_gbp).toBe(1555.99)
     expect(r.ce1154.duty_gbp).toBe(0)
@@ -758,6 +803,57 @@ describe('OPR 3 — R1/R2 real-shipment C&E1154 fixtures (Item C)', () => {
     // Structural check on compensatory value (not a table figure, same
     // convention as the R1 test above):
     expect(r.ce1154.compensatory_value_gbp).toBe(round2(72 + 1345.63 + 105.18 + 0))
+  })
+
+  it('Sprint A 2a guard, positive path: if R2\'s freight figures WERE broker-supplied, the guard would genuinely SOLVE value_adjustment from entry_vat_base_gbp instead of refusing', () => {
+    // Secondary demonstration of the provenance-gated guard, using R2's
+    // real figures with the provenance tags flipped to what they would be
+    // once FedEx's own "OP WS 875147276207" worksheet actually arrives
+    // (the owner-facing resolution the guard is holding a gap open for).
+    // Not a replacement for the refuse-path test above (real R2 data, the
+    // guard's primary demonstration) — this is the complementary positive
+    // path: same inputs, different provenance, opposite guard outcome.
+    const lines: ShipmentLine[] = Array.from({ length: 72 }, (_, i) => ({
+      id: i + 1, organisation_id: 1, shipment_id: 2, received_device_id: i + 1,
+      imei: `860455190002${String(i).padStart(2, '0')}`, sku: null, brand: 'Samsung', model: 'S23',
+      capacity: null, color: null, grade: 'A', unit_value: 1, currency: 'GBP',
+      added_by_user_id: null, created_at: '',
+    }))
+    const importShipment = mkBase({
+      reference: 'R2', import_mrn: '26GB8JRJW1IQOR7AR0', supplementary_units: 72,
+      repair_cost: 1345.63, repair_cost_currency: 'GBP', customs_exchange_rate: null,
+      inbound_freight_gbp: 105.18, non_eu_freight_share_gbp: 45.18, export_freight_gbp: 103.87,
+      insurance_gbp: 0, duty_rate_pct: 0,
+      // ALL inputs broker-supplied this time — the guard's condition for
+      // solving to fire.
+      worksheet_input_provenance: JSON.stringify({
+        process_charge: 'broker-supplied',
+        inbound_freight_gbp: 'broker-supplied',
+        non_eu_freight_share_gbp: 'broker-supplied',
+        export_freight_gbp: 'broker-supplied',
+      }),
+      entry_duty_base_gbp: 1390.81, entry_vat_base_gbp: 1555.99, entry_duty_gbp: 0, entry_vat_gbp: 311.20,
+    })
+    const r = computeCe1154(importShipment, mkExport('26GB7LKWO3QHFLCAA0'), auth, lines)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    // Guard passes: solves value_adjustment = entry_vat_base_gbp − process
+    // charge − inbound freight − export freight − duty
+    //            = 1555.99 − 1345.63 − 105.18 − 103.87 − 0 = 1.31
+    // Note this happens to equal the same £1.31 default — but this time
+    // it is a genuine solve (every other input broker-supplied), not the
+    // guard's refusal-with-default-fallback from the primary R2 test.
+    expect(r.ce1154.value_adjustment_gbp).toBe(1.31)
+    expect(r.ce1154.value_adjustment_provenance).toBe('solved')
+    expect(r.ce1154.unattributed_variance_gbp).toBeNull()
+    // Table figures are IDENTICAL to the primary R2 test's — the guard's
+    // choice of path (solve vs. refuse) is invisible on the table itself
+    // when the solved figure happens to match the default; the visible
+    // difference is entirely in the new provenance/variance fields above.
+    expect(r.ce1154.duty_base_gbp).toBe(1390.81)
+    expect(r.ce1154.vat_base_gbp).toBe(1555.99)
+    expect(r.ce1154.duty_gbp).toBe(0)
+    expect(r.ce1154.pva_amount_gbp).toBe(311.20)
   })
 
   it('R2 duty-base tie: derived process charge + NEU freight share reconstructs the known duty base independently of computeCe1154()', () => {
