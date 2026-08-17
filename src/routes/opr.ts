@@ -1141,6 +1141,21 @@ app.get('/shipments/:id/clearance', async (c) => {
 // period. Returned = lines on FINALISED import shipments related to the
 // export (receipt is what discharges; draft returns are still abroad).
 //
+// Supplementary-units aggregation (0024/2b): `returned` is counted in
+// CUSTOMS-DECLARED supplementary_units, not raw shipment_lines rows —
+// migration 0024 introduced supplementary_units specifically so discharge
+// tracking could reflect the customs-declaration quantity ("Falls back to
+// the line count when NULL (COALESCE at read time)"). supplementary_units
+// is documented and enforced (parseRepairFields) as IMPORT-shipment data
+// only — it describes the returning goods' declared quantity — so it is
+// never set on the export leg itself; `exported` stays a raw line count.
+// `returned` must be a PER-LEG COALESCE, summed across every FINALISED
+// import leg discharging this export — one leg's supplementary_units
+// can't be read off the pooled line count of every leg combined, and a
+// flat COUNT(*) across pooled lines (the prior behaviour) silently
+// ignored supplementary_units entirely, matching only by coincidence
+// when every leg happened to have supplementary_units NULL.
+//
 // Value reconciliation (0019): also compares goods VALUE, not just unit
 // counts. exported_value_gbp is the batch's reconciled_value_gbp if ops
 // has explicitly set one, else the computed sum of the batch's frozen
@@ -1154,8 +1169,12 @@ app.get('/discharge', async (c) => {
     SELECT s.id, s.reference, s.export_mrn, s.ship_date, s.finalised_at,
            a.discharge_period_months,
            (SELECT COUNT(*) FROM shipment_lines sl WHERE sl.shipment_id = s.id) AS exported,
-           (SELECT COUNT(*) FROM shipment_lines rl
-              JOIN shipments r ON r.id = rl.shipment_id
+           (SELECT COALESCE(SUM(
+                COALESCE(r.supplementary_units,
+                  (SELECT COUNT(*) FROM shipment_lines rl WHERE rl.shipment_id = r.id)
+                )
+              ), 0)
+              FROM shipments r
              WHERE r.direction = 'import' AND r.status = 'FINALISED'
                AND r.related_export_shipment_id = s.id) AS returned,
            COALESCE(s.reconciled_value_gbp,

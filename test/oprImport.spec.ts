@@ -1080,6 +1080,70 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     expect(((await again.json()) as { restocked: number }).restocked).toBe(0)
   })
 
+  it('Sprint A 2b: GET /discharge sums supplementary_units per FINALISED import leg, not raw shipment_lines COUNT(*)', async () => {
+    // Proves the fix reads supplementary_units, not line count: the return
+    // leg scans only 1 device (line count = 1) but declares
+    // supplementary_units: 5 (the customs-declaration quantity, e.g. a
+    // multi-unit commodity code). If GET /discharge were still using the
+    // pre-fix raw COUNT(*) of shipment_lines, `returned` would read 1, not
+    // 5 — a deliberately DIFFERENT value from the line count so the two
+    // codepaths cannot coincidentally agree.
+    const { shipment: exp, devices } = await makeFinalisedExport(2, '26GB0000000000AA20')
+    const ret = await makeReturnShipment(exp.id, { supplementary_units: 5 })
+    const scan = await api(`/api/opr/shipments/${ret.id}/scan`, {
+      method: 'POST', body: JSON.stringify({ imei: devices[0].imei }),
+    })
+    expect(scan.status).toBe(201)
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, {
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222YY20' }),
+    })
+    expect(fin.status).toBe(200)
+
+    const tracker = await api('/api/opr/discharge')
+    expect(tracker.status).toBe(200)
+    const rows = ((await tracker.json()) as { discharge: { export_shipment_id: number; exported: number; returned: number; outstanding: number }[] }).discharge
+    const row = rows.find(r => r.export_shipment_id === exp.id)!
+    // exported stays a raw line count (2) — supplementary_units is
+    // documented/enforced as import-shipment-only data, never set on the
+    // export leg itself.
+    expect(row.exported).toBe(2)
+    // returned reflects the DECLARED supplementary_units (5), not the raw
+    // scanned-line count (1) of the single FINALISED import leg.
+    expect(row.returned).toBe(5)
+    expect(row.outstanding).toBe(-3) // 2 - 5; a real over-declaration would be investigated, but the arithmetic must be honest either way
+  })
+
+  it('Sprint A 2b: GET /discharge sums supplementary_units ACROSS MULTIPLE FINALISED import legs (per-leg COALESCE, not one pooled COUNT)', async () => {
+    // Two return legs against the same export, each with a distinct
+    // supplementary_units figure, neither equal to its own scanned-line
+    // count — this is the case a single pooled COUNT(*) across all legs'
+    // lines could never reproduce correctly (it has no per-leg boundary),
+    // and mirrors the Item C worked example's R1(90)+R2(72)=162 shape at
+    // small scale.
+    const { shipment: exp, devices } = await makeFinalisedExport(2, '26GB0000000000AA21')
+    const ret1 = await makeReturnShipment(exp.id, { supplementary_units: 9 })
+    expect((await api(`/api/opr/shipments/${ret1.id}/scan`, {
+      method: 'POST', body: JSON.stringify({ imei: devices[0].imei }),
+    })).status).toBe(201)
+    expect((await api(`/api/opr/shipments/${ret1.id}/finalise`, {
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222YY21' }),
+    })).status).toBe(200)
+
+    const ret2 = await makeReturnShipment(exp.id, { supplementary_units: 7 })
+    expect((await api(`/api/opr/shipments/${ret2.id}/scan`, {
+      method: 'POST', body: JSON.stringify({ imei: devices[1].imei }),
+    })).status).toBe(201)
+    expect((await api(`/api/opr/shipments/${ret2.id}/finalise`, {
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222YY22' }),
+    })).status).toBe(200)
+
+    const tracker = await api('/api/opr/discharge')
+    const rows = ((await tracker.json()) as { discharge: { export_shipment_id: number; returned: number }[] }).discharge
+    const row = rows.find(r => r.export_shipment_id === exp.id)!
+    // 9 + 7 = 16, NOT the pooled raw line count (1 + 1 = 2).
+    expect(row.returned).toBe(16)
+  })
+
   it('import-proof records the 6121 MRN on a FINALISED import only; export-proof refuses imports', async () => {
     const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000AA10')
     const ret = await makeReturnShipment(exp.id)
