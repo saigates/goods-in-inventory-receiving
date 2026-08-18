@@ -361,3 +361,118 @@ export type ShipmentReply = {
   logged_by_user_id: number | null
   created_at: string
 }
+
+// ───────── Sprint B §1-§3: bill builder, cost ledger, freight (0028) ─────────
+
+export type BillType = 'purchase' | 'repair'
+export type BillPriceSource = 'header' | 'per_line' | 'per_imei'
+export type BillStatus = 'draft' | 'closed'
+export type RateSource = 'manual' | 'zoho' | 'hmrc_monthly'
+
+export type Bill = {
+  id: number
+  organisation_id: number
+  bill_type: BillType
+  vendor_name: string
+  bill_date: string              // purchase date, per the confirmed "Bill Date == purchase date" convention
+  invoice_number: string
+  currency_code: string          // GBP | USD | AED
+  exchange_rate: number | null   // accounting rate, foreign units per GBP 1
+  rate_date: string | null
+  rate_source: RateSource | null
+  customs_exchange_rate: number | null  // distinct from exchange_rate where the two diverge
+  unit_count: number
+  declared_total: number
+  price_source: BillPriceSource
+  gbp_total: number | null       // app-computed sum of bill_lines.unit_price_gbp — NEVER a re-conversion of declared_total
+  declared_total_gbp: number | null  // declared_total converted to GBP at the header rate — the close-rule target; DELIBERATELY distinct from gbp_total
+  header_residual_gbp: number | null
+  status: BillStatus
+  closed_at: string | null
+  notes: string | null
+  created_by_user_id: number | null
+  created_at: string
+  updated_at: string | null
+}
+
+// Append-only force-close record (misdeclaration-ack pattern reused).
+export type BillCloseOverride = {
+  id: number
+  organisation_id: number
+  bill_id: number
+  variance_gbp: number
+  reason: string
+  overridden_by_user_id: number
+  overridden_at: string
+}
+
+export type BillLine = {
+  id: number
+  organisation_id: number
+  bill_id: number
+  line_no: number
+  sku: string | null
+  description: string | null
+  quantity: number
+  unit_price: number | null
+  exchange_rate_used: number | null
+  unit_price_gbp: number | null
+  is_continuation: number
+  created_at: string
+}
+
+export type BillLineSerial = {
+  id: number
+  organisation_id: number
+  bill_line_id: number
+  imei: string
+  received_device_id: number | null
+  created_at: string
+}
+
+export type CostType = 'purchase' | 'repair' | 'freight'
+// Reuses the philosophy of ValueAdjustmentProvenance (migration 0027):
+// an incomplete/assumed figure must never present as final.
+export type CostLedgerProvenance = 'supplier-invoiced' | 'derived' | 'default-unverified'
+
+// Append-only — one row per cost EVENT, never updated/deleted.
+export type CostLedgerEntry = {
+  id: number
+  organisation_id: number
+  received_device_id: number
+  cost_type: CostType
+  amount_gbp: number
+  currency_code: string
+  exchange_rate: number | null
+  rate_date: string | null
+  source_bill_line_id: number | null
+  source_freight_invoice_id: number | null
+  provenance: CostLedgerProvenance
+  note: string | null
+  created_by_user_id: number | null
+  created_at: string
+}
+
+export type FreightLeg = 'outbound' | 'return'
+
+// Owner-paid freight actually invoiced (never an accrual/estimate).
+// Deliberately separate from shipments.inbound_freight_gbp /
+// export_freight_gbp (broker-generated customs figures feeding
+// computeCe1154() — see migrations/0028's header comment for the boundary
+// rationale, mirroring the repair_jobs vs. Ce1154.repair_cost_gbp
+// naming-separation precedent in docs/plan/device-lifecycle-slice1.md).
+export type FreightInvoice = {
+  id: number
+  organisation_id: number
+  shipment_id: number
+  leg: FreightLeg
+  amount: number
+  currency_code: string
+  exchange_rate: number | null
+  amount_gbp: number
+  invoice_ref: string | null
+  invoiced_at: string | null
+  apportioned_at: string | null
+  created_by_user_id: number | null
+  created_at: string
+}
