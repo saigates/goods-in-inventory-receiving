@@ -2920,6 +2920,17 @@ General cleanup:
 Show me a short summary at the end: total rows processed, how many were
 flagged and why, how many duplicate IMEIs were removed, and a breakdown of
 how many rows fell into each Condition, each VAT Type, and each Currency.`;
+  // Bill-vendor precedence (batch item 5): when a manifest upload has a
+  // bill selected via #mf-bill, Supplier is pre-filled from THAT bill's
+  // own vendor_name (already fetched into uploadCtx.openBills) and the
+  // Supplier input is locked read-only — see #mf-sup's own comment.
+  // Unlinking (back to "— no bill —") does NOT clear a manually-typed
+  // supplier from before linking; it simply unlocks the field again.
+  function applyBillVendorPrecedence() {
+    if (uploadCtx.billId == null) return;
+    const b = uploadCtx.openBills.find(x => x.id === uploadCtx.billId);
+    if (b && b.vendor_name) uploadCtx.supplier = b.vendor_name;
+  }
   async function openManifestUpload() {
     uploadCtx = {
       reference: '', supplier: '', notes: '',
@@ -2994,10 +3005,19 @@ how many rows fell into each Condition, each VAT Type, and each Currency.`;
           h('div', {},
             h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Supplier *'),
             h('input', {
-              class: 'input', id: 'mf-sup', placeholder: 'e.g. Saigates Limited',
+              class: 'input', id: 'mf-sup', placeholder: 'e.g. LW001',
               value: uploadCtx.supplier,
-              oninput: (e) => uploadCtx.supplier = e.target.value,
-            })
+              // Bill-vendor precedence: once a bill is linked (via #mf-bill
+              // above), the Supplier field is FILLED FROM and LOCKED TO that
+              // bill's own vendor_name — a linked bill's vendor is already an
+              // authoritative fact, so letting the operator also free-type a
+              // (possibly different) supplier name here would just create a
+              // second, disagreeing source of truth for the same field.
+              readonly: uploadCtx.billId != null ? 'readonly' : null,
+              oninput: (e) => { if (uploadCtx.billId == null) uploadCtx.supplier = e.target.value; },
+            }),
+            uploadCtx.billId != null ? h('div', { class: 'text-[10px] text-slate-500 mt-1' },
+              'Pre-filled from the linked bill\u2019s vendor \u2014 unlink the bill to edit.') : null
           )
         ),
         h('div', { class: 'mb-4' },
@@ -3017,18 +3037,36 @@ how many rows fell into each Condition, each VAT Type, and each Currency.`;
           h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Link to bill (optional)'),
           h('select', {
             class: 'input', id: 'mf-bill',
-            value: uploadCtx.billId == null ? '' : String(uploadCtx.billId),
-            onchange: (e) => { uploadCtx.billId = e.target.value ? Number(e.target.value) : null; },
+            onchange: (e) => {
+              uploadCtx.billId = e.target.value ? Number(e.target.value) : null;
+              applyBillVendorPrecedence();
+              renderUploadModal();
+            },
           },
-            h('option', { value: '' }, '— no bill —'),
-            ...uploadCtx.openBills.map(b => h('option', { value: String(b.id) },
+            // <select>'s `value` is a DOM property, not an HTML content
+            // attribute — h()'s catch-all setAttribute('value', ...) is a
+            // silent no-op for <select> (same class of gotcha its own
+            // comment documents for <textarea>). renderUploadModal() tears
+            // down and rebuilds this whole modal on every re-render (file
+            // parse, mapping change, etc.), so relying on a `value` attr
+            // here meant the picker visually snapped back to "— no bill —"
+            // after ANY re-render even though uploadCtx.billId was still
+            // correctly set underneath — a real, user-visible bug, not
+            // just cosmetic. Fixed using this file's OWN established
+            // pattern for stateful <select>s (see MAPPABLE_FIELDS' mkOpt
+            // below): mark the matching <option> with `selected` directly.
+            h('option', { value: '', ...(uploadCtx.billId == null ? { selected: 'selected' } : {}) }, '— no bill —'),
+            ...uploadCtx.openBills.map(b => h('option', {
+              value: String(b.id),
+              ...(uploadCtx.billId === b.id ? { selected: 'selected' } : {}),
+            },
               `${b.vendor_name || 'Unknown vendor'} · ${b.invoice_number || 'no ref'} · ${b.currency_code || 'GBP'} ${Number(b.declared_total ?? 0).toFixed(2)}`
             ))
           ),
           h('div', { class: 'text-[11px] text-slate-500 mt-1' },
             uploadCtx.openBills.length === 0
               ? 'No open bills found — this is fine for goods received without a bill.'
-              : `${uploadCtx.openBills.length} open bill(s) available.`)
+              : `${uploadCtx.openBills.length} open bill${uploadCtx.openBills.length === 1 ? '' : 's'} available.`)
         ),
         h('div', { class: 'dropzone rounded-xl p-8 text-center cursor-pointer mb-4',
           id: 'dz',
