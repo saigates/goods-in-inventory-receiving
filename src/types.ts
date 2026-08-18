@@ -50,6 +50,12 @@ export type Manifest = {
   status: 'open' | 'closed'
   created_at: string
   closed_at: string | null
+  // Optional pointer to the bill this manifest was shipped against (0029).
+  // Manifests carry the itemisation, bills carry the header — this is
+  // NOT a generate-lines-from-bill relationship; it only lets
+  // manifest→bill reconciliation find its counterpart bill. NULL for the
+  // permitted goods-received-without-a-bill case.
+  bill_id: number | null
 }
 
 export type ExpectedDevice = {

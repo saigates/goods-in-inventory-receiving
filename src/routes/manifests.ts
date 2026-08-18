@@ -4,6 +4,7 @@ import { normalizeGrade } from '../lib/grade'
 import { resolveCatalogSkuBulk, normalizeCapacity, norm } from '../lib/catalog'
 import { currentUser } from '../lib/auth'
 import { validateImei, cleanString, validateBuyPrice, isValidCurrency, normalizeCurrency, isValidVatType } from '../lib/validate'
+import { reconcileManifestAgainstBill, type ManifestLineForReconciliation } from '../lib/manifestBillReconciliation'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -50,11 +51,30 @@ app.get('/:id', async (c) => {
     FROM expected_devices WHERE manifest_id = ? AND organisation_id = ?
   `).bind(id, user.organisation_id).first<{ expected_count: number; received_count: number }>()
 
+  // Manifest → bill reconciliation (0029): sum of THIS manifest's own
+  // unit_cost hints vs. the linked bill's declared_total_gbp. Deliberately
+  // NOT checkBillCloseable() (that's the bill's own lines vs. its own
+  // header — a same-document check); this compares two separate
+  // documents. Replaces the historical header-only false-green: with no
+  // bill linked, or the bill/manifest not yet priced, this reports
+  // 'awaiting_manifest', never 'balanced'.
+  const m = manifest as { bill_id: number | null }
+  let bill: { declared_total_gbp: number | null; currency_code: string; exchange_rate: number | null; unit_count: number } | null = null
+  if (m.bill_id != null) {
+    bill = await c.env.DB.prepare(
+      'SELECT declared_total_gbp, currency_code, exchange_rate, unit_count FROM bills WHERE id = ? AND organisation_id = ?'
+    ).bind(m.bill_id, user.organisation_id).first()
+  }
+  const reconLines: ManifestLineForReconciliation[] = (expected.results as Array<{ unit_cost: number | null; currency: string | null }>)
+    .map(e => ({ unit_cost: e.unit_cost, currency: e.currency }))
+  const bill_reconciliation = reconcileManifestAgainstBill(m.bill_id != null, reconLines, bill)
+
   return c.json({
     manifest,
     expected: expected.results,
     unreconciled: unreconciled.results,
     summary,
+    bill_reconciliation,
   })
 })
 
@@ -112,10 +132,27 @@ app.post('/', async (c) => {
     supplier: string
     notes?: string
     rows: ImportRow[]
+    bill_id?: number | null
   }>().catch(() => ({} as any))
 
   if (!body.reference || !body.supplier || !Array.isArray(body.rows) || body.rows.length === 0) {
     return c.json({ error: 'reference, supplier, and rows[] are required' }, 400)
+  }
+
+  // Optional bill link (0029). Leaving it empty must still work — goods
+  // received without a bill remains fully permitted. When supplied, the
+  // bill must exist, belong to this org, and be 'draft' (open) — a
+  // manifest should link to the bill it's about to reconcile against,
+  // not one already closed and settled.
+  let billId: number | null = null
+  if (body.bill_id != null) {
+    const bid = Number(body.bill_id)
+    if (!Number.isInteger(bid)) return c.json({ error: 'bill_id must be an integer' }, 400)
+    const bill = await c.env.DB.prepare(
+      "SELECT id FROM bills WHERE id = ? AND organisation_id = ? AND status = 'draft'"
+    ).bind(bid, orgId).first()
+    if (!bill) return c.json({ error: `bill_id ${bid} is not an open bill in this organisation` }, 400)
+    billId = bid
   }
 
   // Server-side validation of every inbound row (Priority 5) — the API is
@@ -130,8 +167,8 @@ app.post('/', async (c) => {
 
   // Create manifest
   const ins = await c.env.DB.prepare(
-    'INSERT INTO manifests (organisation_id, reference, supplier, notes, created_by_user_id) VALUES (?, ?, ?, ?, ?)'
-  ).bind(orgId, body.reference, body.supplier, body.notes || null, user.id).run()
+    'INSERT INTO manifests (organisation_id, reference, supplier, notes, created_by_user_id, bill_id) VALUES (?, ?, ?, ?, ?, ?)'
+  ).bind(orgId, body.reference, body.supplier, body.notes || null, user.id, billId).run()
   const manifestId = ins.meta.last_row_id as number
 
   // Pre-resolve SKU from CATALOG (source of truth). We don't invent SKUs

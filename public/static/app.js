@@ -85,6 +85,10 @@
     expected: [],
     unreconciled: [],
     summary: { expected_count: 0, received_count: 0 },
+    // Manifest → bill reconciliation (0029) for the active manifest —
+    // { verdict: 'awaiting_manifest'|'balanced'|'variance', ... } from
+    // GET /api/manifests/:id's bill_reconciliation field.
+    billReconciliation: null,
     events: [],
     inventory: [],
     inventorySelected: new Set(),   // Set<deviceId> for bulk operations on Inventory view
@@ -276,6 +280,7 @@
     if (!state.activeManifestId) {
       state.activeManifest = null; state.expected = []; state.unreconciled = [];
       state.summary = { expected_count: 0, received_count: 0 };
+      state.billReconciliation = null;
       return;
     }
     const r = await api.get(`/manifests/${state.activeManifestId}`);
@@ -283,6 +288,7 @@
     state.expected = r.expected || [];
     state.unreconciled = r.unreconciled || [];
     state.summary = r.summary || { expected_count: 0, received_count: 0 };
+    state.billReconciliation = r.bill_reconciliation || null;
     const ev = await api.get(`/scan/events/${state.activeManifestId}`);
     state.events = ev.events || [];
   }
@@ -557,14 +563,19 @@
           )
         ),
         h('nav', { class: 'flex items-center gap-1 ml-6' },
+          // Order follows the actual work flow (2026-08-18 reorder — Bills used
+          // to sit eighth purely because it was built last): a bill arrives,
+          // its manifest is uploaded/linked, goods are received against it,
+          // land in inventory, get catalogued, printed, and tracked as
+          // devices; OPR (export/repair round-trip) runs alongside/after.
           Tab('dashboard', 'Dashboard', 'gauge-high'),
+          Tab('bills', 'Bills', 'file-invoice-dollar'),
           Tab('manifests', 'Manifests', 'file-invoice'),
           Tab('receive', 'Receive', 'barcode'),
           Tab('inventory', 'Inventory', 'warehouse'),
           Tab('catalog', 'Catalog', 'tags'),
           Tab('print', 'Print Queue', 'print'),
           Tab('devices', 'Devices', 'mobile-screen-button'),
-          Tab('bills', 'Bills', 'file-invoice-dollar'),
           Tab('opr', 'OPR', 'plane-departure'),
           Tab('settings', 'Settings', 'gear'),
         ),
@@ -2514,6 +2525,32 @@
   }
 
   // ───────── Manifests view ─────────
+  // ── Manifest → bill reconciliation panel (0029) ──
+  // sum(manifest unit costs) vs. the linked bill's declared_total_gbp,
+  // with unit count checked against row count. 'awaiting_manifest'
+  // replaces the historical header-only false green — it is NOT a
+  // Balanced verdict, just "nothing to compare yet".
+  function ManifestBillReconciliationBadge() {
+    const r = state.billReconciliation;
+    if (!r) return null;
+    if (r.verdict === 'awaiting_manifest') {
+      return h('div', { id: 'manifest-bill-reconciliation', class: 'card p-3 flex items-center gap-2 text-sm' },
+        h('span', { class: 'badge badge-slate' }, h('i', { class: 'fas fa-hourglass-half mr-1' }), 'Awaiting manifest'),
+        h('span', { class: 'text-xs text-slate-500' }, r.reason)
+      );
+    }
+    const balanced = r.verdict === 'balanced';
+    return h('div', { id: 'manifest-bill-reconciliation', class: 'card p-3 flex items-center gap-3 text-sm flex-wrap' },
+      h('span', { class: 'badge ' + (balanced ? 'badge-green' : 'badge-red') },
+        h('i', { class: `fas fa-${balanced ? 'check' : 'triangle-exclamation'} mr-1` }),
+        balanced ? 'Balanced — manifest matches bill' : `Variance: ${fmtMoney(r.variance_gbp, 'GBP')}`),
+      h('span', { class: 'text-xs text-slate-400' }, `Manifest sum: ${fmtMoney(r.sum_manifest_gbp, 'GBP')}`),
+      h('span', { class: 'text-xs text-slate-400' }, `Bill declared: ${fmtMoney(r.declared_total_gbp, 'GBP')}`),
+      !balanced && r.unit_count_mismatch ? h('span', { class: 'badge badge-amber text-[10px]' },
+        h('i', { class: 'fas fa-hashtag mr-1' }), `${r.unit_count_manifest} priced lines vs ${r.unit_count_bill} bill units`) : null
+    );
+  }
+
   function ManifestsView() {
     return h('div', { class: 'space-y-6' },
       h('div', { class: 'flex items-center justify-between' },
@@ -2794,9 +2831,10 @@ General cleanup:
 Show me a short summary at the end: total rows processed, how many were
 flagged and why, how many duplicate IMEIs were removed, and a breakdown of
 how many rows fell into each Condition, each VAT Type, and each Currency.`;
-  function openManifestUpload() {
+  async function openManifestUpload() {
     uploadCtx = {
       reference: '', supplier: '', notes: '',
+      billId: null,    // optional link to an OPEN bill (0029) — empty is fine
       fileName: '',
       rawRows: [],     // every row of the sheet, including header
       headers: [],     // normalised header row (lowercased strings)
@@ -2804,8 +2842,14 @@ how many rows fell into each Condition, each VAT Type, and each Currency.`;
       mapping: {},     // { fieldKey: columnIndex | -1 }
       rows: [],        // parsed rows (the payload we POST)
       showPrompt: false, // toggles the AI cleanup prompt preview panel
+      openBills: [],   // GET /api/bills?status=draft — the picker's options
     };
     renderUploadModal();
+    try {
+      const r = await api.get('/bills?status=draft');
+      uploadCtx.openBills = r.bills || [];
+      renderUploadModal();
+    } catch { /* picker just stays empty — bill link is optional */ }
   }
   function renderUploadModal() {
     const m = $('#upload-modal');
@@ -3238,6 +3282,13 @@ how many rows fell into each Condition, each VAT Type, and each Currency.`;
             h('div', { class: 'text-xs text-slate-400 mt-1 mono' }, `${pct}% received`)
           ) : null,
         ),
+
+        // ── Manifest → bill reconciliation (0029) ──
+        // Manifests carry the itemisation, bills carry the header — this
+        // is never a header-only false-green: with no bill linked (or an
+        // unpriced manifest/bill) it reads "Awaiting manifest", resolving
+        // to a real Balanced/Variance verdict only once linked and priced.
+        m ? ManifestBillReconciliationBadge() : null,
 
         // Scan input
         h('div', { class: 'card scan-ring p-6' },
