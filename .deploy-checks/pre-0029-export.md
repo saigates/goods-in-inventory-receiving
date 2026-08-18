@@ -107,3 +107,192 @@ actually runs, since production data may have changed in the interim.
 - This satisfies "confirm retrievable independently of the given URL, or
   copy it somewhere that outlives the session" — the actual export DATA now
   lives in a location the user controls directly, not just a link to it.
+
+## Coverage note (recorded per explicit user request, not a bug)
+
+Grade `B` has **zero rows** in production (`COUNT(*) FROM expected_devices
+WHERE grade='B'` = 0, confirmed in the raw cross-tab above — only A/C/UG
+appear). Consequence: `deriveConditionFromGrade()`'s `B → USED` branch
+(`src/lib/condition.ts`) is currently exercised **only by its unit test**,
+never by live data. Not a defect — just a confidence/coverage fact worth
+having on record before 0030 (which depends on that function) ships.
+
+## Migration-mechanics investigation for the 0024–0029 deploy (this pass)
+
+**Question**: does `gsk hosted deploy` apply migrations itself (so
+schema-first ordering is guaranteed), or is that a separate manual step?
+
+**Finding — re-test of `gsk hosted d1_query` under the confirmed project id
+(d6aea290-...) FAILED again**, this time consistently across every read-only
+`gsk hosted` probe tried:
+
+```
+d1_query      -> resource_not_found: "No D1 database deployed for project
+                 d6aea290-...  Deploy with --with-db first."
+d1_schema     -> resource_not_found: same message
+worker_get    -> resource_not_found: "No worker deployed for project
+                 d6aea290-...  Run `gsk hosted deploy` first to create one."
+worker_stats  -> resource_not_found: "Stats only exist after a successful
+                 deploy."
+custom_domain_status -> resource_not_found: "No custom domain is bound..."
+list          -> Found 1 hosted resource: the ff2edf75-... worker only
+                 (confirmed NOT ours, per above) — zero resources under
+                 d6aea290-...
+```
+
+This is a **stronger and different** failure than the earlier pass: last
+time only D1 reads failed while production was independently confirmed
+live. This time EVERY hosted-control-plane read for this project — worker,
+D1, stats, custom domain — reports nothing provisioned at all, while an
+independent plain HTTPS check in the same moment shows production is still
+fully live and unchanged:
+
+```
+GET /api/health -> 200 {"ok":true,"ts":"2026-08-18T16:20:45.327Z"}
+GET /tracker/   -> 200
+```
+
+Interpretation: the `gsk hosted` control plane currently cannot see ANY
+resource for this project — not "the worker exists but D1 doesn't," but
+"nothing is registered under this project id at all" from the control
+plane's point of view — even though the actual Cloudflare Worker and its D1
+data are demonstrably still serving real traffic. This looks like the same
+class of session/control-plane visibility gap flagged earlier in this
+deploy-check sequence, now worse (covering worker_get/stats/custom_domain
+too, not just D1), not a new data-loss event — production traffic and data
+are unaffected — but it means the safety rail this deploy explicitly
+depends on (confirming `d1_query` works BEFORE trusting `gsk hosted deploy`
+to sequence migrations correctly) cannot be exercised right now.
+
+**Per explicit user instruction this pass ("if d1_query still returns
+resource_not_found, hold — a worker-only deploy is worse than no deploy"):
+this deploy is HELD.** No `gsk hosted deploy` call has been made. No
+`--with-db`, `d1_rebuild`, or `d1_execute` call has been made either (all
+three remain off-limits per standing instruction regardless of project
+identification).
+
+### Secondary findings from the same investigation (retained for when the
+### control plane recovers and this is re-attempted)
+
+- **No dedicated "apply migrations" subcommand exists.** `gsk hosted --help`
+  lists exactly: `d1_query`, `d1_execute`, `d1_export`, `d1_import`,
+  `d1_rebuild`, `d1_schema` for D1, plus worker/R2/secret/custom-domain
+  commands. There is no `d1_migrate` / `migrations_apply`.
+- **Circumstantial evidence that `gsk hosted deploy` bundles migration
+  application into the same approved action** (not a separate step the
+  agent must trigger):
+  - The `gsk-hosted-deploy` skill documents a deploy action's result schema
+    carrying `result.migration_status` (`applied`/`failed`/`seed_applied`/
+    `seed_failed`), `result.migration_errors`, and `result.schema_verification`
+    (`verified`/`incomplete`/`unavailable`) — fields that only make sense if
+    migration application is something the deploy pipeline itself performs
+    and reports on.
+  - README.md's own deploy history (lines 456-458): "production is on
+    commit `6cbe4e2` (deployed 2026-08-11 via an approved `gsk hosted
+    deploy` action, 22/22 migrations applied...)" — describing ONE approved
+    action that both shipped code and applied all pending migrations, not
+    two separate approvals.
+  - A second, earlier deploy entry (2026-07-29, lines 361-372) explicitly
+    says the redeploy "also re-ran migration 0017 against prod D1 (wrangler
+    applies any migration file not yet recorded as applied on that Worker's
+    tracking table)" — again describing migration application as an
+    automatic, built-in part of the same `gsk hosted deploy` invocation,
+    keyed off a tracking table so already-applied migrations are skipped
+    (idempotent), not something requiring a separate manual trigger.
+  - There is no example anywhere in README's deploy history of a separate
+    manual migration-apply step being run against production alongside a
+    `gsk hosted deploy` action. Every recorded prod deploy either applied
+    pending migrations automatically as part of the one approved action, or
+    (the 197-IMEI-manifest-fix redeploy) explicitly noted "no migrations
+    pending, so this was a code-only redeploy" — i.e. the deploy pipeline
+    itself is what decides whether migrations run, based on what's pending.
+  - **Not fully reconciled**: README also documents `npm run
+    db:migrate:prod` (lines 294, 413) as a step in the LOCAL-DEV and BYOK
+    (bring-your-own-Cloudflare-account) instructions — that script runs
+    `wrangler d1 migrations apply webapp-production` directly against a
+    user's OWN Cloudflare account, entirely outside the `gsk hosted deploy`
+    pipeline. This is the alternate/legacy path for someone deploying to
+    their own account (see the `cf-byok-deploy` skill), not evidence
+    against automatic migration application under `gsk hosted deploy` —
+    the two are different deploy mechanisms for two different account
+    setups, not two steps of the same one. Conclusion: no contradiction,
+    but this was inferential, not from one single unambiguous sentence
+    naming the mechanism explicitly for the `gsk hosted deploy` path.
+  - **Overall confidence**: schema-first ordering (migrations landing before
+    the new worker version starts serving requests) is very likely achieved
+    automatically by `gsk hosted deploy` for THIS deploy mechanism, based on
+    the above — but this is inference from documented behavior and a result
+    schema, not a single explicit guarantee statement, and it cannot be
+    exercised live right now because the control plane read path is down
+    for this project. Recommend treating this as "probably fine, but
+    unverified for this specific attempt" rather than "confirmed safe."
+
+## Migration content review — 0024, 0025, 0027, 0028, 0029 (this pass)
+
+Read in full (0026 was already confirmed additive in the Check 2 pass).
+None of the six drop or rewrite a column; all are additive:
+
+- **0024** (`ce1154_worksheet_rewrite`): 15× `ALTER TABLE shipments ADD
+  COLUMN` only (inbound_freight_gbp, non_eu_freight_share_gbp,
+  export_freight_gbp, insurance_gbp, value_adjustment_gbp DEFAULT 1.31,
+  commodity_code, duty_override_claimed NOT NULL DEFAULT 0,
+  entry_accepted_at, entry_cleared_at, supplementary_units,
+  entry_duty_base_gbp, entry_vat_base_gbp, entry_duty_gbp, entry_vat_gbp,
+  declared_invoice_total_gbp, declared_piece_count,
+  declared_gross_weight_kg, misdeclaration_ack_at,
+  misdeclaration_ack_by_user_id). No DROP, no rewrite, no table recreate.
+- **0025** (`misdeclaration_ack_and_value_adjustment_defaults`): 2×
+  `CREATE TABLE IF NOT EXISTS` (shipment_misdeclaration_acks,
+  value_adjustment_defaults) + indexes + one seed `INSERT`. Purely
+  additive new tables.
+- **0027** (`worksheet_input_provenance`): single `ALTER TABLE shipments
+  ADD COLUMN worksheet_input_provenance TEXT`. Purely additive.
+- **0028** (`bills_cost_ledger_freight`, Sprint B §1-§3 — this is the
+  previously-unknown migration): 5× `CREATE TABLE IF NOT EXISTS` (bills,
+  bill_close_overrides, bill_lines, bill_line_serials, cost_ledger,
+  freight_invoices — 6 tables total) + indexes. No ALTER on any existing
+  table. Purely additive new tables.
+- **0029** (`manifest_bill_link`): single `ALTER TABLE manifests ADD
+  COLUMN bill_id INTEGER REFERENCES bills(id) ON DELETE SET NULL` + one
+  index. Purely additive, nullable, `ON DELETE SET NULL` (not CASCADE) so
+  it cannot destructively cascade either.
+
+**Confirmed: all of 0024-0029 (plus the already-checked 0026) are additive
+only — every statement is `CREATE TABLE IF NOT EXISTS` or `ALTER TABLE ...
+ADD COLUMN`. Zero `DROP COLUMN`, zero `DROP TABLE`, zero
+recreate-and-copy-data pattern anywhere in the six files.** The user's
+premise ("0024-0029 should all be additive, so rollback ought to be
+bundle-only") is now independently confirmed true by direct inspection,
+not assumed.
+
+## Rollback plan (stated per user request, now with the additive-only
+## confirmation above backing it)
+
+- **Bundle rollback**: redeploy git commit `6cbe4e2` via `gsk hosted
+  deploy` (that commit is what production is on today, positively
+  confirmed above). Since all six pending migrations are additive-only,
+  the OLD code at `6cbe4e2` continues to run correctly against a schema
+  that has EXTRA (unused-by-it) columns/tables — additive schema changes
+  are backward-compatible with older code by construction, so a
+  bundle-only rollback is sufficient; there is no scenario among 0024-0029
+  where old code would break against the new schema.
+- **Data rollback**: the durable export at
+  `/mnt/aidrive/prod-export-2026-08-18-pre-0029.sql` (md5-verified) is the
+  fallback ONLY if something outside the migrations themselves corrupts
+  data (e.g. a bad manual `d1_execute`, which is off-limits anyway) — not
+  expected to be needed given the additive-only confirmation above. Using
+  it would require `d1_rebuild` (drop+recreate) followed by `d1_import`,
+  both destructive/approval-gated operations, and would lose any writes
+  made to production between this export and the rebuild.
+- **Net**: rollback should be bundle-only in the expected case. Data
+  rollback is a documented but unlikely-to-be-needed fallback, gated
+  behind operations already prohibited this pass unless the user
+  explicitly authorizes them at that time.
+
+## Current status: DEPLOY HELD
+
+Per the user's explicit instruction, this deploy does not proceed while
+`gsk hosted d1_query` (and, as newly found, every other hosted-control-plane
+read for this project) returns `resource_not_found`. Nothing has been
+applied. Next action is to re-test the control plane again before
+attempting `gsk hosted deploy` for 0024-0029.
