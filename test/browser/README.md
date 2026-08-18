@@ -6,6 +6,62 @@ vitest suite (deliberately named `.browser.mjs` so vitest's `*.spec.*` glob
 ignores it), because it needs a live server + Chromium rather than the
 workerd test pool.
 
+## Process fix (2026-08-18): every script now enforces its own build + bundle freshness — not a documented step, an enforced one
+
+**The incident this closes**: `dist/static/app.js` was found to be a stale
+pre-reorder build while `public/static/app.js` (source) already had the
+correct nav order — `wrangler pages dev dist` serves whatever is physically
+in `dist/`, and nothing rebuilds it automatically on a source edit or a
+`pm2 restart`. This means every browser-test PASS before the fix (Devices
+tab 18/18 then 25/25, Bills UI 27/28) was potentially checking a bundle that
+didn't contain the code under test — not necessarily wrong, but not proven
+either.
+
+**The fix**: `test/browser/_harness.mjs` is now imported as the literal
+first line of every `*.browser.mjs` script. Being an ES module, its
+top-level code runs synchronously on import, before anything else in the
+calling script executes, which is what makes this enforced rather than a
+step someone can skip. It does two things, in order, and exits with code 2
+(aborting the whole run before any check executes) if either fails:
+
+1. Runs `npm run build` for real. A build failure aborts immediately.
+2. Fetches the live server's `/static/app.js` (cache-busted) and compares
+   its **SHA-256 content hash** against the current `public/static/app.js`
+   on disk. Deliberately not a fixed marker string — a hardcoded marker can
+   itself go stale and keep passing against a bundle missing some later,
+   unrelated change, which would silently recreate the exact failure mode
+   this fix exists to close. A full-content hash is self-maintaining: it
+   fails the instant served and source diverge by even one byte, for any
+   reason (stale `dist/`, wrong port, wrong branch, a caching layer, etc.).
+
+Verified both directions before wiring it in: run clean against the real
+dev server (passes, hash match logged) and run against a deliberately
+mismatched served bundle (aborts with exit 2, both hashes printed, before
+any Playwright check runs). Also verified the underlying assumption that a
+plain `npm run build` (no `pm2 restart`) is sufficient for `wrangler pages
+dev` to pick up the new `dist/` — confirmed via a scratch marker line
+appended to source, rebuilt, and fetched back from the live server without
+touching pm2.
+
+No `*.browser.mjs` script should ever add its own build step or its own
+freshness check — that duplication is exactly what this file exists to
+avoid. Add `import './_harness.mjs'` as the first import and nothing else.
+
+## Process note (2026-08-18) — bill_lines FK order missing from `manifest-bill-link.browser.mjs`'s printed cleanup line
+
+Running the harness-wired script end to end surfaced a real (if minor) bug
+in the script's own `CLEANUP_HINT` output: `bill_lines.bill_id → bills(id)`
+is `ON DELETE NO ACTION` (confirmed via `PRAGMA foreign_key_list(bill_lines)`
+against local D1), so the printed `DELETE FROM bills ...` failed with
+`SQLITE_CONSTRAINT_FOREIGNKEY` until `bill_lines` was deleted first. Fixed
+in the script itself (the printed line now deletes `bill_lines` before
+`bills`); `expected_devices` does not need its own `DELETE` in that line —
+`manifests`' FK to it is `ON DELETE CASCADE`, so deleting the manifest row
+cascades it. Any bills-related test's cleanup line should be checked
+against `PRAGMA foreign_key_list(<table>)` rather than assumed correct by
+inspection, since `NO ACTION` vs `CASCADE` isn't visible from the DELETE
+statement alone.
+
 ## Process note (2026-08-18): bill-to-manifest consumption is UNSTARTED, confirmed by exhaustive grep
 
 Asked to confirm whether bill line → manifest line consumption (open /

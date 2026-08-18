@@ -27,6 +27,7 @@
 // Cleanup: same discipline as opr-ui.spec.mjs / opr6-ui.spec.mjs / the
 // prior devices-tab-check runs — delete every seeded row (respecting FK
 // order), reset password_hash to NULL, confirm via SQL zero-count checks.
+import './_harness.mjs'  // enforced build + bundle-freshness check — see _harness.mjs
 import { chromium } from 'playwright'
 
 const BASE = 'http://localhost:3000'

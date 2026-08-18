@@ -5,6 +5,7 @@
 // with the exact valuation persisted. Test row cleaned up at the end via
 // the app's own delete endpoint is NOT used — cleanup is done by the runner
 // script via wrangler (documented in test/browser/README.md).
+import './_harness.mjs'  // enforced build + bundle-freshness check — see _harness.mjs
 import { chromium } from 'playwright'
 
 const BASE = 'http://localhost:3000'

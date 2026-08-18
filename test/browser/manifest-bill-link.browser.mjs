@@ -8,6 +8,7 @@
 // bills-tab.browser.mjs — see test/browser/README.md.
 //
 // IMEI prefix: 8604561 (next free after bills-tab's 8604560).
+import './_harness.mjs'  // enforced build + bundle-freshness check — see _harness.mjs
 import { chromium } from 'playwright'
 import { writeFileSync, unlinkSync } from 'node:fs'
 
@@ -141,5 +142,11 @@ try { unlinkSync(csvPath) } catch {}
 
 console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : failures + ' CHECK(S) FAILED'}`)
 console.log(`CLEANUP_HINT imeis=${IMEI_1} invoices=${invBill} manifest_ref=${manifestRef}`)
-console.log(`Cleanup (respecting FK order): DELETE FROM received_devices WHERE imei IN ('${IMEI_1}'); DELETE FROM expected_devices WHERE manifest_id IN (SELECT id FROM manifests WHERE reference = '${manifestRef}'); DELETE FROM manifests WHERE reference = '${manifestRef}'; DELETE FROM bills WHERE invoice_number = '${invBill}';`)
+// bill_lines.bill_id -> bills(id) is ON DELETE NO ACTION (confirmed via
+// PRAGMA foreign_key_list(bill_lines) during a live harness run 2026-08-18)
+// — it MUST be deleted before bills or the DELETE FROM bills fails with
+// SQLITE_CONSTRAINT_FOREIGNKEY. expected_devices does not need its own
+// DELETE: manifests.expected_devices FK is ON DELETE CASCADE, so deleting
+// the manifest row cascades it automatically.
+console.log(`Cleanup (respecting FK order): DELETE FROM received_devices WHERE imei IN ('${IMEI_1}'); DELETE FROM bill_lines WHERE bill_id IN (SELECT id FROM bills WHERE invoice_number = '${invBill}'); DELETE FROM manifests WHERE reference = '${manifestRef}'; DELETE FROM bills WHERE invoice_number = '${invBill}';`)
 process.exit(failures === 0 ? 0 : 1)

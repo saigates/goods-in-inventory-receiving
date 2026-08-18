@@ -12,6 +12,7 @@
 // Every positive check is paired with a NEGATIVE (wrong password must be
 // rejected AND must not reach the app shell), so this cannot pass against a
 // broken always-true verifier.
+import './_harness.mjs'  // enforced build + bundle-freshness check — see _harness.mjs
 import { chromium } from 'playwright'
 
 const BASE = process.env.BASE || 'https://d6aea290-bd61-4f82-aa8d-94378b9f2fec.vip.gensparksite.com'

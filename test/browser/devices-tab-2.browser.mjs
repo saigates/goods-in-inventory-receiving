@@ -10,6 +10,7 @@
 //
 // IMEI namespace: 8604559 (next free after ...8604557 temp-export-standard,
 // 8604558 devices-tab-check).
+import './_harness.mjs'  // enforced build + bundle-freshness check — see _harness.mjs
 import { chromium } from 'playwright'
 
 const BASE = process.env.BASE || 'http://localhost:3000'

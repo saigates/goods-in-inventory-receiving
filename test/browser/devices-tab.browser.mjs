@@ -11,6 +11,7 @@
 // IMEI namespace: 8604558 (next free after opr-ui 8604550-53, opr6-ui
 // 8604554, dbg-valui/manifest-val 8604555, confirm-only 8604556,
 // temp-export-standard-lifecycle 8604557).
+import './_harness.mjs'  // enforced build + bundle-freshness check — see _harness.mjs
 import { chromium } from 'playwright'
 
 const BASE = process.env.BASE || 'http://localhost:3000'

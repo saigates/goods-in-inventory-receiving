@@ -14,6 +14,7 @@
 //          server-through-UI proof.
 //       d. Valid values → force-add succeeds, device row exists with the
 //          exact valuation persisted (verified via authenticated API).
+import './_harness.mjs'  // enforced build + bundle-freshness check — see _harness.mjs
 import { chromium } from 'playwright'
 
 const BASE = 'http://localhost:3000'

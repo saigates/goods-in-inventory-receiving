@@ -8,6 +8,7 @@
 // reset it to NULL after, clean up seeded rows).
 //
 // IMEI prefix: 8604560 (next free after devices-tab-2's 8604559).
+import './_harness.mjs'  // enforced build + bundle-freshness check — see _harness.mjs
 import { chromium } from 'playwright'
 
 const BASE = process.env.BASE || 'http://localhost:3000'
