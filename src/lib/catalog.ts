@@ -16,12 +16,35 @@ export type CatalogRow = {
 
 // "128", "128G", "128 GB", "128GB" → "128GB"; anything else returned trimmed-upper.
 // Returns null for null / empty.
+//
+// TB/GB canonical form (fixed 2026-08-18, LW001 manifest-14 follow-up):
+// the catalogue itself NEVER stores "1024GB"/"2048GB" — confirmed via
+// `SELECT DISTINCT capacity FROM sku_catalog`, whose full real value set is
+// exactly {64GB, 128GB, 256GB, 512GB, 1TB, 2TB}. A plain-GB value that is an
+// exact multiple of 1024 (1024, 2048, "1024GB", "1024 GB", "2048G", ...) is
+// therefore folded to the TB form ("1TB", "2TB") to match, and an explicit
+// TB value ("1TB", "1 TB", "2TB") is normalized to the same collapsed form
+// rather than falling through to the generic uppercase-only fallback (which
+// would otherwise leave a stray space, e.g. "1 TB" staying "1 TB" instead of
+// becoming "1TB"). Without this, a device correctly recorded as "1024GB"
+// (or "1024 GB") could never match a catalogue row stored as "1TB", even
+// with an otherwise-perfect model/color/grade match (see id 701 in
+// .deploy-checks/lw001-16-catalog-coverage.md).
 export function normalizeCapacity(raw: unknown): string | null {
   if (raw == null) return null
   const s = String(raw).trim()
   if (!s) return null
-  const m = s.match(/^(\d+)\s*(?:GB|G)?$/i)
-  if (m) return `${m[1]}GB`
+
+  const gb = s.match(/^(\d+)\s*(?:GB|G)?$/i)
+  if (gb) {
+    const n = parseInt(gb[1], 10)
+    if (n > 0 && n % 1024 === 0) return `${n / 1024}TB`
+    return `${gb[1]}GB`
+  }
+
+  const tb = s.match(/^(\d+)\s*TB$/i)
+  if (tb) return `${tb[1]}TB`
+
   // Fallback: just uppercase + collapse whitespace
   return s.toUpperCase().replace(/\s+/g, ' ')
 }
