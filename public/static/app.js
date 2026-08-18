@@ -2579,7 +2579,19 @@
               : state.manifests.map(m => {
                 const pct = m.expected_count ? Math.round((m.received_count / m.expected_count) * 100) : 0;
                 return h('tr', { class: 'row-strip' },
-                  h('td', { class: 'px-4 py-3 font-semibold mono text-cyan-300' }, m.reference),
+                  h('td', { class: 'px-4 py-3 font-semibold mono text-cyan-300' },
+                    h('div', { class: 'flex items-center gap-2' },
+                      m.reference,
+                      // Linked-bill indicator (0029) — a manifest with bill_id
+                      // set has a supplier invoice to reconcile against; one
+                      // with bill_id null was received with no bill, which is
+                      // a normal, fully-supported case, not shown as a warning.
+                      m.bill_id != null
+                        ? h('span', { class: 'badge badge-slate text-[10px]', title: `Linked to bill #${m.bill_id}` },
+                            h('i', { class: 'fas fa-link mr-1' }), 'bill')
+                        : null
+                    )
+                  ),
                   h('td', { class: 'px-4 py-3' }, m.supplier),
                   h('td', { class: 'px-4 py-3' },
                     h('div', { class: 'flex items-center gap-3' },
@@ -2918,6 +2930,28 @@ how many rows fell into each Condition, each VAT Type, and each Currency.`;
             oninput: (e) => uploadCtx.notes = e.target.value,
           })
         ),
+        // Optional link to an OPEN bill (0029). Manifests carry the
+        // itemisation, bills carry the header — this is a reconciliation
+        // pointer only, never a source of manifest lines. Leaving it on
+        // "— no bill —" is fully supported: goods received without a bill
+        // must keep working exactly as before.
+        h('div', { class: 'mb-4' },
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Link to bill (optional)'),
+          h('select', {
+            class: 'input', id: 'mf-bill',
+            value: uploadCtx.billId == null ? '' : String(uploadCtx.billId),
+            onchange: (e) => { uploadCtx.billId = e.target.value ? Number(e.target.value) : null; },
+          },
+            h('option', { value: '' }, '— no bill —'),
+            ...uploadCtx.openBills.map(b => h('option', { value: String(b.id) },
+              `${b.vendor_name || 'Unknown vendor'} · ${b.invoice_number || 'no ref'} · ${b.currency_code || 'GBP'} ${Number(b.declared_total ?? 0).toFixed(2)}`
+            ))
+          ),
+          h('div', { class: 'text-[11px] text-slate-500 mt-1' },
+            uploadCtx.openBills.length === 0
+              ? 'No open bills found — this is fine for goods received without a bill.'
+              : `${uploadCtx.openBills.length} open bill(s) available.`)
+        ),
         h('div', { class: 'dropzone rounded-xl p-8 text-center cursor-pointer mb-4',
           id: 'dz',
           onclick: () => $('#mf-file').click(),
@@ -3197,6 +3231,7 @@ how many rows fell into each Condition, each VAT Type, and each Currency.`;
         supplier: uploadCtx.supplier,
         notes: uploadCtx.notes,
         rows: uploadCtx.rows,
+        bill_id: uploadCtx.billId,
       });
       const skipped = (r.invalid_valuations || []).length;
       toast(`Manifest created · ${r.count} devices loaded` +
