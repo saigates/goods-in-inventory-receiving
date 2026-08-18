@@ -2756,7 +2756,7 @@
     { key: 'imei',        label: 'IMEI *',         hint: 'serial / IMEI' },
     { key: 'oem',         label: 'OEM / Brand',    hint: 'Apple, Samsung…' },
     { key: 'model_no',    label: 'Model No. *',    hint: 'iPhone 15 Pro, Galaxy S24… (used for catalogue lookup)' },
-    { key: 'capacity',    label: 'Storage *',      hint: '128GB, 256G… (normalised to 128GB form)' },
+    { key: 'capacity',    label: 'Storage *',      hint: '128GB, 256G, 1TB… (1024GB folds to 1TB)' },
     { key: 'color',       label: 'Color *',        hint: 'Phantom Black… (case-insensitive)' },
     { key: 'grade',       label: 'Grade *',        hint: 'A | B | C (anything else → UG)' },
     { key: 'description', label: 'Description',    hint: 'optional · human label only' },
@@ -2776,7 +2776,17 @@
   // brand). Keep the accepted Condition / VAT Type / currency-format rules
   // below in sync with src/lib/validate.ts and this file's own
   // MAPPABLE_FIELDS hints if either ever changes.
-  const MANIFEST_CLEANUP_PROMPT = `STEP 1 — Before touching anything, scan the whole file and ask me any
+  // MANIFEST_CLEANUP_PROMPT_VERSION: v2-2026-08-18 — bump this (and the
+  // "(v2 — 2026-08-18)" line inside the prompt text itself, just below)
+  // every time the prompt's rules change, so a cleaned sheet someone
+  // hands us can be traced back to the ruleset that produced it. See
+  // test/manifestCleanupPrompt.spec.ts, which pins this version string
+  // and cross-checks the STEP 2 header line against MAPPABLE_FIELDS so
+  // the two can't silently drift apart again.
+  const MANIFEST_CLEANUP_PROMPT_VERSION = 'v2-2026-08-18';
+  const MANIFEST_CLEANUP_PROMPT = `MANIFEST CLEANUP PROMPT (v2 — 2026-08-18)
+
+STEP 1 — Before touching anything, scan the whole file and ask me any
 clarifying questions you need BEFORE reorganizing it. In particular, check
 for and ask about:
 
@@ -2789,10 +2799,6 @@ for and ask about:
   STANDARD = full VAT on sale price, ZERO = zero-rated, PVAT = Postponed
   VAT/import accounting) — most second-hand phone shipments use MARGIN,
   but don't assume, ask.
-- Condition: if there is no condition column at all, ASK ME whether every
-  device in this shipment should be treated as one single condition (Raw,
-  Used, Refurbished, or New), or whether it varies by row and I need to
-  provide that some other way.
 - Grade: if there is no grade/condition/quality column at all (not even
   under a different name), ask me whether every device in this file
   should be treated as the same grade, or whether grading needs to happen
@@ -2831,10 +2837,20 @@ Apply these exact rules per column:
      truncates digits or shows scientific notation, and never drops a
      leading zero.
    - Strip spaces, dashes, and any trailing ".0".
-   - Valid values are either exactly 15 digits, or exactly 10 alphanumeric
-     characters (for non-cellular serials) — flag any row that is neither
-     length in a new column called "Flag" with the text "Bad IMEI length".
-   - Delete exact duplicate IMEI rows, keeping the first occurrence.
+   - Valid values are either exactly 15 digits that pass the standard
+     GSMA Luhn (mod-10) checksum, or exactly 10 alphanumeric characters
+     (for non-cellular serials — no checksum applies to these). Flag any
+     row that doesn't satisfy this in a new column called "Flag": use
+     "Bad IMEI length" for a value that is neither 15 digits nor 10
+     alphanumeric characters, and "Bad IMEI checksum" for a value that IS
+     15 digits but fails the Luhn check.
+   - Do NOT delete duplicate IMEI rows yourself. If the same IMEI appears
+     on more than one row, leave every occurrence in the sheet, flag each
+     one in the "Flag" column with "Duplicate IMEI", and list the
+     affected row numbers in your closing summary so I can decide what to
+     do — a repeated IMEI is sometimes a genuine data-entry error, but it
+     can also mean two rows describe the same physical device with
+     different details on each, which silently deleting one would hide.
 
 2. OEM: brand name only (e.g. Apple, Samsung, Google). Title-case it. If
    you had to ask me for this in Step 1, apply my answer to every row.
@@ -2845,37 +2861,58 @@ Apply these exact rules per column:
    Black"), split it: put the model name here, the storage into Storage,
    and the color into Color.
 
-4. Storage: a plain number immediately followed by "GB" — e.g. "128GB",
-   "256GB", "1TB" → convert to "1024GB". Remove all other text/units.
+4. Storage: our catalogue only ever stores GB-notation BELOW 1024 and
+   TB-notation AT OR ABOVE 1024 — it never stores "1024GB" or "2048GB".
+   Normalize to match:
+      - A plain number under 1024, with or without "GB"/"G" — e.g.
+        "64", "128G", "256 GB" → keep as GB form: "64GB", "128GB",
+        "256GB". Remove all other text/units.
+      - A value equal to 1024 in any GB spelling ("1024", "1024G",
+        "1024GB", "1024 GB") → convert to "1TB".
+      - A value equal to 2048 in any GB spelling ("2048", "2048GB", …)
+        → convert to "2TB".
+      - A value already given in TB ("1TB", "1 TB", "2TB") → keep as TB,
+        just tidied to "1TB"/"2TB" (no space, uppercase TB).
+   Do NOT do the reverse (do not expand an existing TB value out into a
+   4/5-digit GB number) — that produces a value the catalogue can never
+   match.
 
 5. Color: just the color name, no extra text. Normalize obvious spelling
    variants (e.g. "Space Grey"/"Space Gray" → pick one consistently).
 
-6. Grade: normalize to exactly one of A, B, C, or UG (ungraded). Map common
-   supplier terms as follows — "Grade A"/"Excellent"/"Like New" → A;
-   "Grade B"/"Good" → B; "Grade C"/"Fair"/"Acceptable" → C; anything
-   unclear or not matching these → UG. If you had to ask me in Step 1
-   whether to apply one grade to everything, apply my answer; if I said
-   grading happens later, leave this column blank for every row instead
-   of defaulting to UG.
+6. Grade: capture the vendor's own grade letter as literally as you can
+   rather than guessing it away. Map common supplier terms as follows —
+   "Grade A"/"Excellent"/"Like New" → A; "Grade B"/"Good" → B; "Grade C"/
+   "Fair"/"Acceptable" → C; "Grade D"/"Poor" → D; "Grade E"/"Scrap"/"For
+   Parts" → E. Only use UG when the file genuinely gives NO grade
+   information at all for a row — never as a stand-in for a D or E you
+   weren't sure how to map. A real vendor D or E must be passed through
+   as literal D or E here, not coerced to UG in this cleanup step: our
+   system has its own downstream policy for handling grades outside our
+   internal A/B/C scale, and that policy needs to see the vendor's actual
+   claim to record it correctly. If you had to ask me in Step 1 whether
+   to apply one grade to everything, apply my answer; if I said grading
+   happens later, leave this column blank for every row instead of
+   defaulting to UG.
 
 7. Description: short free-text label only — do not duplicate what's
    already captured in Model No./Storage/Color.
 
-8. Condition: must be exactly one of these four values (these are the
-   only conditions we deal in):
-      - Raw          — untested / as received, not yet inspected
-      - Used         — tested/working, previously owned
-      - Refurbished  — repaired/restored to a working standard
-      - New          — unused, sealed (we rarely receive New stock, but
+8. Condition: OPTIONAL — this column is a cross-check against Grade, not
+   an independent input, so leave a row blank if the file simply doesn't
+   say rather than asking me or guessing. Where you do fill it in, it
+   must be exactly one of these four values (UPPERCASE):
+      - RAW          — untested / as received, not yet inspected
+      - USED         — tested/working, previously owned
+      - REFURBISHED  — repaired/restored to a working standard
+      - NEW          — unused, sealed (we rarely receive NEW stock, but
                        it is still a valid value — keep it as an option)
    Map common supplier wording as: "Raw"/"Untested"/"As-is"/"Bulk"/
-   "Grade U" → Raw; "Used"/"Pre-owned"/"Second Hand"/"2nd Hand" → Used;
-   "Refurb"/"Refurbished"/"Renewed"/"Reconditioned" → Refurbished; "New"/
-   "Brand New"/"Sealed"/"Unused" → New. If a value doesn't clearly match
-   one of these four, or the whole file has no condition information and
-   you didn't already get an answer from me in Step 1, ask me rather than
-   guessing — do not leave this column inconsistently filled.
+   "Grade U" → RAW; "Used"/"Pre-owned"/"Second Hand"/"2nd Hand" → USED;
+   "Refurb"/"Refurbished"/"Renewed"/"Reconditioned" → REFURBISHED; "New"/
+   "Brand New"/"Sealed"/"Unused" → NEW. If a value doesn't clearly match
+   one of these four, ask me rather than guessing — do not leave this
+   column inconsistently filled.
 
 9. Unit Cost: plain number only — no currency symbols, no thousands
    separators, no text. Leave blank if unknown (do not enter 0).
@@ -2887,6 +2924,12 @@ Apply these exact rules per column:
     extract that 3-letter code into this column. If you had to ask me for
     the currency in Step 1 because it wasn't in the file, apply my answer
     to every row that has a Unit Cost.
+    STOP if you find more than one distinct currency across the rows
+    (even after Step 1) — do not clean up and hand me back a single sheet
+    mixing currencies. Tell me which rows are in which currency and ask
+    me how to proceed; our system treats one uploaded manifest as having
+    a single currency, so a mixed file needs to be split before upload,
+    and that split is my call, not yours.
 
 11. VAT Type: must be exactly one of these four values (uppercase, no
     others are accepted):
@@ -2911,15 +2954,32 @@ General cleanup:
   than 1 (e.g. a "Qty" column shows 5 for one IMEI-less line), do NOT
   duplicate it — flag it in the "Flag" column as "No IMEI — qty row" since
   every device needs its own unique IMEI to be received.
+- Extra columns: if the file has other genuinely useful information
+  beyond the 11 columns above (e.g. an invoice/PO number, a warehouse or
+  batch code, a supplier's own line reference), keep it — but add it as
+  its own column to the RIGHT of the 11 canonical headers, never
+  interleaved between them and never renamed to look like one of the 11.
+  Our upload tool only auto-maps columns it recognises by header name;
+  anything past column 11 is simply ignored by the importer and left for
+  me to read manually, so it's always safe to keep rather than delete.
+  In particular, if the file's cost/header area names an invoice or PO
+  number for this shipment, add it as its own operational column named
+  "Invoice No." (one value repeated on every row if it's shipment-wide,
+  or per-row if the file already varies it) — leave it out entirely if
+  the file has no such reference; do not invent one.
 - Put the cleaned result on a new sheet named "Manifest Import", with the
-  11 headers above in row 1 and one device per row below, and nothing else
-  on that sheet (no extra title rows, no summary rows, no merged cells).
+  11 canonical headers (plus any extra operational columns to their
+  right, per the rule above) in row 1 and one device per row below, and
+  nothing else on that sheet (no extra title rows, no summary rows, no
+  merged cells).
 - Add the "Flag" column only if any row still needed one after Step 1;
   otherwise omit it.
 
 Show me a short summary at the end: total rows processed, how many were
-flagged and why, how many duplicate IMEIs were removed, and a breakdown of
-how many rows fell into each Condition, each VAT Type, and each Currency.`;
+flagged and why (broken out by flag reason, including duplicate IMEIs —
+list their row numbers, do not just give a count of rows "removed" since
+none should have been removed), and a breakdown of how many rows fell
+into each Condition, each VAT Type, and each Currency.`;
   // Bill-vendor precedence (batch item 5): when a manifest upload has a
   // bill selected via #mf-bill, Supplier is pre-filled from THAT bill's
   // own vendor_name (already fetched into uploadCtx.openBills) and the
