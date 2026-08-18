@@ -5,6 +5,7 @@ import { resolveCatalogSkuBulk, normalizeCapacity, norm } from '../lib/catalog'
 import { currentUser } from '../lib/auth'
 import { validateImei, cleanString, validateBuyPrice, isValidCurrency, normalizeCurrency, isValidVatType } from '../lib/validate'
 import { reconcileManifestAgainstBill, type ManifestLineForReconciliation } from '../lib/manifestBillReconciliation'
+import { deriveConditionFromGrade } from '../lib/condition'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -195,6 +196,11 @@ app.post('/', async (c) => {
   let unmatched = 0
   const invalidImeis: Array<{ row_index: number; imei: unknown; reason: string }> = []
   const invalidValuations: Array<{ row_index: number; imei: unknown; reason: string }> = []
+  // Condition is DERIVED from grade (0030) — never stored from the upload.
+  // Where the file carries its own condition value that disagrees with the
+  // derived one, that's reported here so drift is visible, not silently
+  // discarded and not silently overridden.
+  const conditionDiscrepancies: Array<{ row_index: number; imei: string; uploaded: string; derived: string }> = []
 
   type ValidRow = {
     r: ImportRow
@@ -255,6 +261,21 @@ app.post('/', async (c) => {
       unmatched += 1
     }
 
+    // Condition is derived from grade (0030) — grade always wins, condition
+    // is always optional. We no longer read r.condition into the column at
+    // all: an uploaded condition can no longer drift out of sync with grade
+    // because it's never stored. If the file DID carry a condition and it
+    // disagrees with what grade derives, log the discrepancy for visibility
+    // (e.g. a vendor claims grade A but writes "Used" in their own sheet) —
+    // report it, don't store it, and don't let it override the derivation.
+    const derivedCondition = deriveConditionFromGrade(grade)
+    const uploadedCondition = cleanString(r.condition, 64)
+    if (uploadedCondition && uploadedCondition.toUpperCase() !== derivedCondition) {
+      conditionDiscrepancies.push({
+        row_index: i, imei, uploaded: uploadedCondition, derived: derivedCondition,
+      })
+    }
+
     stmts.push(c.env.DB.prepare(
       `INSERT INTO expected_devices
        (organisation_id, manifest_id, oem, condition, description, grade, model_no, imei, unit_cost, currency, vat_type, sku, capacity, color)
@@ -263,7 +284,7 @@ app.post('/', async (c) => {
       orgId,
       manifestId,
       cleanString(r.oem, 64),
-      cleanString(r.condition, 64),
+      derivedCondition,
       cleanString(r.description, 256),
       grade,
       cleanString(r.model_no, 128),
@@ -287,6 +308,7 @@ app.post('/', async (c) => {
     catalog_unmatched: unmatched,
     invalid_imeis: invalidImeis,
     invalid_valuations: invalidValuations,
+    condition_discrepancies: conditionDiscrepancies,
   })
 })
 

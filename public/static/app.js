@@ -27,6 +27,39 @@
     return el;
   };
   const fmtDate = (s) => s ? new Date(s.replace(' ', 'T') + 'Z').toLocaleString() : '—';
+  // Clipboard write with a fallback path for contexts where the async
+  // Clipboard API is unavailable or rejects (non-secure context, denied
+  // Permissions-Policy in an embedded/iframed preview, focus-loss at
+  // click time, or an older browser). navigator.clipboard.writeText can
+  // fail for reasons that have nothing to do with the code that calls it
+  // (e.g. document not focused, permission not granted) — the fallback
+  // uses the legacy execCommand('copy') path via a temporary offscreen
+  // textarea, which works in more of those cases. Returns true if either
+  // path succeeded, false if both failed (caller shows the manual-copy
+  // toast only in that case).
+  async function copyToClipboard(text) {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch { /* fall through to legacy path */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      ta.style.left = '-1000px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
 
   // ───────── Bulk-paste IMEI parsing (shared by BulkTransitionModal and
   // BulkScanModal) ─────────
@@ -2269,8 +2302,9 @@
     const d = state.oprDraftDoc;
     const close = () => { state.oprDraftDoc = null; render(); };
     const copy = async (text, what) => {
-      try { await navigator.clipboard.writeText(text); toast(`${what} copied`, 'ok'); }
-      catch { toast('Clipboard unavailable — select and copy manually', 'warn'); }
+      const ok = await copyToClipboard(text);
+      if (ok) toast(`${what} copied`, 'ok');
+      else toast('Clipboard unavailable — select and copy manually', 'warn');
     };
     const isPre = d.kind === 'prealert';
     const to = d.data.to || null;
@@ -2892,8 +2926,9 @@ how many rows fell into each Condition, each VAT Type, and each Currency.`;
               h('button', {
                 class: 'btn btn-primary text-xs',
                 onclick: async () => {
-                  try { await navigator.clipboard.writeText(MANIFEST_CLEANUP_PROMPT); toast('Prompt copied', 'ok'); }
-                  catch { toast('Clipboard unavailable — select and copy manually', 'warn'); }
+                  const ok = await copyToClipboard(MANIFEST_CLEANUP_PROMPT);
+                  if (ok) toast('Prompt copied', 'ok');
+                  else toast('Clipboard unavailable — select and copy manually', 'warn');
                 },
               },
                 h('i', { class: 'fas fa-copy mr-1' }), 'Copy Prompt')
