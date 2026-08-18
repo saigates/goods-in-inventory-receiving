@@ -201,6 +201,20 @@ app.post('/', async (c) => {
   // derived one, that's reported here so drift is visible, not silently
   // discarded and not silently overridden.
   const conditionDiscrepancies: Array<{ row_index: number; imei: string; uploaded: string; derived: string }> = []
+  // normalizeGrade() flattening any out-of-scale vendor grade (a real D or
+  // E, or any other non-A/B/C/UG value) to 'UG' at import is CORRECT and
+  // INTENDED (owner decision — the vendor's grade is a claim, not a
+  // verified fact, and normalizeGrade()'s behaviour is deliberately left
+  // unchanged by this pass). What was missing was visibility: this array
+  // records every such coercion event — the exact raw value the vendor's
+  // file carried, which row/imei it was on, and that it was stored as
+  // 'UG' — so the coercion is observable without changing what gets
+  // stored. Mirrors conditionDiscrepancies's pattern exactly. Deliberately
+  // NOT logged for a raw value that's already A/B/C/UG (nothing was
+  // coerced) or for a blank/missing grade (there is no vendor claim to
+  // report on) — only for a genuinely out-of-scale value that
+  // normalizeGrade() had to launder.
+  const gradeCoercions: Array<{ row_index: number; imei: string; uploaded: string; stored: 'UG' }> = []
 
   type ValidRow = {
     r: ImportRow
@@ -209,6 +223,7 @@ app.post('/', async (c) => {
     capacity: string | null
     color: string | null
     grade: ReturnType<typeof normalizeGrade>
+    rawGrade: string | null   // grade exactly as the uploaded file carried it, pre-normalizeGrade() — for grade_coercions only
     modelForLookup: string | null
   }
   const validRows: ValidRow[] = []
@@ -234,7 +249,8 @@ app.post('/', async (c) => {
     // human-readable model name there); fall back to description if model_no
     // is empty (older manifests where description holds "Galaxy S24_256G").
     const modelForLookup = r.model_no || r.description || null
-    validRows.push({ r, imei, val, capacity, color, grade, modelForLookup })
+    const rawGrade = r.grade == null ? null : String(r.grade).trim()
+    validRows.push({ r, imei, val, capacity, color, grade, rawGrade, modelForLookup })
   }
 
   // One query for the whole organisation's catalog, then match every valid
@@ -251,7 +267,7 @@ app.post('/', async (c) => {
   )
 
   for (let i = 0; i < validRows.length; i++) {
-    const { r, imei, val, capacity, color, grade, modelForLookup } = validRows[i]
+    const { r, imei, val, capacity, color, grade, rawGrade, modelForLookup } = validRows[i]
     let sku: string | null = null
     if (modelForLookup) {
       const lookup = lookups[i]
@@ -274,6 +290,17 @@ app.post('/', async (c) => {
       conditionDiscrepancies.push({
         row_index: i, imei, uploaded: uploadedCondition, derived: derivedCondition,
       })
+    }
+
+    // grade_coercions: record only a GENUINE coercion — a raw value that
+    // was present and did not already equal (case-insensitively) the
+    // normalized result. A blank/missing grade normalizes to 'UG' too,
+    // but that's an absent claim, not a coerced one, so it's excluded.
+    // normalizeGrade() only ever coerces TO 'UG' (never to A/B/C), so
+    // grade === 'UG' here is guaranteed whenever this branch is taken —
+    // asserted explicitly so the literal 'stored: UG' type holds.
+    if (rawGrade && rawGrade.toUpperCase() !== grade && grade === 'UG') {
+      gradeCoercions.push({ row_index: i, imei, uploaded: rawGrade, stored: grade })
     }
 
     stmts.push(c.env.DB.prepare(
@@ -309,6 +336,7 @@ app.post('/', async (c) => {
     invalid_imeis: invalidImeis,
     invalid_valuations: invalidValuations,
     condition_discrepancies: conditionDiscrepancies,
+    grade_coercions: gradeCoercions,
   })
 })
 
