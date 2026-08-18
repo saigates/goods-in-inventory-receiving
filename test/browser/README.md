@@ -6,6 +6,61 @@ vitest suite (deliberately named `.browser.mjs` so vitest's `*.spec.*` glob
 ignores it), because it needs a live server + Chromium rather than the
 workerd test pool.
 
+## Named process smell (2026-08-18): "vacuous same-side reconciliation" — any reconciliation where one side is derived from the other must never render a verdict
+
+**The smell, named explicitly so it stops recurring by accident:** if a
+comparison's two "independent" sides are actually the same value expressed
+two ways — one computed FROM the other rather than sourced independently —
+the comparison carries zero information and rendering a definitive verdict
+from it (especially a green/Balanced one) is a defect, not a display
+choice. It looks like a real check and always passes, which is worse than
+having no check at all.
+
+**Confirmed occurrences of this exact shape in this build, in order:**
+1. `c5e5f25` — a bill's `gbp_total` column (itself defined as the sum of
+   its own `bill_lines`) was being compared against that same sum, in
+   `checkBillCloseable()`'s original form. Fixed by comparing sum(lines)
+   against the bill's independently-entered `declared_total_gbp` instead.
+2. The manifest→bill "header-only false green" that
+   `reconcileManifestAgainstBill()`'s `awaiting_manifest` verdict exists to
+   prevent (see that module's own header comment) — comparing a bill
+   against itself when no manifest was actually linked yet.
+3. **This pass** — `BillDetailView()`'s same-document check, reproduced in
+   the DISPLAY layer rather than the data layer: a `price_source='header'`
+   bill (`src/lib/billBuilder.ts`) has exactly ONE synthetic `bill_lines`
+   row whose `unit_price_gbp` is computed directly FROM `declared_total`.
+   `sum(lines)` therefore equals `declared_total_gbp` BY CONSTRUCTION for
+   every such bill, with no exception — the old unconditional badge was
+   arithmetically incapable of ever showing anything but "Balanced". Fixed
+   with a two-armed gate (`bill.price_source === 'header' || lines.length
+   === 0`) that suppresses the same-document verdict and, where a manifest
+   IS linked, delegates to the genuinely independent
+   `reconcileManifestAgainstBill()` comparison instead (via the shared
+   `ManifestBillReconciliationBadge()` function — one verdict function, not
+   two copies of the comparison logic). Proven via
+   `bill-detail-vacuous-check.browser.mjs`, per the standing rule below.
+   With no manifest linked, the badge shows a neutral, non-green "UNPRICED —
+   NO LINE DETAIL; RECONCILIATION NOT APPLICABLE" state rather than any
+   fabricated verdict.
+
+**The rule going forward:** before wiring any A-vs-B comparison that will
+render a Balanced/Matched/OK-style verdict, check whether B was computed
+FROM A (or vice versa) anywhere upstream. If it was, either source a
+genuinely independent B, or suppress the verdict and say so explicitly
+(as `awaiting_manifest` and the header-mode gate above both do) — never
+render green from a comparison that cannot mathematically fail.
+
+## Standing process rule (2026-08-18): any claim about a rendered verdict must be cited from a browser check, never an API or pure-function test
+
+A pure-function test (e.g. `reconcileManifestAgainstBill()`'s own spec) or
+an HTTP-layer test (e.g. `test/bills.spec.ts` asserting a JSON field) can
+prove the DATA is correct, but neither one renders `BillDetailView()` or
+any other UI function — so neither can be cited as proof of what a badge,
+button, or piece of rendered text actually SHOWS a user. Any statement of
+the form "the UI now correctly displays X" must be backed by a
+`*.browser.mjs` script that reads the rendered DOM text and asserts on it,
+not by a green vitest run alone.
+
 ## Process fix (2026-08-18): every script now enforces its own build + bundle freshness — not a documented step, an enforced one
 
 **The incident this closes**: `dist/static/app.js` was found to be a stale
@@ -344,7 +399,9 @@ never collide on the `received_devices.imei` UNIQUE constraint. Prefixes
 claimed so far: `8604550`-`8604553` (opr-ui, in `~/ui-tests/`, not yet moved
 into this repo), `8604554` (opr6-ui), `8604555` (dbg-valui/manifest-val),
 `8604556` (confirm-only), `8604557` (temp-export-standard-lifecycle),
-`8604558` (devices-tab), `8604559` (devices-tab-2), `8604560` (bills-tab).
+`8604558` (devices-tab), `8604559` (devices-tab-2), `8604560` (bills-tab),
+`8604561` (manifest-bill-link), `8604562` (bill-detail-vacuous-check —
+claimed per convention though this script seeds no received_devices rows).
 
 ### `devices-tab.browser.mjs` (15 checks)
 Devices tab — **All Devices** sub-view (status + legal transition via the

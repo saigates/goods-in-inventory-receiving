@@ -7,6 +7,7 @@ import type { Bindings, AuthUser, BillType, BillPriceSource, RateSource } from '
 import { currentUser } from '../lib/auth'
 import { cleanString, isValidCurrency } from '../lib/validate'
 import { buildBill, checkBillCloseable, checkRepairBillAgainstDeclaredCharge, SUPPLIER_INVOICED, type BillImportRow, type BillHeaderInput } from '../lib/billBuilder'
+import { reconcileManifestAgainstBill, type ManifestLineForReconciliation } from '../lib/manifestBillReconciliation'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -50,7 +51,33 @@ app.get('/:id', async (c) => {
        JOIN bill_lines bl ON bl.id = bls.bill_line_id
       WHERE bl.bill_id = ? AND bls.organisation_id = ?`
   ).bind(id, user.organisation_id).all()
-  return c.json({ bill, lines, close_overrides: overrides, serials })
+
+  // Manifest → bill reconciliation, surfaced from the BILL's side (0029's
+  // link is one-directional — manifests.bill_id points AT bills, bills
+  // carry no reverse pointer — so this is a lookup, not a stored column).
+  // Needed for BillDetailView()'s false-green fix: a header-only bill (or
+  // any bill with zero REAL per-unit line rows) has nothing of its own to
+  // reconcile sum(lines) against — that comparison is circular by
+  // construction (see billBuilder.ts's 'header' mode: the one synthetic
+  // line's unit_price_gbp IS declared_total_gbp, converted). Where a
+  // manifest is linked, the real (non-circular) comparison is manifest
+  // sum vs. bill declared total — exactly what reconcileManifestAgainstBill()
+  // already computes for GET /api/manifests/:id. Reusing it here rather
+  // than duplicating the logic; null when no manifest links to this bill.
+  const linkedManifest = await c.env.DB.prepare(
+    'SELECT id, bill_id FROM manifests WHERE bill_id = ? AND organisation_id = ? LIMIT 1'
+  ).bind(id, user.organisation_id).first<{ id: number; bill_id: number | null }>()
+  let bill_reconciliation = null
+  if (linkedManifest) {
+    const { results: expected } = await c.env.DB.prepare(
+      'SELECT unit_cost, currency FROM expected_devices WHERE manifest_id = ? AND organisation_id = ?'
+    ).bind(linkedManifest.id, user.organisation_id).all<{ unit_cost: number | null; currency: string | null }>()
+    const reconLines: ManifestLineForReconciliation[] = expected.map(e => ({ unit_cost: e.unit_cost, currency: e.currency }))
+    const billForRecon = bill as { declared_total_gbp: number | null; currency_code: string; exchange_rate: number | null; unit_count: number }
+    bill_reconciliation = reconcileManifestAgainstBill(true, reconLines, billForRecon)
+  }
+
+  return c.json({ bill, lines, close_overrides: overrides, serials, linked_manifest_id: linkedManifest?.id ?? null, bill_reconciliation })
 })
 
 // POST /api/bills — ONE builder for both bill_type values ('purchase' |

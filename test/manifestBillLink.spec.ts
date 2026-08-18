@@ -109,19 +109,17 @@ describe('manifest → bill link (0029)', () => {
   })
 
   it('non-vacuity: a bill with declared_total_gbp but NO manifest linked to it does not surface as Balanced anywhere', async () => {
-    // The historical false-green this replaces. There is no manifest-side
-    // query possible here (nothing points AT this bill) — the guarantee
-    // instead lives in the pure-function test (manifestBillReconciliation.
-    // spec.ts) and in the fact that GET /api/bills/:id has never returned
-    // a manifest-comparison verdict at all (grepped — bills.ts has zero
-    // references to manifest_id/expected_devices outside prose comments).
-    // This test documents that boundary at the HTTP level: bills.ts's own
-    // detail response carries no bill_reconciliation field.
+    // The historical false-green this replaces. GET /api/bills/:id now
+    // DOES look up a linked manifest (BillDetailView()'s false-green fix
+    // needs this — see src/routes/bills.ts), but the guarantee this test
+    // documents is unchanged: with no manifest pointing at this bill,
+    // bill_reconciliation is null, never a fabricated 'balanced' verdict.
     const billId = await makeOpenBill(4774.00, 16)
     const res = await api(`/api/bills/${billId}`)
     expect(res.status).toBe(200)
-    const data = await res.json() as Record<string, unknown>
-    expect(data).not.toHaveProperty('bill_reconciliation')
+    const data = await res.json() as { bill_reconciliation: unknown; linked_manifest_id: number | null }
+    expect(data.bill_reconciliation).toBeNull()
+    expect(data.linked_manifest_id).toBeNull()
   })
 
   it('16-row manifest summing to £4,774.00 linked to a bill declaring £4,774.00 → Balanced', async () => {

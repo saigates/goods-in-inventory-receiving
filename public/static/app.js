@@ -1538,10 +1538,37 @@
     // Reconciliation: sum(lines) vs declared_total_gbp — the actual §1
     // close-rule comparison (NOT vs gbp_total, which is itself the sum of
     // lines and would make this display circular/meaningless).
+    //
+    // NAMED PROCESS SMELL — "vacuous same-side reconciliation": a
+    // 'header'-mode bill (src/lib/billBuilder.ts) has exactly ONE synthetic
+    // bill_lines row whose unit_price_gbp is DERIVED FROM declared_total.
+    // sumLines therefore equals declaredTotalGbp BY CONSTRUCTION — this is
+    // not "a different question answered correctly", it is arithmetically
+    // incapable of returning anything but Balanced. Same shape as the
+    // historical c5e5f25 circular gbp_total defect, reproduced here in the
+    // display layer (3rd occurrence of this smell in this build — see
+    // test/browser/README.md Process Notes). Any reconciliation where one
+    // side is derived from the other is vacuous and MUST NOT render a
+    // verdict. Two-armed gate below: price_source === 'header' covers the
+    // real cause; lines.length === 0 is a defensive second arm for the
+    // opposite-direction case (a per-line/per-imei bill that somehow has
+    // no real lines yet) — it costs nothing and closes that false-green too.
+    const vacuousSameDocCheck = bill.price_source === 'header' || lines.length === 0;
     const sumLines = Math.round(lines.reduce((s, l) => s + (l.unit_price_gbp || 0), 0) * 100) / 100;
     const declaredTotalGbp = bill.declared_total_gbp;
     const variance = declaredTotalGbp != null ? Math.round((sumLines - declaredTotalGbp) * 100) / 100 : null;
+    // `balanced` stays the REAL arithmetic result (variance === 0) — it
+    // still drives whether the normal Close button's own server-side check
+    // will succeed and whether Force-close is offered. Gating only the
+    // BADGE/verdict text (below) would leave Force-close wrongly offered
+    // on every header-mode bill (they are always mathematically balanced
+    // by construction, so normal Close always succeeds — there is nothing
+    // to force). Only the DISPLAYED verdict is suppressed when vacuous.
     const balanced = variance === 0;
+    // Manifest-linked branch delegates to the SAME badge/verdict function
+    // the Receive view uses (ManifestBillReconciliationBadge) rather than
+    // duplicating comparison logic — one badge, one code path.
+    const manifestLinked = d.linked_manifest_id != null;
 
     return h('div', { class: 'space-y-5' },
       h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
@@ -1576,10 +1603,21 @@
         ),
         bill.header_residual_gbp != null ? h('div', { class: 'text-xs text-slate-500 mt-2' },
           `Header residual: ${fmtMoney(bill.header_residual_gbp, 'GBP')} (independent per-line rounding vs. direct header conversion — never apportioned across lines)`) : null,
-        h('div', { id: 'bill-variance-indicator', class: 'mt-3 flex items-center gap-2' },
-          variance == null ? h('span', { class: 'badge badge-slate' }, 'No declared_total_gbp yet')
-            : balanced ? h('span', { class: 'badge badge-green' }, h('i', { class: 'fas fa-check mr-1' }), 'Balanced — sum(lines) = declared total')
-            : h('span', { class: 'badge badge-red' }, h('i', { class: 'fas fa-triangle-exclamation mr-1' }), `Variance: ${fmtMoney(variance, 'GBP')}`)
+        // Vacuous same-document check (header-mode / zero real lines):
+        // never render a same-document Balanced/Variance verdict here —
+        // it is arithmetically incapable of being anything else. Delegate
+        // to the manifest↔bill reconciliation (a genuinely independent
+        // comparison) when a manifest is linked; otherwise show a neutral
+        // "not applicable" state — never green, never a fabricated verdict.
+        h('div', { id: 'bill-variance-indicator', class: 'mt-3 flex flex-col items-start gap-2' },
+          vacuousSameDocCheck
+            ? (manifestLinked
+                ? ManifestBillReconciliationBadge(d.bill_reconciliation)
+                : h('span', { class: 'badge badge-slate' }, h('i', { class: 'fas fa-ban mr-1' }),
+                    'UNPRICED — NO LINE DETAIL; RECONCILIATION NOT APPLICABLE'))
+            : (variance == null ? h('span', { class: 'badge badge-slate' }, 'No declared_total_gbp yet')
+                : balanced ? h('span', { class: 'badge badge-green' }, h('i', { class: 'fas fa-check mr-1' }), 'Balanced — sum(lines) = declared total')
+                : h('span', { class: 'badge badge-red' }, h('i', { class: 'fas fa-triangle-exclamation mr-1' }), `Variance: ${fmtMoney(variance, 'GBP')}`))
         ),
         h('div', { class: 'mt-4 flex items-center gap-2 flex-wrap' },
           bill.status === 'draft' ? h('button', {
@@ -2564,8 +2602,13 @@
   // with unit count checked against row count. 'awaiting_manifest'
   // replaces the historical header-only false green — it is NOT a
   // Balanced verdict, just "nothing to compare yet".
-  function ManifestBillReconciliationBadge() {
-    const r = state.billReconciliation;
+  function ManifestBillReconciliationBadge(r) {
+    // Optional param so BillDetailView() can pass d.bill_reconciliation
+    // explicitly (the manifest-linked branch of its own display) while
+    // ReceiveView()'s existing no-arg call site keeps reading
+    // state.billReconciliation unchanged — same function, same verdict
+    // logic, no duplicated comparison code either place.
+    if (r === undefined) r = state.billReconciliation;
     if (!r) return null;
     if (r.verdict === 'awaiting_manifest') {
       return h('div', { id: 'manifest-bill-reconciliation', class: 'card p-3 flex items-center gap-2 text-sm' },
