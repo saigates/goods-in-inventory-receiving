@@ -34,10 +34,23 @@ app.get('/:id', async (c) => {
   const { results: lines } = await c.env.DB.prepare(
     'SELECT * FROM bill_lines WHERE bill_id = ? AND organisation_id = ? ORDER BY line_no ASC'
   ).bind(id, user.organisation_id).all()
+  // Join the user's name/email so the UI can display WHO force-closed —
+  // §1's close-rule override must capture variance, reason AND user; the
+  // raw overridden_by_user_id alone isn't presentable.
   const { results: overrides } = await c.env.DB.prepare(
-    'SELECT * FROM bill_close_overrides WHERE bill_id = ? AND organisation_id = ? ORDER BY overridden_at ASC'
+    `SELECT bco.*, u.name AS overridden_by_name, u.email AS overridden_by_email
+       FROM bill_close_overrides bco
+       LEFT JOIN users u ON u.id = bco.overridden_by_user_id
+      WHERE bco.bill_id = ? AND bco.organisation_id = ?
+      ORDER BY bco.overridden_at ASC`
   ).bind(id, user.organisation_id).all()
-  return c.json({ bill, lines, close_overrides: overrides })
+  const { results: serials } = await c.env.DB.prepare(
+    `SELECT bls.bill_line_id, bls.imei, bls.received_device_id
+       FROM bill_line_serials bls
+       JOIN bill_lines bl ON bl.id = bls.bill_line_id
+      WHERE bl.bill_id = ? AND bls.organisation_id = ?`
+  ).bind(id, user.organisation_id).all()
+  return c.json({ bill, lines, close_overrides: overrides, serials })
 })
 
 // POST /api/bills — ONE builder for both bill_type values ('purchase' |

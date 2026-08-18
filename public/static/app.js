@@ -137,6 +137,15 @@
     removalFlagsShowResolved: false,
     devicesBusy: false,          // in-flight guard for device-lifecycle mutations
     bulkTransitionOpen: false,   // bulk-transition-by-scan modal visibility
+    // ───── Bills tab (Sprint B §1 — ONE builder for purchase|repair) ─────
+    bills: [],                   // GET /api/bills list rows
+    billsFilterType: '',         // '' | 'purchase' | 'repair'
+    billsFilterStatus: '',       // '' | 'draft' | 'closed'
+    billId: null,                // open detail view when set
+    billDetail: null,            // { bill, lines, close_overrides, serials } for the open bill
+    billNewOpen: false,          // new-bill modal visibility
+    billForceCloseOpen: false,   // force-close reason modal visibility (holds the bill id)
+    billBusy: false,             // in-flight guard for bill mutations
   };
   function setLabelSize(v) { state.labelSize = v; localStorage.setItem('labelSize.v2', v); }
   function setLabelRotate(on) { state.labelRotate = !!on; localStorage.setItem('labelRotate.v1', on ? '1' : '0'); }
@@ -507,6 +516,7 @@
         : state.view === 'catalog' ? CatalogView()
         : state.view === 'print' ? PrintView()
         : state.view === 'devices' ? DevicesView()
+        : state.view === 'bills' ? BillsView()
         : state.view === 'opr' ? OprView()
         : state.view === 'settings' ? SettingsView()
         : h('div', {}, 'Not found')
@@ -522,6 +532,8 @@
       state.oprFinaliseOpen ? OprFinaliseModal() : null,
       state.oprDraftDoc ? OprDraftDocModal() : null,
       state.bulkTransitionOpen ? BulkTransitionModal() : null,
+      state.billNewOpen ? BillNewModal() : null,
+      state.billForceCloseOpen ? BillForceCloseModal() : null,
     );
   }
 
@@ -552,6 +564,7 @@
           Tab('catalog', 'Catalog', 'tags'),
           Tab('print', 'Print Queue', 'print'),
           Tab('devices', 'Devices', 'mobile-screen-button'),
+          Tab('bills', 'Bills', 'file-invoice-dollar'),
           Tab('opr', 'OPR', 'plane-departure'),
           Tab('settings', 'Settings', 'gear'),
         ),
@@ -607,6 +620,7 @@
     else if (v === 'catalog') refreshCatalog().then(render);
     else if (v === 'print') refreshPrint().then(render);
     else if (v === 'devices') refreshDevicesSubview().then(render);
+    else if (v === 'bills') refreshBillsList().then(render);
     else if (v === 'opr') refreshOprAll().then(render);
     else if (v === 'settings') refreshSettings().then(render);
     render();
@@ -1086,6 +1100,503 @@
             class: 'btn btn-primary' + (ctx.busy ? ' opacity-60 cursor-not-allowed' : ''),
             id: 'bulk-transition-run-btn', onclick: run, disabled: ctx.busy ? 'disabled' : null,
           }, ctx.busy ? [h('i', { class: 'fas fa-spinner fa-spin' }), 'Processing…'] : [h('i', { class: 'fas fa-check-double' }), 'Transition batch'])
+        )
+      )
+    );
+  }
+
+  // ───────── Bills (Sprint B §1 — ONE builder for purchase|repair) ─────────
+  // API-backed UI over /api/bills/* — list + filters, create (header fields
+  // incl. currency_code/exchange_rate/rate_date/rate_source + per-IMEI
+  // line entry), detail with sum(lines) vs declared_total_gbp
+  // reconciliation, close / force-close (variance + reason + user).
+  //
+  // This UI works entirely off received_devices resolution
+  // (bill_line_serials.received_device_id) — bill-to-manifest consumption
+  // status is tracked in test/browser/README.md's process notes, not here.
+  function billStatusBadge(s) {
+    return h('span', { class: 'badge ' + (s === 'closed' ? 'badge-green' : 'badge-amber') }, s);
+  }
+  function billTypeBadge(t) {
+    return t === 'repair'
+      ? h('span', { class: 'badge badge-violet' }, h('i', { class: 'fas fa-screwdriver-wrench mr-1' }), 'repair')
+      : h('span', { class: 'badge badge-cyan' }, h('i', { class: 'fas fa-cart-shopping mr-1' }), 'purchase');
+  }
+  async function refreshBillsList() {
+    const params = new URLSearchParams();
+    if (state.billsFilterType) params.set('bill_type', state.billsFilterType);
+    if (state.billsFilterStatus) params.set('status', state.billsFilterStatus);
+    const qs = params.toString();
+    const r = await api.get(`/bills${qs ? '?' + qs : ''}`);
+    state.bills = r.bills || [];
+  }
+  async function refreshBillDetail() {
+    if (!state.billId) { state.billDetail = null; return; }
+    state.billDetail = await api.get(`/bills/${state.billId}`);
+  }
+  function BillsView() {
+    return h('div', { class: 'space-y-5' },
+      h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
+        h('div', {},
+          h('h1', { class: 'text-2xl font-bold' }, 'Bills'),
+          h('p', { class: 'text-slate-400 text-sm' }, 'One builder for purchase and repair invoices — header fields, per-IMEI pricing, close/force-close.')
+        )
+      ),
+      state.billId ? BillDetailView() : BillsListView()
+    );
+  }
+
+  // ─── Bills list ───
+  function BillsListView() {
+    return h('div', { class: 'space-y-4' },
+      h('div', { class: 'flex items-center gap-2 flex-wrap' },
+        h('select', {
+          id: 'bills-filter-type', class: 'input text-sm w-auto',
+          onchange: (e) => { state.billsFilterType = e.target.value; refreshBillsList().then(render); },
+        },
+          h('option', { value: '', selected: !state.billsFilterType ? 'selected' : null }, 'All bill types'),
+          h('option', { value: 'purchase', selected: state.billsFilterType === 'purchase' ? 'selected' : null }, 'Purchase'),
+          h('option', { value: 'repair', selected: state.billsFilterType === 'repair' ? 'selected' : null }, 'Repair'),
+        ),
+        h('select', {
+          id: 'bills-filter-status', class: 'input text-sm w-auto',
+          onchange: (e) => { state.billsFilterStatus = e.target.value; refreshBillsList().then(render); },
+        },
+          h('option', { value: '', selected: !state.billsFilterStatus ? 'selected' : null }, 'All statuses'),
+          h('option', { value: 'draft', selected: state.billsFilterStatus === 'draft' ? 'selected' : null }, 'Draft'),
+          h('option', { value: 'closed', selected: state.billsFilterStatus === 'closed' ? 'selected' : null }, 'Closed'),
+        ),
+        h('div', { class: 'text-sm text-slate-400 ml-2' },
+          `${state.bills.length} bill${state.bills.length === 1 ? '' : 's'}`),
+        h('button', { id: 'bill-new-btn', class: 'btn btn-primary text-sm ml-auto', onclick: () => { state.billNewOpen = true; render(); } },
+          h('i', { class: 'fas fa-plus' }), 'New bill')
+      ),
+      h('div', { class: 'card overflow-hidden' },
+        h('table', { class: 'w-full text-sm' },
+          h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+            h('tr', {},
+              h('th', { class: 'text-left px-4 py-3' }, 'Vendor'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Invoice #'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Type'),
+              h('th', { class: 'text-left px-4 py-3' }, 'Status'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Units'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Declared'),
+              h('th', { class: 'text-right px-4 py-3' }, 'GBP total'),
+              h('th', { class: 'text-right px-4 py-3' }, '')
+            )
+          ),
+          h('tbody', { class: 'divide-y divide-slate-800' },
+            !state.bills.length
+              ? h('tr', {}, h('td', { colspan: 8, class: 'text-center py-10 text-slate-500' },
+                  'No bills yet — create one to start recording a purchase or repair invoice.'))
+              : state.bills.map(b => h('tr', { class: 'row-strip bill-row', 'data-bill-id': b.id },
+                  h('td', { class: 'px-4 py-2 font-medium' }, b.vendor_name),
+                  h('td', { class: 'px-4 py-2 mono text-xs text-cyan-300' }, b.invoice_number),
+                  h('td', { class: 'px-4 py-2' }, billTypeBadge(b.bill_type)),
+                  h('td', { class: 'px-4 py-2' }, billStatusBadge(b.status)),
+                  h('td', { class: 'px-4 py-2 text-right mono' }, b.unit_count),
+                  h('td', { class: 'px-4 py-2 text-right mono text-xs' }, fmtMoney(b.declared_total, b.currency_code)),
+                  h('td', { class: 'px-4 py-2 text-right mono text-xs' }, b.gbp_total != null ? fmtMoney(b.gbp_total, 'GBP') : '—'),
+                  h('td', { class: 'px-4 py-2 text-right' },
+                    h('button', {
+                      class: 'btn btn-ghost text-xs bill-open-btn',
+                      onclick: () => { state.billId = b.id; refreshBillDetail().then(render); },
+                    }, h('i', { class: 'fas fa-folder-open' }), 'Open'))
+                ))
+          )
+        )
+      )
+    );
+  }
+
+  // ─── New bill modal — header fields + per-IMEI rows ───
+  function BillNewModal() {
+    const f = {
+      bill_type: 'purchase', vendor_name: '', bill_date: new Date().toISOString().slice(0, 10),
+      invoice_number: '', currency_code: 'GBP', exchange_rate: '', rate_date: '', rate_source: 'manual',
+      price_source: 'per_imei', declared_total: '', unit_count: '',
+      rowsText: '', // one row per line: sku,description,imei,unit_price
+    };
+    const close = () => { state.billNewOpen = false; render(); };
+    let bodyWrap;
+    const isGbp = () => f.currency_code.trim().toUpperCase() === 'GBP';
+
+    function parseRows(text) {
+      // sku,description,imei,unit_price — one per line. Blank sku+
+      // description+unit_price with a non-blank imei is a valid
+      // continuation row per billBuilder.ts's documented pick-and-note
+      // rule; the builder handles grouping server-side, this is just a
+      // thin CSV-ish parse.
+      return text.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
+        const [sku, description, imei, unit_price] = line.split(',').map(s => (s ?? '').trim());
+        return {
+          sku: sku || null,
+          description: description || null,
+          imei: imei || null,
+          unit_price: unit_price !== '' && unit_price != null ? Number(unit_price) : null,
+        };
+      });
+    }
+
+    const doCreate = async () => {
+      if (state.billBusy) return;
+      if (!f.vendor_name.trim()) { toast('Vendor name is required', 'warn'); return; }
+      if (!f.invoice_number.trim()) { toast('Invoice number is required', 'warn'); return; }
+      if (!isGbp() && !(Number(f.exchange_rate) > 0)) { toast('exchange_rate is required and must be positive for a non-GBP bill', 'warn'); return; }
+      const declaredTotal = Number(f.declared_total);
+      if (!Number.isFinite(declaredTotal) || declaredTotal < 0) { toast('Declared total must be a non-negative number', 'warn'); return; }
+      const unitCount = Number(f.unit_count);
+      if (!Number.isFinite(unitCount) || unitCount < 0) { toast('Unit count must be a non-negative number', 'warn'); return; }
+
+      const body = {
+        bill_type: f.bill_type,
+        vendor_name: f.vendor_name.trim(),
+        bill_date: f.bill_date,
+        invoice_number: f.invoice_number.trim(),
+        currency_code: f.currency_code.trim().toUpperCase(),
+        price_source: f.price_source,
+        declared_total: declaredTotal,
+        unit_count: unitCount,
+      };
+      if (!isGbp()) {
+        body.exchange_rate = Number(f.exchange_rate);
+        if (f.rate_date) body.rate_date = f.rate_date;
+        body.rate_source = f.rate_source;
+      } else if (f.rate_source) {
+        body.rate_source = f.rate_source;
+      }
+      if (f.price_source !== 'header') {
+        body.rows = parseRows(f.rowsText);
+      }
+
+      state.billBusy = true; render();
+      try {
+        const r = await api.post('/bills', body);
+        if (r.dropped_non_imei_rows) toast(`${r.dropped_non_imei_rows} row(s) dropped (no usable IMEI)`, 'warn', 4000);
+        if (r.cross_bill_duplicate_imeis && r.cross_bill_duplicate_imeis.length) {
+          toast(`${r.cross_bill_duplicate_imeis.length} IMEI(s) already appear on another bill — flagged for manager review`, 'warn', 5000);
+        }
+        toast(`Bill <span class="mono">${body.invoice_number}</span> created — GBP total ${fmtMoney(r.gbp_total, 'GBP')}`, 'ok');
+        state.billNewOpen = false;
+        state.billId = r.bill_id;
+        await refreshBillsList();
+        await refreshBillDetail();
+        render();
+      } catch (err) {
+        const data = err.response?.data;
+        if (data?.within_bill_duplicate_imeis?.length) {
+          toast(`Rejected — duplicate IMEI(s) within this bill: ${data.within_bill_duplicate_imeis.join(', ')}`, 'err', 6000);
+        } else {
+          toast(data?.error || err.message, 'err', 5000);
+        }
+      } finally {
+        state.billBusy = false; render();
+      }
+    };
+
+    const fields = () => h('div', { class: 'space-y-3' },
+      h('div', { class: 'grid grid-cols-2 gap-3' },
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Bill type'),
+          h('select', { id: 'bill-new-type', class: 'input', onchange: (e) => { f.bill_type = e.target.value; } },
+            h('option', { value: 'purchase', selected: f.bill_type === 'purchase' ? 'selected' : null }, 'Purchase'),
+            h('option', { value: 'repair', selected: f.bill_type === 'repair' ? 'selected' : null }, 'Repair'))
+        ),
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Pricing mode'),
+          h('select', { id: 'bill-new-price-source', class: 'input', onchange: (e) => { f.price_source = e.target.value; bodyWrap.replaceChildren(fields()); } },
+            h('option', { value: 'per_imei', selected: f.price_source === 'per_imei' ? 'selected' : null }, 'Per-IMEI (one price per device)'),
+            h('option', { value: 'per_line', selected: f.price_source === 'per_line' ? 'selected' : null }, 'Per-line (priced groups)'),
+            h('option', { value: 'header', selected: f.price_source === 'header' ? 'selected' : null }, 'Header only (no breakdown)'))
+        )
+      ),
+      h('div', { class: 'grid grid-cols-2 gap-3' },
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Vendor *'),
+          h('input', { id: 'bill-new-vendor', class: 'input', placeholder: 'LW001', value: f.vendor_name,
+            oninput: (e) => { f.vendor_name = e.target.value; } })
+        ),
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Invoice number *'),
+          h('input', { id: 'bill-new-invoice', class: 'input mono', placeholder: 'INV-2026-001', value: f.invoice_number,
+            oninput: (e) => { f.invoice_number = e.target.value; } })
+        )
+      ),
+      h('div', {},
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Bill date'),
+        h('input', { id: 'bill-new-date', class: 'input mono', type: 'date', value: f.bill_date,
+          oninput: (e) => { f.bill_date = e.target.value; } })
+      ),
+      h('div', { class: 'grid grid-cols-3 gap-3' },
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Currency'),
+          h('select', { id: 'bill-new-currency', class: 'input mono', onchange: (e) => { f.currency_code = e.target.value; bodyWrap.replaceChildren(fields()); } },
+            h('option', { value: 'GBP', selected: f.currency_code === 'GBP' ? 'selected' : null }, 'GBP'),
+            h('option', { value: 'USD', selected: f.currency_code === 'USD' ? 'selected' : null }, 'USD'),
+            h('option', { value: 'AED', selected: f.currency_code === 'AED' ? 'selected' : null }, 'AED'))
+        ),
+        !isGbp() ? h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Exchange rate *'),
+          h('input', { id: 'bill-new-exrate', class: 'input mono', type: 'number', step: '0.0001', placeholder: 'e.g. 1.29 (foreign units per £1)',
+            value: f.exchange_rate, oninput: (e) => { f.exchange_rate = e.target.value; } })
+        ) : null,
+        !isGbp() ? h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Rate date'),
+          h('input', { id: 'bill-new-ratedate', class: 'input mono', type: 'date', value: f.rate_date,
+            oninput: (e) => { f.rate_date = e.target.value; } })
+        ) : null
+      ),
+      h('div', {},
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Rate source'),
+        h('select', { id: 'bill-new-ratesource', class: 'input', onchange: (e) => { f.rate_source = e.target.value; } },
+          h('option', { value: 'manual', selected: f.rate_source === 'manual' ? 'selected' : null }, 'Manual'),
+          h('option', { value: 'zoho', selected: f.rate_source === 'zoho' ? 'selected' : null }, 'Zoho'),
+          h('option', { value: 'hmrc_monthly', selected: f.rate_source === 'hmrc_monthly' ? 'selected' : null }, 'HMRC monthly'))
+      ),
+      h('div', { class: 'grid grid-cols-2 gap-3' },
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Declared total *'),
+          h('input', { id: 'bill-new-declared', class: 'input mono', type: 'number', step: '0.01', placeholder: '39386.00',
+            value: f.declared_total, oninput: (e) => { f.declared_total = e.target.value; } })
+        ),
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Unit count *'),
+          h('input', { id: 'bill-new-unitcount', class: 'input mono', type: 'number', step: '1', placeholder: '162',
+            value: f.unit_count, oninput: (e) => { f.unit_count = e.target.value; } })
+        )
+      ),
+      f.price_source !== 'header' ? h('div', {},
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' },
+          'Lines — one per row: sku,description,imei,unit_price'),
+        h('textarea', {
+          id: 'bill-new-rows', class: 'input mono text-xs', rows: 6,
+          placeholder: 'APL-I17-256-BLK-A,iPhone 17 256GB Black A,356965410000001,160.00\nAPL-I17-256-BLK-A,iPhone 17 256GB Black A,356965410000018,182.00',
+          value: f.rowsText, oninput: (e) => { f.rowsText = e.target.value; },
+        }),
+        h('p', { class: 'text-[11px] text-slate-500 mt-1' },
+          'A row with blank sku/description/unit_price but a non-blank IMEI is treated as a continuation of the row above it (same price, extra serial) — the same rule billBuilder.ts documents.')
+      ) : h('p', { class: 'text-[11px] text-slate-500' },
+        'Header-only mode: one implicit line covering the whole declared total, no serials attached.')
+    );
+    bodyWrap = h('div', {}, fields());
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-xl' },
+        h('div', { class: 'flex items-center gap-3 mb-4' },
+          h('div', { class: 'w-10 h-10 rounded-xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center' },
+            h('i', { class: 'fas fa-file-invoice-dollar' })),
+          h('div', {},
+            h('h2', { class: 'text-lg font-semibold' }, 'New bill'),
+            h('p', { class: 'text-xs text-slate-500' }, 'Purchase or repair — one builder, bill_type selects only the downstream cost_ledger type.'))
+        ),
+        bodyWrap,
+        h('div', { class: 'mt-5 flex justify-end gap-2' },
+          h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
+          h('button', {
+            id: 'bill-new-create-btn', class: 'btn btn-primary' + (state.billBusy ? ' opacity-60 cursor-not-allowed' : ''),
+            onclick: doCreate, disabled: state.billBusy ? 'disabled' : null,
+          }, state.billBusy ? [h('i', { class: 'fas fa-spinner fa-spin' }), 'Creating…'] : [h('i', { class: 'fas fa-check' }), 'Create bill'])
+        )
+      )
+    );
+  }
+
+  // ─── Bill detail — reconciliation + close/force-close ───
+  async function doCloseBill(billId) {
+    if (state.billBusy) return;
+    state.billBusy = true; render();
+    try {
+      await api.post(`/bills/${billId}/close`, {});
+      toast('Bill closed', 'ok');
+      await refreshBillsList();
+      await refreshBillDetail();
+      render();
+    } catch (err) {
+      const data = err.response?.data;
+      if (data?.code === 'bill_unbalanced') {
+        toast(`Cannot close — variance £${Number(data.variance_gbp).toFixed(2)}. Use Force-close with a reason to override.`, 'warn', 6000);
+      } else {
+        toast(data?.error || err.message, 'err', 5000);
+      }
+    } finally {
+      state.billBusy = false; render();
+    }
+  }
+  async function doWriteCostLedger(billId) {
+    if (state.billBusy) return;
+    state.billBusy = true; render();
+    try {
+      const r = await api.post(`/bills/${billId}/write-cost-ledger`, {});
+      toast(`${r.posted} cost_ledger row(s) posted${r.skipped_already_posted ? `, ${r.skipped_already_posted} already posted (skipped)` : ''}`, 'ok', 4000);
+      await refreshBillDetail();
+      render();
+    } catch (err) {
+      toast(err.response?.data?.error || err.message, 'err', 5000);
+    } finally {
+      state.billBusy = false; render();
+    }
+  }
+  function BillForceCloseModal() {
+    const ctx = { reason: '' };
+    const billId = state.billForceCloseOpen;
+    const close = () => { state.billForceCloseOpen = false; render(); };
+    const submit = async () => {
+      if (!ctx.reason.trim()) { toast('A reason is required to force-close an unbalanced bill', 'warn'); return; }
+      if (state.billBusy) return;
+      state.billBusy = true; render();
+      try {
+        const r = await api.post(`/bills/${billId}/force-close`, { reason: ctx.reason.trim() });
+        toast(`Force-closed — variance £${Number(r.variance_gbp).toFixed(2)} recorded against your account`, 'warn', 5000);
+        state.billForceCloseOpen = false;
+        await refreshBillsList();
+        await refreshBillDetail();
+        render();
+      } catch (err) {
+        toast(err.response?.data?.error || err.message, 'err', 5000);
+      } finally {
+        state.billBusy = false; render();
+      }
+    };
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-md' },
+        h('div', { class: 'flex items-center gap-3 mb-4' },
+          h('div', { class: 'w-10 h-10 rounded-xl bg-red-500/10 text-red-400 flex items-center justify-center' },
+            h('i', { class: 'fas fa-triangle-exclamation' })),
+          h('div', {},
+            h('h2', { class: 'text-lg font-semibold' }, 'Force-close unbalanced bill'),
+            h('p', { class: 'text-xs text-slate-500' }, 'Writes an append-only override recording the variance, this reason, and your user.'))
+        ),
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Reason *'),
+        h('textarea', {
+          id: 'bill-force-close-reason', class: 'input text-sm', rows: 3, autofocus: 'true',
+          placeholder: 'e.g. Owner confirmed £999 declared total was a typo; lines are correct',
+          oninput: (e) => { ctx.reason = e.target.value; },
+        }),
+        h('div', { class: 'mt-4 flex justify-end gap-2' },
+          h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
+          h('button', {
+            id: 'bill-force-close-submit', class: 'btn text-sm !bg-red-600/20 !text-red-300' + (state.billBusy ? ' opacity-60 cursor-not-allowed' : ''),
+            onclick: submit, disabled: state.billBusy ? 'disabled' : null,
+          }, h('i', { class: 'fas fa-triangle-exclamation' }), 'Force-close')
+        )
+      )
+    );
+  }
+  function BillDetailView() {
+    const d = state.billDetail;
+    if (!d) return h('div', { class: 'text-slate-500 text-sm' }, 'Loading…');
+    const bill = d.bill;
+    const lines = d.lines || [];
+    const overrides = d.close_overrides || [];
+    const serials = d.serials || [];
+    const serialsByLine = {};
+    serials.forEach(s => { (serialsByLine[s.bill_line_id] = serialsByLine[s.bill_line_id] || []).push(s); });
+
+    // Reconciliation: sum(lines) vs declared_total_gbp — the actual §1
+    // close-rule comparison (NOT vs gbp_total, which is itself the sum of
+    // lines and would make this display circular/meaningless).
+    const sumLines = Math.round(lines.reduce((s, l) => s + (l.unit_price_gbp || 0), 0) * 100) / 100;
+    const declaredTotalGbp = bill.declared_total_gbp;
+    const variance = declaredTotalGbp != null ? Math.round((sumLines - declaredTotalGbp) * 100) / 100 : null;
+    const balanced = variance === 0;
+
+    return h('div', { class: 'space-y-5' },
+      h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
+        h('button', { id: 'bill-back-btn', class: 'btn btn-ghost text-sm', onclick: () => { state.billId = null; state.billDetail = null; render(); } },
+          h('i', { class: 'fas fa-arrow-left' }), 'Back to bills'),
+        h('div', { class: 'flex items-center gap-2' },
+          billTypeBadge(bill.bill_type), billStatusBadge(bill.status)
+        )
+      ),
+      h('div', { class: 'card p-5' },
+        h('div', { class: 'grid grid-cols-2 md:grid-cols-4 gap-4 text-sm' },
+          h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'Vendor'), h('div', { class: 'font-semibold' }, bill.vendor_name)),
+          h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'Invoice #'), h('div', { class: 'mono text-cyan-300' }, bill.invoice_number)),
+          h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'Bill date'), h('div', {}, bill.bill_date)),
+          h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'Currency'), h('div', { class: 'mono' }, bill.currency_code)),
+          bill.currency_code !== 'GBP' ? h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'Exchange rate'), h('div', { class: 'mono' }, bill.exchange_rate)) : null,
+          bill.currency_code !== 'GBP' ? h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'Rate date'), h('div', {}, bill.rate_date || '—')) : null,
+          h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'Rate source'), h('div', {}, bill.rate_source || '—')),
+          h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'Pricing mode'), h('div', {}, bill.price_source)),
+          h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'Unit count'), h('div', { class: 'mono' }, bill.unit_count)),
+        )
+      ),
+      // ── Reconciliation panel: sum(lines) vs declared_total_gbp ──
+      h('div', { id: 'bill-reconciliation', class: 'card p-5' },
+        h('h3', { class: 'text-sm font-semibold mb-3 flex items-center gap-2' },
+          h('i', { class: 'fas fa-scale-balanced' }), 'Reconciliation'),
+        h('div', { class: 'grid grid-cols-2 md:grid-cols-4 gap-4 text-sm' },
+          h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'Declared total'), h('div', { class: 'mono' }, fmtMoney(bill.declared_total, bill.currency_code))),
+          h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'Declared total (GBP)'), h('div', { id: 'bill-declared-total-gbp', class: 'mono' }, declaredTotalGbp != null ? fmtMoney(declaredTotalGbp, 'GBP') : '—')),
+          h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'Sum of lines (GBP)'), h('div', { id: 'bill-sum-lines-gbp', class: 'mono' }, fmtMoney(sumLines, 'GBP'))),
+          h('div', {}, h('div', { class: 'text-xs text-slate-500' }, 'gbp_total (stored)'), h('div', { class: 'mono' }, bill.gbp_total != null ? fmtMoney(bill.gbp_total, 'GBP') : '—')),
+        ),
+        bill.header_residual_gbp != null ? h('div', { class: 'text-xs text-slate-500 mt-2' },
+          `Header residual: ${fmtMoney(bill.header_residual_gbp, 'GBP')} (independent per-line rounding vs. direct header conversion — never apportioned across lines)`) : null,
+        h('div', { id: 'bill-variance-indicator', class: 'mt-3 flex items-center gap-2' },
+          variance == null ? h('span', { class: 'badge badge-slate' }, 'No declared_total_gbp yet')
+            : balanced ? h('span', { class: 'badge badge-green' }, h('i', { class: 'fas fa-check mr-1' }), 'Balanced — sum(lines) = declared total')
+            : h('span', { class: 'badge badge-red' }, h('i', { class: 'fas fa-triangle-exclamation mr-1' }), `Variance: ${fmtMoney(variance, 'GBP')}`)
+        ),
+        h('div', { class: 'mt-4 flex items-center gap-2 flex-wrap' },
+          bill.status === 'draft' ? h('button', {
+            id: 'bill-close-btn', class: 'btn btn-primary text-sm' + (state.billBusy ? ' opacity-60 cursor-not-allowed' : ''),
+            onclick: () => doCloseBill(bill.id), disabled: state.billBusy ? 'disabled' : null,
+          }, h('i', { class: 'fas fa-lock' }), 'Close') : null,
+          bill.status === 'draft' && !balanced ? h('button', {
+            id: 'bill-force-close-btn', class: 'btn text-sm !bg-red-600/20 !text-red-300',
+            onclick: () => { state.billForceCloseOpen = bill.id; render(); },
+          }, h('i', { class: 'fas fa-triangle-exclamation' }), 'Force-close…') : null,
+          bill.status === 'closed' ? h('button', {
+            id: 'bill-write-ledger-btn', class: 'btn btn-ghost text-sm' + (state.billBusy ? ' opacity-60 cursor-not-allowed' : ''),
+            onclick: () => doWriteCostLedger(bill.id), disabled: state.billBusy ? 'disabled' : null,
+            title: 'Write one cost_ledger row per serial resolved to a received device',
+          }, h('i', { class: 'fas fa-book' }), 'Write cost ledger') : null,
+        )
+      ),
+      // ── Force-close overrides (append-only) ──
+      overrides.length ? h('div', { id: 'bill-close-overrides', class: 'card p-5' },
+        h('h3', { class: 'text-sm font-semibold mb-3 flex items-center gap-2' },
+          h('i', { class: 'fas fa-clock-rotate-left' }), 'Force-close history (append-only)'),
+        h('div', { class: 'space-y-2' },
+          overrides.map(o => h('div', { class: 'text-xs border-l-2 border-red-500/40 pl-3 py-1' },
+            h('div', { class: 'flex items-center gap-2' },
+              h('span', { class: 'badge badge-red' }, `variance ${fmtMoney(o.variance_gbp, 'GBP')}`),
+              h('span', { class: 'text-slate-500' }, fmtDate(o.overridden_at)),
+              h('span', { class: 'text-slate-500' }, 'by'),
+              h('span', { class: 'text-slate-300' }, o.overridden_by_name || o.overridden_by_email || `user #${o.overridden_by_user_id}`)
+            ),
+            h('div', { class: 'text-slate-400 mt-1' }, o.reason)
+          ))
+        )
+      ) : null,
+      // ── Lines table ──
+      h('div', { class: 'card overflow-hidden' },
+        h('table', { class: 'w-full text-sm' },
+          h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+            h('tr', {},
+              h('th', { class: 'text-left px-4 py-3' }, 'Line'),
+              h('th', { class: 'text-left px-4 py-3' }, 'SKU / description'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Qty'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Unit price'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Unit price (GBP)'),
+              h('th', { class: 'text-left px-4 py-3' }, 'IMEIs'),
+            )
+          ),
+          h('tbody', { class: 'divide-y divide-slate-800' },
+            !lines.length
+              ? h('tr', {}, h('td', { colspan: 6, class: 'text-center py-10 text-slate-500' }, 'No lines on this bill.'))
+              : lines.map(l => h('tr', { class: 'row-strip' },
+                  h('td', { class: 'px-4 py-2 mono text-xs' }, l.line_no),
+                  h('td', { class: 'px-4 py-2 text-xs' },
+                    h('div', { class: 'font-medium text-cyan-300 mono' }, l.sku || '—'),
+                    h('div', { class: 'text-slate-500' }, l.description || '—')),
+                  h('td', { class: 'px-4 py-2 text-right mono' }, l.quantity),
+                  h('td', { class: 'px-4 py-2 text-right mono text-xs' }, l.unit_price != null ? Number(l.unit_price).toFixed(2) : '—'),
+                  h('td', { class: 'px-4 py-2 text-right mono text-xs' }, l.unit_price_gbp != null ? fmtMoney(l.unit_price_gbp, 'GBP') : '—'),
+                  h('td', { class: 'px-4 py-2 text-xs mono text-slate-400' },
+                    (serialsByLine[l.id] || []).map(s => s.imei).join(', ') || '—'),
+                ))
+          )
         )
       )
     );

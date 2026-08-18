@@ -6,6 +6,36 @@ vitest suite (deliberately named `.browser.mjs` so vitest's `*.spec.*` glob
 ignores it), because it needs a live server + Chromium rather than the
 workerd test pool.
 
+## Process note (2026-08-18): bill-to-manifest consumption is UNSTARTED, confirmed by exhaustive grep
+
+Asked to confirm whether bill line → manifest line consumption (open /
+partly-received / fully-received states) was built as part of Sprint B §1
+or remains unstarted. Confirmed **unstarted**, not merely unsurfaced,
+via zero-match greps rather than assumption:
+- `grep -n "bill" src/routes/manifests.ts` → zero matches (exit code 1).
+- `grep -rn "manifest_id\|expected_devices"` across `src/routes/bills.ts`,
+  `src/lib/billBuilder.ts`, and `migrations/0028_bills_cost_ledger_freight.sql`
+  → zero matches, aside from two prose comments citing
+  `manifests.ts`'s *coding discipline* (bulk-lookup pattern) as a style
+  precedent — not actual linkage code.
+- `grep -rn "bill_id" migrations/ src/` → every hit is confined to bills'
+  own tables (`bill_lines`, `bill_line_serials`, `bill_close_overrides`);
+  none reference a manifest or manifest line.
+
+The only cross-linkage that exists today is
+`bill_line_serials.received_device_id`, resolved via IMEI match against
+`received_devices` at bill-creation time (`src/routes/bills.ts`'s
+`POST /`). That is a narrower, different mechanism than "a bill line
+consumes a manifest line with open/partly-received/fully-received
+states" — it ties a bill line to a device that has already been
+received, not to the manifest line that predicted its arrival. Building
+real manifest-consumption is a separate, unstarted unit.
+
+(This note was originally written as an inline comment in
+`public/static/app.js`'s Bills UI section; moved here 2026-08-18 since a
+process/investigation finding belongs in process notes, not shipped
+frontend code.)
+
 ## Process note (2026-08-14): a tool's own success/failure signal is not proof — `tsc` is
 
 While wiring `siblingLegs` through the last few `computeCe1154()` /
@@ -228,6 +258,7 @@ Standing steps for every run:
    node test/browser/devices-tab.browser.mjs
    node test/browser/devices-tab-2.browser.mjs
    node test/browser/temp-export-standard-lifecycle.browser.mjs
+   node test/browser/bills-tab.browser.mjs
    ```
 4. **Clean up**: copy the `Cleanup (respecting FK order): ...` line the
    script printed and run it via `wrangler d1 execute ... --local
@@ -243,7 +274,10 @@ Standing steps for every run:
           (SELECT COUNT(*) FROM device_events) AS events_remaining,
           (SELECT COUNT(*) FROM repair_jobs) AS repair_jobs_remaining,
           (SELECT COUNT(*) FROM removal_flags) AS removal_flags_remaining,
-          (SELECT COUNT(*) FROM scan_events) AS scan_events_remaining;
+          (SELECT COUNT(*) FROM scan_events) AS scan_events_remaining,
+          (SELECT COUNT(*) FROM bills) AS bills_remaining,
+          (SELECT COUNT(*) FROM bill_lines) AS bill_lines_remaining,
+          (SELECT COUNT(*) FROM cost_ledger) AS cost_ledger_remaining;
    ```
    Every column should read `0` (the `users.password_hash` reset is checked
    separately, since a real operator's password may legitimately be set at
@@ -254,7 +288,7 @@ never collide on the `received_devices.imei` UNIQUE constraint. Prefixes
 claimed so far: `8604550`-`8604553` (opr-ui, in `~/ui-tests/`, not yet moved
 into this repo), `8604554` (opr6-ui), `8604555` (dbg-valui/manifest-val),
 `8604556` (confirm-only), `8604557` (temp-export-standard-lifecycle),
-`8604558` (devices-tab), `8604559` (devices-tab-2).
+`8604558` (devices-tab), `8604559` (devices-tab-2), `8604560` (bills-tab).
 
 ### `devices-tab.browser.mjs` (15 checks)
 Devices tab — **All Devices** sub-view (status + legal transition via the
@@ -285,6 +319,33 @@ The four surfaces `devices-tab.browser.mjs` leaves unexercised:
   Asserts the toast summary counts AND each individual result row's
   per-IMEI outcome badge (`transitioned` / `skipped`), not just the
   aggregate.
+
+### `bills-tab.browser.mjs` (34 checks)
+Bills tab (Sprint B §1 UI) — list, create (per-IMEI pricing, GBP and
+non-GBP with the exchange_rate/rate_date fields appearing conditionally),
+reconciliation panel (`declared_total_gbp` vs `sum(lines)`, explicitly not
+`gbp_total`), close, force-close, and the append-only force-close history
+panel.
+
+**Non-vacuity proof of the §1 close rule, through the real UI+API (not
+asserted from unit tests alone)**: one bill is built to be genuinely
+balanced (declared total and per-IMEI line sum both £300) and closes on
+the first Close click; a second bill is built to be deliberately
+unbalanced (£799.20 summed vs £200 declared_total_gbp) and normal Close is
+asserted to be **rejected** with the correct variance message before
+Force-close (with a reason) is used to override it — demonstrating the
+check is not circular/always-true, since an unbalanced bill visibly fails
+the same code path a balanced one visibly passes.
+
+**Console-error scoping is per-step, not one end-of-run assertion.** The
+close-rejection step deliberately drives a 409 from
+`POST /api/bills/:id/close`, which Chromium logs as a `Failed to load
+resource: 409` console entry. Rather than filtering all 409s globally out
+of the console-error check (which would also hide an unrelated real 409
+bug anywhere else in the run), the script checkpoints `consoleErrors`
+between phases and asserts each phase is clean; the one phase that
+expects a 409 asserts the fresh set contains **exactly** that one line and
+nothing else.
 
 ### `temp-export-standard-lifecycle.browser.mjs` (34 checks)
 Full `TEMP_EXPORT_STANDARD` device/shipment lifecycle: create export via
