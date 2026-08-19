@@ -1,15 +1,37 @@
--- Migration 0023b (REWRITE, 2026-08-19): shipments.shipment_type CHECK
--- widened +1 value. Split from 0023a per Sprint-E instruction (see
--- 0023a's header for the full defect writeup and nine-table audit).
+-- Migration 0023a (REWRITE, 2026-08-19, Sprint G re-split): shipments
+-- recreate — shipment_type CHECK widened +1 value, authorisation_id /
+-- procedure_code relaxed to nullable. FIRST in the new split ordering
+-- (previously LAST as 0023b) — see "SPLIT ORDERING" below for why.
 --
--- This table's original 5-child accounting (sent_emails,
--- shipment_value_deltas, shipment_replies, shipment_lines, shipments'
--- own self-referencing related_export_shipment_id) was correct and is
--- unchanged here — this file only widens shipment_type's CHECK. Runs
--- after 0023a so shipment_lines already carries the received_devices_new
--- repoint from that file; this file's own shipment_lines_new step
--- re-derives shipment_lines' shape from the (already-updated) live
--- shipment_lines table, so no drift between the two files' copies of it.
+-- Split from the original monolithic 0023 (migrations/0023_temp_export_
+-- standard_and_received_at.sql, left unmodified in place, never deployed)
+-- per Sprint-E instruction: "a rewritten table-recreation migration is
+-- its own reviewed unit." See 0023b's header for the full nine-table
+-- audit and the ON DELETE-mode audit table (Sprint G, G1).
+--
+-- SPLIT ORDERING (Sprint G, G2 — reversed from the previous Sprint F
+-- draft): shipments recreates FIRST, received_devices SECOND (0023b).
+-- The naive alternative — received_devices strictly last, with
+-- shipment_lines recreated twice (once here referencing the not-yet-
+-- touched received_devices, once more in 0023b re-deriving from the
+-- by-then-updated copy) — was built and empirically validated
+-- (/tmp/f2-final-reorder, now cleaned up) but rejected: it doubles
+-- shipment_lines' exposure window and copies its data twice for a table
+-- that only needs reshaping once. Instead, shipment_lines is intentionally
+-- left UNTOUCHED by this file — it keeps pointing at the current
+-- (pre-widening) shipments table across this migration and into 0023b,
+-- where it is recreated EXACTLY ONCE, after BOTH parents have settled
+-- into their final names. Empirically validated end-to-end (this pass,
+-- /tmp/g3-combined, now cleaned up): full 0023a→0023b→0023c sequence
+-- against a seeded copy of all 9 originally-recreated tables plus every
+-- one of the 6 received_devices children — zero row loss, clean
+-- foreign_key_check, no leftover _old/_new tables.
+--
+-- This table's 4-child accounting (sent_emails, shipment_value_deltas,
+-- shipment_replies, plus shipments' own self-referencing
+-- related_export_shipment_id) was already correct in the original 0023
+-- and is unchanged here — the only defect in the original monolith was
+-- received_devices' undercounted child list (see 0023b's header).
 --
 -- One new shipment_type value added:
 --   TEMP_EXPORT_STANDARD - the new non-customs consignment type. Existing
@@ -20,7 +42,13 @@
 -- and no procedure code. OPR_REPAIR creation code (opr.ts) continues to
 -- always supply both; this is a widening, not a removal, of guarantees
 -- for the existing flow.
-
+--
+-- ZERO-EXPOSURE-WINDOW SWAP: the old shipments table is renamed away and
+-- the new one renamed into place as two ADJACENT statements (zero
+-- statements where "shipments" resolves to nothing), matching 0023b's
+-- pattern. shipments_old is deliberately NOT dropped by this file — see
+-- "WHAT A FAILURE HERE LEAVES" below.
+------------------------------------------------------------------
 CREATE TABLE shipments_new (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   organisation_id INTEGER NOT NULL REFERENCES organisations(id),
@@ -141,42 +169,29 @@ SELECT
   id, organisation_id, shipment_id, from_mailbox, summary, received_at, logged_by_user_id, created_at
 FROM shipment_replies;
 
-CREATE TABLE shipment_lines_new (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  organisation_id INTEGER NOT NULL REFERENCES organisations(id),
-  shipment_id INTEGER NOT NULL REFERENCES shipments_new(id) ON DELETE CASCADE,
-  received_device_id INTEGER NOT NULL REFERENCES received_devices(id),
-  imei TEXT NOT NULL,
-  sku TEXT,
-  brand TEXT,
-  model TEXT,
-  capacity TEXT,
-  color TEXT,
-  grade TEXT,
-  unit_value REAL NOT NULL,
-  currency TEXT NOT NULL DEFAULT 'GBP',
-  added_by_user_id INTEGER,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-INSERT INTO shipment_lines_new
-  (id, organisation_id, shipment_id, received_device_id, imei, sku, brand, model, capacity, color, grade,
-   unit_value, currency, added_by_user_id, created_at)
-SELECT
-  id, organisation_id, shipment_id, received_device_id, imei, sku, brand, model, capacity, color, grade,
-  unit_value, currency, added_by_user_id, created_at
-FROM shipment_lines;
+------------------------------------------------------------------
+-- ZERO-EXPOSURE-WINDOW SWAP for shipments and its 3 children that are
+-- NOT shared with received_devices (sent_emails, shipment_value_deltas,
+-- shipment_replies). shipment_lines is DELIBERATELY excluded from this
+-- swap — see the file header. Old parent renamed away and new parent
+-- renamed into place as adjacent statements; shipments_old is left
+-- standing (not dropped) because shipment_lines' live FK clause still
+-- reads (after this rename) "REFERENCES shipments_old(id)" and dropping
+-- it now would trip that constraint. It is dropped by 0023b, once
+-- shipment_lines has been repointed at the final `shipments` table.
+------------------------------------------------------------------
+ALTER TABLE shipments     RENAME TO shipments_old;
+ALTER TABLE shipments_new RENAME TO shipments;
 
 DROP TABLE sent_emails;
 DROP TABLE shipment_value_deltas;
 DROP TABLE shipment_replies;
-DROP TABLE shipment_lines;
-DROP TABLE shipments;
 
-ALTER TABLE shipments_new              RENAME TO shipments;
-ALTER TABLE sent_emails_new            RENAME TO sent_emails;
-ALTER TABLE shipment_value_deltas_new  RENAME TO shipment_value_deltas;
-ALTER TABLE shipment_replies_new       RENAME TO shipment_replies;
-ALTER TABLE shipment_lines_new         RENAME TO shipment_lines;
+ALTER TABLE sent_emails_new           RENAME TO sent_emails;
+ALTER TABLE shipment_value_deltas_new RENAME TO shipment_value_deltas;
+ALTER TABLE shipment_replies_new      RENAME TO shipment_replies;
+
+-- shipments_old intentionally NOT dropped here. See header + 0023b.
 
 CREATE INDEX IF NOT EXISTS idx_shipments_org     ON shipments(organisation_id);
 CREATE INDEX IF NOT EXISTS idx_shipments_auth    ON shipments(authorisation_id);
@@ -191,15 +206,36 @@ CREATE INDEX IF NOT EXISTS idx_shipment_value_deltas_org      ON shipment_value_
 CREATE INDEX IF NOT EXISTS idx_shipment_replies_shipment ON shipment_replies(shipment_id);
 CREATE INDEX IF NOT EXISTS idx_shipment_replies_org      ON shipment_replies(organisation_id);
 
-CREATE INDEX IF NOT EXISTS idx_shipment_lines_device   ON shipment_lines(received_device_id);
-CREATE INDEX IF NOT EXISTS idx_shipment_lines_shipment ON shipment_lines(shipment_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_shipment_lines_unique ON shipment_lines(shipment_id, received_device_id);
+-- NOTE: no idx_shipment_lines_* here — shipment_lines is untouched by
+-- this file; its indexes are recreated once, in 0023b, alongside its
+-- single recreation.
 
 ------------------------------------------------------------------
--- Fail loudly if the recreate left anything inconsistent (verified
--- pattern, see 0023a's header for why this is not a bare foreign_key_check).
+-- WHAT A FAILURE HERE LEAVES / DOES THE APP STILL FUNCTION (Sprint F/G
+-- explicit ask). If any statement in this file fails on a real
+-- (non-atomic) D1 deploy:
+--   - Before the swap block: `shipments` is untouched, still the
+--     pre-widening table. No app impact; the deploy simply needs a
+--     re-run once the cause is fixed. d1_migrations correctly records
+--     0023a as not-applied.
+--   - During/after the swap block but before this file's guard: the app
+--     is DOWN for anything touching shipments (TEMP_EXPORT_STANDARD
+--     shipment creation, OPR flows) — `shipments` and its 3 recreated
+--     children are in one of a few well-defined intermediate states
+--     (e.g. shipments_new created but not yet swapped in, or swapped in
+--     but sent_emails/shipment_value_deltas/shipment_replies still mid-
+--     drop-and-rename). `shipment_lines` itself is NEVER broken by this
+--     file (it isn't touched), so anything reading/writing
+--     shipment_lines directly by id continues to work throughout.
+--   - shipments_old surviving past this file's end (by design, until
+--     0023b) is diagnosable, not a mystery: `SELECT name FROM
+--     sqlite_master WHERE name = 'shipments_old'` after this file
+--     should show the table if and only if 0023b has not yet completed.
+--     If it is still present after the full 0023a+0023b+0023c batch is
+--     supposed to have finished, that is itself the fault signal — 0023b
+--     did not reach its final DROP TABLE shipments_old statement.
 ------------------------------------------------------------------
-CREATE TABLE __fk_check_guard_0023b (ok INTEGER NOT NULL CHECK (ok = 1));
-INSERT INTO __fk_check_guard_0023b (ok)
+CREATE TABLE __fk_check_guard_0023a (ok INTEGER NOT NULL CHECK (ok = 1));
+INSERT INTO __fk_check_guard_0023a (ok)
 SELECT 0 FROM pragma_foreign_key_check() LIMIT 1;
-DROP TABLE __fk_check_guard_0023b;
+DROP TABLE __fk_check_guard_0023a;
