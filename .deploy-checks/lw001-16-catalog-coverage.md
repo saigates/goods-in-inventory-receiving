@@ -115,3 +115,49 @@ Catalog tab before treating this as final — the README explicitly
 confirms local and prod matched exactly as of that migration, but that
 was over two weeks before this manifest was received, so it's worth a
 direct look rather than assuming persistence.
+
+## Post-deploy checklist
+
+Once the held commits (including `4a6d16f` / the id-43 self-heal follow-up
+committed after it) are deployed via `gsk hosted deploy`:
+
+1. **Row 701 re-resolution** (`expected_devices`, iPhone 15 Pro Max /
+   1024GB / Black / UG): deploying the `normalizeCapacity()` fix
+   (`e52b4ce`) does NOT retroactively rewrite this already-stored row —
+   its `capacity` column still literally holds `1024GB` until it is
+   explicitly re-resolved (Confirm-SKU / manual-pick flow, or an
+   edit-and-re-save that goes back through the fixed normalizer). Do this
+   after deploy; it does not happen automatically.
+
+2. **Re-run the SKU/grade consistency sweep against PRODUCTION — do not
+   trust the local result as representative.** The `1 mismatch out of 16`
+   figure reported in `4a6d16f`'s commit message (id 43 locally) is a
+   **local-only finding with zero extrapolation value**: local D1 holds
+   only 16 `received_devices` rows total, while **production holds 193
+   `received_devices` rows, none of which are present in local D1**. The
+   true production mismatch count is therefore genuinely **unknown** — it
+   could be 0, it could be dozens — until the sweep is actually re-run
+   against production data. After deploy:
+   - Call `GET /api/inventory/sku-grade-consistency` against the
+     production URL (authenticated as an org admin), or run the
+     equivalent read via `gsk hosted d1_query` directly against the
+     production D1 binding, and record the real `mismatch_count` and the
+     full `mismatches` list here.
+   - For any production id that surfaces (id 43's local shape — grade
+     column correct, SKU suffix stale — is exactly the case the
+     `POST /api/inventory/grade` self-heal fix now handles): call
+     `POST /api/inventory/grade` with each flagged device's own
+     (already-correct) `grade` value. This re-resolves the SKU alone,
+     writes a `SKU_CORRECTION` `device_events` row (not `GRADE_CHANGE`,
+     no `grade_audit` write), and invalidates/re-queues any stale queued
+     print label for that device — no fabricated regrade round-trip
+     needed.
+   - Re-run the consistency check once more afterward and confirm
+     `mismatch_count: 0` (or that every remaining entry has been
+     triaged — the self-heal only fires when it can find an unambiguous
+     catalogue match; anything it can't resolve stays as an explicit
+     `skipped` entry naming the missing combination, same fail-closed
+     posture as the grade-change path).
+   - Update this file with the actual production count once known —
+     do not carry the "1/16" figure forward as if it were a production
+     number.

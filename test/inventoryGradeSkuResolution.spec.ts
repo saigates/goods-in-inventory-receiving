@@ -85,8 +85,19 @@ async function deviceById(id: number) {
 }
 
 async function gradeChangeEventsFor(deviceId: number) {
+  return deviceEventsFor(deviceId, 'GRADE_CHANGE')
+}
+
+async function deviceEventsFor(deviceId: number, eventType: string) {
   const { results } = await db()
-    .prepare(`SELECT * FROM device_events WHERE device_id = ? AND event_type = 'GRADE_CHANGE' ORDER BY id ASC`)
+    .prepare(`SELECT * FROM device_events WHERE device_id = ? AND event_type = ? ORDER BY id ASC`)
+    .bind(deviceId, eventType).all<Record<string, any>>()
+  return results
+}
+
+async function gradeAuditFor(deviceId: number) {
+  const { results } = await db()
+    .prepare(`SELECT * FROM grade_audit WHERE received_device_id = ? ORDER BY id ASC`)
     .bind(deviceId).all<Record<string, any>>()
   return results
 }
@@ -310,5 +321,119 @@ describe('GET /api/inventory/sku-grade-consistency', () => {
     const after = await getConsistency()
     expect(after.json.mismatches.some((m: any) => m.id === device.id)).toBe(false)
     expect((await deviceById(device.id))?.sku).toBe(`TST-${model}-64-WHT-A`)
+  })
+})
+
+describe('POST /api/inventory/grade — SKU-only self-heal when grade is unchanged but SKU is stale (id-43 remediation)', () => {
+  it('re-resolves the SKU when called with the SAME (already-correct) grade, id-43-shaped fixture', async () => {
+    const model = `TESTMODEL-${uniqueSuffix()}`
+    await insertCatalogRow({ sku: `TST-${model}-1TB-NAT-UG`, brand: 'TESTBRAND', model, capacity: '1TB', color: 'NATURAL', grade: 'UG' })
+    // Exactly id 43's real shape: grade column already correct (UG), but sku
+    // still carries the stale -A suffix from before this fix existed.
+    const device = await insertReceivedDevice({ sku: `TST-${model}-1TB-NAT-A`, grade: 'UG', model, capacity: '1TB', color: 'NATURAL' })
+
+    // Calling /grade with the grade it ALREADY has — not a fake round-trip.
+    const { res, json } = await postGrade({ ids: [device.id], grade: 'UG' })
+    expect(res.status).toBe(200)
+    expect(json.updated_count).toBe(0) // grade itself never changed
+    expect(json.updated_ids).toEqual([])
+    expect(json.sku_corrected_count).toBe(1)
+    expect(json.sku_corrected_ids).toEqual([device.id])
+    expect(json.skipped).toEqual([]) // corrected, not skipped
+
+    const row = await deviceById(device.id)
+    expect(row?.grade).toBe('UG') // unchanged
+    expect(row?.sku).toBe(`TST-${model}-1TB-NAT-UG`) // corrected
+  })
+
+  it('writes NO grade_audit row for a SKU-only correction', async () => {
+    const model = `TESTMODEL-${uniqueSuffix()}`
+    await insertCatalogRow({ sku: `TST-${model}-256-BLK-B`, brand: 'TESTBRAND', model, capacity: '256GB', color: 'BLACK', grade: 'B' })
+    const device = await insertReceivedDevice({ sku: `TST-${model}-256-BLK-A`, grade: 'B', model, capacity: '256GB', color: 'BLACK' })
+
+    await postGrade({ ids: [device.id], grade: 'B' })
+
+    expect(await gradeAuditFor(device.id)).toEqual([])
+  })
+
+  it('logs the correction under a distinct device_events type, NOT GRADE_CHANGE', async () => {
+    const model = `TESTMODEL-${uniqueSuffix()}`
+    await insertCatalogRow({ sku: `TST-${model}-128-WHT-C`, brand: 'TESTBRAND', model, capacity: '128GB', color: 'WHITE', grade: 'C' })
+    const device = await insertReceivedDevice({ sku: `TST-${model}-128-WHT-B`, grade: 'C', model, capacity: '128GB', color: 'WHITE' })
+
+    await postGrade({ ids: [device.id], grade: 'C' })
+
+    expect(await gradeChangeEventsFor(device.id)).toEqual([]) // no GRADE_CHANGE row
+
+    const corrections = await deviceEventsFor(device.id, 'SKU_CORRECTION')
+    expect(corrections.length).toBe(1)
+    const meta = JSON.parse(corrections[0].metadata)
+    expect(meta.old_sku).toBe(`TST-${model}-128-WHT-B`)
+    expect(meta.new_sku).toBe(`TST-${model}-128-WHT-C`)
+    expect(meta.grade).toBe('C')
+    // Must not read as a grade change anywhere in the metadata.
+    expect(meta.old_grade).toBeUndefined()
+    expect(meta.new_grade).toBeUndefined()
+  })
+
+  it('invalidates the stale queued print job and queues a fresh one with the corrected SKU', async () => {
+    const model = `TESTMODEL-${uniqueSuffix()}`
+    await insertCatalogRow({ sku: `TST-${model}-512-GLD-UG`, brand: 'TESTBRAND', model, capacity: '512GB', color: 'GOLD', grade: 'UG' })
+    const device = await insertReceivedDevice({ sku: `TST-${model}-512-GLD-A`, grade: 'UG', model, capacity: '512GB', color: 'GOLD' })
+    const oldJobId = await insertQueuedPrintJob(device.id, `TST-${model}-512-GLD-A`)
+
+    await postGrade({ ids: [device.id], grade: 'UG' })
+
+    const jobs = await printJobsFor(device.id)
+    const oldJob = jobs.find(j => j.id === oldJobId)
+    expect(oldJob?.status).toBe('invalidated')
+
+    const freshJobs = jobs.filter(j => j.id !== oldJobId)
+    expect(freshJobs).toHaveLength(1)
+    expect(freshJobs[0].status).toBe('queued')
+    const payload = JSON.parse(freshJobs[0].payload_json)
+    expect(payload.sku).toBe(`TST-${model}-512-GLD-UG`)
+  })
+
+  it('is a true no-op for a device whose grade is unchanged AND SKU already consistent (no DB writes)', async () => {
+    const model = `TESTMODEL-${uniqueSuffix()}`
+    await insertCatalogRow({ sku: `TST-${model}-64-SLV-A`, brand: 'TESTBRAND', model, capacity: '64GB', color: 'SILVER', grade: 'A' })
+    const device = await insertReceivedDevice({ sku: `TST-${model}-64-SLV-A`, grade: 'A', model, capacity: '64GB', color: 'SILVER' })
+    const jobId = await insertQueuedPrintJob(device.id, `TST-${model}-64-SLV-A`)
+
+    const { json } = await postGrade({ ids: [device.id], grade: 'A' })
+    expect(json.updated_count).toBe(0)
+    expect(json.sku_corrected_count).toBe(0)
+    expect(json.sku_corrected_ids).toEqual([])
+    expect(json.skipped).toEqual([{ id: device.id, reason: 'unchanged' }])
+
+    const row = await deviceById(device.id)
+    expect(row?.sku).toBe(`TST-${model}-64-SLV-A`) // untouched
+    expect(await gradeAuditFor(device.id)).toEqual([])
+    expect(await gradeChangeEventsFor(device.id)).toEqual([])
+    expect(await deviceEventsFor(device.id, 'SKU_CORRECTION')).toEqual([])
+    const jobs = await printJobsFor(device.id)
+    expect(jobs).toHaveLength(1)
+    expect(jobs[0].id).toBe(jobId)
+    expect(jobs[0].status).toBe('queued') // untouched, no invalidate/requeue fired
+  })
+
+  it('leaves the device untouched and reports a plain skip when the mismatch cannot be auto-corrected (no catalogue match)', async () => {
+    const model = `TESTMODEL-${uniqueSuffix()}`
+    // No catalogue row at all for this (model, capacity, color, UG) shape —
+    // self-heal cannot resolve, must fail closed like the grade-change path.
+    const device = await insertReceivedDevice({ sku: `TST-${model}-256-TEAL-A`, grade: 'UG', model, capacity: '256GB', color: 'TEAL' })
+
+    const { json } = await postGrade({ ids: [device.id], grade: 'UG' })
+    expect(json.sku_corrected_count).toBe(0)
+    expect(json.skipped).toHaveLength(1)
+    expect(json.skipped[0].id).toBe(device.id)
+    expect(json.skipped[0].reason).toMatch(/mismatch/)
+
+    const row = await deviceById(device.id)
+    expect(row?.sku).toBe(`TST-${model}-256-TEAL-A`) // unchanged — cannot self-heal
+    expect(row?.grade).toBe('UG')
+    expect(await gradeAuditFor(device.id)).toEqual([])
+    expect(await deviceEventsFor(device.id, 'SKU_CORRECTION')).toEqual([])
   })
 })

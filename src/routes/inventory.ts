@@ -108,6 +108,23 @@ app.delete('/:id', async (c) => {
 // failure, not whole-batch abort: this matches the endpoint's existing
 // "not found"/"unchanged" skip-and-report convention, so one bad device in
 // a bulk regrade doesn't block the others.
+//
+// SKU-only self-heal (2026-08-19, id-43 remediation follow-up): the
+// re-resolution above only fires when grade is CHANGING, so a device
+// regraded before this fix existed — grade column already correct, but
+// sku still carrying the old grade's suffix — can never be reached by
+// calling /grade with its current (unchanged) grade; it hits the plain
+// "unchanged" skip before ever reaching re-resolution. Faking a grade
+// round-trip (e.g. UG -> A -> UG) would fix the SKU but writes two
+// fabricated rows into grade_audit and device_events, which is worse than
+// the mismatch itself. So the "unchanged" branch additionally checks
+// whether the stored SKU's grade suffix (parseSkuGradeSuffix) disagrees
+// with the (already correct) grade column, and if so re-resolves the SKU
+// ALONE via the catalogue — grade is never written, grade_audit is never
+// touched, and the correction is logged as its own device_events type
+// (SKU_CORRECTION, not GRADE_CHANGE) so the audit trail never implies a
+// re-grade that didn't happen. No new endpoint/surface — folded into this
+// existing handler per instruction, since this makes /grade self-healing.
 app.post('/grade', async (c) => {
   const user = currentUser(c)
   const orgId = user.organisation_id
@@ -151,9 +168,12 @@ app.post('/grade', async (c) => {
     brand: string | null; model: string | null; capacity: string | null; color: string | null
   }>()
 
+  type DeviceRow = (typeof current)[number]
+
   const updated: number[] = []
   const skipped: { id: number; reason: string }[] = []
   const flaggedForRemoval: number[] = []
+  const skuCorrectedIds: number[] = []
   const stmts = []
   const foundIds = new Set(current.map(r => r.id))
   for (const id of ids) {
@@ -163,11 +183,33 @@ app.post('/grade', async (c) => {
   }
 
   // Devices whose grade is actually changing — these are the only ones
-  // that need catalogue re-resolution. Devices already at the target grade
-  // are skipped below exactly as before (no audit row, no SKU touch).
+  // that need grade-change catalogue re-resolution (below). Devices
+  // already at the target grade are handled separately just below: most
+  // are a true no-op skip, but a subset need a DIFFERENT kind of
+  // self-healing (see "SKU-only correction" block).
   const changing = current.filter(r => r.grade !== grade)
-  for (const row of current) {
-    if (row.grade === grade) skipped.push({ id: row.id, reason: 'unchanged' })
+  const unchanged = current.filter(r => r.grade === grade)
+
+  // SKU-only self-heal (2026-08-19, id-43 follow-up): a device whose grade
+  // is unchanged never reaches the grade-change re-resolution above, so a
+  // device regraded BEFORE this fix existed — grade column already correct,
+  // but sku still carrying the OLD grade's suffix — can never be reached by
+  // calling /grade with its current (unchanged) grade. Faking a grade
+  // round-trip (e.g. UG -> A -> UG) would "fix" the SKU but writes two
+  // fabricated entries into grade_audit and device_events, which is worse
+  // than the mismatch itself — so instead we detect the SKU/grade-suffix
+  // disagreement here and re-resolve the SKU ALONE, without touching grade
+  // or grade_audit at all. This is a distinct concept from a grade change —
+  // logged as its own device_events type (SKU_CORRECTION, not
+  // GRADE_CHANGE) below so the audit trail never implies a re-grade that
+  // didn't happen.
+  const skuMismatched = unchanged.filter(r => {
+    const suffix = parseSkuGradeSuffix(r.sku)
+    return suffix !== null && suffix !== r.grade
+  })
+  const consistent = unchanged.filter(r => !skuMismatched.includes(r))
+  for (const row of consistent) {
+    skipped.push({ id: row.id, reason: 'unchanged' })
   }
 
   // Bulk-resolve the catalogue for every changing device's (model, capacity,
@@ -182,10 +224,24 @@ app.post('/grade', async (c) => {
       )
     : []
 
+  // Same bulk resolution for the SKU-only self-heal set — same (already
+  // correct) grade, since grade is not changing for these rows.
+  const skuFixLookups = skuMismatched.length
+    ? await resolveCatalogSkuBulk(
+        c.env.DB,
+        skuMismatched.map(r => ({ model: r.model, capacity: r.capacity, color: r.color, grade })),
+        orgId,
+      )
+    : []
+
   // device_events writes need to happen after the batch commits (they're
   // logged individually below), but we decide per-row here what SKU (if
   // any) to write and whether the row proceeds at all.
-  const eventsToLog: Array<{ row: typeof changing[number]; oldSku: string; newSku: string }> = []
+  const eventsToLog: Array<{ row: DeviceRow; oldSku: string; newSku: string }> = []
+  // Separate log for the SKU-only self-heal path — kept distinct from
+  // eventsToLog so it can be written under its own device_events type
+  // (SKU_CORRECTION, not GRADE_CHANGE) and never touches grade_audit.
+  const skuCorrectionsToLog: Array<{ row: DeviceRow; oldSku: string; newSku: string }> = []
 
   for (let i = 0; i < changing.length; i++) {
     const row = changing[i]
@@ -242,6 +298,48 @@ app.post('/grade', async (c) => {
     }
   }
 
+  // SKU-only self-heal: re-resolve the catalogue for rows whose grade is
+  // already correct but whose stored SKU's grade suffix disagrees with it
+  // (id 43's exact shape). Grade itself is NOT written here — it's already
+  // right — only sku. No grade_audit row (nothing about the grade changed
+  // to audit); the correction is recorded via device_events below with its
+  // own SKU_CORRECTION event type instead.
+  for (let i = 0; i < skuMismatched.length; i++) {
+    const row = skuMismatched[i]
+    const lookup = skuFixLookups[i]
+
+    if (lookup.status !== 'match') {
+      // Can't self-heal without an unambiguous catalogue row — leave the
+      // device untouched (same fail-closed posture as the grade-change
+      // path) and report the mismatch was seen but not auto-correctable.
+      const combo = `${row.model ?? '?'} · ${row.capacity ?? '?'} · ${row.color ?? '?'} · grade ${grade}`
+      const detail = lookup.status === 'ambiguous'
+        ? `${lookup.candidates.length} catalogue SKUs match ${combo} — cannot pick one automatically`
+        : `No catalogue SKU exists for ${combo}`
+      skipped.push({
+        id: row.id,
+        reason: `sku/grade mismatch detected (sku suggests ${parseSkuGradeSuffix(row.sku)}, grade is ${row.grade}) but could not self-heal: ${detail}. SKU left unchanged at ${row.sku}.`,
+      })
+      continue
+    }
+
+    const newSku = lookup.row.sku
+    if (newSku === row.sku) {
+      // Catalogue resolves back to the same SKU the device already has —
+      // nothing to correct after all (shouldn't normally happen since we
+      // only get here when parseSkuGradeSuffix disagreed with grade, but
+      // stay safe rather than write a no-op correction event).
+      skipped.push({ id: row.id, reason: 'unchanged' })
+      continue
+    }
+    stmts.push(
+      c.env.DB.prepare('UPDATE received_devices SET sku = ? WHERE id = ? AND organisation_id = ?')
+        .bind(newSku, row.id, orgId)
+    )
+    skuCorrectedIds.push(row.id)
+    skuCorrectionsToLog.push({ row, oldSku: row.sku, newSku })
+  }
+
   // Print-job invalidation/re-queue (2026-08-19, same follow-up): a queued
   // (not-yet-printed) label was rendered with the OLD sku baked into its
   // payload_json. If the SKU is changing, that queued job is now wrong and
@@ -251,7 +349,10 @@ app.post('/grade', async (c) => {
   // same pattern as print.ts's mark-sent-batch handler.
   const printInvalidated: Record<number, number[]> = {}
   const printRequeued: Record<number, number> = {}
-  for (const { row, oldSku, newSku } of eventsToLog) {
+  // Covers both actual grade changes AND SKU-only self-heal corrections —
+  // either way the device's SKU changed, so any queued label baked with
+  // the old SKU string is equally stale and needs the same treatment.
+  for (const { row, oldSku, newSku } of [...eventsToLog, ...skuCorrectionsToLog]) {
     if (newSku === oldSku) continue
     const { results: queuedJobs } = await c.env.DB.prepare(
       `SELECT id FROM print_jobs WHERE received_device_id = ? AND organisation_id = ? AND status = 'queued'`
@@ -299,11 +400,32 @@ app.post('/grade', async (c) => {
     })
   }
 
+  // SKU-only self-heal corrections get their OWN event type — deliberately
+  // NOT 'GRADE_CHANGE' — so the audit trail never implies a re-grade
+  // happened when only the SKU was ever wrong. No grade_audit row for
+  // these (grade field never changed).
+  for (const { row, oldSku, newSku } of skuCorrectionsToLog) {
+    await logDeviceEvent(c.env.DB, {
+      organisationId: orgId, deviceId: row.id, eventType: 'SKU_CORRECTION', userId: user.id,
+      reference: bulkId,
+      metadata: {
+        grade: row.grade,
+        reason: reason || 'sku grade-suffix disagreed with grade column; re-resolved via catalogue (grade unchanged)',
+        old_sku: oldSku, new_sku: newSku,
+        ...(printInvalidated[row.id]
+          ? { print_jobs_invalidated: printInvalidated[row.id], print_jobs_requeued: printRequeued[row.id] }
+          : {}),
+      },
+    })
+  }
+
   return c.json({
     ok: true,
     grade,
     updated_count: updated.length,
     updated_ids: updated,
+    sku_corrected_count: skuCorrectedIds.length,
+    sku_corrected_ids: skuCorrectedIds,
     skipped,
     bulk_id: bulkId,
     flagged_for_removal: flaggedForRemoval,
