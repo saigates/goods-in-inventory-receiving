@@ -259,25 +259,62 @@ SELECT
 FROM zoho_batch_devices;
 
 ------------------------------------------------------------------
--- Drop ALL children first (dropping a table only checks constraints IT
--- declares, never incoming references to it — always safe before
--- parents, regardless of NO ACTION vs CASCADE), THEN the parent.
+-- ZERO-EXPOSURE-WINDOW SWAP (F2 revision, 2026-08-19): the previous draft
+-- of this file dropped the OLD received_devices before renaming the NEW
+-- one into place, which meant the name "received_devices" resolved to
+-- NOTHING for several intervening statements — and since D1 has no
+-- atomic multi-statement DDL on a real deploy, a control-plane
+-- interruption inside that window would leave production with the table
+-- gone entirely (193 live rows unreachable under any name). Empirically
+-- tested (this pass, /tmp/f2-final and /tmp/f2-negtest scratch
+-- projects): the fix is to rename the OLD parent away and rename the NEW
+-- parent into place as two ADJACENT statements — a window of ZERO
+-- statements where "received_devices" fails to resolve — and to defer
+-- dropping the old (now differently-named) parent table until every
+-- child has already been swapped successfully.
+--
+-- This also relies on and is protected by a second empirically-confirmed
+-- SQLite behavior: renaming a table causes SQLite to REWRITE the literal
+-- REFERENCES clause text of every OTHER table whose FK points at it, by
+-- name, immediately at rename time (confirmed via sqlite_master.sql
+-- inspection before/after). Concretely: the children below (device_events,
+-- print_jobs, grade_audit, shipment_lines, repair_jobs, zoho_batch_devices)
+-- are DROPPED, not renamed, at this stage — but if any child were
+-- (incorrectly) omitted from this rewrite, that omitted child's live FK
+-- clause still literally reads "REFERENCES received_devices(id)" and gets
+-- silently rewritten to "REFERENCES received_devices_old(id)" the instant
+-- the RENAME below runs — so the final DROP TABLE received_devices_old
+-- fails loudly with the omitted child's own live row as evidence, instead
+-- of silently succeeding. Empirically re-verified this pass: a
+-- deliberately-broken copy of this exact 6-child zero-window file with
+-- repair_jobs omitted still fails at that final DROP with
+-- SQLITE_CONSTRAINT_FOREIGNKEY, confirming the safety net survives this
+-- reordering unchanged.
 ------------------------------------------------------------------
+ALTER TABLE received_devices     RENAME TO received_devices_old;
+ALTER TABLE received_devices_new RENAME TO received_devices;
+
 DROP TABLE device_events;
 DROP TABLE print_jobs;
 DROP TABLE grade_audit;
 DROP TABLE shipment_lines;
 DROP TABLE repair_jobs;
 DROP TABLE zoho_batch_devices;
-DROP TABLE received_devices;
 
-ALTER TABLE received_devices_new    RENAME TO received_devices;
 ALTER TABLE device_events_new       RENAME TO device_events;
 ALTER TABLE print_jobs_new          RENAME TO print_jobs;
 ALTER TABLE grade_audit_new         RENAME TO grade_audit;
 ALTER TABLE shipment_lines_new      RENAME TO shipment_lines;
 ALTER TABLE repair_jobs_new         RENAME TO repair_jobs;
 ALTER TABLE zoho_batch_devices_new  RENAME TO zoho_batch_devices;
+
+-- Old parent dropped LAST, only once every child swap above has already
+-- succeeded — by this point received_devices_old carries no live
+-- incoming FK from anything still named for production use (its own
+-- schema declares no outgoing FK, so this DROP itself never fails; it
+-- exists purely to reclaim the old rowset once the new one is confirmed
+-- live under the real name).
+DROP TABLE received_devices_old;
 
 CREATE INDEX IF NOT EXISTS idx_received_imei     ON received_devices(imei);
 CREATE INDEX IF NOT EXISTS idx_received_sku      ON received_devices(sku);
