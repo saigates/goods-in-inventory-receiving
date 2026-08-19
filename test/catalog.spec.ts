@@ -15,7 +15,7 @@
 // 1024GB / Black / UG device that has a real, exact-match catalogue SKU
 // stored as "1TB").
 import { describe, it, expect } from 'vitest'
-import { normalizeCapacity } from '../src/lib/catalog'
+import { normalizeCapacity, parseSkuGradeSuffix } from '../src/lib/catalog'
 
 describe('normalizeCapacity', () => {
   describe('TB folding (the bug this fixes)', () => {
@@ -122,5 +122,41 @@ describe('normalizeCapacity', () => {
     for (const v of catalogueValues) {
       expect(normalizeCapacity(v)).toBe(v)
     }
+  })
+})
+
+// parseSkuGradeSuffix() — pure-function tests for the SKU-grade-suffix
+// consistency check (2026-08-19, re-grade/SKU follow-up). Confirmed pattern:
+// deriveSku() in src/routes/catalog.ts always appends `-${grade}` as the
+// LAST hyphen segment, verified against local D1 (2772/2781 sku_catalog
+// rows end in -{grade}; the 9 that don't are a legacy pre-migration-0007
+// naming scheme with no grade segment at all, deliberately treated as
+// "no suffix" below, not a mismatch).
+describe('parseSkuGradeSuffix()', () => {
+  it('extracts the trailing grade segment from a well-formed catalogue SKU', () => {
+    expect(parseSkuGradeSuffix('APL-I15PM-1TB-BLK-UG')).toBe('UG')
+    expect(parseSkuGradeSuffix('APL-I17-256-MBL-B')).toBe('B')
+    expect(parseSkuGradeSuffix('SMSG-S24-256-PBK-A')).toBe('A')
+    expect(parseSkuGradeSuffix('SMSG-S24-256-PBK-C')).toBe('C')
+  })
+
+  it('is case-insensitive on the suffix', () => {
+    expect(parseSkuGradeSuffix('APL-I17-256-MBL-b')).toBe('B')
+    expect(parseSkuGradeSuffix('apl-i17-256-mbl-ug')).toBe('UG')
+  })
+
+  it('returns null for a legacy SKU with no grade segment (9 real catalogue rows are this shape)', () => {
+    expect(parseSkuGradeSuffix('SMSG-S24-256-PBK')).toBeNull()
+    expect(parseSkuGradeSuffix('SMSG-ZFOLD5-256-PBK')).toBeNull()
+  })
+
+  it('returns null for a trailing segment that is not a valid grade (e.g. a colour code)', () => {
+    expect(parseSkuGradeSuffix('SMSG-S24-256-XYZ')).toBeNull()
+  })
+
+  it('returns null for null/undefined/empty input', () => {
+    expect(parseSkuGradeSuffix(null)).toBeNull()
+    expect(parseSkuGradeSuffix(undefined)).toBeNull()
+    expect(parseSkuGradeSuffix('')).toBeNull()
   })
 })

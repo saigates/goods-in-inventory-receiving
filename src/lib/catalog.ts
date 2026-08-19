@@ -2,7 +2,7 @@
 // we look up by (model, capacity, color, grade) and return the catalog's
 // SKU verbatim. No SKU invention.
 
-import type { Grade } from './grade'
+import { VALID_GRADES, type Grade } from './grade'
 
 export type CatalogRow = {
   id: number
@@ -312,4 +312,25 @@ export async function resolveCatalogSkuBulk(
     .bind(organisationId)
     .all<CatalogRow>()
   return rows.map((r) => matchCatalogRows(results, r))
+}
+
+// Extract the grade suffix from a catalogue-style SKU string, e.g.
+// "APL-I15PM-1TB-BLK-UG" -> "UG". Confirmed authoritative pattern (2026-08-19,
+// re-grade/SKU-consistency follow-up): `deriveSku()` in src/routes/catalog.ts
+// builds every catalogue SKU as `${buildSku(...).sku}-${grade}` — i.e. the
+// grade is always the LAST hyphen-delimited segment. Verified against local
+// D1: 2772/2781 sku_catalog rows end in `-{grade}`; the 9 that don't are a
+// legacy pre-migration-0007 naming scheme (all grade UG, no trailing
+// suffix at all) and are treated as "no suffix" (null) here rather than a
+// mismatch, since there is nothing wrong to flag — the SKU simply predates
+// grade being encoded in it.
+//
+// Returns null if the SKU has no trailing segment that is itself one of
+// VALID_GRADES (covers both the legacy no-suffix rows above and any
+// malformed/hand-entered SKU that doesn't follow the convention at all).
+export function parseSkuGradeSuffix(sku: string | null | undefined): Grade | null {
+  if (!sku) return null
+  const parts = sku.split('-')
+  const last = (parts[parts.length - 1] || '').toUpperCase()
+  return (VALID_GRADES as readonly string[]).includes(last) ? (last as Grade) : null
 }

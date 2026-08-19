@@ -4,6 +4,7 @@ import { normalizeGrade, VALID_GRADES } from '../lib/grade'
 import { currentUser } from '../lib/auth'
 import { logDeviceEvent } from '../lib/deviceLifecycle'
 import { cleanString } from '../lib/validate'
+import { resolveCatalogSkuBulk, parseSkuGradeSuffix } from '../lib/catalog'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -91,6 +92,22 @@ app.delete('/:id', async (c) => {
 // Writes one received_devices.grade update per id and one grade_audit row per id.
 // Bulk and single use the same endpoint — single is just ids.length === 1.
 // Returns { ok, updated, skipped, audit_bulk_id }.
+//
+// SKU re-resolution (2026-08-19, LW001 follow-up — root cause of id 701/43
+// was a grade change that silently left the OLD, now-wrong-grade SKU in
+// place): a grade change is a change to one of the four dimensions the
+// catalogue SKU is keyed on (model, capacity, color, grade), so whenever a
+// device's grade actually changes we re-run catalogue resolution for the
+// device's (model, capacity, color, NEW grade) and, on a match, update
+// received_devices.sku to match. This is NOT optional/best-effort: if no
+// catalogue row exists for the new combination, that device's regrade is
+// refused outright (grade is NOT updated, no audit/event row is written,
+// its stale SKU is left untouched) rather than silently succeeding with a
+// stale SKU — "silent success is what produced this row" (id 43 in local
+// D1 today: sku ...-A, grade UG, from exactly this gap). Per-device
+// failure, not whole-batch abort: this matches the endpoint's existing
+// "not found"/"unchanged" skip-and-report convention, so one bad device in
+// a bulk regrade doesn't block the others.
 app.post('/grade', async (c) => {
   const user = currentUser(c)
   const orgId = user.organisation_id
@@ -121,11 +138,18 @@ app.post('/grade', async (c) => {
     : null
 
   // Fetch current state for the audit row + skip detection (org-scoped —
-  // an id belonging to another tenant is treated as not-found).
+  // an id belonging to another tenant is treated as not-found). Now also
+  // pulls uuid/brand/model/capacity/color: needed both to re-resolve the
+  // catalogue SKU for the new grade, and to build a fresh print-job payload
+  // if that resolution changes the SKU (see below).
   const placeholders = ids.map(() => '?').join(',')
   const { results: current } = await c.env.DB.prepare(
-    `SELECT id, imei, sku, grade, status FROM received_devices WHERE id IN (${placeholders}) AND organisation_id = ?`
-  ).bind(...(ids as unknown[]), orgId).all<{ id: number; imei: string; sku: string; grade: string; status: string }>()
+    `SELECT id, uuid, imei, sku, grade, status, brand, model, capacity, color
+       FROM received_devices WHERE id IN (${placeholders}) AND organisation_id = ?`
+  ).bind(...(ids as unknown[]), orgId).all<{
+    id: number; uuid: string; imei: string; sku: string; grade: string; status: string
+    brand: string | null; model: string | null; capacity: string | null; color: string | null
+  }>()
 
   const updated: number[] = []
   const skipped: { id: number; reason: string }[] = []
@@ -137,14 +161,59 @@ app.post('/grade', async (c) => {
       skipped.push({ id, reason: 'not found' })
     }
   }
+
+  // Devices whose grade is actually changing — these are the only ones
+  // that need catalogue re-resolution. Devices already at the target grade
+  // are skipped below exactly as before (no audit row, no SKU touch).
+  const changing = current.filter(r => r.grade !== grade)
   for (const row of current) {
-    if (row.grade === grade) {
-      // No-op — same grade, don't write an audit row.
-      skipped.push({ id: row.id, reason: 'unchanged' })
+    if (row.grade === grade) skipped.push({ id: row.id, reason: 'unchanged' })
+  }
+
+  // Bulk-resolve the catalogue for every changing device's (model, capacity,
+  // color, NEW grade) in one query (resolveCatalogSkuBulk loads the whole
+  // org catalogue once and matches in memory) rather than one D1 round-trip
+  // per device — same rationale as the manifest-upload bulk path.
+  const lookups = changing.length
+    ? await resolveCatalogSkuBulk(
+        c.env.DB,
+        changing.map(r => ({ model: r.model, capacity: r.capacity, color: r.color, grade })),
+        orgId,
+      )
+    : []
+
+  // device_events writes need to happen after the batch commits (they're
+  // logged individually below), but we decide per-row here what SKU (if
+  // any) to write and whether the row proceeds at all.
+  const eventsToLog: Array<{ row: typeof changing[number]; oldSku: string; newSku: string }> = []
+
+  for (let i = 0; i < changing.length; i++) {
+    const row = changing[i]
+    const lookup = lookups[i]
+
+    if (lookup.status !== 'match') {
+      // Fail-closed: no catalogue row for this device's new (model,
+      // capacity, color, grade) combination (or more than one, equally
+      // unsafe to guess). Refuse the regrade for THIS device — do not
+      // touch grade, sku, grade_audit, or device_events — and name the
+      // exact missing combination so the operator can add the catalogue
+      // row or correct the input, rather than getting a silent stale-SKU
+      // success.
+      const combo = `${row.model ?? '?'} · ${row.capacity ?? '?'} · ${row.color ?? '?'} · grade ${grade}`
+      const detail = lookup.status === 'ambiguous'
+        ? `${lookup.candidates.length} catalogue SKUs match ${combo} — cannot pick one automatically`
+        : `No catalogue SKU exists for ${combo}`
+      skipped.push({
+        id: row.id,
+        reason: `regrade refused: ${detail}. SKU left unchanged at ${row.sku}.`,
+      })
       continue
     }
+
+    const newSku = lookup.row.sku
     stmts.push(
-      c.env.DB.prepare('UPDATE received_devices SET grade = ? WHERE id = ? AND organisation_id = ?').bind(grade, row.id, orgId)
+      c.env.DB.prepare('UPDATE received_devices SET grade = ?, sku = ? WHERE id = ? AND organisation_id = ?')
+        .bind(grade, newSku, row.id, orgId)
     )
     stmts.push(
       c.env.DB.prepare(
@@ -154,6 +223,7 @@ app.post('/grade', async (c) => {
       ).bind(orgId, row.id, row.imei, row.grade, grade, actor, reason, bulkId, user.id)
     )
     updated.push(row.id)
+    eventsToLog.push({ row, oldSku: row.sku, newSku })
 
     // Regrade-fix 2: a device downgraded to UG while it is ACTIVE_INVENTORY
     // (already on the shelf/for sale) needs manual pull-for-review —
@@ -166,21 +236,66 @@ app.post('/grade', async (c) => {
           `INSERT INTO removal_flags
            (organisation_id, received_device_id, imei, sku, old_grade, new_grade, reason, flagged_by_user_id)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(orgId, row.id, row.imei, row.sku, row.grade, grade, 'regrade_to_UG_while_active_inventory', user.id)
+        ).bind(orgId, row.id, row.imei, newSku, row.grade, grade, 'regrade_to_UG_while_active_inventory', user.id)
       )
       flaggedForRemoval.push(row.id)
     }
   }
 
+  // Print-job invalidation/re-queue (2026-08-19, same follow-up): a queued
+  // (not-yet-printed) label was rendered with the OLD sku baked into its
+  // payload_json. If the SKU is changing, that queued job is now wrong and
+  // must not be printed as-is — invalidate it and queue a fresh one with
+  // the new SKU. Jobs already 'sent' are left alone (the physical label is
+  // already printed; nothing here can un-print it). Reads-before-batch,
+  // same pattern as print.ts's mark-sent-batch handler.
+  const printInvalidated: Record<number, number[]> = {}
+  const printRequeued: Record<number, number> = {}
+  for (const { row, oldSku, newSku } of eventsToLog) {
+    if (newSku === oldSku) continue
+    const { results: queuedJobs } = await c.env.DB.prepare(
+      `SELECT id FROM print_jobs WHERE received_device_id = ? AND organisation_id = ? AND status = 'queued'`
+    ).bind(row.id, orgId).all<{ id: number }>()
+    if (queuedJobs.length === 0) continue
+
+    for (const job of queuedJobs) {
+      stmts.push(c.env.DB.prepare("UPDATE print_jobs SET status = 'invalidated' WHERE id = ?").bind(job.id))
+    }
+    const payload = {
+      uuid: row.uuid, sku: newSku, imei: row.imei,
+      brand: row.brand, model: row.model, capacity: row.capacity, color: row.color, grade,
+    }
+    stmts.push(
+      c.env.DB.prepare(
+        `INSERT INTO print_jobs (organisation_id, received_device_id, payload_json, created_by_user_id) VALUES (?, ?, ?, ?)`
+      ).bind(orgId, row.id, JSON.stringify(payload), user.id)
+    )
+    printInvalidated[row.id] = queuedJobs.map(j => j.id)
+    // Actual new id isn't known until after the batch runs (D1 batch results
+    // don't expose per-statement meta.last_row_id reliably across statement
+    // types in one batch), so we record that a requeue happened; the count
+    // is what the caller needs (device_events carries the audit detail).
+    printRequeued[row.id] = queuedJobs.length
+  }
+
   if (stmts.length) await c.env.DB.batch(stmts)
 
-  // One device_events row per changed device, so grade history is visible
-  // in the unified audit trail alongside status transitions.
-  for (const row of current) {
-    if (row.grade === grade) continue
+  // One device_events row per changed device, so grade + SKU history is
+  // visible in the unified audit trail alongside status transitions. Both
+  // old_sku and new_sku are recorded (not just old_grade/new_grade) so the
+  // correction itself — not just the grade change that triggered it — is
+  // auditable, per the incident that motivated this.
+  for (const { row, oldSku, newSku } of eventsToLog) {
     await logDeviceEvent(c.env.DB, {
       organisationId: orgId, deviceId: row.id, eventType: 'GRADE_CHANGE', userId: user.id,
-      reference: bulkId, metadata: { old_grade: row.grade, new_grade: grade, reason },
+      reference: bulkId,
+      metadata: {
+        old_grade: row.grade, new_grade: grade, reason,
+        old_sku: oldSku, new_sku: newSku,
+        ...(printInvalidated[row.id]
+          ? { print_jobs_invalidated: printInvalidated[row.id], print_jobs_requeued: printRequeued[row.id] }
+          : {}),
+      },
     })
   }
 
@@ -193,6 +308,34 @@ app.post('/grade', async (c) => {
     bulk_id: bulkId,
     flagged_for_removal: flaggedForRemoval,
   })
+})
+
+// Consistency check (2026-08-19, LW001 follow-up): scan received_devices for
+// rows whose stored SKU's grade suffix (the last hyphen-delimited segment —
+// see parseSkuGradeSuffix, confirmed against deriveSku() in
+// src/routes/catalog.ts, which always appends `-${grade}`) disagrees with
+// the row's own `grade` column. A mismatch here means the SKU was never
+// re-resolved after a grade change — exactly the class of bug the /grade
+// re-resolution above now closes going forward; this surfaces any rows a
+// PRE-fix regrade already produced (id 43 in local D1: sku ...-A, grade UG,
+// confirmed via grade_audit as a regrade that happened before this fix).
+// Scoped to received_devices (not expected_devices): this is the
+// post-receipt table where a SKU is actually assigned/persisted and where
+// grade changes are actually written; expected_devices rows are pre-receipt
+// manifest lines with no independently-writable grade column to drift
+// against. SKUs with no parseable grade suffix (the 9 legacy pre-0007 rows)
+// are not counted as mismatches — there is no suffix to disagree.
+app.get('/sku-grade-consistency', async (c) => {
+  const user = currentUser(c)
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, uuid, imei, sku, grade FROM received_devices WHERE organisation_id = ? ORDER BY id ASC`
+  ).bind(user.organisation_id).all<{ id: number; uuid: string; imei: string; sku: string; grade: string }>()
+
+  const mismatches = results
+    .map(r => ({ ...r, sku_grade_suffix: parseSkuGradeSuffix(r.sku) }))
+    .filter(r => r.sku_grade_suffix !== null && r.sku_grade_suffix !== r.grade)
+
+  return c.json({ checked: results.length, mismatch_count: mismatches.length, mismatches })
 })
 
 // Removal-flag list (regrade-fix 2): devices downgraded to UG while
