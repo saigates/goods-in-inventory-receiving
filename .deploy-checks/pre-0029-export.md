@@ -92,12 +92,174 @@ post-migration (grade wins), not USED — that's the entire source of the
 
 ## Deploy scope for THIS deploy
 
-Migrations 0024-0029 only. 0030 is explicitly HELD BACK per user instruction
+~~Migrations 0024-0029 only.~~ **CORRECTION (2026-08-19, in-place addendum,
+file not renamed):** this was wrong. Direct evidence from this same export's
+own `d1_migrations` table (grepped precisely: `INSERT INTO "d1_migrations"`
+lines) shows only IDs 1-22 ever applied to production — nothing for `0023`
+or higher. Independently confirmed by inspecting this export's own
+`received_devices` CREATE TABLE (lines ~100-122): production's live
+`status` CHECK constraint does NOT include `TEMP_EXPORTED_STANDARD` /
+`RETURNED_UNDER_STANDARD`, the two values migration 0023 adds — so 0023
+itself has never run against production. **The true undeployed/held set is
+0023 through 0029 (seven files), not 0024-0029 (six).** No evidence was
+found anywhere in git history of a separate 0023-only deploy between
+`6cbe4e2` (2026-08-11, last confirmed production deploy) and now; commit
+`b9d2dcc` (introducing 0023) landed one day after `6cbe4e2`, and no commit
+in between mentions a deploy action. This correction also propagates to
+`migrations-held/README.md` and `README.md`'s stale "22 migrations" line —
+see those files' own 2026-08-19 notes. This does not change 0030's
+held-back status, which remains for the separate, additional reason stated
+below.
+
+0030 is explicitly HELD BACK per user instruction
 (recreate-and-copy over 756 live expected_devices rows; deploy separately
 once tooling has proven itself further). The raw cross-tab above IS the
 gate check required immediately before 0030's eventual deploy — captured
 now, to be re-verified fresh (not reused) immediately before that migration
 actually runs, since production data may have changed in the interim.
+
+## D1 forensics on migration 0023 itself — BLOCKING DEFECT FOUND (2026-08-19)
+
+Per explicit sprint instruction, migration 0023
+(`0023_temp_export_standard_and_received_at.sql`) was read in full and
+checked against production's live schema (this same export file) before
+any deploy attempt. Three required answers, verbatim:
+
+1. **Does it recreate `received_devices`?** Yes — full recreate-and-copy
+   (`CREATE received_devices_new` / `INSERT ... SELECT` / `DROP
+   received_devices` / `RENAME received_devices_new TO received_devices`),
+   to widen the `status` CHECK by two values.
+
+2. **Does the `INSERT INTO ... SELECT` enumerate every column present in
+   the live production schema (this export's lines 100-122), or a stale
+   list?** The column list itself is NOT stale — diffed programmatically,
+   0023's `received_devices_new` CREATE and INSERT column lists are exactly
+   production's 22 pre-existing columns (`id` through `supplier_id`) plus
+   the one new `received_at` column, in the same order, nothing added or
+   dropped. **However**, see finding 3 below — the migration is unsafe for
+   an entirely different reason than a stale column list.
+
+3. **Every table carrying a foreign key into `received_devices`, and what
+   happens to those references during the recreate:** grepped this export
+   file directly (`REFERENCES received_devices` / `REFERENCES
+   "received_devices"`) and found **six** referencing tables, not the four
+   migration 0021's REVISION-3 fix (and 0023's own header comment, which
+   explicitly claims a "combined 9-table recreate" covering exactly those
+   four) accounts for:
+   - `device_events.device_id` — recreated by 0023 (`device_events_new`,
+     repointed). Handled.
+   - `shipment_lines.received_device_id` — recreated by 0023
+     (`shipment_lines_new`, repointed). Handled.
+   - `print_jobs.received_device_id` (`ON DELETE CASCADE`) — recreated by
+     0023 (`print_jobs_new`, repointed). Handled.
+   - `grade_audit.received_device_id` (`ON DELETE CASCADE`) — recreated by
+     0023 (`grade_audit_new`, repointed). Handled.
+   - **`repair_jobs.device_id`** (created by migration 0022, `NOT NULL
+     REFERENCES received_devices(id)`, no `ON DELETE` action specified —
+     i.e. `NO ACTION`) — **NOT mentioned anywhere in 0023, not recreated,
+     not repointed.**
+   - **`zoho_batch_devices.device_id`** (also created by migration 0022,
+     identical `NOT NULL REFERENCES received_devices(id)`, `NO ACTION`) —
+     **also not mentioned anywhere in 0023.**
+
+   0023's own header comment lists exactly what it believes are "all four
+   children with any FK pointing at received_devices" (device_events,
+   shipment_lines, print_jobs, grade_audit) — this is the same class of
+   miscount migration 0021's REVISION 2 made and had to correct in
+   REVISION 3 (see 0021's own extensive header comment on that incident),
+   except this time nobody caught it: `repair_jobs` and
+   `zoho_batch_devices` did not exist yet when 0021 was written (they were
+   both introduced one migration later, by 0022), so 0021's accounting was
+   correct for the schema at the time — but 0023 was written AFTER 0022
+   and inherited 0021's four-table list without re-deriving it against the
+   schema as it stood by 0023's own time, missing the two NEW children
+   0022 had just added.
+
+   **Consequence, reproduced empirically** (minimal in-memory sqlite3
+   test, `PRAGMA foreign_keys = ON`, mirroring D1's enforcement per 0021's
+   own verified finding that D1 cannot disable FK enforcement mid-migration):
+   `repair_jobs`/`zoho_batch_devices` are `NO ACTION` children exactly like
+   `device_events`/`shipment_lines` were before 0021's REVISION-3 fix —
+   which per that fix's own established finding means `DROP TABLE
+   received_devices` is BLOCKED (not silently corrupted — outright
+   blocked) with `FOREIGN KEY constraint failed` the instant either table
+   has even one row referencing a `received_devices` row. Confirmed via a
+   from-scratch two-scenario test: (a) with a `repair_jobs` row present,
+   `DROP TABLE received_devices` raises `sqlite3.IntegrityError: FOREIGN
+   KEY constraint failed`; (b) with `repair_jobs`/`zoho_batch_devices`
+   empty (0 rows each — production's ACTUAL current state, confirmed via
+   0023's own header comment: "print_jobs=0, grade_audit=0 also
+   confirmed" — though notably that comment never states `repair_jobs`/
+   `zoho_batch_devices` counts, because it never considered those tables
+   at all), the DROP succeeds cleanly.
+
+   **This means migration 0023, AS WRITTEN TODAY, would only fail loudly
+   (not corrupt data) if it were deployed at a moment `repair_jobs` or
+   `zoho_batch_devices` has any rows** — and per `src/lib/repairWorkflow.ts`
+   line 77 (`INSERT INTO repair_jobs (...)`), that table is an ACTIVE,
+   currently-shipped feature (introduced by the same `b9d2dcc` sprint that
+   introduced 0023 itself), not a placeholder. It is not populated in the
+   md5-verified 2026-08-18 production export (0 rows, confirmed via
+   `INSERT INTO "repair_jobs"` grep returning zero matches), so 0023 would
+   likely still succeed if deployed RIGHT NOW against that exact snapshot —
+   but this is a live, actively-written table, not a static one, so that
+   safety window is not guaranteed to still hold by the time any deploy
+   actually runs, and `zoho_batch_devices` is written by the (separate,
+   unconfirmed-active) Zoho batch flow.
+
+   **Branch outcome (per the sprint's own explicit branching instruction):
+   an inbound FK would break — deploy track for 0023-0029 STOPS.** Per the
+   same instruction, no attempt has been made to fix 0023 in this pass —
+   rewriting a table-recreation migration is its own reviewed unit, and the
+   fix pattern is not novel (0021 REVISION 3's dependency-order approach
+   for exactly this NO-ACTION-child class of failure applies directly:
+   `repair_jobs_new` and `zoho_batch_devices_new` need to be added to the
+   same dependency-ordered create/copy/drop/rename sequence, created and
+   repointed before any table that references `received_devices` is
+   dropped) — but that rewrite itself, and its own from-scratch
+   seeded-database verification against `wrangler d1 migrations apply
+   --local` (per 0021's own established verification standard — an
+   empty-DB test would not catch this, exactly as 0021's REVISION-2
+   post-mortem already documented for the cascade-wipe case), is deferred
+   to its own pass, not bundled into this one.
+
+   0023 also does not touch `PRAGMA foreign_keys` anywhere (confirmed via
+   grep — zero matches) — consistent with 0021's own established finding
+   that D1 does not support toggling FK enforcement mid-migration and that
+   attempting it is not "the fix."
+
+## Rollback statement (per sprint instruction, written before any deploy attempt)
+
+Given the finding above, this cannot be written as the simple "bundle-only
+redeploy of `6cbe4e2`" case: **0023 is confirmed to include a
+recreate-and-copy of `received_devices` and five other tables**, not an
+additive-only change. Since the D1 forensics above found 0023 itself
+defective and the deploy track is stopped before any deploy is attempted,
+there is no post-deploy state to roll back FROM — but stating what recovery
+would look like if this had been missed and deployed anyway, honestly, per
+the instruction that an inability to write this paragraph is itself an
+abort: if `repair_jobs`/`zoho_batch_devices` were non-empty at deploy time,
+the migration's own `DROP TABLE received_devices` statement would fail with
+`FOREIGN KEY constraint failed` — per the "DDL transactional caveat" in
+`gsk-hosted-deploy`'s own skill doc, D1's HTTP API has no atomic
+multi-statement DDL, so the statements before the failing `DROP` (the
+`CREATE ... _new` tables and their `INSERT ... SELECT` copies) would already
+be committed, leaving production in a **partial, non-bundle-revertible
+state**: the original `received_devices`/`shipments` tables still present
+and authoritative (the DROP that would have removed them never succeeded),
+but orphaned `*_new` copy tables also present alongside them. Recovery in
+that scenario would require manually dropping the orphaned `_new` tables
+(safe — they hold copies, not the live data) via `d1_execute`, which
+**IS** permitted for that narrow DDL-cleanup purpose since it is not
+`d1_rebuild`/`d1_import`/`--with-db` — those three remain absolutely
+prohibited per the sprint's own standing instruction, including as a
+recovery step, and are not needed here since the live tables were never
+touched. This paragraph could be written honestly (the instruction's own
+abort condition — "if that paragraph cannot be written honestly, that is
+itself an abort" — does not itself trigger), but the underlying finding
+(a genuine, reproducible inbound-FK defect in 0023) is the actual abort
+trigger per the D1 branch rule, independent of whether the rollback
+paragraph itself was writable.
 
 ## Durability — resolved this pass
 
@@ -296,3 +458,11 @@ Per the user's explicit instruction, this deploy does not proceed while
 read for this project) returns `resource_not_found`. Nothing has been
 applied. Next action is to re-test the control plane again before
 attempting `gsk hosted deploy` for 0024-0029.
+
+**SUPERSEDED (2026-08-19)**: see the correction addendum earlier in this
+file — the true scope is 0023-0029 (seven files), and a blocking D1 defect
+was found in migration 0023 itself (missing `repair_jobs`/
+`zoho_batch_devices` FK repointing). The deploy track for this batch is
+now stopped for that reason, not merely the control-plane instability
+described above (which remains separately true and would have held the
+deploy regardless).

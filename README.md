@@ -418,7 +418,7 @@ npm run deploy
 
 ## Testing
 
-**Automated suite**: [Vitest](https://vitest.dev/) via [`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/), which runs tests inside the real `workerd`/Miniflare runtime against a real D1 binding (all 22 migrations in `migrations/` applied before each test file — see `vitest.config.ts` and `test/apply-migrations.ts`), not mocks.
+**Automated suite**: [Vitest](https://vitest.dev/) via [`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/), which runs tests inside the real `workerd`/Miniflare runtime against a real D1 binding (all migrations in `migrations/` applied before each test file — currently 29, `0001`-`0029`; `0030` is deliberately held at `migrations-held/` pending its own deploy, see that directory's README — see `vitest.config.ts` and `test/apply-migrations.ts`), not mocks.
 
 ```bash
 npm test              # vitest run — runs once and exits

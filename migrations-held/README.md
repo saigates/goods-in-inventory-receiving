@@ -13,12 +13,33 @@ approved deploy action) will pick them up.
 `0030_expected_devices_condition_derived_from_grade.sql` is a
 recreate-and-copy migration over the live production `expected_devices`
 table (756 rows at last audit). Per explicit user instruction (2026-08-19),
-it must not ship as a side effect of deploying the already-held 0024–0029
-batch, and its own pre-flight cross-tab needs to be re-run fresh
-immediately before it is deployed on its own. See
-`.deploy-checks/pre-0029-export.md` for the migration-mechanics
-investigation and `.deploy-checks/lw001-16-catalog-coverage.md` for the
-related sweep-scope caveat.
+it must not ship as a side effect of deploying the already-held batch, and
+its own pre-flight cross-tab needs to be re-run fresh immediately before
+it is deployed on its own. See `.deploy-checks/pre-0029-export.md` for the
+migration-mechanics investigation and `.deploy-checks/lw001-16-catalog-coverage.md`
+for the related sweep-scope caveat.
+
+**CORRECTION (2026-08-19):** the batch referenced above is **0023–0029
+(seven files)**, not "0024–0029 (six)" as originally written here.
+Production's own `d1_migrations` table (in the same md5-verified export
+cited below) shows only IDs 1-22 ever applied — nothing for 0023 — and
+production's live `received_devices` CHECK constraint independently
+confirms 0023 was never run (it lacks the two status values 0023 adds).
+**Separately, and more urgently: forensic review of 0023 itself found a
+real, blocking defect** — it recreates `received_devices` and repoints
+four child tables' foreign keys (`device_events`, `shipment_lines`,
+`print_jobs`, `grade_audit`) but misses two more that also carry a
+`NO ACTION` FK into it, `repair_jobs` and `zoho_batch_devices` (both added
+one migration later, by 0022, after 0023's four-table list was written and
+apparently never re-derived against the by-then-current schema). Deploying
+0023 as written would raise `FOREIGN KEY constraint failed` and abort
+(not silently corrupt data) the moment either table holds a row at deploy
+time — `repair_jobs` is confirmed to be an actively-written feature
+(`src/lib/repairWorkflow.ts`), not dormant. **The entire 0023-0029 batch is
+therefore held, not just 0030** — see `.deploy-checks/pre-0029-export.md`'s
+own 2026-08-19 addendum for the full forensics, empirical reproduction,
+and rollback-statement writeup. Fixing 0023 is its own reviewed unit, not
+attempted in this pass.
 
 ## Mechanism confirmation (resolved 2026-08-19, previously unconfirmed)
 

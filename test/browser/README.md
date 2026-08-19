@@ -482,3 +482,45 @@ the frontend (`OprShipmentDetail` in `public/static/app.js`) — if a future
 backend check is worded differently, this script fails loudly with the
 exact badge class and message text logged, rather than silently rendering
 a skipped customs check as a passed one.
+
+## Process note (2026-08-19): scope correction (0023-0029, not 0024-0029) + two owed browser assertions closed + local dev D1 reset side-effect
+
+**Scope correction**: earlier deploy-hold documentation (`.deploy-checks/pre-0029-export.md`,
+`migrations-held/README.md`) stated the held/undeployed migration batch was
+"0024-0029". Production's own `d1_migrations` export shows only IDs 1-22
+ever applied — the correct scope is **0023-0029 (seven files)**. Worse,
+forensic review of migration 0023 itself (per explicit sprint instruction)
+found a genuine blocking defect: it recreates `received_devices` and
+repoints four child tables' FKs but misses two more added by the very next
+migration (0022) — `repair_jobs` and `zoho_batch_devices`, both `NO ACTION`
+children. Deploying 0023 as written would raise `FOREIGN KEY constraint
+failed` the moment either table holds a row. Full forensics, empirical
+reproduction, and the required rollback statement are in
+`.deploy-checks/pre-0029-export.md`'s 2026-08-19 addendum. The whole
+0023-0029 batch is held pending a fix to 0023, which is its own reviewed
+unit, not attempted this pass.
+
+**Two owed browser assertions closed**: commit `7b3d590`'s own message
+stated plainly that the sentinel-survives-a-re-render behavior and the
+`#mf-sup` read-only-lock/pre-fill text had no dedicated browser assertion
+yet. `mf-bill-sentinel-and-lock.browser.mjs` (22 checks) now proves both:
+`#mf-bill` keeps the linked bill selected across an UNRELATED re-render
+(triggered via an unmapped column-mapping change, not by re-touching
+`#mf-bill` itself — a genuine survives-re-render check, not a tautology),
+and `#mf-sup` becomes readonly + pre-filled + captioned on link, and
+editable again (without losing its value) on unlink.
+
+**Local dev D1 reset side-effect, now fixed**: `test/apply-migrations.ts`'s
+`rm -rf .wrangler/state/v3/d1` (used earlier this sprint to get a clean
+schema for the vitest suite) shares its persistence path with the live
+`pm2`-managed dev server, so that reset also wiped the dev server's own
+local D1 — surfaced as `POST /api/auth/login` 500s / `no such table: users`
+when this pass's browser scripts were run. Fixed via `npm run
+db:migrate:local && npm run db:seed` (dry-path check output doubled as
+proof: exactly 0023-0029 applied, 0030 correctly absent) followed by `pm2
+restart webapp` and re-provisioning `owner@saigates.com`'s local-only test
+password (`node scripts/set-password.mjs`, per this file's own documented
+steps above — never touches production). Any future `rm -rf
+.wrangler/state/v3/d1` during a vitest-focused pass should be followed by
+the same restore sequence before assuming the dev server is still usable
+for a browser check.
