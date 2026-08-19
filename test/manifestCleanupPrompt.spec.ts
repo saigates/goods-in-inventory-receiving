@@ -134,6 +134,27 @@ describe('MANIFEST_CLEANUP_PROMPT rule content (v2 fixes)', () => {
     expect(PROMPT).not.toMatch(/- Raw {10}—/)
   })
 
+  // Owner decision 2026-08-18 (see src/lib/condition.ts's "RESOLVED" note):
+  // NEW is dropped, not merely deprioritised. deriveConditionFromGrade()
+  // cannot produce it and migration 0030's CHECK constraint doesn't admit
+  // it, so a prompt that told operators to write NEW would produce a
+  // permanent, unclearable condition_discrepancies flag on every such row
+  // — worse than the value not existing at all.
+  it('Rule 8 (Condition) no longer offers NEW as a valid value', () => {
+    expect(PROMPT).not.toMatch(/-\s*NEW\s+—/)
+    expect(PROMPT).not.toMatch(/"New"\/\s*\n?\s*"Brand New"\/"Sealed"\/"Unused" → NEW/)
+    // "New"/"Brand New" etc. may still appear as vendor wording to detect
+    // and leave blank (not map away silently), but never as a mapping
+    // target — the four-way conjunction "→ NEW" must not occur anywhere.
+    expect(PROMPT).not.toMatch(/→ NEW\b/)
+  })
+
+  it('the MAPPABLE_FIELDS Condition hint no longer lists New as an option', () => {
+    const hintMatch = appJs.match(/key: 'condition',\s*label: 'Condition',\s*hint: '([^']*)'/)
+    expect(hintMatch).not.toBeNull()
+    expect(hintMatch![1]).not.toMatch(/New/)
+  })
+
   it('Rule 10 (Currency) stops on mixed currencies rather than silently merging them', () => {
     expect(PROMPT).toMatch(/STOP if you find more than one distinct currency/i)
   })

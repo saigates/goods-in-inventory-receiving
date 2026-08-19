@@ -50,6 +50,34 @@
 // given the above, they are currently unreachable via the normal import
 // path (normalizeGrade() resolves them to 'UG' first). This is fine, not
 // a defect — acknowledged explicitly, not silently accepted.
+//
+// RESOLVED (owner decision, 2026-08-18, LW001/MANIFEST_CLEANUP_PROMPT v2
+// follow-up): there is no NEW/sealed Condition value anywhere in this
+// scale, and none was added. Two reasons, the second decisive: (1) this
+// function cannot produce NEW from any grade, and migration 0030's CHECK
+// on expected_devices only admits RAW/USED/REFURBISHED, so a NEW value
+// would have nowhere to land; (2) more practically, src/routes/manifests
+// .ts no longer stores an uploaded r.condition at all — it only compares
+// it against the derived value to populate condition_discrepancies (see
+// that file's comment above conditionDiscrepancies). A prompt/operator
+// that writes NEW for genuinely sealed stock would therefore produce a
+// discrepancy flag on every such row that NOTHING can ever clear, since
+// no grade this function accepts derives to NEW. That is worse than the
+// value simply not existing, so MANIFEST_CLEANUP_PROMPT (public/static/
+// app.js) now tells the cleaner to leave Condition blank and report it
+// rather than write NEW.
+//
+// Recorded consequence, not solved here (deliberately out of scope for a
+// grade-derivation function): genuinely sealed/unused stock, if it ever
+// arrives, has no grade in A/B/C/UG that means "new" — it would most
+// likely be graded A by whoever grades it, and derive to REFURBISHED,
+// which is factually wrong. This is harmless today because this pipeline
+// handles buy-back/trade-in stock, not new stock, so the case doesn't
+// arise in practice. If new/sealed stock becomes a real intake category,
+// that is a grade-SCALE question (the A/B/C/UG scale itself needs a fifth
+// value, with its own CHECK-constraint and derivation-table change), not
+// something MANIFEST_CLEANUP_PROMPT or this function should quietly work
+// around on their own.
 export type StoredGrade = 'A' | 'B' | 'C' | 'UG'
 export type VendorScaleGrade = StoredGrade | 'D' | 'E'
 export type Condition = 'REFURBISHED' | 'USED' | 'RAW'

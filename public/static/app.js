@@ -2760,7 +2760,7 @@
     { key: 'color',       label: 'Color *',        hint: 'Phantom Black… (case-insensitive)' },
     { key: 'grade',       label: 'Grade *',        hint: 'A | B | C (anything else → UG)' },
     { key: 'description', label: 'Description',    hint: 'optional · human label only' },
-    { key: 'condition',   label: 'Condition',      hint: 'Raw | Used | Refurbished | New' },
+    { key: 'condition',   label: 'Condition',      hint: 'Raw | Used | Refurbished' },
     { key: 'unit_cost',   label: 'Unit cost',      hint: 'numeric · pre-fills the confirm modal' },
     { key: 'currency',    label: 'Currency',       hint: 'ISO 4217 (USD, GBP…) · optional' },
     { key: 'vat_type',    label: 'VAT type',       hint: 'MARGIN | STANDARD | ZERO | PVAT · optional' },
@@ -2901,18 +2901,24 @@ Apply these exact rules per column:
 8. Condition: OPTIONAL — this column is a cross-check against Grade, not
    an independent input, so leave a row blank if the file simply doesn't
    say rather than asking me or guessing. Where you do fill it in, it
-   must be exactly one of these four values (UPPERCASE):
+   must be exactly one of these three values (UPPERCASE) — there is no
+   NEW/sealed condition in our system; every device we receive is graded
+   A/B/C/UG and its condition is DERIVED from that grade, and there is no
+   grade that derives to a "new/sealed" condition:
       - RAW          — untested / as received, not yet inspected
       - USED         — tested/working, previously owned
       - REFURBISHED  — repaired/restored to a working standard
-      - NEW          — unused, sealed (we rarely receive NEW stock, but
-                       it is still a valid value — keep it as an option)
    Map common supplier wording as: "Raw"/"Untested"/"As-is"/"Bulk"/
    "Grade U" → RAW; "Used"/"Pre-owned"/"Second Hand"/"2nd Hand" → USED;
-   "Refurb"/"Refurbished"/"Renewed"/"Reconditioned" → REFURBISHED; "New"/
-   "Brand New"/"Sealed"/"Unused" → NEW. If a value doesn't clearly match
-   one of these four, ask me rather than guessing — do not leave this
-   column inconsistently filled.
+   "Refurb"/"Refurbished"/"Renewed"/"Reconditioned" → REFURBISHED. If a
+   supplier's file marks a row "New"/"Brand New"/"Sealed"/"Unused", leave
+   Condition blank for that row and tell me about it in your summary
+   rather than mapping it to anything — writing NEW here would only
+   produce a discrepancy flag on receipt that nothing can ever clear
+   (our derivation can't produce NEW from any grade, so the flag would be
+   permanent), which is worse than leaving the field blank. If any other
+   value doesn't clearly match one of the three, ask me rather than
+   guessing — do not leave this column inconsistently filled.
 
 9. Unit Cost: plain number only — no currency symbols, no thousands
    separators, no text. Leave blank if unknown (do not enter 0).

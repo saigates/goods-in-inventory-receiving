@@ -44,24 +44,40 @@ grade-C combo twice).
 **id 701 — iPhone 15 Pro Max / 1024GB / Black / UG**: this is NOT a
 missing catalogue row — the catalogue HAS `iPhone 15 Pro Max` at 1TB in
 every colour/grade (incl. `APL-I15PM-1TB-BLK-UG`, catalogue colour is
-literally "Black"). The blocker is `normalizeCapacity()`
-(`src/lib/catalog.ts` lines 19-25): it only recognizes a bare number
-optionally followed by `GB`/`G` and rewrites it to `<n>GB` — there is no
-GB↔TB unit conversion anywhere in the function. `"1024GB"` normalizes to
-`"1024GB"` and can never equal the catalogue's `"1TB"`, regardless of
-colour or grade. This is a **normalization gap, not a missing SKU** — the
-underlying catalogue entry already exists.
-  - Two ways to close it before this device blocks anything: (a) the
-    fastest fix — just add a `1024GB`-labelled duplicate row to the
-    catalogue for this one SKU (no code change, mirrors how the catalogue
-    already treats capacity as a free-text label); or (b) the correct fix
-    — extend `normalizeCapacity()` to fold `1024` (and `1024GB`) to `1TB`
-    for models whose catalogue capacity is expressed in TB. (b) is a code
-    change and out of scope for "add it in production today through the
-    UI" — recommend (a) for the immediate unblock, and I can open (b) as
-    a follow-up ticket if you want the normalization fixed properly later
-    (it would silently affect every future 1TB manifest row, not just
-    this device).
+literally "Black"). The `1024GB` shown in the table above is the RAW value
+this row was stored with under the OLD `normalizeCapacity()` (see below) —
+it is not, and was never, a second valid catalogue-side spelling.
+
+**UPDATE (2026-08-18, superseding the two options originally listed
+here)**: the canonical form has since been decided and implemented —
+committed as `e52b4ce` (`src/lib/catalog.ts`, with
+`test/catalog.spec.ts`). The catalogue's own real distinct-capacity set
+is exactly `{64GB, 128GB, 256GB, 512GB, 1TB, 2TB}` — it NEVER stores
+`1024GB`/`2048GB` — so `1TB` is the one true canonical form, not `1024GB`.
+`normalizeCapacity()` now folds any bare-GB value that's an exact multiple
+of 1024 UP into TB form (`1024`/`1024GB` → `1TB`, `2048`/`2048GB` → `2TB`),
+the opposite direction from what was floated as "option (a)" in the
+original version of this note (adding a `1024GB`-labelled duplicate
+catalogue row) — that option is now obsolete and was NOT taken; do not
+reintroduce it or any other `1024GB`/`2048GB`-labelled catalogue row.
+`MANIFEST_CLEANUP_PROMPT`'s Rule 4 was also corrected to match (commit
+`02e7502`) — it used to instruct converting a TB value INTO `1024GB`,
+which was backwards and is exactly what produced this row's bad value in
+the first place.
+
+**This code fix has NOT been deployed yet** (deploy remains HELD per
+`pre-0029-export.md` pending the `worker_get` control-plane gate). Once it
+IS deployed, note that fixing `normalizeCapacity()` does not retroactively
+rewrite anything already stored — production `expected_devices` row 701
+will still hold the literal stored value `1024GB` from the original
+upload (inserted via the old, pre-fix normalizer at `src/routes/
+manifests.ts` line 243) until it is explicitly **re-resolved**: re-running
+the catalogue match against this row's current fields (e.g. via the
+Confirm-SKU / manual-pick flow, or an edit-and-re-save that goes back
+through `normalizeCapacity()`) so its stored capacity is rewritten to
+`1TB` and the SKU lookup can then succeed. Deploying the code alone does
+not fix this specific already-received row; it only fixes future uploads
+and any future re-resolution of this one.
 
 **id 709 — iPhone 16 Pro Max / 256GB / Gold / UG**: this one IS a genuine
 missing catalogue row. iPhone 16 Pro Max only exists in four Apple
@@ -84,11 +100,13 @@ listing before picking a SKU — not something to resolve by inference.
 ## Bottom line for your two-blocker sequencing
 
 14 of the 16 devices have a clean, unambiguous local catalogue resolution
-today. 2 need attention before catalogue lookup succeeds for them: 701
-needs either a same-model 1024GB-labelled row added or the TB-normalization
-fix; 709 needs a human decision on which Titanium finish "Gold" actually
-means (or a new catalogue row if it's genuinely a colour Apple doesn't
-sell — unlikely but not ruled out here).
+today. 2 need attention before catalogue lookup succeeds for them: 701's
+code-side blocker is fixed (`e52b4ce`/`02e7502`, canonical form = `1TB`,
+not deployed yet) but the already-stored production row still needs
+re-resolving after deploy, as detailed above — it is not automatically
+corrected by the deploy itself; 709 needs a human decision on which
+Titanium finish "Gold" actually means (or a new catalogue row if it's
+genuinely a colour Apple doesn't sell — unlikely but not ruled out here).
 
 **Production coverage is UNVERIFIED** — this whole table is checked
 against local D1 only, which mirrors the catalogue as of migration 0017
