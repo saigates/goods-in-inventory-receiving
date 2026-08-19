@@ -148,14 +148,17 @@ describe('expected_devices.condition is derived from grade at write time (0030)'
     expect(detailData.expected[0].condition).toBe('REFURBISHED')
   })
 
-  it('the expected_devices.grade CHECK constraint rejects a raw grade outside A/B/C/UG at the DB level', async () => {
-    // This exercises the CHECK added by 0030 directly (bypassing
-    // normalizeGrade() entirely) to prove the CONSTRAINT itself is
-    // correctly in place — separate from, and not a substitute for, the
-    // still-open normalizeGrade() D/E-laundering gap flagged in
-    // src/lib/condition.ts (that gap is about the APPLICATION layer
-    // laundering D/E to UG before this constraint ever sees it; this test
-    // proves the constraint itself does its job against a raw bad value).
+  // Deploy-hold note (2026-08-19): migration 0030 is temporarily held at
+  // migrations-held/ (not migrations/), per explicit user instruction, to
+  // keep it out of the 0024-0029 deploy batch — see migrations-held/README.md.
+  // test/apply-migrations.ts applies every file under ./migrations, so with
+  // 0030 held out, expected_devices has NO grade CHECK constraint right now,
+  // and this test genuinely fails (not "should be un-skipped" — it correctly
+  // detects the constraint's absence). Honest skip, not a silent pass,
+  // matching the project's existing convention (see test/repairWorkflow.spec.ts's
+  // Group D skip). Restore this to `it(...)` the same time 0030 is moved back
+  // into migrations/.
+  it.skip('the expected_devices.grade CHECK constraint rejects a raw grade outside A/B/C/UG at the DB level (skipped while migration 0030 is held out of migrations/ — see migrations-held/README.md)', async () => {
     await expect(
       testEnv.DB.prepare(
         `INSERT INTO expected_devices (manifest_id, imei, grade, condition, organisation_id)
