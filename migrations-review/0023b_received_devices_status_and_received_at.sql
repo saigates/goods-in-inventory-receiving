@@ -51,19 +51,50 @@
 -- │ received_devices    │ cost_ledger (0028)   │ NO ACTION       │ N/A — created by 0028, which  │ Out of scope for 0023b: 0028 runs after     │
 -- │                     │                      │                 │ runs after this file          │ 0023-0027; its FK targets the FINAL         │
 -- │                     │                      │                 │                               │ received_devices, never touched by 0023b     │
--- │ shipments           │ sent_emails          │ none declared   │ Yes (0023a, unchanged from    │ 1→1 (0023a)                                 │
--- │                     │                      │ (no FOREIGN KEY │ Sprint E's correct verdict)   │                                              │
--- │                     │                      │ ON DELETE clause)│                              │                                              │
--- │ shipments           │ shipment_value_deltas│ none declared   │ Yes (0023a)                   │ 1→1 (0023a)                                 │
--- │ shipments           │ shipment_replies     │ none declared   │ Yes (0023a)                   │ 1→1 (0023a)                                 │
+-- │ shipments           │ sent_emails          │ NO ACTION       │ Yes (0023a, unchanged from    │ 1→1 (0023a)                                 │
+-- │                     │                      │ (implicit — FK  │ Sprint E's correct verdict)   │                                              │
+-- │                     │                      │ declares no ON  │                               │                                              │
+-- │                     │                      │ DELETE clause,  │                               │                                              │
+-- │                     │                      │ SQLite default) │                               │                                              │
+-- │ shipments           │ shipment_value_deltas│ NO ACTION       │ Yes (0023a)                   │ 1→1 (0023a)                                 │
+-- │                     │                      │ (implicit)      │                               │                                              │
+-- │ shipments           │ shipment_replies     │ NO ACTION       │ Yes (0023a)                   │ 1→1 (0023a)                                 │
+-- │                     │                      │ (implicit)      │                               │                                              │
 -- │ shipments           │ shipment_lines       │ ON DELETE CASCADE│ Yes (recreated ONCE below,   │ 1→1 (this file's single recreate)           │
 -- │                     │ (shipment_id)        │                 │ shared with received_devices) │                                              │
--- │ shipments (self-ref)│ related_export_      │ none declared   │ Yes (0023a, self-reference    │ Confirmed via /tmp/f2-selfref (Sprint F):    │
--- │                     │ shipment_id          │                 │ column carried through)       │ SQLite rewrites a table's OWN self-reference │
+-- │ shipments (self-ref)│ related_export_      │ NO ACTION       │ Yes (0023a, self-reference    │ Confirmed via /tmp/f2-selfref (Sprint F):    │
+-- │                     │ shipment_id          │ (implicit)      │ column carried through)       │ SQLite rewrites a table's OWN self-reference │
 -- │                     │                      │                 │                               │ FK text on its own rename automatically      │
--- │ shipments           │ shipment_misdeclaration_acks (0025)│ none declared │ N/A — created by 0025, runs after 0023a │ Out of scope: targets the FINAL shipments   │
--- │ shipments           │ freight_invoices (0028)│ none declared │ N/A — created by 0028, runs after 0023a │ Out of scope: targets the FINAL shipments   │
+-- │ shipments           │ shipment_misdeclaration_acks (0025)│ NO ACTION (implicit) │ N/A — created by 0025, runs after 0023a │ Out of scope: targets the FINAL shipments   │
+-- │ shipments           │ freight_invoices (0028)│ NO ACTION (implicit) │ N/A — created by 0028, runs after 0023a │ Out of scope: targets the FINAL shipments   │
 -- └────────────────────┴──────────────────────┴─────────────────┴──────────────────────────────┴──────────────────────────────────────────────┘
+--
+-- "NO ACTION (implicit)" above means: the column declares a bare
+-- `REFERENCES parent(id)` with no explicit `ON DELETE` clause at all —
+-- SQLite's documented default for an omitted ON DELETE clause is NO
+-- ACTION, so these behave identically to an explicit `ON DELETE NO
+-- ACTION` child (loud SQLITE_CONSTRAINT_FOREIGNKEY failure if orphaned),
+-- but the table above previously wrote "none declared" for these rows,
+-- which reads ambiguously as "no ON DELETE mode applies" rather than
+-- "defaults to NO ACTION." Corrected here (Sprint G review pass) so the
+-- table states the actual enforced behaviour, not just the absence of a
+-- keyword in the DDL.
+--
+-- POST-0023 CHILDREN OF received_devices / shipments, NAMED FOR FUTURE
+-- DISCOVERABILITY: `cost_ledger` (0028, child of received_devices, NO
+-- ACTION), `shipment_misdeclaration_acks` (0025, child of shipments, NO
+-- ACTION implicit), and `freight_invoices` (0028, child of shipments, NO
+-- ACTION implicit) are correctly out of scope for THIS deploy because
+-- 0025/0028 run strictly after 0023a-0023c and their FK clauses target
+-- the FINAL, already-settled parent tables — there is no window in which
+-- they could be pointed at a since-renamed-away `_old` copy. But they ARE
+-- children of received_devices/shipments from 0025/0028 onward, and nobody
+-- reading only 0023a/0023b/0023c in isolation would know that. If 0023 is
+-- ever re-run against a database that already has 0025-0028 applied, or
+-- if a future migration recreates either parent again after 0028, these
+-- three tables MUST be added to that recreate's own child list and
+-- audited by this same ON-DELETE-mode method — do not assume the audit
+-- above still covers them once the schema has moved past 0028.
 --
 -- The other 7 originally-recreated tables (device_events, print_jobs,
 -- grade_audit, sent_emails, shipment_value_deltas, shipment_replies,
