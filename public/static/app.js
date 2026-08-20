@@ -122,6 +122,17 @@
     // { verdict: 'awaiting_manifest'|'balanced'|'variance', ... } from
     // GET /api/manifests/:id's bill_reconciliation field.
     billReconciliation: null,
+    // Most recent POST /manifests response's condition_discrepancies /
+    // grade_coercions (G5 item 1) — { manifestId, reference,
+    // conditionDiscrepancies[], gradeCoercions[] } or null before any
+    // upload this session. These two arrays are NEVER persisted
+    // server-side (not written to any table, not returned by
+    // GET /manifests/:id) — this is the only place they exist after the
+    // upload request completes, so it lives in the global state object
+    // (not local to the upload modal, which is removed from the DOM
+    // immediately on a successful submit) to survive re-render and
+    // navigating away from/back to this manifest's Receive tab.
+    lastUploadResult: null,
     events: [],
     inventory: [],
     inventorySelected: new Set(),   // Set<deviceId> for bulk operations on Inventory view
@@ -2596,6 +2607,76 @@
     );
   }
 
+  // ── Upload-result panel (G5 item 1) ──
+  // condition_discrepancies / grade_coercions from the most recent
+  // POST /manifests response for THIS manifest. Persistent (lives in
+  // state.lastUploadResult, not local to the now-removed upload modal) so
+  // a finding discovered at upload is still readable when someone comes
+  // back later to act on it. Renders for exactly the manifest that was
+  // just uploaded (id match) — switching to a different manifest doesn't
+  // carry a stale finding over onto it.
+  //
+  // grade_coercions is deliberately given LOUDER, more alarming treatment
+  // than condition_discrepancies, not equal weight: a discrepancy is the
+  // vendor's own condition text disagreeing with the grade-derived one
+  // (visible, the operator can eyeball which is right); a coercion means
+  // normalizeGrade() silently rewrote an out-of-scale grade to UG because
+  // the data didn't fit the enum at all — a quieter, easier-to-miss event
+  // precisely because nothing "looks wrong" in the row afterwards. Amber
+  // (badge-amber / warning border) for coercions vs slate (badge-slate /
+  // neutral border) for discrepancies keeps a scan-past from happening.
+  function UploadResultPanel() {
+    const res = state.lastUploadResult;
+    if (!res || res.manifestId !== state.activeManifestId) return null;
+    const discrepancies = res.conditionDiscrepancies || [];
+    const coercions = res.gradeCoercions || [];
+    const clean = discrepancies.length === 0 && coercions.length === 0;
+
+    if (clean) {
+      // The zero case matters as much as the populated case — render an
+      // explicit, unambiguous "clean" state, never an empty box that
+      // could be misread as "this feature is broken" or "still loading".
+      return h('div', { id: 'upload-result-panel', class: 'card p-3 flex items-center gap-2 text-sm border border-green-800/40' },
+        h('span', { class: 'badge badge-green' }, h('i', { class: 'fas fa-check mr-1' }), 'Clean upload'),
+        h('span', { class: 'text-xs text-slate-400' }, `${res.reference} — no condition discrepancies, no grade coercions`)
+      );
+    }
+
+    return h('div', { id: 'upload-result-panel', class: 'card p-4 space-y-3 text-sm' },
+      h('div', { class: 'flex items-center gap-2' },
+        h('i', { class: 'fas fa-clipboard-list text-slate-400' }),
+        h('span', { class: 'font-semibold' }, `Upload findings — ${res.reference}`)
+      ),
+      // Coercions FIRST and louder — a silent enum rewrite is the easier
+      // finding to miss, so it doesn't sit second beneath the (visually
+      // similar) discrepancy list at equal weight.
+      coercions.length > 0
+        ? h('div', { id: 'upload-result-coercions', class: 'rounded border border-amber-700/50 bg-amber-500/5 p-3 space-y-1' },
+            h('div', { class: 'flex items-center gap-2 mb-1' },
+              h('span', { class: 'badge badge-amber' }, h('i', { class: 'fas fa-triangle-exclamation mr-1' }), `${coercions.length} grade coercion${coercions.length === 1 ? '' : 's'}`),
+              h('span', { class: 'text-xs text-amber-300/80' }, 'vendor grade was out of scale — silently stored as UG')
+            ),
+            h('div', { class: 'text-xs text-slate-400 space-y-0.5 max-h-40 overflow-y-auto' },
+              coercions.map(gc => h('div', { class: 'mono' },
+                `row ${gc.row_index + 1} · ${gc.imei} · uploaded "${gc.uploaded}" → stored UG`))
+            )
+          )
+        : null,
+      discrepancies.length > 0
+        ? h('div', { id: 'upload-result-discrepancies', class: 'rounded border border-slate-700 p-3 space-y-1' },
+            h('div', { class: 'flex items-center gap-2 mb-1' },
+              h('span', { class: 'badge badge-slate' }, h('i', { class: 'fas fa-circle-info mr-1' }), `${discrepancies.length} condition discrepanc${discrepancies.length === 1 ? 'y' : 'ies'}`),
+              h('span', { class: 'text-xs text-slate-500' }, 'uploaded condition disagreed with the grade-derived condition (grade wins; not overridden)')
+            ),
+            h('div', { class: 'text-xs text-slate-400 space-y-0.5 max-h-40 overflow-y-auto' },
+              discrepancies.map(cd => h('div', { class: 'mono' },
+                `row ${cd.row_index + 1} · ${cd.imei} · uploaded "${cd.uploaded}" vs derived "${cd.derived}"`))
+            )
+          )
+        : null
+    );
+  }
+
   // ───────── Manifests view ─────────
   // ── Manifest → bill reconciliation panel (0029) ──
   // sum(manifest unit costs) vs. the linked bill's declared_total_gbp,
@@ -3419,6 +3500,20 @@ into each Condition, each VAT Type, and each Currency.`;
       toast(`Manifest created · ${r.count} devices loaded` +
         (skipped ? `<br><span class="text-xs">${skipped} row${skipped === 1 ? '' : 's'} skipped — bad price/currency/VAT (fix the file and re-upload, or receive those units without prefill)</span>` : ''),
         skipped ? 'warn' : 'ok', skipped ? 6000 : 3000);
+      // condition_discrepancies / grade_coercions (0030) exist ONLY in this
+      // response — never persisted server-side, never returned by
+      // GET /manifests/:id — so this is the one chance to capture them.
+      // A toast isn't enough (the whole point of this panel is that the
+      // finding is still readable when someone comes back later to act on
+      // it), and the upload modal is removed a few lines below, so it goes
+      // into global state keyed by manifest id and is rendered from
+      // ReceiveView() for as long as that manifest stays active.
+      state.lastUploadResult = {
+        manifestId: r.manifest_id,
+        reference: uploadCtx.reference,
+        conditionDiscrepancies: r.condition_discrepancies || [],
+        gradeCoercions: r.grade_coercions || [],
+      };
       $('#upload-modal').remove();
       state.activeManifestId = r.manifest_id;
       await refreshManifests();
@@ -3506,6 +3601,13 @@ into each Condition, each VAT Type, and each Currency.`;
         // unpriced manifest/bill) it reads "Awaiting manifest", resolving
         // to a real Balanced/Variance verdict only once linked and priced.
         m ? ManifestBillReconciliationBadge() : null,
+
+        // ── Upload-result panel (G5 item 1) — condition_discrepancies /
+        // grade_coercions from the manifest's most recent upload, if any.
+        // Renders below the bill-reconciliation badge (both are per-manifest
+        // findings surfaced above the scan input) and persists across
+        // re-render / navigating away and back via state.lastUploadResult.
+        UploadResultPanel(),
 
         // Scan input
         h('div', { class: 'card scan-ring p-6' },

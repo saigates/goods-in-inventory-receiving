@@ -401,7 +401,8 @@ into this repo), `8604554` (opr6-ui), `8604555` (dbg-valui/manifest-val),
 `8604556` (confirm-only), `8604557` (temp-export-standard-lifecycle),
 `8604558` (devices-tab), `8604559` (devices-tab-2), `8604560` (bills-tab),
 `8604561` (manifest-bill-link), `8604562` (bill-detail-vacuous-check —
-claimed per convention though this script seeds no received_devices rows).
+claimed per convention though this script seeds no received_devices rows),
+`8604563` (upload-result-panel).
 
 ### `devices-tab.browser.mjs` (15 checks)
 Devices tab — **All Devices** sub-view (status + legal transition via the
@@ -482,6 +483,41 @@ the frontend (`OprShipmentDetail` in `public/static/app.js`) — if a future
 backend check is worded differently, this script fails loudly with the
 exact badge class and message text logged, rather than silently rendering
 a skipped customs check as a passed one.
+
+### `upload-result-panel.browser.mjs` (22 checks)
+Upload-result panel (G5 item 1) — `condition_discrepancies` /
+`grade_coercions` from `POST /manifests`, surfaced in a persistent panel
+(`#upload-result-panel`) on the Receive tab rather than a toast, since
+these two arrays are never persisted server-side and a toast alone would
+make a finding unreadable the moment someone came back later to act on
+it. Two manifests are uploaded in sequence against a dedicated disposable
+fixture account (`g5-fixture@example.invalid` — `owner@saigates.com` /
+`ops@saigates.com` are real per-person accounts and are off-limits as
+disposable test fixtures per the standing constraint; provision this
+fixture the same way as `g4-fixture@example.invalid` below, via
+`scripts/set-password.mjs` + a plain `INSERT INTO users`):
+
+- **Populated case**: a 2-row manifest with one out-of-scale grade (`Z` →
+  coerced to `UG`, logged in `grade_coercions`) and two uploaded
+  `condition` values that disagree with their grade-derived condition
+  (logged in `condition_discrepancies`). Asserts the exact coercion/
+  discrepancy counts and per-row detail text render, that the two findings
+  render in visually **distinct** blocks (`#upload-result-coercions` /
+  `#upload-result-discrepancies`, amber vs slate), and — checked via
+  `compareDocumentPosition`, not inferred — that the coercions block
+  precedes the discrepancies block in DOM order, since a coercion is the
+  quieter, easier-to-miss event of the two and must not be scanned past at
+  equal visual weight. Then asserts the panel **survives an unrelated
+  re-render** (opening and dismissing the Bulk-scan modal) and **survives
+  navigating away to Manifests and back to Receive**, without a page
+  reload, still showing the same findings — both via actual DOM text
+  reads after the navigation, not inferred from the global `state` object
+  persisting.
+- **Zero case**: a second, clean manifest (grade `B` + condition `Used`,
+  which is exactly what `B` derives) is uploaded and made active. Asserts
+  the panel switches to an explicit "Clean upload" state — not an empty
+  box, and not the prior manifest's stale coercion/discrepancy counts
+  bleeding across the switch.
 
 ## Process note (2026-08-19): scope correction (0023-0029, not 0024-0029) + two owed browser assertions closed + local dev D1 reset side-effect
 
@@ -598,3 +634,34 @@ destructive command (`rm -rf`, `db:reset` without explicit opt-in, or any
 manual equivalent) should be run against that path without the same
 intentional, opt-in gate `db:reset` now enforces, since that path — not
 the test harness — is what actually cost two restores.
+
+## G5 item 1 (2026-08-20): upload-result panel — persistent, distinct coercion/discrepancy treatment, zero-case proven
+
+`condition_discrepancies` / `grade_coercions` from `POST /manifests` exist
+only in that response — never persisted server-side, never returned by
+`GET /manifests/:id` — and the pre-submission upload modal that receives
+the response is removed from the DOM (`$('#upload-modal').remove()`)
+immediately on success, before either array is read. `submitManifest()`
+(`public/static/app.js`) now captures both into a new `state.lastUploadResult`
+field (`{ manifestId, reference, conditionDiscrepancies, gradeCoercions }`)
+instead of discarding them, and a new `UploadResultPanel()` renders on the
+Receive tab for the manifest that field is keyed to.
+
+`grade_coercions` is given deliberately louder treatment than
+`condition_discrepancies` — a discrepancy is the vendor's own condition
+text disagreeing with the grade-derived one (visible, an operator can
+eyeball which is right); a coercion means `normalizeGrade()` silently
+rewrote an out-of-scale grade to `UG` because the data didn't fit the enum
+at all, a quieter event precisely because nothing "looks wrong" in the row
+afterwards. The coercions block (amber, `#upload-result-coercions`) is
+rendered ahead of the discrepancies block (slate, `#upload-result-discrepancies`)
+in DOM order — proven via `compareDocumentPosition`, not asserted from
+memory. The zero case renders an explicit "Clean upload" state
+(`#upload-result-panel` with a green badge), never an empty box.
+
+Proven end-to-end by `upload-result-panel.browser.mjs` (22 checks, all
+passing) — see its entry above — including that the panel survives an
+unrelated re-render and a navigation away (Manifests) and back (Receive)
+without a page reload, and that the zero-case manifest does not inherit
+the previous manifest's stale counts. `tsc --noEmit` clean; full vitest
+suite unchanged at 25 files / 511 passed / 8 skipped / 519 total.
