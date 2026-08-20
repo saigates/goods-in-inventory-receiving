@@ -1,8 +1,9 @@
--- Migration 0023b (REWRITE, 2026-08-19, Sprint G re-split): received_devices
--- recreate — status CHECK widened +2 values, received_at column, plus the
--- SINGLE recreation of shipment_lines (shared child of both received_devices
--- and shipments). SECOND in the new split ordering (previously FIRST as
--- 0023a) — see 0023a's "SPLIT ORDERING" note for why the order flipped.
+-- Migration 0023b (REWRITE, 2026-08-19, Sprint G re-split; follow-up pass
+-- 2026-08-20 for M1/M2/M4/M6): received_devices recreate — status CHECK
+-- widened +2 values, received_at column, plus the SINGLE recreation of
+-- shipment_lines (shared child of both received_devices and shipments).
+-- SECOND in the new split ordering (previously FIRST as 0023a) — see
+-- 0023a's "SPLIT ORDERING" note for why the order flipped.
 --
 -- 0023 has never been applied to production (confirmed: production's
 -- d1_migrations table only lists IDs 1-22; production's live
@@ -83,30 +84,49 @@
 -- POST-0023 CHILDREN OF received_devices / shipments, NAMED FOR FUTURE
 -- DISCOVERABILITY: `cost_ledger` (0028, child of received_devices, NO
 -- ACTION), `shipment_misdeclaration_acks` (0025, child of shipments, NO
--- ACTION implicit), and `freight_invoices` (0028, child of shipments, NO
--- ACTION implicit) are correctly out of scope for THIS deploy because
--- 0025/0028 run strictly after 0023a-0023c and their FK clauses target
--- the FINAL, already-settled parent tables — there is no window in which
--- they could be pointed at a since-renamed-away `_old` copy. But they ARE
--- children of received_devices/shipments from 0025/0028 onward, and nobody
--- reading only 0023a/0023b/0023c in isolation would know that. If 0023 is
--- ever re-run against a database that already has 0025-0028 applied, or
--- if a future migration recreates either parent again after 0028, these
--- three tables MUST be added to that recreate's own child list and
--- audited by this same ON-DELETE-mode method — do not assume the audit
--- above still covers them once the schema has moved past 0028.
+-- ACTION implicit), `freight_invoices` (0028, child of shipments, NO
+-- ACTION implicit), and `removal_flags` (0023c, child of received_devices,
+-- ON DELETE CASCADE — see below) are correctly out of scope for THIS
+-- deploy because 0025/0028 run strictly after 0023a-0023c and their FK
+-- clauses target the FINAL, already-settled parent tables, and because
+-- 0023c runs after this file's own received_devices swap has fully
+-- completed — there is no window in which any of the four could be
+-- pointed at a since-renamed-away `_old` copy. But they ARE children of
+-- received_devices/shipments from this point onward, and nobody reading
+-- only 0023a/0023b in isolation would know that. If 0023 (0023a+0023b) is
+-- ever re-run against a database that already has 0023c/0025/0028
+-- applied, or if a future migration recreates either parent again after
+-- any of these exist, all four tables MUST be added to that recreate's
+-- own child list and audited by this same ON-DELETE-mode method — do not
+-- assume the audit above still covers them once the schema has moved past
+-- this point. `removal_flags` is the one member of this list to treat
+-- with the most caution: it is the only CASCADE relationship among the
+-- four (the other three are NO ACTION / implicit NO ACTION), so a future
+-- recreate that misses it would not fail loudly on a dangling reference —
+-- it would silently delete removal_flags' rows via the same CASCADE-
+-- hazard mechanism documented below, the exact failure class this sprint
+-- exists to close. See 0023c's own header for the reciprocal note written
+-- from that file's side.
 --
--- The other 7 originally-recreated tables (device_events, print_jobs,
--- grade_audit, sent_emails, shipment_value_deltas, shipment_replies,
--- repair_jobs's own... no, correction: the 7 non-parent recreated tables)
--- are themselves FK LEAVES — nothing anywhere in the codebase declares a
--- FOREIGN KEY pointing at any of them (re-verified this pass:
+-- The other 9 originally-recreated non-parent tables (device_events,
+-- print_jobs, grade_audit, repair_jobs, zoho_batch_devices, sent_emails,
+-- shipment_value_deltas, shipment_replies, shipment_lines) are themselves
+-- FK LEAVES — nothing anywhere in the codebase declares a FOREIGN KEY
+-- pointing at any of them (re-verified this pass, now including
+-- repair_jobs and zoho_batch_devices which the original version of this
+-- check omitted:
 -- `grep -rn "REFERENCES device_events(\|REFERENCES print_jobs(\|REFERENCES
 -- grade_audit(\|REFERENCES sent_emails(\|REFERENCES shipment_value_deltas(\|
--- REFERENCES shipment_replies(\|REFERENCES shipment_lines("` across
--- migrations/*.sql and migrations-review/*.sql returns zero hits except
--- the two parent FKs on shipment_lines itself, both accounted for above).
--- So they need no further child-of-child accounting.
+-- REFERENCES shipment_replies(\|REFERENCES shipment_lines(\|REFERENCES
+-- repair_jobs(\|REFERENCES zoho_batch_devices("` across migrations/*.sql
+-- and migrations-review/*.sql returns zero real hits — the only matches
+-- are this comment's own quoted grep pattern, and the two parent FKs on
+-- shipment_lines itself, both accounted for above). That makes 9 non-
+-- parent recreated tables in total (of 11 tables touched by 0023a+0023b
+-- combined, the other 2 being the parents shipments and received_devices
+-- themselves), not the 7 an earlier draft of this paragraph named before
+-- repair_jobs/zoho_batch_devices were folded in — so they need no further
+-- child-of-child accounting.
 --
 -- SPRINT E "EIGHT OF NINE CORRECT" VERDICT: DOES NOT SURVIVE THE STRICTER
 -- TEST, AS STATED, BUT THE OUTCOME IS UNCHANGED. The stricter ON DELETE
@@ -158,6 +178,38 @@
 -- reintroduce either pragma as "the fix" without re-verifying against a
 -- real `wrangler d1 migrations apply --local` run first.
 --
+-- SELF-REFERENCING FK ORDERING — settled, not just carried through
+-- (Sprint G follow-up): shipments.related_export_shipment_id's ordering
+-- risk (whether an INSERT...SELECT with no ORDER BY could trip on a row
+-- referencing another not-yet-inserted row) was fully resolved this pass
+-- in 0023a, not merely "carried through" from the rename-rewrite finding
+-- this table previously cited. See 0023a's header for the three-test
+-- proof (linked pair, adversarial reverse-ordered pair, negative control)
+-- and the underlying documented SQLite guarantee (immediate FK
+-- constraints are checked at statement end, not per row).
+--
+-- INDEX/TRIGGER/VIEW COMPLETENESS — measured, not assumed (Sprint G
+-- follow-up, M2/M5/M7): a passing row-count-and-foreign_key_check test
+-- battery, however thorough, cannot see a silently-lost schema object —
+-- the same blindness the CASCADE-hazard finding above describes for rows,
+-- extended to indexes, triggers, and views. This was not a hypothetical
+-- concern: querying `sqlite_master`/`pragma_index_list` AFTER a full
+-- 0001-0022 + 0023a + 0023b + 0023c sequence (not the SQL source text)
+-- found that the original version of 0023a's index-recreation statements
+-- silently no-oped against `shipments` — see 0023a's header for the full
+-- account and fix. Triggers and views were also checked directly against
+-- the same pre-0023 baseline (all 11 tables touched by 0023a+0023b+0023c):
+-- `SELECT type, count(*) FROM sqlite_master WHERE type IN ('trigger',
+-- 'view') GROUP BY type` returns an EMPTY result set — zero triggers and
+-- zero views exist anywhere in this codebase's schema, not just on these
+-- 11 tables. That is a measured result, not an absence of a check: there
+-- is nothing in either category for any recreate in this file (or 0023a
+-- or 0023c) to silently lose, and this must be re-confirmed by the same
+-- query if a future migration ever introduces the first trigger or view.
+-- The full `(name, tbl_name, unique)` index comparison against the
+-- pre-0023 baseline, run fresh after this fix, is in
+-- migrations-review/README.md's "What was empirically established" list.
+--
 -- SINGLE SHIPMENT_LINES RECREATE (Sprint G, G2): shipment_lines is a
 -- child of BOTH received_devices and shipments. Recreating it separately
 -- in each parent's file (as an earlier Sprint F draft did) would double
@@ -184,14 +236,51 @@
 --                              counterpart.
 -- See src/lib/deviceLifecycle.ts for the ALLOWED_TRANSITIONS wiring.
 --
--- received_at (plain ALTER, no recreate needed) records when a device was
--- physically received, independent of created_at (row-insert time) —
--- backdatable via scan.ts's receive endpoints.
+-- received_at records when a device was physically received, independent
+-- of created_at (row-insert time) — backdatable via scan.ts's receive
+-- endpoints. It is a brand-new column with no prior data anywhere, so it
+-- is declared directly on received_devices_new below and populated as
+-- NULL by the recreate's INSERT...SELECT — see M1 note immediately below
+-- for why this replaces the previous separate ALTER TABLE statement.
+--
+-- M1 FIX (Sprint G follow-up): the original version of this file opened
+-- with a standalone `ALTER TABLE received_devices ADD COLUMN received_at
+-- DATETIME` purely so the recreate's INSERT...SELECT column list below
+-- could reference `received_at` uniformly against both the old and new
+-- table. That made this file NOT RE-RUNNABLE on a real non-atomic D1
+-- deploy: after ANY mid-file failure, a straight re-run died on statement
+-- 1 with "duplicate column name: received_at", regardless of whether the
+-- failure happened before or after the swap — directly contradicting the
+-- "the deploy simply needs a re-run" language this file's own failure
+-- narrative used in three places. Fixed by dropping the separate ALTER
+-- entirely: received_at is declared only on received_devices_new, and the
+-- INSERT...SELECT below supplies `NULL AS received_at` directly rather
+-- than reading a column that no longer needs to exist on the pre-recreate
+-- table. Paired with the DROP TABLE IF EXISTS prologue immediately below,
+-- this file's PRE-SWAP portion is now genuinely re-runnable from a clean
+-- failure (see that prologue's own closing caveat for what "genuinely"
+-- does not yet cover).
 
 ------------------------------------------------------------------
--- Plain column addition (no recreate required)
+-- RE-RUN SAFETY PROLOGUE (Sprint G follow-up, M1): mirrors 0023a's
+-- prologue for the identical reason — a partial failure on a real,
+-- non-atomic D1 deploy could leave one or more _new scratch tables, or
+-- the guard table, already created from a failed attempt, and a straight
+-- re-run of this file's text would otherwise die on "table already
+-- exists" instead of retrying. No-op on a genuine first run. As with
+-- 0023a, this resolves re-run safety for a failure BEFORE the swap
+-- statements below have executed; a retry after the swap(s) have already
+-- run once still needs manual inspection rather than a blind re-run,
+-- pending the outstanding production D1 atomicity answer.
 ------------------------------------------------------------------
-ALTER TABLE received_devices ADD COLUMN received_at DATETIME;
+DROP TABLE IF EXISTS received_devices_new;
+DROP TABLE IF EXISTS device_events_new;
+DROP TABLE IF EXISTS print_jobs_new;
+DROP TABLE IF EXISTS grade_audit_new;
+DROP TABLE IF EXISTS repair_jobs_new;
+DROP TABLE IF EXISTS zoho_batch_devices_new;
+DROP TABLE IF EXISTS shipment_lines_new;
+DROP TABLE IF EXISTS __fk_check_guard_0023b;
 
 ------------------------------------------------------------------
 -- received_devices (parent) — status CHECK widened +2 values
@@ -243,7 +332,7 @@ SELECT
   id, organisation_id, uuid, imei, sku, brand, model, capacity, color, grade, source,
   manifest_id, expected_device_id, status, label_printed_at, notes,
   created_by_user_id, created_at, updated_at,
-  buy_price, currency, vat_type, supplier_id, received_at
+  buy_price, currency, vat_type, supplier_id, NULL AS received_at
 FROM received_devices;
 
 ------------------------------------------------------------------
@@ -359,6 +448,44 @@ FROM zoho_batch_devices;
 -- after both parents (shipments from 0023a, received_devices here) have
 -- settled into their final names.
 
+-- M6 SCOPE FOR THIS FILE — determined, not silently skipped (Sprint G
+-- follow-up): 0023a's M6 instruction was to apply the same explicit
+-- DROP-INDEX pattern "for every recreated table" in this file. Checked
+-- against every table this file recreates, by tracing this file's own
+-- statement order rather than assuming the pattern is or isn't needed:
+--   - received_devices is RENAMED (not dropped) to received_devices_old
+--     below, the same shape as shipments in 0023a. But unlike
+--     shipments_old (deliberately kept alive past 0023a's own end, so
+--     its indexes were still claimed when 0023a's original CREATE INDEX
+--     statements ran), received_devices_old is fully DROPPED by THIS
+--     FILE (see "DROP TABLE received_devices_old" below) BEFORE this
+--     file's own CREATE INDEX block runs. The DROP frees all of
+--     received_devices_old's index names outright; there is no
+--     surviving claimant left when idx_received_* is (re)created, so
+--     there is nothing for CREATE INDEX IF NOT EXISTS to collide with.
+--   - device_events, print_jobs, grade_audit, repair_jobs and
+--     zoho_batch_devices are each DROPPED OUTRIGHT below (not renamed
+--     and deferred) — DROP TABLE frees a table's index names in the
+--     same statement, so these five never have a surviving old
+--     claimant at any point, let alone at their own CREATE INDEX time.
+--   - shipment_lines is likewise DROPPED OUTRIGHT (see the
+--     single-recreate section below), for the same reason.
+-- Conclusion: none of this file's own recreated tables share
+-- `shipments`' exposure shape (an old copy that is still alive, under
+-- the contested names, at the moment the new table's indexes are
+-- created). This is a structural property of this file's statement
+-- ordering, not a coincidence to take on faith — it is also what the
+-- M2 verification run in migrations-review/README.md already measured
+-- directly: of the full pre-fix 0/3 shipments-family result, 0023b's
+-- OWN tables (received_devices, its five children, shipment_lines)
+-- were separately confirmed fully intact in that same run. No DROP
+-- INDEX statements are added to this file's swap blocks below as a
+-- result — adding them would be inert (there is nothing left to free
+-- by the time they'd run) and would misrepresent this file as sharing
+-- an exposure it does not have. `__fk_check_guard_0023b` (file end)
+-- remains the last statement in this file, after every CREATE INDEX
+-- statement below, satisfying M6's guard-placement rider unchanged.
+
 ------------------------------------------------------------------
 -- ZERO-EXPOSURE-WINDOW SWAP for received_devices and its 5 NO ACTION/
 -- CASCADE children that are NOT shared with shipments. Old parent
@@ -427,6 +554,14 @@ ALTER TABLE shipment_lines_new RENAME TO shipment_lines;
 DROP TABLE received_devices_old;
 DROP TABLE shipments_old;
 
+-- M6 note: IF NOT EXISTS is intentionally KEPT on every CREATE INDEX
+-- below (unlike 0023a's three shipments-family indexes). Both old
+-- claimants of every name used here (received_devices_old just above,
+-- plus device_events/print_jobs/grade_audit/repair_jobs/
+-- zoho_batch_devices/shipment_lines dropped earlier in this file) are
+-- gone before this point — see the M6 SCOPE note near the top of this
+-- file for the full reasoning. IF NOT EXISTS here is the ordinary
+-- re-run-safety idempotency guard, not a mask over a live collision.
 CREATE INDEX IF NOT EXISTS idx_received_imei     ON received_devices(imei);
 CREATE INDEX IF NOT EXISTS idx_received_sku      ON received_devices(sku);
 CREATE INDEX IF NOT EXISTS idx_received_manifest ON received_devices(manifest_id);

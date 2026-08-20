@@ -36,7 +36,11 @@ have settled into their final names. That is the design now in place:
   `shipment_value_deltas`, `shipment_replies`). Its 4-child accounting
   (now 3, with `shipment_lines` deliberately deferred) was already correct
   in the original monolithic 0023. **Deliberately does not drop
-  `shipments_old`** — `shipment_lines` still points at it until 0023b.
+  `shipments_old`** — `shipment_lines` still points at it until 0023b. Its
+  three own indexes (including the UNIQUE `idx_shipments_org_ref`) ARE
+  dropped and recreated in-file, immediately after the rename, under the
+  M6 pattern below — not deferred to a later file (an earlier draft of
+  this fix proposed exactly that deferral and it was rejected; see M6).
 - `0023b_received_devices_status_and_received_at.sql` — recreates
   `received_devices` (status CHECK +2 values, `received_at` column) with
   the corrected 5 non-shared-child list (adds `repair_jobs` and
@@ -49,10 +53,12 @@ have settled into their final names. That is the design now in place:
   Sprint G G1 ON-DELETE audit table and the CASCADE-hazard writeup in its
   header (see below).
 - `0023c_removal_flags.sql` — new `removal_flags` table, no recreate
-  needed, SQL content unchanged from the original 0023, but its header was
-  rewritten in Sprint G to document why running strictly after 0023b's
-  final `DROP TABLE received_devices_old` keeps it outside the
-  CASCADE-hazard window (see below).
+  needed; its `CREATE TABLE` and index statements are functionally the
+  same as the original 0023 (`IF NOT EXISTS` was added to the table
+  statement per M3, so "unchanged" no longer describes it byte-for-byte),
+  and its header was rewritten in Sprint G to document why running
+  strictly after 0023b's final `DROP TABLE received_devices_old` keeps it
+  outside the CASCADE-hazard window (see below).
 
 ## Why three files instead of one
 
@@ -89,13 +95,13 @@ clean `foreign_key_check` afterward.
 
 **Scope, established by Sprint G's G1 re-audit (full table in 0023b's
 header):** every child of both `received_devices` and `shipments`,
-enumerated by ON DELETE mode, across all of `migrations/0001-0028`. Only
-three CASCADE children exist in the whole graph: `print_jobs` and
+enumerated by ON DELETE mode, across all of `migrations/0001-0028`. Four
+CASCADE children exist in the whole graph: `print_jobs` and
 `grade_audit` (children of `received_devices`, both correctly recreated in
 0023b and now verified 1→1 by seeded row count, not merely by
-`foreign_key_check`), and `shipment_lines.shipment_id` (a newly-identified
+`foreign_key_check`), `shipment_lines.shipment_id` (a newly-identified
 CASCADE case this pass, previously not flagged as such — correctly handled
-by the single-recreate in 0023b), plus `removal_flags.received_device_id`
+by the single-recreate in 0023b), and `removal_flags.received_device_id`
 (new table, 0023c, discussed above). No additional silent-loss case was
 found beyond the ordering-dependent `removal_flags` hazard. **Sprint E's
 "eight of nine correct" verdict**: the outcome survives — no table's
@@ -114,6 +120,79 @@ specific run. The hazard is real for correctness, for any future re-run of
 this migration set against a database that already has `removal_flags`
 rows, and for any as-yet-unenumerated CASCADE child introduced by a future
 migration — but it is not currently pointed at live data.
+
+## The index/trigger/view-loss finding (M2/M5/M7) — a SECOND blindness, parallel to the CASCADE one
+
+The CASCADE-hazard finding above says the test battery cannot see a
+silently-deleted *row*. There is a second, independent blindness in the
+same battery, discovered this pass: it cannot see a silently-lost
+*schema object* either — an index, trigger, or view — because every test
+in this directory asserts row counts and `foreign_key_check` results,
+never `sqlite_master` contents.
+
+This was not a hypothetical concern. `shipments` carries three named
+indexes, including the UNIQUE `idx_shipments_org_ref` on
+`(organisation_id, reference)`. The `RENAME` in 0023a's original
+zero-exposure-window swap carries all three names to `shipments_old`
+along with the table; because `shipments_old` is deliberately kept alive
+until 0023b drops it, those three names stayed claimed by `shipments_old`
+for the rest of 0023a's own file. The original version of 0023a
+recreated the three indexes with `CREATE INDEX IF NOT EXISTS` at the end
+of the file — which found the names already taken and **silently
+no-oped**. Measured directly (not assumed) by querying
+`pragma_index_list('shipments')` and `sqlite_master` after applying the
+full 0001–0022 + 0023a + 0023b + 0023c sequence against a fresh scratch
+DB: **0 of 3 indexes existed on the final `shipments` table**, including
+the UNIQUE constraint, with a clean `foreign_key_check` and zero errors
+throughout the whole run.
+
+The significant consequence is not the defect itself but what it says
+about the existing green results: `/tmp/g3-combined`'s end-to-end test
+(zero row loss, clean `foreign_key_check`, no leftover `_old`/`_new`
+tables) passed WHILE this was happening. All three of its assertions
+were true at the same time a uniqueness constraint silently evaporated.
+That is the same class of gap as a previously-fixed `BillDetailView()`
+false-green bug elsewhere in this project: the check was real and passed
+legitimately, but its coverage was narrower than its passing result
+implied. `/tmp/g3-combined`'s result is accordingly demoted from *proof*
+that the rewrite is safe to *partial proof* — proof of row/FK safety
+only, not of schema-object safety.
+
+**The fix taken (M6)**: explicit `DROP INDEX` statements immediately
+after the `shipments` rename in 0023a itself (same file, not deferred to
+0023b), freeing the three names at once, followed by `CREATE INDEX`
+without `IF NOT EXISTS` (a collision at that point, with the names
+already freed a few statements earlier, would mean something upstream is
+structurally wrong and should fail loudly rather than vanish a second
+time). A cross-file deferral fix — moving the three `CREATE INDEX`
+statements into 0023b, after 0023b's own `DROP TABLE shipments_old` — was
+considered and rejected: it would leave the live, final-shaped
+`shipments` table with **no uniqueness constraint at all** on
+organisation/reference for the entire window between 0023a completing
+and 0023b completing, which on a stalled non-atomic deploy could stay
+open indefinitely while the app keeps writing, and any duplicates
+admitted during that window would then make the eventual
+`CREATE UNIQUE INDEX` fail against real data — turning a recoverable
+stall into a data-repair job. The same explicit-drop-then-recreate
+pattern was checked against every table 0023b itself recreates
+(`received_devices` and its five non-shared children, plus
+`shipment_lines`) and found to be unnecessary there: none of those tables
+are left alive under their old names past the point their own indexes
+are recreated (each old copy is fully `DROP TABLE`d — not
+renamed-and-deferred — before its name's `CREATE INDEX IF NOT EXISTS`
+statement runs), so `IF NOT EXISTS` there is an ordinary re-run guard,
+not a mask over a live collision. See 0023a's and 0023b's own headers for
+the full statement-by-statement reasoning.
+
+**Triggers and views were checked too, not left as an unmeasured
+category.** The same `sqlite_master` query, filtered to
+`type IN ('trigger','view')`, was run against the same full sequence for
+all eleven tables touched by 0023a+0023b+0023c: the result set is empty.
+Zero triggers and zero views exist anywhere in this codebase's schema —
+not a gap in the check, a measured absence. There is currently nothing in
+either category for any of these recreates to lose, and this must be
+re-confirmed by the same query if a future migration ever introduces the
+first trigger or view in this codebase.
 
 ## What was empirically established (not assumed) before writing these
 
@@ -140,7 +219,16 @@ migration — but it is not currently pointed at live data.
   the CASCADE-hazard finding above** — it can only catch `NO ACTION`
   violations, never a silent CASCADE/SET NULL row loss. CASCADE/SET NULL
   children in this rewrite are verified separately, by seeded
-  before/after row count, not by this guard.
+  before/after row count, not by this guard. **Guard-strength comparison,
+  the two guards are not equally strong**: 0023a's own terminal guard
+  runs while `shipments_old` still exists and `shipment_lines` is still
+  pointing at it — that is legitimate and expected at that point (by
+  design, shipment_lines is not repointed until 0023b), not a defect, but
+  it means 0023a's guard cannot see the shipments graph as fully settled.
+  Only 0023b's terminal guard, which runs after `shipment_lines` has been
+  repointed and both `_old` parents dropped, carries that stronger
+  meaning. A green 0023a run in isolation is not proof the shipments graph
+  is settled; only a green 0023b run is.
 - Positive test: with the project's real `migrations/0001-0022_*.sql`
   applied, and exactly 1 seeded `repair_jobs` row + 1 seeded
   `zoho_batch_devices` row (matching the flagged race-condition
@@ -180,6 +268,27 @@ migration — but it is not currently pointed at live data.
   failed with `FOREIGN KEY constraint failed: SQLITE_CONSTRAINT
   (extended: SQLITE_CONSTRAINT_FOREIGNKEY)`, confirming the defect is
   real and reproducible outside the abstract schema analysis.
+- Sprint G follow-up, M2 (index-name collision, measured not assumed):
+  the `(name, tbl_name, unique)` triple for every index on `shipments`
+  was compared against the pre-0023 baseline after applying the full
+  0001–0022 + 0023a + 0023b + 0023c sequence in a fresh scratch DB.
+  Before the M6 fix: **0 of 3 present** (`idx_shipments_org`,
+  `idx_shipments_auth`, and the UNIQUE `idx_shipments_org_ref` all
+  silently no-oped against the already-claimed names on `shipments_old`).
+  0023b's own recreated tables (`received_devices` and its five children,
+  plus `shipment_lines`) were checked in the same run and were fully
+  intact — this defect was confined to `shipments`' three indexes only.
+  **Re-run against the M6-fixed files, in the same commit that applied
+  the fix: 3 of 3 present, names and `unique` flags matching the
+  pre-0023 baseline exactly** — see that commit's message for the exact
+  query output.
+- Sprint G follow-up, M7 (trigger/view completeness, measured not
+  omitted): `SELECT type, name, tbl_name FROM sqlite_master WHERE type IN
+  ('trigger','view')` run against the same full sequence, for all eleven
+  tables touched by 0023a+0023b+0023c, returns an empty result set. Zero
+  triggers and zero views exist anywhere in this codebase's schema — a
+  measured absence, not an unmeasured category. Re-confirmed against the
+  M6-fixed files in the same commit/run as the M2 re-check above.
 
 All of the above testing was done in isolated `/tmp` scratch wrangler
 projects with distinct `database_id`s — the shared dev-server D1 state
@@ -193,8 +302,17 @@ under `.wrangler/state/v3/d1` was not touched by any of it.
 - **Not yet exercised by the test suite** — these files are outside
   `./migrations`, so `test/apply-migrations.ts` does not apply them.
   Once approved, moving them into `migrations/` (replacing the original
-  0023 file) is the intended next step, at which point the existing test
-  suite becomes the acceptance gate.
+  0023 file) is the intended next step. **Post-M2, the existing test
+  suite by itself is NOT a safe acceptance gate for that step** — it
+  proved capable of passing green (`/tmp/g3-combined`) while a UNIQUE
+  index was silently lost, because its assertions cover rows and FK
+  consistency only. Making the move safe requires either adding a
+  schema-snapshot assertion (comparing `sqlite_master`'s `(name,
+  tbl_name, unique)` triples, and ideally trigger/view names, against the
+  pre-migration baseline) to the adoption criteria, or treating the
+  manual `sqlite_master` checks performed in this review as a
+  once-only substitute that must be re-run if these files are edited
+  again before the move.
 - The full G1 ON-DELETE audit table (recreated parent / child / ON DELETE
   mode / handled / row-count evidence) lives in `0023b`'s file header, not
   duplicated here in full — this README summarizes its conclusions only.
