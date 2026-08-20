@@ -269,9 +269,12 @@
 -- re-run of this file's text would otherwise die on "table already
 -- exists" instead of retrying. No-op on a genuine first run. As with
 -- 0023a, this resolves re-run safety for a failure BEFORE the swap
--- statements below have executed; a retry after the swap(s) have already
--- run once still needs manual inspection rather than a blind re-run,
--- pending the outstanding production D1 atomicity answer.
+-- statements below have executed. The precise boundary is the first
+-- rename of the received_devices swap (`ALTER TABLE received_devices
+-- RENAME TO received_devices_old`, below) — see that statement's own
+-- note for exactly what "manual inspection" means past that point and
+-- why `received_devices_old` must NOT be added to this prologue's
+-- DROP TABLE IF EXISTS list.
 ------------------------------------------------------------------
 DROP TABLE IF EXISTS received_devices_new;
 DROP TABLE IF EXISTS device_events_new;
@@ -495,6 +498,28 @@ FROM zoho_batch_devices;
 -- rename) "REFERENCES received_devices_old(id)", and it is repointed,
 -- along with shipments_old's equivalent, by the single-recreate section
 -- immediately below.
+--
+-- RE-RUN SAFETY BOUNDARY (Sprint G follow-up, documentation-only — not a
+-- fix): the RE-RUN SAFETY PROLOGUE above only covers a failure BEFORE the
+-- very next statement executes. Once
+-- `ALTER TABLE received_devices RENAME TO received_devices_old` has run,
+-- a straight re-run of this file is no longer safe — it will die on
+-- "table received_devices_old already exists" whether or not the second
+-- rename (immediately below) also completed. Do NOT respond to that by
+-- adding `DROP TABLE IF EXISTS received_devices_old` to the prologue: if
+-- the failure landed strictly between these two renames, `received_devices`
+-- does not exist under that name yet and `received_devices_old` IS the
+-- only surviving copy of every row — blindly dropping it on the next
+-- attempt would be unrecoverable data loss, not a safe retry. The correct
+-- response to a failure at or after this point is manual inspection —
+-- `SELECT name FROM sqlite_master WHERE name IN
+-- ('received_devices','received_devices_old')` — to determine which
+-- table currently holds the live rows before deciding how to proceed.
+-- This is moot under the local per-file rollback already measured for
+-- `wrangler d1 migrations apply --local` (a failure here rolls the whole
+-- file back, so this intermediate state cannot persist), but remains real
+-- and undecided for the outstanding hosted/remote D1 atomicity question —
+-- see migrations-review/README.md's atomicity addendum.
 ------------------------------------------------------------------
 ALTER TABLE received_devices     RENAME TO received_devices_old;
 ALTER TABLE received_devices_new RENAME TO received_devices;

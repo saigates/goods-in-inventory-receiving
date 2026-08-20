@@ -134,10 +134,17 @@ any deploy attempt. Three required answers, verbatim:
    the live production schema (this export's lines 100-122), or a stale
    list?** The column list itself is NOT stale — diffed programmatically,
    0023's `received_devices_new` CREATE and INSERT column lists are exactly
-   production's 22 pre-existing columns (`id` through `supplier_id`) plus
+   production's 23 pre-existing columns (`id` through `supplier_id`) plus
    the one new `received_at` column, in the same order, nothing added or
-   dropped. **However**, see finding 3 below — the migration is unsafe for
-   an entirely different reason than a stale column list.
+   dropped. **Correction (2026-08-20):** this entry originally said "22
+   pre-existing columns" — an off-by-one in the count, not in the list
+   itself. This export's own `received_devices` CREATE TABLE (lines 100-122
+   inclusive — 23 lines, one column declaration per line) re-derives the
+   correct figure as 23; `id` through `supplier_id` is 23 names, not 22.
+   No column was ever dropped or added by 0023 — this was a counting error
+   in this write-up, not a defect in the migration. **However**, see
+   finding 3 below — the migration is unsafe for an entirely different
+   reason than a stale column list.
 
 3. **Every table carrying a foreign key into `received_devices`, and what
    happens to those references during the recreate:** grepped this export

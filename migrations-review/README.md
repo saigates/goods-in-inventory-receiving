@@ -160,11 +160,19 @@ only, not of schema-object safety.
 
 **The fix taken (M6)**: explicit `DROP INDEX` statements immediately
 after the `shipments` rename in 0023a itself (same file, not deferred to
-0023b), freeing the three names at once, followed by `CREATE INDEX`
-without `IF NOT EXISTS` (a collision at that point, with the names
-already freed a few statements earlier, would mean something upstream is
-structurally wrong and should fail loudly rather than vanish a second
-time). A cross-file deferral fix — moving the three `CREATE INDEX`
+0023b), freeing the three names, followed immediately by `CREATE INDEX`
+without `IF NOT EXISTS` (a collision at that point, with the names just
+freed, would mean something upstream is structurally wrong and should
+fail loudly rather than vanish a second time). **Tightened (Sprint G
+follow-up, 2026-08-20)**: the three `CREATE INDEX` statements were
+originally placed after the three shipments-family children's own
+`DROP TABLE`/`RENAME` statements, leaving the constraint-free window
+spanning those ~9 intervening statements rather than the single statement
+an earlier pass of this note claimed. They now sit directly after the
+`DROP INDEX` block, before the children's `DROP TABLE`s — a pure
+reorder, no behavioural change — so the window is the 3 `DROP INDEX` +
+3 `CREATE INDEX` statements sitting immediately adjacent inside 0023a. A
+cross-file deferral fix — moving the three `CREATE INDEX`
 statements into 0023b, after 0023b's own `DROP TABLE shipments_old` — was
 considered and rejected: it would leave the live, final-shaped
 `shipments` table with **no uniqueness constraint at all** on
@@ -330,6 +338,33 @@ first trigger or view in this codebase.
   stricter method, per instruction that only the constraint-bearing three
   warrant it. All scratch dirs used for this re-run were cleaned up
   afterward; the shared dev-server D1 state was not touched.
+- **Local-versus-hosted atomicity — scope of the negative-test finding
+  above, stated explicitly.** The negative test two entries up (stripping
+  `repair_jobs` handling back out of a scratch copy of 0023b) showed
+  0023a's changes staying intact with no partial 0023b artifacts
+  persisted after 0023b failed. That result is specific to
+  **`wrangler d1 migrations apply --local`** (the local D1 engine, which
+  this whole review has run against exclusively) — it demonstrates that
+  *this* local engine treats each migration *file* as its own
+  failure/rollback unit. It does **not** answer the outstanding
+  hosted/remote D1 atomicity question: nothing here has been run against
+  a real Cloudflare-hosted D1 database, and the local result is not
+  evidence either way for whether hosted D1 rolls back a failed file the
+  same way. Two further limits, unaddressed by this or any other finding
+  in this file: (1) **9-file batch atomicity is unaddressed** — even
+  granting per-file rollback, nothing here shows what happens to files
+  that already committed earlier in the same `wrangler d1 migrations
+  apply` invocation if a later file in that batch fails (i.e. whether the
+  whole batch is transactional, or each file's commit is independent and
+  irreversible once done); and (2) **this finding does not reduce the
+  need for the M6 fix** — the DROP-INDEX/CREATE-INDEX exposure inside
+  0023a that M6 fixes is a real window regardless of what the answer to
+  either atomicity question turns out to be, since it exists even within
+  a single file's own statement sequence. This addendum does not alter
+  the pessimistic "assumed, unverified" framing already carried by
+  0023a's/0023b's/0023c's own `DROP TABLE IF EXISTS` prologues and
+  RE-RUN SAFETY notes — those remain written for the worst case
+  (non-atomic hosted deploy) on purpose.
 
 All of the above testing was done in isolated `/tmp` scratch wrangler
 projects with distinct `database_id`s — the shared dev-server D1 state

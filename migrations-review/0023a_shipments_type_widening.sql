@@ -103,12 +103,19 @@
 -- on a stalled non-atomic deploy, in which the live `shipments` table has
 -- no uniqueness constraint on org/reference at all). Dropping the
 -- indexes (not the table — shipments_old itself must still exist for
--- 0023b to repoint shipment_lines against) frees the names at once, and
--- the collision window shrinks to a single statement inside this file.
--- The three CREATE INDEX statements below now omit IF NOT EXISTS as well:
--- with the names freed immediately above, a genuine collision at CREATE
--- INDEX time can only mean something upstream is structurally wrong, and
--- should fail the migration loudly rather than vanish a second time.
+-- 0023b to repoint shipment_lines against) frees the names immediately.
+-- The three CREATE INDEX statements are placed directly after the DROP
+-- INDEX block (Sprint G follow-up, tightening pass), so the collision
+-- window is the 3 DROP INDEX + 3 CREATE INDEX statements sitting
+-- immediately adjacent — not "a single statement" as an earlier pass of
+-- this note claimed, and not spread across the ~9 statements it spanned
+-- before this reorder (the three child DROP TABLEs and three RENAMEs now
+-- sit AFTER shipments' own indexes are already recreated, not between the
+-- drop and the recreate). The three CREATE INDEX statements for shipments
+-- itself omit IF NOT EXISTS: with the names freed immediately above, a
+-- genuine collision at CREATE INDEX time can only mean something
+-- upstream is structurally wrong, and should fail the migration loudly
+-- rather than vanish a second time.
 --
 -- GUARD STRENGTH NOTE: this file's own foreign_key_check guard (below)
 -- CANNOT detect that shipment_lines is still pointing at shipments_old at
@@ -287,6 +294,22 @@ DROP INDEX idx_shipments_org;
 DROP INDEX idx_shipments_auth;
 DROP INDEX idx_shipments_org_ref;
 
+-- Recreated immediately, right after the DROP INDEX block above and BEFORE
+-- the child DROP TABLE/RENAME statements below (Sprint G follow-up,
+-- tightening M6): the names are freed by the three DROP INDEX statements
+-- immediately above, so nothing prevents recreating them here rather than
+-- after the three children are swapped. Moving these three statements up
+-- (they used to sit after the children's RENAMEs) shrinks the window
+-- during which `shipments` carries no uniqueness constraint on
+-- (organisation_id, reference) from ~9 statements down to these 3
+-- DROP INDEX / 3 CREATE INDEX statements being directly adjacent. See the
+-- header's INDEX-NAME COLLISION note for the full rationale; this is a
+-- pure reorder, no behavioural change — the data copy into shipments_new
+-- (INSERT...SELECT, above) already completed long before any of this.
+CREATE INDEX idx_shipments_org     ON shipments(organisation_id);
+CREATE INDEX idx_shipments_auth    ON shipments(authorisation_id);
+CREATE UNIQUE INDEX idx_shipments_org_ref ON shipments(organisation_id, reference);
+
 DROP TABLE sent_emails;
 DROP TABLE shipment_value_deltas;
 DROP TABLE shipment_replies;
@@ -298,10 +321,21 @@ ALTER TABLE shipment_replies_new      RENAME TO shipment_replies;
 -- shipments_old (the TABLE) intentionally NOT dropped here — its indexes
 -- are already gone, above. See header + 0023b for the table's own drop.
 
-CREATE INDEX idx_shipments_org     ON shipments(organisation_id);
-CREATE INDEX idx_shipments_auth    ON shipments(authorisation_id);
-CREATE UNIQUE INDEX idx_shipments_org_ref ON shipments(organisation_id, reference);
-
+-- IF NOT EXISTS ASYMMETRY (deliberate, not an oversight): the three
+-- shipments-family children below keep `CREATE INDEX IF NOT EXISTS`,
+-- while `shipments`' own three indexes above do not. This is correct, not
+-- inconsistent: sent_emails/shipment_value_deltas/shipment_replies are
+-- fully DROP TABLEd (above), which unconditionally frees their old index
+-- names outright — a subsequent collision there really would mean nothing
+-- was dropped, so IF NOT EXISTS costs nothing and stays as a defensive
+-- no-op. `shipments`, by contrast, is RENAMEd (not dropped) — its old
+-- indexes only stop claiming the names because of the explicit DROP INDEX
+-- block above, so a collision at its CREATE INDEX time is a genuine signal
+-- that block didn't run as expected, and IF NOT EXISTS would silently mask
+-- exactly that failure (see INDEX-NAME COLLISION note above). Do not
+-- "fix" this asymmetry in either direction — it reflects the two
+-- differing removal mechanisms (DROP TABLE vs. explicit DROP INDEX after
+-- RENAME), not carelessness.
 CREATE INDEX IF NOT EXISTS idx_sent_emails_shipment ON sent_emails(shipment_id);
 CREATE INDEX IF NOT EXISTS idx_sent_emails_org      ON sent_emails(organisation_id);
 
