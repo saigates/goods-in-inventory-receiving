@@ -5,6 +5,61 @@ sprint" holding pen — it is a **reviewable staging area** for a
 table-recreation migration rewrite the user explicitly asked to read
 before it goes anywhere near `migrations/`.
 
+**Status update:** `0023a_shipments_type_widening.sql`,
+`0023b_received_devices_status_and_received_at.sql`, and
+`0023c_removal_flags.sql` have since been adopted — moved into
+`migrations/` (replacing the original monolithic
+`0023_temp_export_standard_and_received_at.sql`, which was removed).
+This file (`migrations-review/README.md`) stays in place as the
+review record; `migrations-review/` remains the correct location for
+it, since the directory continues to exist for other review material
+and was not itself moved. See the adoption-hazard precondition
+immediately below before applying this adoption to any other
+database.
+
+## Adoption precondition — unsafe for any database that already applied the original 0023
+
+Adopting `0023a`/`0023b`/`0023c` (i.e. deleting the old monolithic
+`0023_temp_export_standard_and_received_at.sql` from `migrations/` and
+replacing it with the three split files) is **safe only for a
+database whose `d1_migrations` table has never recorded the old
+`0023_temp_export_standard_and_received_at.sql` row.**
+
+The reason is mechanical, not incidental: removing a file from
+`migrations/` does not retroactively remove its already-recorded row
+from `d1_migrations`. If a database already applied the old
+monolithic `0023`, that row (originally id 23) stays exactly where it
+is. The three new split filenames are unrecorded, so the next
+`wrangler d1 migrations apply` simply appends them as new pending
+migrations **after** whatever already-applied files come after them
+numerically — e.g. after `0024`-`0029` — rather than inserting them in
+their intended position 23-25. This was not a hypothetical: it is
+exactly what happened to this project's own shared dev-server D1
+during this same session (see the incident note in the git history
+around commit `0f01ae6`/`103b6dc`), producing an out-of-order,
+unreproducible-from-clean `d1_migrations` history (`0023a`/`0023b`/
+`0023c` landing at ids 30-32, after `0024`-`0029` at ids 24-29, with
+the stale old-`0023` row still sitting at id 23).
+
+- **Production is unaffected.** It has never applied the old `0023` —
+  it sits behind `0023`-`0029` all still pending — so the next real
+  deploy will apply `0023a`/`0023b`/`0023c` in the correct position,
+  in order, exactly as authored.
+- **Any other database (most likely: a developer's local/shared
+  dev-server D1 under `.wrangler/state/v3/d1`) that already ran the
+  old `0023` is NOT safe** to adopt this change against with a plain
+  `wrangler d1 migrations apply`. The only remedy is a full reset:
+  `CONFIRM_DB_RESET=1 npm run db:reset` (the guarded script added in
+  Sprint G's G4 item) — which wipes the local D1 state and re-applies
+  the full current `./migrations` tree from clean, producing the
+  correct sequence unconditionally.
+
+Before re-running migrations against any pre-existing local D1 after
+this adoption, confirm first whether that database ever applied the
+old `0023_temp_export_standard_and_received_at.sql` (check its
+`d1_migrations` table for that filename). If it has, reset it with the
+guarded command above rather than running a plain migrate.
+
 ## What's here (Sprint G ordering — shipments FIRST, received_devices SECOND)
 
 Split rewrite of `migrations/0023_temp_export_standard_and_received_at.sql`
