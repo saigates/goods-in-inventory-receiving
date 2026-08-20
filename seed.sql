@@ -9,9 +9,11 @@
 -- rows in a fresh local D1 with grade IS NULL or a bare "256G"-style
 -- capacity (confirmed via direct query; production and every
 -- migration-inserted row already use grade='UG'/'A'/etc. and canonical
--- "256GB" form). Migration 0030 data-fixes any already-seeded copies of
--- these rows in existing databases; this fixture is corrected here so a
--- fresh `db:reset` doesn't reintroduce the same drift.
+-- "256GB" form). Migration 0031 (renumbered from a locally-drafted 0030
+-- before it was ever pushed anywhere — see that migration's own header)
+-- data-fixes any already-seeded copies of these rows in existing
+-- databases; this fixture is corrected here so a fresh `db:reset`
+-- doesn't reintroduce the same drift.
 INSERT OR IGNORE INTO sku_catalog (sku, brand, model, capacity, color, grade) VALUES
   ('SMSG-S24-256-PBK',  'Samsung', 'Galaxy S24',         '256GB', 'Phantom Black', 'UG'),
   ('SMSG-S24-512-PBK',  'Samsung', 'Galaxy S24',         '512GB', 'Phantom Black', 'UG'),

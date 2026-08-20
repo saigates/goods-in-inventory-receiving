@@ -89,5 +89,37 @@ git mv migrations-held/0030_expected_devices_condition_derived_from_grade.sql \
 
 Then re-run the fresh pre-flight cross-tab against production (do not
 reuse the 2026-08-18 one without re-verifying — production data may have
-changed), `npx vitest run` to confirm the three tests below still pass
-with 0030 back in the applied set, and only then deploy.
+changed), `npx vitest run` to confirm the tests below still pass with
+0030 back in the applied set, and only then deploy.
+
+**CORRECTION (2026-08-20) — the `git mv` alone is NOT sufficient, and the
+"three tests below" this section used to point at were never actually
+listed here (a dangling reference — this section originally ended right
+after that sentence).** The specific, previously-uninspected assumption
+that needs correcting: `test/manifestConditionDerivation.spec.ts`'s
+`it.skip('the expected_devices.grade CHECK constraint rejects a raw
+grade outside A/B/C/UG at the DB level ...')` (line 161) does **NOT**
+auto-flip to a passing `it(...)` just because the migration file moves
+back into `migrations/`. It is a bare, hardcoded `it.skip(...)` call —
+confirmed by grep (zero filesystem/glob/env condition anywhere in the
+file, in `test/apply-migrations.ts`, or in `vitest.config.ts`) and by
+running that spec file alone before and after an unrelated migration
+rename this same day (identical 8 passed / 1 skipped both times, proving
+the skip cannot react to any migration file's presence or absence). This
+had been carried forward across sprints as if it *were* self-correcting
+(see the comment block directly above that `it.skip` at the time of
+writing, which frames it as "restore this to `it(...)` the same time
+0030 is moved back into `migrations/`" — an instruction for a human to
+act on, not a mechanism that fires on its own). **Restoration checklist,
+in order:**
+1. `git mv` the migration file back (command above).
+2. Manually edit `test/manifestConditionDerivation.spec.ts` line 161
+   from `it.skip(...)` to `it(...)` (and update the test's own title
+   string, which currently says "skipped while migration 0030 is held
+   out of migrations/" — that clause becomes stale the moment step 1
+   runs).
+3. Re-run the fresh pre-flight cross-tab against production per above.
+4. `npx vitest run` — confirm the now-unskipped test passes for real
+   against the live CHECK constraint, not just that the suite total
+   changed.
+5. Only then deploy.
