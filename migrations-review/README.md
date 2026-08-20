@@ -289,6 +289,47 @@ first trigger or view in this codebase.
   triggers and zero views exist anywhere in this codebase's schema — a
   measured absence, not an unmeasured category. Re-confirmed against the
   M6-fixed files in the same commit/run as the M2 re-check above.
+- Sprint G follow-up, post-`e53a536` seeded row-preservation re-run
+  (closing the M1 evidence gap): all prior seeded-row evidence in this
+  file predates M1 (`received_at` ALTER removal, which changed the
+  `INSERT...SELECT` column-list shape on `received_devices` — the one
+  edit in that commit capable of silently misaligning a column during
+  the copy). Re-run fresh, against the `e53a536`-committed file content
+  exactly, in a two-phase scratch DB (real `migrations/0001-0022*.sql`
+  applied first, then one seed row inserted directly into the pre-0023
+  schema for every one of the 11 tables 0023a/0023b touch, THEN
+  0023a→0023b→0023c applied on top): all 11 tables — `shipments` +
+  `sent_emails`/`shipment_value_deltas`/`shipment_replies`;
+  `received_devices` + `device_events`/`print_jobs`/`grade_audit`/
+  `repair_jobs`/`zoho_batch_devices`; `shipment_lines` — confirmed 1→1,
+  every non-key column value read back unchanged (including the
+  `supplier_id=901` marker seeded specifically to catch M1-style
+  column-list misalignment, which survived exactly). `received_at`
+  itself: read back `NULL` immediately after the recreate (matching the
+  fix's stated intent, since it has no pre-existing value anywhere to
+  preserve), then confirmed genuinely present/writable via a follow-up
+  `UPDATE ... SET received_at = <timestamp>` + read-back round-trip
+  (mimicking the real backdating flow in `scan.ts`). `removal_flags`
+  (0023c, not a recreate but included for completeness) accepted an
+  insert cleanly. `PRAGMA foreign_key_check` empty, `d1_migrations`
+  shows all 25 files recorded, no leftover `_old`/`_new`/
+  `__fk_check_guard` tables. Negative test also re-run against this same
+  committed 0023b content (not assumed still valid from the earlier
+  pre-fix `/tmp/g3-neg` run): a scratch copy with `repair_jobs` handling
+  stripped back out still fails loudly with `SQLITE_CONSTRAINT_FOREIGNKEY`
+  on 0023b, with 0023a's changes (including its 3/3 recreated indexes)
+  left intact and no partial 0023b artifacts persisted — confirming D1's
+  local engine treats each migration file as its own failure/rollback
+  unit. Narrowed index re-check (replacing the weaker "full expected
+  index sets" method used for the original M2 write-up): the
+  `(name, tbl_name, unique)` triple for all three UNIQUE indexes in the
+  touched graph — `idx_shipments_org_ref` (unique=1),
+  `idx_zoho_batch_devices_unique` (unique=1), `idx_shipment_lines_unique`
+  (unique=1) — confirmed present against the pre-0023 baseline in the
+  same run; the other 8 non-unique indexes were not re-verified by this
+  stricter method, per instruction that only the constraint-bearing three
+  warrant it. All scratch dirs used for this re-run were cleaned up
+  afterward; the shared dev-server D1 state was not touched.
 
 All of the above testing was done in isolated `/tmp` scratch wrangler
 projects with distinct `database_id`s — the shared dev-server D1 state
