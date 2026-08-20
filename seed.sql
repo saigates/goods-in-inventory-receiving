@@ -1,19 +1,32 @@
 -- Seed common SKUs (resolved at scan time when manifest model_no matches)
-INSERT OR IGNORE INTO sku_catalog (sku, brand, model, capacity, color) VALUES
-  ('SMSG-S24-256-PBK',  'Samsung', 'Galaxy S24',         '256G', 'Phantom Black'),
-  ('SMSG-S24-512-PBK',  'Samsung', 'Galaxy S24',         '512G', 'Phantom Black'),
-  ('SMSG-S24FE-256-GRY','Samsung', 'Galaxy S24 FE',      '256G', 'Graphite'),
-  ('SMSG-S23-256-BLK',  'Samsung', 'Galaxy S23',         '256G', 'Phantom Black'),
-  ('SMSG-S23-512-BLK',  'Samsung', 'Galaxy S23',         '512G', 'Phantom Black'),
-  ('SMSG-S23P-256-BLK', 'Samsung', 'Galaxy S23 Plus',    '256G', 'Phantom Black'),
-  ('SMSG-S23P-512-BLK', 'Samsung', 'Galaxy S23 Plus',    '512G', 'Phantom Black'),
-  ('SMSG-S23FE-256-GRY','Samsung', 'Galaxy S23 FE',      '256G', 'Graphite'),
-  ('SMSG-S22P-256-BLK', 'Samsung', 'Galaxy S22 Plus',    '256G', 'Phantom Black'),
-  ('SMSG-S21-256-GRY',  'Samsung', 'Galaxy S21',         '256G', 'Phantom Gray'),
-  ('SMSG-S20FE-128-CLD','Samsung', 'Galaxy S20 FE',      '128G', 'Cloud Navy'),
-  ('SMSG-ZFLIP5-256-GRA','Samsung','Galaxy Z Flip5',     '256G', 'Graphite'),
-  ('SMSG-ZFLIP5-512-GRA','Samsung','Galaxy Z Flip5',     '512G', 'Graphite'),
-  ('SMSG-ZFOLD5-256-PBK','Samsung','Galaxy Z Fold5',     '256G', 'Phantom Black');
+--
+-- CORRECTED (2026-08-20, G5 item 2 prep): this fixture used to omit `grade`
+-- entirely and use non-canonical "256G"/"128G"/"512G" capacity strings.
+-- Because seed.sql loads AFTER migrations (see db:seed / db:reset in
+-- package.json), these 14 rows never passed through migration 0017's
+-- grade-backfill (`UPDATE sku_catalog SET grade = 'UG' WHERE grade IS
+-- NULL`) or its capacity-canonicalisation UPDATE — they were the ONLY
+-- rows in a fresh local D1 with grade IS NULL or a bare "256G"-style
+-- capacity (confirmed via direct query; production and every
+-- migration-inserted row already use grade='UG'/'A'/etc. and canonical
+-- "256GB" form). Migration 0030 data-fixes any already-seeded copies of
+-- these rows in existing databases; this fixture is corrected here so a
+-- fresh `db:reset` doesn't reintroduce the same drift.
+INSERT OR IGNORE INTO sku_catalog (sku, brand, model, capacity, color, grade) VALUES
+  ('SMSG-S24-256-PBK',  'Samsung', 'Galaxy S24',         '256GB', 'Phantom Black', 'UG'),
+  ('SMSG-S24-512-PBK',  'Samsung', 'Galaxy S24',         '512GB', 'Phantom Black', 'UG'),
+  ('SMSG-S24FE-256-GRY','Samsung', 'Galaxy S24 FE',      '256GB', 'Graphite', 'UG'),
+  ('SMSG-S23-256-BLK',  'Samsung', 'Galaxy S23',         '256GB', 'Phantom Black', 'UG'),
+  ('SMSG-S23-512-BLK',  'Samsung', 'Galaxy S23',         '512GB', 'Phantom Black', 'UG'),
+  ('SMSG-S23P-256-BLK', 'Samsung', 'Galaxy S23 Plus',    '256GB', 'Phantom Black', 'UG'),
+  ('SMSG-S23P-512-BLK', 'Samsung', 'Galaxy S23 Plus',    '512GB', 'Phantom Black', 'UG'),
+  ('SMSG-S23FE-256-GRY','Samsung', 'Galaxy S23 FE',      '256GB', 'Graphite', 'UG'),
+  ('SMSG-S22P-256-BLK', 'Samsung', 'Galaxy S22 Plus',    '256GB', 'Phantom Black', 'UG'),
+  ('SMSG-S21-256-GRY',  'Samsung', 'Galaxy S21',         '256GB', 'Phantom Gray', 'UG'),
+  ('SMSG-S20FE-128-CLD','Samsung', 'Galaxy S20 FE',      '128GB', 'Cloud Navy', 'UG'),
+  ('SMSG-ZFLIP5-256-GRA','Samsung','Galaxy Z Flip5',     '256GB', 'Graphite', 'UG'),
+  ('SMSG-ZFLIP5-512-GRA','Samsung','Galaxy Z Flip5',     '512GB', 'Graphite', 'UG'),
+  ('SMSG-ZFOLD5-256-PBK','Samsung','Galaxy Z Fold5',     '256GB', 'Phantom Black', 'UG');
 
 -- ───────── OPR authorisation (OPR 1) ─────────
 -- The Saigates OPR authorisation as configurable DATA (never inline in
