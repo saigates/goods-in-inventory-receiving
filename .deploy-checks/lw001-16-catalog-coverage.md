@@ -5,10 +5,34 @@ Source: production `expected_devices` WHERE `manifest_id = 14 AND status =
 gate was open at query time). Manifest 14 (`LW001-40242714_40242715_20`,
 supplier `LW001`) has 20 total lines: 16 received (these), 4 still pending.
 
-Checked against the LOCAL sku_catalog (2,781 rows — mirrors production per
-README's migration-0017 entry; **production coverage itself is
-unverified — flagged per your instruction, needs checking through the
-production Catalog tab directly**), using the actual `matchCatalogRows()`
+Checked against the LOCAL sku_catalog (2,781 rows — believed at the time
+of this check to mirror production per README's migration-0017 entry;
+**production coverage itself is unverified — flagged per your instruction,
+needs checking through the production Catalog tab directly**), using the
+actual `matchCatalogRows()`
+
+**CORRECTION (2026-08-20): the "mirrors production" premise above is
+false and this file's checked-against catalog was never actually
+2,781 rows.** Direct `SELECT COUNT(*)` against this sandbox's local
+`--local` D1 today returns 682 `sku_catalog` rows, not 2,781 — confirmed
+consistent with `backups/d1-local-baseline-2026-08-10.sql` (taken before
+this file was written, already 682 rows), so local has held 682 rows,
+not 2,781, for the whole period this file has existed. This file's own
+17 rows above were therefore either (a) checked against a since-reset
+local D1 that genuinely held 2,781 rows at write time and has since
+dropped to 682, or (b) written from the production export data without
+the local D1 actually holding it — the git history available does not
+distinguish these two, and no evidence of an intervening `db:reset` or
+migration replay between this file's write date and today was found.
+Either way, this file's original per-row match/no-match findings (14
+exact/fuzzy matches, 2 genuine gaps) cannot be re-verified against
+today's local D1 without re-running the check, and should not be taken
+as still-current without that re-run. This is this file's **second**,
+independent reason (alongside the pre-existing "production coverage
+itself is unverified" flag above) that its findings need re-confirming
+before being relied on — see README.md's `sku_catalog` entry for the
+corrected 2,781-rows-vs-702-configurations distinction that also bears
+on any future re-check of this file's kind.
 logic from `src/lib/catalog.ts` (lines 66-151) reimplemented faithfully in
 Python — not a naive exact-string check. That matters: 3 of what looked
 like misses on a first pass turned out to be legitimate **fuzzy-color
