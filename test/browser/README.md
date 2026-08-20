@@ -510,17 +510,91 @@ yet. `mf-bill-sentinel-and-lock.browser.mjs` (22 checks) now proves both:
 and `#mf-sup` becomes readonly + pre-filled + captioned on link, and
 editable again (without losing its value) on unlink.
 
-**Local dev D1 reset side-effect, now fixed**: `test/apply-migrations.ts`'s
-`rm -rf .wrangler/state/v3/d1` (used earlier this sprint to get a clean
-schema for the vitest suite) shares its persistence path with the live
-`pm2`-managed dev server, so that reset also wiped the dev server's own
-local D1 — surfaced as `POST /api/auth/login` 500s / `no such table: users`
-when this pass's browser scripts were run. Fixed via `npm run
-db:migrate:local && npm run db:seed` (dry-path check output doubled as
-proof: exactly 0023-0029 applied, 0030 correctly absent) followed by `pm2
-restart webapp` and re-provisioning `owner@saigates.com`'s local-only test
-password (`node scripts/set-password.mjs`, per this file's own documented
-steps above — never touches production). Any future `rm -rf
-.wrangler/state/v3/d1` during a vitest-focused pass should be followed by
-the same restore sequence before assuming the dev server is still usable
-for a browser check.
+**Local dev D1 reset side-effect (2026-08-19 note) — RETRACTED 2026-08-20,
+attribution was wrong.** The paragraph originally here claimed
+`test/apply-migrations.ts`'s `rm -rf .wrangler/state/v3/d1` shared its
+persistence path with the live `pm2`-managed dev server and that running
+the vitest suite was what wiped the dev server's own local D1. That claim
+does not survive a check of the actual file: `git log --all --oneline --
+test/apply-migrations.ts` shows exactly **one** commit ever (`e99f8bb`, the
+file's creation), and its content — then and now — is 13 lines that only
+call `applyD1Migrations(anyEnv.DB, anyEnv.TEST_MIGRATIONS)`. It has never
+contained an `rm -rf` line. A repo-wide trace of the exact string,
+`git log -p --all -S "rm -rf .wrangler/state/v3/d1"`, shows it was only
+ever introduced in three places: this file's own prose (the paragraph being
+retracted here), `backups/RESTORE.md`, and `package.json`'s `db:reset`
+script (`rm -rf .wrangler/state/v3/d1 && npm run db:migrate:local && npm run
+db:seed`). The two historical dev-DB-restore incidents this note was
+explaining were therefore almost certainly caused by a manual or
+`npm run db:reset` invocation against the shared path — not by running the
+vitest suite, which never touches it.
+
+**G4 (2026-08-20): vitest D1 isolation measured, root cause corrected, the
+actual destructive path guarded.**
+
+*What vitest actually does, measured, not inferred.* `vitest.config.ts`
+loads its D1 binding via `wrangler: { configPath: './wrangler.jsonc' }`,
+the same config file the `pm2`-managed dev server reads
+(`ecosystem.config.cjs` → `wrangler pages dev dist --d1=webapp-production
+--local`). Despite sharing that config file, tracing all three layers
+involved —
+`@cloudflare/vitest-pool-workers/dist/pool/index.mjs`'s
+`buildProjectMiniflareOptions()` / `SHARED_MINIFLARE_OPTIONS` (no
+persist-related key), `miniflare/dist/src/index.js`'s D1 plugin
+`getPersistPath()` (falls back to `path.join(tmpPath, "d1")` when no
+`d1Persist`/`defaultPersistRoot` is supplied) and its Miniflare-instance
+constructor (`tmpPath = os.tmpdir() + "/miniflare-" + random hex`, removed
+via an exit hook on process exit), and `wrangler/wrangler-dist/cli.js`'s
+`unstable_getMiniflareWorkerOptions()` (the function vitest-pool-workers
+actually calls; its return value carries no `defaultPersistRoot` field at
+all, unlike the sibling `wrangler pages dev` code path, which explicitly
+computes one defaulting to `.wrangler/state/v3`) — shows that
+vitest-pool-workers never forwards a persist root to Miniflare. Each vitest
+run therefore gets its own fresh, ephemeral OS-tmpdir D1 store, never
+`.wrangler/state/v3/d1`.
+
+*Measured, not just traced.* `md5sum` of both files under
+`.wrangler/state/v3/d1/miniflare-D1DatabaseObject/` (`metadata.sqlite` +
+the hash-named data file), taken immediately before and immediately after
+a full `npx vitest run --reporter=dot` run (25 test files / 511 passed / 8
+skipped), came back byte-identical both times this was tried. `curl
+http://localhost:3000/api/auth/me` and `wrangler d1 execute
+webapp-production --local --command="SELECT COUNT(*)/rows FROM users"`
+were also unchanged across the same runs, and `pm2 list` showed the same
+`webapp` pid throughout (no restart occurred or was needed). This is the
+repeatable isolation check for this claim going forward — cheap enough to
+re-run on demand, and it proves the property directly rather than
+inferring it from "the dev server still works."
+
+*The actual destructive path, now guarded.* `package.json`'s `db:reset`
+script is the only scripted path (outside this file's own retracted prose
+and `backups/RESTORE.md`) that ever ran `rm -rf .wrangler/state/v3/d1`
+against the shared dev-server state, so it — not the vitest harness — is
+the real cause of the two historical restores. It now refuses to run
+unless invoked as `CONFIRM_DB_RESET=1 npm run db:reset`; an unguarded `npm
+run db:reset` prints the reason and exits 1 without touching anything.
+Verified: an unguarded call was run and confirmed to exit 1 with the
+warning printed, and the shared D1 files' md5s were unchanged before and
+after that call.
+
+*Login → 200 with no restore step.* Per the standing constraint that
+`owner@saigates.com` / `ops@saigates.com` are real per-person accounts and
+must not be used as disposable test fixtures, this check used a dedicated,
+disposable fixture account instead
+(`g4-fixture@example.invalid`, inserted via `scripts/set-password.mjs` +
+a plain `INSERT INTO users`, following the same seed-and-clean contract as
+the scripts below). `POST /api/auth/login` with its credentials returned
+`200` with a valid token and user object; the fixture row was then deleted
+per the seed-and-clean contract. `/api/auth/me` without a bearer token
+(the check this note previously — wrongly — treated as sufficient) only
+proves the server is up and routing; it does not exercise the credential
+path at all, so it is not cited as the login proof here.
+
+**Consequence for the sprint-wide constraint list**: "vitest shares
+persistence with `.wrangler/state/v3/d1`" is retracted as a stated risk —
+it was never true. The constraint that generalizes correctly from this
+incident is narrower and about `.wrangler/state/v3/d1` itself: no
+destructive command (`rm -rf`, `db:reset` without explicit opt-in, or any
+manual equivalent) should be run against that path without the same
+intentional, opt-in gate `db:reset` now enforces, since that path — not
+the test harness — is what actually cost two restores.

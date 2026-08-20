@@ -13,7 +13,7 @@
     "db:migrate:local": "wrangler d1 migrations apply webapp-production --local",
     "db:migrate:prod": "wrangler d1 migrations apply webapp-production",
     "db:seed": "wrangler d1 execute webapp-production --local --file=./seed.sql",
-    "db:reset": "rm -rf .wrangler/state/v3/d1 && npm run db:migrate:local && npm run db:seed",
+    "db:reset": "bash -c '[ \"$CONFIRM_DB_RESET\" = 1 ] || { echo \"Refused: db:reset wipes .wrangler/state/v3/d1 (SHARED with the live pm2 dev server, NOT vitest state). Re-run with CONFIRM_DB_RESET=1 npm run db:reset to proceed intentionally.\" >&2; exit 1; }' && rm -rf .wrangler/state/v3/d1 && npm run db:migrate:local && npm run db:seed",
     "clean-port": "fuser -k 3000/tcp 2>/dev/null || true"
   },
   "dependencies": {
