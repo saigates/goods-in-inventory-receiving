@@ -287,6 +287,59 @@ before calling `gsk hosted deploy` — but it is a thing to *verify in that
 session*, not a value the deploy tooling looks up or guarantees on its
 own.
 
+**Gap flagged by the user, 2026-08-21, later same day: cross-machine
+reproducibility was untested.** All three matching `d444aba2...` rebuilds
+above ran in *this* sandbox against the same already-installed
+`node_modules` — none of them exercised a fresh `npm install` from a
+committed lockfile, which is what a genuinely different deploying session
+(e.g. one freshly authenticated as `saigateslimited@gmail.com`) would
+actually do. Checked, read-only, this pass:
+
+```
+$ ls -la package-lock.json yarn.lock pnpm-lock.yaml 2>&1
+-rw-r--r-- 1 user user 145456 Jul 29 10:54 package-lock.json
+ls: cannot access 'yarn.lock': No such file or directory
+ls: cannot access 'pnpm-lock.yaml': No such file or directory
+$ git ls-files | grep -i lock
+package-lock.json
+test/browser/mf-bill-sentinel-and-lock.browser.mjs
+```
+
+**Confirmed: `package-lock.json` exists and is tracked in git** (the only
+other "lock" hit is an unrelated test file name). No lockfile-exclusion
+pattern exists in `.gitignore` either. This means a fresh `npm ci` (or
+`npm install`, though `npm ci` is the stricter, lockfile-honouring form)
+in a different session *should*, in principle, reproduce the same
+dependency tree that produced `d444aba2...` — but this has not yet been
+exercised end-to-end in a fresh session, so it remains a documented
+precondition, not a demonstrated fact.
+
+**Mandatory pre-deploy gate (added 2026-08-21, applies to the deploying
+session specifically, not this one):** before calling `gsk hosted deploy`
+for the held batch (or any deploy of this repo), the deploying session
+MUST run, in order:
+
+1. Confirm the intended commit is checked out (`git log -1 --oneline`
+   matches what was intended to ship).
+2. `npm ci` (fresh install from `package-lock.json`, not a reused
+   `node_modules` carried over from a different session).
+3. `rm -rf dist && npm run build`.
+4. `sha256sum dist/_worker.js` and compare against `d444aba2...`
+   (or whatever hash is current for the intended commit, if source has
+   changed since this doc was written — see the staleness note above).
+5. **A hash mismatch is stop-and-investigate, not a curiosity.** Do not
+   proceed to `gsk hosted deploy` on a mismatched hash — it means either
+   the lockfile did not pin something that matters (a transitive
+   dependency resolving differently, a Node/npm version difference
+   affecting the build), or the wrong commit is checked out. Either
+   cause must be resolved and the hash re-confirmed before deploying, not
+   waved through as probably-fine drift.
+
+This gate has not yet been run end-to-end in a genuinely fresh session
+(this pass only confirmed the lockfile is present and tracked); it is a
+documented requirement for whichever session actually deploys, not a
+result reported as already exercised.
+
 ## Item 3: full test suite, re-run as its own explicit action this pass
 
 **Why re-run rather than cite the prior gate-check**: the last actual

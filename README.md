@@ -394,6 +394,20 @@ re-verify via `gsk hosted worker_get` / `d1_schema` that the resource
 actually mutated belongs to the intended project (`d6aea290-...`) before
 reporting the deploy as successful.
 
+**Mandatory pre-deploy build-determinism gate (added 2026-08-21):**
+because the deploy publishes the invoking session's own fresh
+`npm run build` output (not a pinned/committed artifact), the deploying
+session MUST: (1) confirm the intended commit is checked out; (2)
+`npm ci` — a fresh install from `package-lock.json` (confirmed present
+and git-tracked), not a `node_modules` carried over from a different
+session; (3) `rm -rf dist && npm run build`; (4) `sha256sum
+dist/_worker.js` and compare against the hash recorded for that commit
+in `.deploy-checks/g5-phase2-offline-half.md` (`d444aba2...` for
+`e73ea64`, re-derive if HEAD has moved since). **A hash mismatch is
+stop-and-investigate, not a curiosity** — it means either the lockfile
+didn't pin something that matters or the wrong commit is checked out;
+resolve the cause and re-confirm before calling `gsk hosted deploy`.
+
 **2026-07-29 redeploy — fixed "new catalog SKUs invisible in the Catalog tab":**
 after migration 0017 expanded `sku_catalog` to 2,781 rows, the new iPhone 17/Air/
 SE/XR and Galaxy S26/Z Fold7/Flip7-family rows were correctly in D1 (confirmed via
@@ -521,8 +535,28 @@ README's own prior deploy note" to "live-corroborated via migration count
 and bundle hash"** — it does not amount to a first-hand backend-commit
 proof, since the app exposes no version/commit marker to check directly
 (`/api/health` returns only `{ok, ts}`), and no such marker was added this
-pass. The atomicity question for deploying the ten-file held batch remains
-separately open and is not addressed by this corroboration.
+pass.
+
+**How the ten held migrations apply, and what "the atomicity question"
+now specifically means (reconciled 2026-08-21):** `gsk hosted deploy` is
+the ONLY mechanism that applies pending migrations for this project — no
+separate `d1_migrate` subcommand exists, and production's own
+`d1_migrations` timestamps (0018/0019/0020 sharing one timestamp,
+0021/0022 sharing another) are direct evidence that one deploy action
+applies a whole batch of previously-unapplied files together. **The ten
+"held" files are not held out of `migrations/` at all** — only `0030`
+is physically moved to `migrations-held/`; `0023a`/`0023b`/`0023c`,
+`0024`-`0029`, and `0031` all sit inside `migrations/` right now, so the
+next `gsk hosted deploy`, for any reason, ships all ten. What remains
+open is narrower than "how do they apply": D1's HTTP API has no atomic
+multi-statement DDL, so a batch of ten files applied by one deploy
+action is ten independent auto-commit operations, not one transaction —
+a mid-batch failure could leave production partially migrated (the
+deploy result's `schema_verification: incomplete` field is designed to
+detect this, not prevent it), and a check-then-apply race between a
+precondition check and the actual DDL execution is a distinct residual
+risk. See `.deploy-checks/g5-phase2-live-half.md`'s "How the ten held
+migrations apply" section for the full reconciliation and evidence.
 
 Two workstreams are active in parallel and are kept strictly
 separate (a change in one must never touch the other):

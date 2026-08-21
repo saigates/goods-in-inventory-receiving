@@ -325,6 +325,21 @@ across three snapshots and one full dry-run rehearsal — but the atomicity
 question the user has flagged as still open is a distinct question from
 "are the preconditions currently clean," and is not answered by this doc.
 
+**Standalone observation, requested explicitly by the user: the live
+row count matches the 18 August export exactly.** Production's live
+`sku_catalog` row count (2,781, confirmed twice above) is identical to
+the row count in the 18-August export used for the offline half of this
+same precondition check — zero net growth over the three days between
+that export and this live read (2026-08-18 to 2026-08-21). Per the
+self-heal behaviour documented elsewhere in `README.md`, `sku_catalog`
+only grows when a device is received against one of the 9 legacy
+UG-only configurations at a grade the catalog doesn't yet have a row
+for; zero growth over three days is consistent with — though not
+positive proof of — low received-device volume against those specific
+9 configurations in that window. This is offered as an incidental
+observation about production activity, not as a precondition result in
+its own right.
+
 ## Gates / discipline notes
 
 - Every query above except one (the `pragma_table_info` call flagged
@@ -542,3 +557,118 @@ the two as invalidating everything read/attempted in between — including,
 for a deploy, treating a post-deploy identity mismatch as grounds to
 verify via `gsk hosted worker_get`/`d1_schema` that the resource actually
 mutated belongs to the intended project before reporting success.
+
+## How the ten held migrations actually apply — reconciled 2026-08-21, later same day
+
+**The user flagged this as a NEW, unresolved gap in the following message.
+It is not new — it was already settled, read-only, in a prior pass, with
+direct empirical evidence, and the settled answer is recorded in
+`migrations-held/README.md`'s "Mechanism confirmation" section (dated
+2026-08-19). This section reconciles the two rather than re-investigating
+from scratch, and corrects one part of the user's framing of the gap.**
+
+**Prior-pass finding, re-verified this pass by re-reading it (not
+re-derived from nothing):** production's own `d1_migrations` table, as
+captured in the durable md5-verified export at
+`/mnt/aidrive/prod-export-2026-08-18-pre-0029.sql`, shows migrations
+0018/0019/0020 all recorded with the **identical** timestamp
+(`2026-08-11 16:29:03`), and 0021/0022 sharing a second identical
+timestamp (`2026-08-11 16:54:39`) from a same-day follow-up deploy. That
+is direct evidence — not inference from a help string — that a single
+`gsk hosted deploy` action applied a batch of previously-unapplied
+migration files together, keyed off what production's tracking table
+already records. Combined with the circumstantial evidence independently
+re-found this pass (the `gsk-hosted-deploy` skill's own deploy-result
+schema carries `result.migration_status` / `result.migration_errors` /
+`result.schema_verification` fields on the deploy action itself — fields
+that only make sense if the deploy pipeline performs and reports on
+migration application), and with `gsk hosted --help` confirming **no
+separate `d1_migrate`/`migrations_apply` subcommand exists at all**, the
+conclusion already on record stands and is not weakened by anything
+found this pass:
+
+> `gsk hosted deploy` auto-applies every migration file present in
+> `migrations/` that production's `d1_migrations` table does not yet
+> record, as one part of the same approved deploy action — with no
+> user-facing option to apply a subset.
+
+**This forecloses, rather than confirms, the user's specific hypothesis
+that "it may not be `gsk hosted deploy` that runs the batch at all."**
+There is no other mechanism available under the standing `--with-db`
+prohibition to apply them (`d1_execute` DDL is the only alternative
+write path, and using it to hand-apply ten migration files instead of
+letting deploy do it would be a deliberate, much riskier departure from
+every precedent in this project's own deploy history — not something
+implied by anything found this pass).
+
+**A sharper, previously-unstated fact this pass surfaced by checking the
+actual filesystem rather than re-reasoning about the mechanism in the
+abstract**: the "ten held files" are not held out of `migrations/` at
+all. Only `0030` is physically moved to `migrations-held/`; the other ten
+(`0023a`, `0023b`, `0023c`, `0024`–`0029`, `0031`) sit inside `migrations/`
+right now, alongside the 22 already-applied files:
+
+```
+$ git ls-files migrations/ | tail -12
+migrations/0023a_shipments_type_widening.sql
+migrations/0023b_received_devices_status_and_received_at.sql
+migrations/0023c_removal_flags.sql
+migrations/0024_ce1154_worksheet_rewrite.sql
+migrations/0025_misdeclaration_ack_and_value_adjustment_defaults.sql
+migrations/0026_export_procedure_policy_defaults.sql
+migrations/0027_worksheet_input_provenance.sql
+migrations/0028_bills_cost_ledger_freight.sql
+migrations/0029_manifest_bill_link.sql
+migrations/0031_sku_catalog_unique_config_grade.sql
+$ git ls-files migrations-held/
+migrations-held/0030_expected_devices_condition_derived_from_grade.sql
+migrations-held/README.md
+```
+
+Given the mechanism above, this means **the very next `gsk hosted
+deploy` — for any reason, even one intended as "just" a code fix —
+would auto-apply all ten of these in the same action**, because they are
+sitting exactly where the pipeline looks. "Held" currently means
+"reviewed and judged deployable," not "kept out of the deploy's reach."
+Only `0030` is actually withheld from the next deploy by virtue of its
+location. This is not a new risk introduced by this pass's reading — it
+is the situation `migrations-held/README.md` already documents and
+0030's own directory already defends against — but it had not, until
+this reconciliation, been stated plainly as "the next deploy ships all
+ten, full stop, regardless of intent."
+
+**What this does NOT resolve, and what remains genuinely open — the
+atomicity/race question already on record is real and is a different
+question from "which mechanism applies migrations":** D1's HTTP API has
+no atomic multi-statement DDL (documented in the `gsk-hosted-deploy`
+skill's "DDL transactional caveat" section, and independently in this
+project's own README as the reason explicit `BEGIN TRANSACTION`/`COMMIT`
+wrappers are rejected). A batch of ten migration files applied "together"
+by one deploy action is ten independent auto-commit operations, not one
+transaction — if file 6 of 10 fails (e.g. a constraint violation the
+live-precondition checks in this document did not anticipate), files
+1–5 are already committed and files 7–10 never run, leaving production
+schema in a partially-migrated state that the deploy's own
+`result.schema_verification: incomplete` field is designed to detect,
+not prevent. **This is the part of "the atomicity question" that remains
+open and is not answered by settling the mechanism question above** —
+knowing *that* the deploy applies all ten together does not establish
+that it applies them *safely* against a partial-failure mid-batch, nor
+does it address a check-then-apply race (a precondition confirmed clean
+at check time could theoretically change before the same batch's DDL
+statement executes, though the live checks in this document minimize
+that window for the two known hazards — `0023b`'s FK repoint and `0031`'s
+unique-index collision — by being as close to deploy time as this pass
+could get without deploying).
+
+**Reframed conclusion**: the mechanism question is settled (deploy alone
+does it, atomically-as-a-batch is NOT guaranteed within that "one
+action"), which narrows the still-open atomicity question to specifically
+the partial-DDL-failure and check-then-apply-race concern — not left
+open because the mechanism itself is unknown, which was the user's
+framing. The practical implication for sequencing is also now clear:
+there is no "deploy code first, migrate schema separately" option to
+sequence at all for this project's pipeline category — code and schema
+ship in the same action, for better (no manual two-step orchestration
+needed) and worse (no way to stage migrations ahead of code, or vice
+versa, if that were ever wanted).
