@@ -672,3 +672,89 @@ sequence at all for this project's pipeline category — code and schema
 ship in the same action, for better (no manual two-step orchestration
 needed) and worse (no way to stage migrations ahead of code, or vice
 versa, if that were ever wanted).
+
+## Decision: ship the ten as one batch, not staged — settled 2026-08-21
+
+**The user proposed staging as an alternative to ship-all-ten, then
+sharpened their own proposal to reject it, for two reasons verified
+directly against the migration files and application source rather than
+accepted on assertion:**
+
+**1. The deploy is one action, not two — there is no "migrations first,
+code after" available.** `gsk hosted deploy` applies unapplied
+migrations AND ships the worker built from the invoking session's
+checked-out tree in a single action (established above). So any staged
+variant is really "deploy with fewer migration files present," which
+forces one of two states, both bad: current HEAD code running against a
+partial schema, or an older commit checked out alongside a newer
+migration subset — a pairing that has never been built or tested.
+**Confirmed current HEAD code cannot run against pre-0023 schema**, via
+direct grep of the two files the user named:
+
+```
+$ grep -n "0023\|received_at\|removal_flag" src/types.ts
+141:  // Physical receipt time (migration 0023) — backdatable, distinct from
+161:// ───────── Removal flags (regrade-fix 2, migration 0023) ─────────
+240:  shipment_type: 'OPR_REPAIR' | 'TEMP_EXPORT_STANDARD'
+$ grep -n "0023" src/lib/deviceLifecycle.ts
+57:  // ── TEMP_EXPORTED_STANDARD consignment flow (migration 0023) ──
+```
+
+`types.ts`'s `shipment_type` union hardcodes `TEMP_EXPORT_STANDARD` —
+the value `0023a`'s `CHECK` widening adds — and its `received_at` /
+`RemovalFlag` fields correspond directly to `0023b`/`0023c`'s added
+columns. Current `main` cannot run correctly against a database that
+lacks these, so "deploy code, migrate later" is not a safe reduction of
+scope — it is a guaranteed break, not a smaller risk.
+
+**2. The `0023a`/`0023b` boundary is not an independent split point —
+splitting there manufactures the exact half-migrated state the
+atomicity concern is about.** Verified directly against both files'
+own headers and statements, not taken on the user's word:
+
+```
+$ grep -n "shipments_old\|shipment_lines" migrations/0023a_shipments_type_widening.sql | head -5
+16:-- shipment_lines recreated twice (once here referencing the not-yet-
+...
+290:ALTER TABLE shipments     RENAME TO shipments_old;
+321:-- shipments_old (the TABLE) intentionally NOT dropped here — its indexes
+```
+
+`0023a`'s own header states `shipment_lines` is deliberately "left
+UNTOUCHED by this file — it keeps pointing at the current (pre-widening)
+shipments table across this migration and into 0023b, where it is
+recreated EXACTLY ONCE." Confirmed in `0023b`:
+
+```
+$ grep -n "shipment_lines: recreated EXACTLY ONCE\|DROP TABLE shipments_old" migrations/0023b_received_devices_status_and_received_at.sql
+542:-- shipment_lines: recreated EXACTLY ONCE here, referencing BOTH final
+580:DROP TABLE shipments_old;
+```
+
+`shipments_old` is not dropped until line 580 of `0023b`, well after
+`shipment_lines` has already been repointed earlier in that same file.
+A deploy that applies `0023a` alone and stops there leaves
+`shipment_lines` pointing at `shipments_old` under live traffic between
+that deploy and the next one — exactly the half-migrated,
+non-atomic-DDL-failure state the atomicity concern describes, except
+deliberately manufactured and held open for an entire deploy cycle
+instead of a single failed statement. Splitting after `0023c` instead
+is self-consistent on the schema side but still spans the `types.ts` /
+`deviceLifecycle.ts` code dependency above, and doubles the number of
+deploy events (each carrying its own identity-stability and build-hash
+gate exposure) for a reduction in per-deploy file count that buys very
+little given point 1 already rules out a code-only interim deploy.
+
+**Conclusion, accepted**: shipping the ten files as one batch is the
+better plan, not merely the more expedient one. Staging trades a
+low-probability risk that has already been measured and mitigated (the
+non-atomic multi-statement DDL exposure, narrowed above, with both
+known preconditions — `0023b`'s FK repoint and `0031`'s collision check
+— live-confirmed clean this same day) for a certain, unrehearsed one
+(a genuinely half-migrated production schema held open across a full
+deploy cycle, or a code/schema pairing that has never been built). The
+rehearsal already run (offline half, this batch, current code) is the
+only pairing that has been validated end-to-end; every staged
+alternative would be a first-time combination. **Decision: ship as one
+batch. No deployment authorised by this decision alone — the user's own
+explicit go-ahead is still required before the deploy call is made.**

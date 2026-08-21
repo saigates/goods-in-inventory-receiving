@@ -307,6 +307,21 @@ If you ever see an error toast when adding one of these to the catalogue instead
 > no code-only deploy path available while these files remain in
 > `migrations/`. Before making any deploy call for any reason, re-read
 > this paragraph and confirm the batch is actually meant to ship.
+>
+> **Decision (2026-08-21): ship as one batch, not staged.** Staging via
+> `migrations-held/` was considered and rejected — the deploy applies
+> migrations and ships code in one action, so there is no "migrations
+> first, code after" available, and current `main` cannot run against
+> pre-`0023` schema (`src/types.ts`'s `shipment_type` union and
+> `received_at`/`RemovalFlag` fields, `src/lib/deviceLifecycle.ts`'s
+> `TEMP_EXPORTED_STANDARD` flow, all depend on it directly). Splitting
+> at the `0023a`/`0023b` boundary specifically would manufacture a
+> half-migrated `shipment_lines`-points-at-`shipments_old` state under
+> live traffic for a full deploy cycle — worse than the non-atomic-DDL
+> risk it would be avoiding, not safer. See "Decision: ship the ten as
+> one batch, not staged" in `.deploy-checks/g5-phase2-live-half.md` for
+> the full verification. **This decision does not itself authorise a
+> deploy** — the explicit go-ahead is still required separately.
 
 - **Platform**: Cloudflare Pages + Workers
 - **Status**: ✅ Running in sandbox (port 3000 via Wrangler)
