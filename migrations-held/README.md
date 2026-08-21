@@ -123,3 +123,69 @@ in order:**
    against the live CHECK constraint, not just that the suite total
    changed.
 5. Only then deploy.
+
+**6. Check for a numbering collision with `0031` before restoring `0030`
+under its original filename — added 2026-08-21.** Migration
+`0031_sku_catalog_unique_config_grade.sql` ships in the 0023-0029+0031
+batch (i.e. before this held file is restored). Its own header comment
+records that it was itself "renumbered from a locally-drafted 0030
+before this commit was ever pushed anywhere" — this project has
+therefore already once avoided exactly this collision by renumbering.
+`gsk hosted deploy` (and this project's `d1_migrations` table generally)
+tracks applied migrations by insertion order at apply time, not by
+filename — so restoring this held file under its ORIGINAL name `0030`
+after `0031` has already shipped would create a file numbered LOWER
+(`0030`) than one already applied (`0031`), but that file would itself
+be applied at a HIGHER `d1_migrations` id than `0031`'s. That is the
+same out-of-order shape as the `0023a`/`0023b`/`0023c` incident
+documented in `migrations-review/README.md`'s "Adoption precondition"
+section (ids 30-32 landing after 0024-0029's ids 24-29), arrived at
+legitimately rather than by mistake this time — but not automatically
+safe merely because it's deliberate.
+
+**Before running step 1 above**, check whether `0031` (or any other
+migration that has shipped in the meantime) has already claimed a
+number this held file would collide or interleave with, and if so,
+**rename this held file to the next available number instead of
+restoring it as `0030`** — the same remedy `0031` itself already used.
+Do not restore it under `0030` once any migration numbered `0030` or
+higher has shipped; check the current `migrations/` listing and this
+directory before deciding the new number, and update every reference
+to "0030" in this README, the tracker backlog entry, and
+`.deploy-checks/pre-0029-export.md` / `lw001-16-catalog-coverage.md` to
+match the new filename at that time — this note does not pre-select the
+new number, since it depends on whatever else has shipped by then.
+
+## Future migration `0032` — duplicate sweep required before the `startRepair()` index fix
+
+The `startRepair()` check-then-insert race (`src/lib/repairWorkflow.ts`
+lines 71-79, logged as an Open defect in `public/tracker/index.html`) is
+expected to be fixed by a future migration adding a partial unique index
+on `repair_jobs(device_id)` WHERE `status IN ('open','awaiting_qc')`,
+the same fix shape migration `0031` used for `sku_catalog` (its own
+header cites this exact defect as precedent). At the time `0031` was
+written, `repair_jobs` was confirmed to have 0 rows in both the
+2026-08-11 and 2026-08-18 production exports (see
+`.deploy-checks/g5-offline-imei-and-repair-job-checks.md`) — so a
+`CREATE UNIQUE INDEX` at that time would have had nothing to collide
+against. **That evidence goes stale the moment this held batch (which
+ships the repair-cost surfaces, `postRepairCostToLedger()` and the
+`/repair/cost` and `/repair/cost-ledger` routes) deploys and bench staff
+begin actively opening repair jobs** — the deferral window between "this
+batch ships" and "the unique-index migration is written" is exactly the
+period during which `repair_jobs` could first become non-empty with the
+race still unfixed, and a live duplicate-open-job sweep from before that
+window says nothing about after it.
+
+**Requirement**: whatever migration eventually adds this index (next
+available number after this batch, referred to informally as "0032")
+MUST be preceded by a FRESH duplicate-open-job sweep of live
+`repair_jobs` — the same query shape as
+`.deploy-checks/g5-offline-imei-and-repair-job-checks.md` check (B), but
+against a live read taken immediately before that migration is written,
+not a reused snapshot. If the sweep finds any device with more than one
+simultaneously open/awaiting_qc repair job, those duplicates must be
+resolved (which job stays open is an app-level decision, not a migration
+concern) before the unique index is added, or `CREATE UNIQUE INDEX` will
+abort exactly as `0031`'s did for `sku_catalog` collisions — the same
+failure mode, on a table that by then may no longer be empty.

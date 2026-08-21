@@ -63,6 +63,44 @@ remain reachable only through a separate, still-unapproved bulk
 remediation — auto-generation on the happy path (brand-new config, zero
 existing rows) is a different case from these 9 and does not touch them.
 
+**CORRECTION (2026-08-21) — the worked example above is wrong; checked,
+not assumed.** `POST /api/catalog` requesting grade A for `GALAXY S24 FE
+/ 256GB / Graphite` (or any of the other 8 UG-only configs) does **not**
+hit Decision 2's refusal and does **not** return `{error, existing}` —
+it self-heals. Root cause: Decision 2's guard
+(`existingMatch.status === 'match'`, `src/routes/catalog.ts` line 290)
+only fires when a row matches on `model+capacity+color+`**`grade`**
+together, and `resolveCatalogSku()`'s exact-match step
+(`src/lib/catalog.ts` lines 206-217) requires the same four-way match
+including the REQUESTED grade — so it returns `match` only when
+re-requesting a grade that already has its own row (e.g. re-requesting
+`UG` on one of these 9 configs), not when requesting a genuinely
+missing grade. When the requested grade is missing, `existingMatch`
+comes back `no_match`, the guard does not fire, and the loop at
+`src/routes/catalog.ts` lines 306-340 computes `missingGrades` across
+**all four** `VALID_GRADES` for that config (not just the requested
+one) and inserts every missing row — the requested grade lands in
+`row`, the rest in `generated_siblings`. Verified empirically, not just
+by re-reading the code: a throwaway scratch spec seeded a fresh
+UG-only config directly via SQL, then `POST /api/catalog` requesting
+grade A returned `200 { ok:true, row:{ grade:"A", ... },
+generated_siblings:[{grade:"B"},{grade:"C"}] }` against the real Hono
+app + D1 (deleted immediately after use, per this project's scratch-file
+discipline — never committed).
+
+**Corrected consequence for the 9 UG-only configs**: any bench receive
+of an A/B/C-graded device on one of them will self-heal that config's
+remaining two missing rows in the same call, via the existing "Add to
+catalogue & receive" button on the no-match red-banner path — no
+separate bulk remediation is required to unblock the bench for that
+case. Re-scanning a UG-graded device on the same 9 configs was never a
+gap (the UG row already exists, so the ordinary `/scan` match succeeds
+without touching this route at all). The still-unapproved 27-row bulk
+remediation therefore becomes optional pre-emptive tidying, not a
+bench-blocking prerequisite — see the tracker correction entry and the
+User Guide note this correction prompted for the operator-facing
+wording.
+
 ## Device-side ("bench-impact") figure — SEPARATE, do not substitute for the above
 
 Per spec: devices whose own grade has no corresponding variant row on

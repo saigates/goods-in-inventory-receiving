@@ -255,6 +255,11 @@ Lifecycle     ──► POST /api/devices/:id/transition ──► received_devi
 - `Esc` while in Receive → refocus the scan input.
 - Inside the SKU-confirm modal: two footer buttons — **Confirm only** (no label) / **Confirm & Print** (queues a label). The old “Auto-queue print label” checkbox was replaced by this explicit choice.
 
+### A/B/C-graded device on 9 specific Samsung models — nothing extra to do
+A 2026-08-11 catalogue sweep found 9 Samsung configurations (GALAXY S20 FE/128GB/Cloud Navy, S21/256GB/Phantom Gray, S23 FE/256GB/Graphite, S24/256GB and 512GB/Phantom Black, S24 FE/256GB/Graphite, Z FLIP5/256GB and 512GB/Graphite, Z FOLD5/256GB/Phantom Black) that only had a UG catalogue row — no A/B/C rows yet existed for them. **This is not something bench staff need to work around**: if you scan a device on one of these models graded A, B, or C, the screen will show the usual red no-match banner exactly like any brand-new configuration — click **Add to catalogue & receive** as normal. That single click creates the missing row for the grade you're receiving *and* the other missing grade rows for that same model/capacity/color in the same action, so the very next device on that model in a different grade will match immediately without needing this step again. Receiving a UG-graded device on these models was never affected — it already matches the existing catalogue row via the normal scan path.
+
+If you ever see an error toast when adding one of these to the catalogue instead of it just working, that's a genuine issue (a SKU string collision, not the missing-row case above) — stop and flag it rather than retrying repeatedly.
+
 ## Production Integration Notes
 
 ### Connecting a physical DYMO LabelWriter
