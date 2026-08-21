@@ -292,6 +292,22 @@ If you ever see an error toast when adding one of these to the catalogue instead
 - **Webhook secret storage**: stored server-side in the `webhooks` table, returned to the caller **once**, at creation time (`POST /api/webhooks`), never echoed back by `GET /api/webhooks` afterwards.
 
 ## Deployment
+
+> ⚠️ **Ten of the eleven pending migration files ship on the NEXT deploy,
+> for ANY reason — including an unrelated one-line code fix.** Only
+> `migrations-held/0030_...sql` is physically withheld; `0023a`, `0023b`,
+> `0023c`, `0024`–`0029`, and `0031` all already sit inside `migrations/`.
+> `gsk hosted deploy` auto-applies every file there that production's
+> `d1_migrations` table doesn't yet record, as one non-atomic batch of
+> ten independent auto-commit DDL statements (D1's HTTP API has no
+> atomic multi-statement DDL — see "How the ten held migrations apply"
+> in `.deploy-checks/g5-phase2-live-half.md`). **The standing "no deploy
+> without explicit go-ahead" instruction is currently the ONLY thing
+> preventing an incidental deploy from applying this batch** — there is
+> no code-only deploy path available while these files remain in
+> `migrations/`. Before making any deploy call for any reason, re-read
+> this paragraph and confirm the batch is actually meant to ship.
+
 - **Platform**: Cloudflare Pages + Workers
 - **Status**: ✅ Running in sandbox (port 3000 via Wrangler)
 - **Tech Stack**: Hono · TypeScript · Cloudflare D1 · vanilla JS SPA · Tailwind CDN
