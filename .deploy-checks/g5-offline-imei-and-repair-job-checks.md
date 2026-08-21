@@ -124,29 +124,94 @@ Run against BOTH exports (2026-08-11 and 2026-08-18), not just one, since
 they're different points in time and a race that hadn't yet occurred by
 08-11 could in principle have occurred by 08-18.
 
-**Result**: `repair_jobs` contains **0 rows in both exports** (confirmed
-two ways per export: `SELECT COUNT(*) FROM repair_jobs` after loading into
-SQLite, AND a raw `grep -c "INSERT INTO repair_jobs"` / case-insensitive
-grep against each source `.sql` file directly — the only match in either
-file is the `d1_migrations` bookkeeping row recording that migration
+**Result, correctly labelled**: `repair_jobs` contains **0 rows in both
+exports** (confirmed two ways per export: `SELECT COUNT(*) FROM
+repair_jobs` after loading into SQLite, AND a raw `grep -c "INSERT INTO
+repair_jobs"` / case-insensitive grep against each source `.sql` file
+directly — the only match in either file is the `d1_migrations`
+bookkeeping row recording that migration
 `0022_repair_jobs_and_zoho_queue.sql` was applied on 2026-08-11, not any
-actual `repair_jobs` data row). Since the table is empty in both exports,
-the duplicate-open-job query trivially returns zero groups — **no
-duplicate-open-job incident exists in either export**, not because the
-defect can't happen, but because the in-house repair workflow evidently has
-no rows in production as of either export's cutoff (consistent with
-`docs/plan/device-lifecycle-slice1.md`'s stated status that this feature's
-usage is still ramping, and with the tracker's own note that "Group D...
-stock currently goes into Zoho by hand").
+actual `repair_jobs` data row).
 
-**What this does and doesn't prove**: it proves the defect has not yet
-manifested as of 2026-08-18. It does NOT close the defect itself (still
-`Open` in the tracker, still unfixed, still explicitly out of scope for G5
-item 3 per instruction) — an empty table today is not evidence the race
-can't occur once the in-house repair flow has real concurrent traffic. This
-check simply answers "has it happened yet" (no) rather than "can it happen"
-(yes, per the existing code-reading-based tracker entry, unchanged by this
-result).
+**Correction (flagged by review, applied here): with a 0-row table, the
+duplicate-open-jobs query is "0 of 0," not a measured zero.** Stating this
+as "no duplicates found" — as an earlier draft of this check did — implies
+a population was searched and came back clean, which overstates what an
+empty-table result actually shows. The correct label is **not measured**:
+there is no open-repair-job population in either export for the query to
+find a duplicate within, so the check cannot distinguish "the race can't
+happen" from "the race has simply never had a chance to fire." This is the
+same standard already applied to the device-IMEI-side sweep (Check A) —
+denominator matters, and a query with denominator 0 proves nothing about
+the property it was written to test.
+
+**The underlying fact is still a genuine, independently useful finding in
+its own right, separate from the vacuous query**: production has never
+written a single `repair_jobs` row as of either snapshot — not "no
+duplicates," but "no repair-job rows at all." That downgrades the
+`startRepair()` race's practical urgency (it cannot have fired yet, since
+firing requires at least one row to exist) without closing the defect,
+which is unaffected by this and stays `Open`, unfixed, and out of scope
+for G5 item 3.
+
+## Check C (added on review): `zoho_batch_devices` row count — completing the deploy-precondition pair
+
+**Why this belongs alongside Check B, not as a separate exercise**: the
+0-repair_jobs-rows fact above is not just a repair-workflow observation —
+it is **half of a specific, already-carried deploy precondition**.
+`.deploy-checks/pre-0029-export.md`'s forensic review of migration
+`0023_*` (the held 0023-0029 batch) found that `repair_jobs.device_id` and
+`zoho_batch_devices.device_id` are both `NO ACTION` FK children of
+`received_devices` that 0023's `DROP TABLE received_devices` recreate step
+does NOT repoint — so that migration, **as written today**, would only
+fail loudly (not corrupt data — `FOREIGN KEY constraint failed`, blocking
+the drop outright) if deployed at a moment either table has any rows. That
+doc's 2026-08-19 addendum already established `repair_jobs = 0` for the
+2026-08-18 export; Check B above independently re-derives the same fact
+for BOTH exports via a different method (a duplicate-groups query rather
+than a plain count, arriving at the same "0 rows" fact from a different
+angle) — but the pair is incomplete without `zoho_batch_devices`, which
+that doc's own text explicitly flags as "written by the (separate,
+unconfirmed-active) Zoho batch flow" and never gives its own count for.
+
+**Method**: same two scratch DBs, same two-way confirmation pattern (SQLite
+`COUNT(*)` plus independent raw `grep -c` against each source `.sql`
+file) —
+
+```sql
+SELECT COUNT(*) FROM zoho_batch_devices;
+```
+
+**Result**: `zoho_batch_devices` contains **0 rows in both the 2026-08-11
+and 2026-08-18 exports** (SQLite `COUNT(*)` = 0 both times; independent
+`grep -ic "INSERT INTO zoho_batch_devices"` against both source `.sql`
+files also = 0 both times — the search was case-insensitive and found no
+match of any kind, not even a bookkeeping row, since `zoho_batch_devices`
+has no corresponding `d1_migrations` name string to match on incidentally).
+
+**This completes the pair**: both `NO ACTION` FK children of
+`received_devices` that migration 0023 fails to repoint —
+`repair_jobs.device_id` and `zoho_batch_devices.device_id` — are
+independently confirmed empty across **two snapshots a week apart**
+(2026-08-11 and 2026-08-18). That is encouraging evidence the deploy
+precondition ("both tables empty at deploy time") has held stably over at
+least that window, not just at a single instant.
+
+**What this does and does not authorise**: a precondition confirmed on two
+snapshots a week apart is **evidence toward**, not **satisfaction of**,
+the deploy precondition — both tables are live, actively-written surfaces
+(`repair_jobs` via `startRepair()`; `zoho_batch_devices` via the separate
+Zoho batch-confirmation flow), so a stale export can never be the final
+word on whether either has since gained a row. Per the review that
+requested this check, **this evidence must be re-verified against LIVE
+production immediately before the 0023-0029 batch actually ships** — filed
+here as the same class of pre-deploy step already carried for the
+`ux_sku_catalog_org_config_grade` unique-index collision re-check
+(migration `0031_sku_catalog_unique_config_grade.sql` line 124, whose own
+header used this same 2026-08-11 export for its collision-freedom
+verification and likewise needs a fresh live re-check before that
+migration ships). Two snapshots agreeing is not a deploy authorisation on
+its own.
 
 ## Gates / discipline notes
 
