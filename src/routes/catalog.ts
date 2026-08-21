@@ -198,9 +198,70 @@ app.post('/lookup', async (c) => {
   return c.json(result)
 })
 
-// Add a single catalog entry on the fly from the ConfirmSkuModal when no
-// matching SKU exists. Body: { brand, model, capacity, color, grade, sku? }
-// Returns the inserted row (or the conflicting row if a SKU collision exists).
+// D1's exact error text distinguishes an index-level collision (the
+// ux_sku_catalog_org_config_grade constraint added by migration 0031) from
+// a column-level collision (the pre-existing `sku` UNIQUE constraint) by
+// naming an INDEX vs a TABLE.COLUMN — confirmed empirically against the
+// real D1 binding (probe run 2026-08-20, spec deleted after capturing the
+// output) and confirmed on review as a general, durable SQLite behaviour,
+// not coincidental to these two constraints specifically:
+//   index-based:  D1_ERROR: UNIQUE constraint failed: index 'ux_sku_catalog_org_config_grade': SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)
+//   column-based: D1_ERROR: UNIQUE constraint failed: sku_catalog.sku: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)
+// Two deliberate construction choices, per review (2026-08-21) — same
+// precedent shape as isImeiUniqueError() in src/routes/scan.ts, but with
+// these two riders layered on:
+//  1. NOT anchored to start-of-string: both real strings happen to be
+//     prefixed `D1_ERROR:`, but that prefix is wrapper-dependent and may
+//     not be present/identical across every error-surfacing layer.
+//  2. Matches the index/column name LITERALLY (exact substring, followed
+//     immediately by the closing quote / a word boundary) so a future
+//     index or column sharing a name PREFIX with this one (e.g.
+//     'ux_sku_catalog_org_config_grade_v2') can never be accidentally
+//     swallowed by a looser match.
+function isCatalogConfigUniqueError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return /UNIQUE constraint failed:\s*index\s*'ux_sku_catalog_org_config_grade'/i.test(msg)
+}
+function isCatalogSkuUniqueError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return /UNIQUE constraint failed:\s*sku_catalog\.sku\b/i.test(msg)
+}
+
+// Add a catalog entry on the fly from the ConfirmSkuModal when no matching
+// SKU exists — now with four-grade-variant auto-generation (G5 item 2).
+// Body: { brand, model, capacity, color, grade, sku? }
+//
+// ── Two design decisions, made and documented here 2026-08-21 (per
+// explicit instruction: "what comes back is a real decision, not an
+// implementation detail... pick one and state it") ──
+//
+// DECISION 1 — response shape when up to 4 rows may be created in one
+// call: `row` stays the SINGLE row matching the REQUESTED grade, exactly
+// as before — this preserves the existing contract every current caller
+// relies on (addToCatalogAndReceive()/confirmIt() in public/static/app.js
+// read `r.row.sku` and immediately receive against it; nothing about that
+// changes). The up-to-3 sibling rows generated in the SAME call are
+// reported SEPARATELY in `generated_siblings` ({id, sku, grade}[]) —
+// additive, never merged into or substituted for `row`.
+//
+// DECISION 2 — the mixed case: the REQUESTED grade already has a row, but
+// one or more siblings are still missing (exactly the shape of the known
+// 9-config/27-row gap the sweep found). Two options were both defensible:
+//   (a) refuse — {error, existing} as today, no side effects.
+//   (b) success that opportunistically fills the missing siblings even
+//       though the requested grade pre-existed.
+// PICKED: (a). Migration 0031's own header requires that "the eventual
+// auto-generation logic" close the race window WITHOUT turning ordinary
+// receive traffic into a remediation channel, and this project has
+// separately, deliberately scoped "any bulk remediation (writing the 27
+// missing rows)" as its OWN future approval, out of this item's commit.
+// Option (b) would make POST / a silent, incremental backdoor for exactly
+// that remediation: any ordinary receive against one of the 9 known-bad
+// configs, requesting its already-existing UG grade, would side-effect-
+// create the missing A/B/C rows with no explicit approval step. That
+// blurs a boundary this project has kept explicit elsewhere, so
+// auto-generation only ever fires on a genuinely NEW grade for a config —
+// i.e. below, only when existingMatch.status !== 'match'.
 app.post('/', async (c) => {
   const user = currentUser(c)
   const orgId = user.organisation_id
@@ -221,8 +282,10 @@ app.post('/', async (c) => {
   if (!brand || !model) {
     return c.json({ error: 'brand and model are required' }, 400)
   }
-  // Refuse if a row already matches (model+capacity+color+grade) — operator
-  // should pick that one rather than create a duplicate.
+
+  // Decision 2: refuse if a row already matches (model+capacity+color+
+  // grade) exactly — operator should pick that one rather than trigger
+  // auto-generation as a side effect of an ordinary duplicate request.
   const existingMatch = await resolveCatalogSku(c.env.DB, { model, capacity, color, grade }, orgId)
   if (existingMatch.status === 'match') {
     return c.json({
@@ -231,29 +294,103 @@ app.post('/', async (c) => {
     }, 409)
   }
 
-  // Derive SKU if not provided
-  const sku = cleanString(body.sku, 128) || (() => {
-    const built = buildSku({ oem: brand, description: model, color, capacity })
-    return `${built.sku}-${grade}`
-  })()
+  // Genuinely new grade for this config: find every grade CURRENTLY
+  // missing from this exact config (organisation_id + brand + model +
+  // capacity + color, same key shape as ux_sku_catalog_org_config_grade)
+  // in one query, diffed in memory against VALID_GRADES — the same
+  // "fetch once, diff in memory" pattern matchCatalogRows/
+  // resolveCatalogSkuBulk already use elsewhere in this file, rather than
+  // up to 4 sequential existence checks. `grade` (the requested one) is
+  // guaranteed to be among the missing set here, since existingMatch
+  // already confirmed no exact row exists for it.
+  const sameConfig = await c.env.DB.prepare(
+    `SELECT grade FROM sku_catalog
+      WHERE organisation_id = ?
+        AND UPPER(brand) = UPPER(?)
+        AND UPPER(model) = UPPER(?)
+        AND COALESCE(capacity, '') = COALESCE(?, '')
+        AND UPPER(COALESCE(color, '')) = UPPER(COALESCE(?, ''))`
+  ).bind(orgId, brand, model, capacity, color).all<{ grade: string | null }>()
+  const existingGrades = new Set(sameConfig.results.map(r => (r.grade || 'UG').toUpperCase()))
+  const missingGrades = (VALID_GRADES as readonly string[]).filter(g => !existingGrades.has(g))
 
-  // Refuse if SKU collides with a different row (within this org)
-  const collision = await c.env.DB.prepare(
-    'SELECT id, sku, brand, model, capacity, color, grade FROM sku_catalog WHERE sku = ? AND organisation_id = ?'
-  ).bind(sku, orgId).first()
-  if (collision) {
-    return c.json({
-      error: `SKU '${sku}' already exists with different fields`,
-      existing: collision,
-    }, 409)
+  const explicitSku = cleanString(body.sku, 128)
+  const deriveGradeSku = (g: string): string => {
+    if (explicitSku && g === grade) return explicitSku
+    const built = buildSku({ oem: brand, description: model, color, capacity })
+    return `${built.sku}-${g}`
   }
 
-  const ins = await c.env.DB.prepare(
-    'INSERT INTO sku_catalog (organisation_id, sku, brand, model, capacity, color, grade) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).bind(orgId, sku, brand, model, capacity, color, grade).run()
-  const row = await c.env.DB.prepare('SELECT * FROM sku_catalog WHERE id = ?')
-    .bind(ins.meta.last_row_id).first()
-  return c.json({ ok: true, row })
+  let row: Record<string, unknown> | null = null
+  const generated_siblings: Array<{ id: number; sku: string; grade: string }> = []
+  const sku_conflicts: Array<{ grade: string; sku: string; existing: unknown }> = []
+
+  for (const g of missingGrades) {
+    const sku = deriveGradeSku(g)
+    try {
+      const ins = await c.env.DB.prepare(
+        'INSERT INTO sku_catalog (organisation_id, sku, brand, model, capacity, color, grade) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).bind(orgId, sku, brand, model, capacity, color, g).run()
+      const insertedRow = await c.env.DB.prepare('SELECT * FROM sku_catalog WHERE id = ?')
+        .bind(ins.meta.last_row_id).first<Record<string, unknown>>()
+      if (g === grade) {
+        row = insertedRow
+      } else if (insertedRow) {
+        generated_siblings.push({ id: ins.meta.last_row_id, sku, grade: g })
+      }
+    } catch (err) {
+      if (isCatalogConfigUniqueError(err)) {
+        // Raced: another request inserted this exact grade for this exact
+        // config between our SELECT above and this INSERT. Idempotent —
+        // re-read what's there instead of failing the whole call.
+        const raced = await c.env.DB.prepare(
+          `SELECT id, sku, brand, model, capacity, color, grade FROM sku_catalog
+            WHERE organisation_id = ?
+              AND UPPER(brand) = UPPER(?) AND UPPER(model) = UPPER(?)
+              AND COALESCE(capacity, '') = COALESCE(?, '')
+              AND UPPER(COALESCE(color, '')) = UPPER(COALESCE(?, ''))
+              AND grade = ?`
+        ).bind(orgId, brand, model, capacity, color, g).first<Record<string, unknown>>()
+        if (g === grade && raced) row = raced
+        continue
+      }
+      if (isCatalogSkuUniqueError(err)) {
+        // Genuine anomaly: the derived SKU string collides with an
+        // UNRELATED row (different config) that already holds it. Do not
+        // abort the whole request — record it, leave that one grade
+        // variant unwritten, and continue with the rest.
+        const conflict = await c.env.DB.prepare(
+          'SELECT id, sku, brand, model, capacity, color, grade FROM sku_catalog WHERE sku = ? AND organisation_id = ?'
+        ).bind(sku, orgId).first()
+        sku_conflicts.push({ grade: g, sku, existing: conflict })
+        continue
+      }
+      throw err
+    }
+  }
+
+  if (!row) {
+    // Should not happen on the normal path (grade was confirmed missing
+    // above, and its insert either succeeded or was raced-and-refetched)
+    // — but if the REQUESTED grade's own derived SKU hit a sku_conflicts
+    // case, surface that as the same 409 shape POST / already used for a
+    // SKU collision, rather than returning ok:true with no row.
+    const requestedConflict = sku_conflicts.find(sc => sc.grade === grade)
+    if (requestedConflict) {
+      return c.json({
+        error: `SKU '${requestedConflict.sku}' already exists with different fields`,
+        existing: requestedConflict.existing,
+      }, 409)
+    }
+    return c.json({ error: 'Failed to create or locate the requested catalog row' }, 500)
+  }
+
+  return c.json({
+    ok: true,
+    row,
+    generated_siblings,
+    ...(sku_conflicts.length ? { sku_conflicts } : {}),
+  })
 })
 
 // Delete a single catalogue entry by id. Does NOT affect received_devices that
