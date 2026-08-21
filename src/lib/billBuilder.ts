@@ -407,3 +407,21 @@ export function checkRepairBillAgainstDeclaredCharge(
 // line) — 'supplier-invoiced'. Exported so routes/tests share one
 // constant rather than each spelling the string out.
 export const SUPPLIER_INVOICED: CostLedgerProvenance = 'supplier-invoiced'
+
+// Default cost-ledger provenance for a cost entered WITHOUT a specific
+// priced source document to attribute it to (e.g. an in-house repair
+// cost with no bill line behind it) — 'default-unverified'.
+// Co-located with SUPPLIER_INVOICED deliberately: CostLedgerProvenance is
+// one closed, two-value-plus-'derived' vocabulary, and splitting it
+// across modules is exactly how the second member drifts from the first.
+// NOTE — checked, not assumed (2026-08-21): queried live sqlite_master
+// directly (`SELECT sql FROM sqlite_master WHERE type='table' AND
+// name='cost_ledger'`, plus a trigger check on the same table) and
+// confirmed cost_ledger.provenance carries NO CHECK constraint and NO
+// enforcing trigger anywhere — migration 0028's column comment
+// ('supplier-invoiced' | 'derived' | 'default-unverified') documents
+// intent only, not a DB-enforced contract. That means this constant (and
+// SUPPLIER_INVOICED above) are the ONLY guard against a typo'd or
+// out-of-vocabulary provenance value reaching this column; the database
+// itself will accept any string silently.
+export const DEFAULT_UNVERIFIED_PROVENANCE: CostLedgerProvenance = 'default-unverified'

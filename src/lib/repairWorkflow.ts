@@ -17,6 +17,7 @@
 
 import type { AuthUser, DeviceStatus } from '../types'
 import { transitionDevice, InvalidTransitionError, DeviceNotFoundError } from './deviceLifecycle'
+import { SUPPLIER_INVOICED, DEFAULT_UNVERIFIED_PROVENANCE } from './billBuilder'
 
 export class RepairJobError extends Error {
   status: 404 | 409 | 422
@@ -299,4 +300,91 @@ export async function recordRepairCost(
 
   const updated = await db.prepare('SELECT * FROM repair_jobs WHERE id = ?').bind(job.id).first<Record<string, unknown>>()
   return { repair_job: updated! }
+}
+
+// POST /api/devices/:id/repair/cost-ledger — { amount_gbp, source_bill_line_id? }
+// Manager-only (see requireManager(c) in the route handler — matches
+// recordRepairCost()'s authorisation level; a ledger write is at least as
+// privileged as the repair_jobs cost-column write it sits alongside).
+//
+// DELIBERATELY SEPARATE from recordRepairCost() above: that function is
+// an explicit, documented compatibility layer writing repair_jobs's own
+// (mutable, UPDATE-in-place) cost columns pending a future device_costs
+// table (docs/plan/device-lifecycle-slice1.md) — a temporary shim. This
+// function writes cost_ledger, the durable, typed, append-only ledger
+// (migration 0028) that item 5 (movement/reporting) reads. Folding the
+// two together would entangle the temporary shim with the durable path.
+//
+// APPEND-ONLY, NO EXCEPTIONS: this function only ever INSERTs. It must
+// never grow an UPDATE or DELETE against cost_ledger — a device sent for
+// repair twice, or a cost corrected after the fact, gets a NEW row each
+// time (a correction is a compensating row, never an edit to the
+// original). Posting this function twice for the same device must
+// produce TWO cost_ledger rows with two distinct ids, never one row
+// updated in place — see test/repairWorkflow.spec.ts's coexistence test
+// for the exact assertion. Do not add an edit path here.
+//
+// source_bill_line_id nullability contract: NULL when this cost has no
+// specific bill_lines row behind it (an in-house-only repair cost, e.g.
+// a grade-band average with no invoice) — provenance is then
+// DEFAULT_UNVERIFIED_PROVENANCE ('default-unverified', billBuilder.ts).
+// Populated with an actual bill_lines.id when attributing this cost to a
+// specific invoiced line — provenance is then SUPPLIER_INVOICED
+// ('supplier-invoiced', billBuilder.ts), matching write-cost-ledger's
+// (src/routes/bills.ts) own convention for that value.
+//
+// provenance vocabulary note: cost_ledger.provenance carries NO CHECK
+// constraint and NO enforcing trigger at the DB level (checked directly
+// against sqlite_master, not inferred from migration 0028's column
+// comment — see the DEFAULT_UNVERIFIED_PROVENANCE comment in
+// billBuilder.ts for the query). The exported constants in billBuilder.ts
+// are therefore the ONLY guard against an out-of-vocabulary provenance
+// value reaching this column — always use them, never a bare literal.
+export async function postRepairCostToLedger(
+  db: D1Database,
+  deviceId: number,
+  body: {
+    amount_gbp?: unknown
+    source_bill_line_id?: unknown
+    note?: unknown
+  },
+  user: AuthUser,
+): Promise<{ cost_ledger_entry: Record<string, unknown> }> {
+  const device = await loadDevice(db, deviceId, user.organisation_id)
+  if (!device) throw new RepairJobError(`Device ${deviceId} not found`, 404)
+
+  const amount = Number(body.amount_gbp)
+  if (!Number.isFinite(amount)) {
+    throw new RepairJobError('amount_gbp is required and must be a finite number', 422)
+  }
+
+  const sourceBillLineId =
+    body.source_bill_line_id === undefined || body.source_bill_line_id === null
+      ? null
+      : Number(body.source_bill_line_id)
+  if (sourceBillLineId !== null && !Number.isFinite(sourceBillLineId)) {
+    throw new RepairJobError('source_bill_line_id must be a number when present', 422)
+  }
+
+  const provenance = sourceBillLineId === null ? DEFAULT_UNVERIFIED_PROVENANCE : SUPPLIER_INVOICED
+  const note = typeof body.note === 'string' && body.note.trim() ? body.note.trim() : null
+
+  const insertResult = await db.prepare(
+    `INSERT INTO cost_ledger
+       (organisation_id, received_device_id, cost_type, amount_gbp, currency_code,
+        source_bill_line_id, provenance, note, created_by_user_id)
+     VALUES (?, ?, 'repair', ?, 'GBP', ?, ?, ?, ?)`
+  ).bind(
+    user.organisation_id,
+    deviceId,
+    amount,
+    sourceBillLineId,
+    provenance,
+    note,
+    user.id,
+  ).run()
+
+  const entryId = insertResult.meta.last_row_id as number
+  const entry = await db.prepare('SELECT * FROM cost_ledger WHERE id = ?').bind(entryId).first<Record<string, unknown>>()
+  return { cost_ledger_entry: entry! }
 }

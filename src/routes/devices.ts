@@ -11,7 +11,7 @@ import type { Bindings, AuthUser, DeviceStatus } from '../types'
 import { currentUser } from '../lib/auth'
 import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES } from '../lib/deviceLifecycle'
 import { dispatchDeviceStatusWebhooks } from '../lib/webhook'
-import { startRepair, scanBackRepair, recordQc, reopenRepair, recordRepairCost, RepairJobError } from '../lib/repairWorkflow'
+import { startRepair, scanBackRepair, recordQc, reopenRepair, recordRepairCost, postRepairCostToLedger, RepairJobError } from '../lib/repairWorkflow'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -519,6 +519,34 @@ app.post('/:id/repair/cost', async (c) => {
   try {
     const result = await recordRepairCost(c.env.DB, id, body, user)
     return c.json(result, 200)
+  } catch (err) {
+    if (err instanceof RepairJobError) return c.json({ error: err.message }, err.status)
+    throw err
+  }
+})
+
+// POST /api/devices/:id/repair/cost-ledger — { amount_gbp, source_bill_line_id? }
+// Manager-only, matching recordRepairCost() above (a ledger write is at
+// least as privileged as the repair_jobs cost-column write). Writes an
+// append-only cost_ledger row — see postRepairCostToLedger()'s header
+// comment in src/lib/repairWorkflow.ts for the full nullability/
+// provenance/append-only contract.
+//
+// NO TRAILING SLASH: called as POST /api/devices/:id/repair/cost-ledger,
+// never with a trailing slash. Every sub-router mounted via app.route()
+// in this codebase 404s on its own root when called WITH a trailing
+// slash under Hono's default strict matching (root-caused 2026-08-21,
+// public/tracker/index.html backlog) — this route inherits that same
+// behaviour since it lives on this mounted sub-router.
+app.post('/:id/repair/cost-ledger', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Cost-ledger entry is manager-only' }, 403)
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as any))
+  try {
+    const result = await postRepairCostToLedger(c.env.DB, id, body, user)
+    return c.json(result, 201)
   } catch (err) {
     if (err instanceof RepairJobError) return c.json({ error: err.message }, err.status)
     throw err

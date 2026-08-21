@@ -888,3 +888,110 @@ describe('E. GET /api/devices/repair-queue (#43, NEW)', () => {
     expect(row.fault_code).toBe('SCREEN_CRACKED')
   })
 })
+
+// ═══════════════════════════════════════════════════════════════════════
+// G5 item 3 — POST /api/devices/:id/repair/cost-ledger
+// (postRepairCostToLedger(), src/lib/repairWorkflow.ts) — separate from
+// the repair_jobs cost-column shim tested above (#26); writes the
+// durable, typed, append-only cost_ledger (migration 0028) that item 5
+// (movement/reporting) reads.
+// ═══════════════════════════════════════════════════════════════════════
+
+// Minimal fixture bill + one bill_lines row for the "attributed to a
+// specific invoiced line" branch (source_bill_line_id populated). Bypasses
+// the API/billBuilder entirely — same direct-INSERT convention as
+// seedDevice() above — because this suite is testing the cost_ledger
+// write, not bill creation itself.
+async function seedBillLine(): Promise<number> {
+  const billResult = await db()
+    .prepare(
+      `INSERT INTO bills
+         (organisation_id, bill_type, vendor_name, bill_date, invoice_number,
+          currency_code, unit_count, declared_total, price_source, status)
+       VALUES (1, 'repair', 'Syncere', '2026-06-01', ?, 'GBP', 1, 45.5, 'per_imei', 'closed')`
+    )
+    .bind(`INV-G5ITEM3-${Date.now()}-${Math.random()}`)
+    .run()
+  const billId = billResult.meta.last_row_id as number
+
+  const lineResult = await db()
+    .prepare(
+      `INSERT INTO bill_lines (organisation_id, bill_id, line_no, sku, description, quantity, unit_price, unit_price_gbp)
+       VALUES (1, ?, 1, 'REPAIR-LINE', 'Screen replacement', 1, 45.5, 45.5)`
+    )
+    .bind(billId)
+    .run()
+  return lineResult.meta.last_row_id as number
+}
+
+async function costLedgerFor(deviceId: number) {
+  const { results } = await db()
+    .prepare('SELECT * FROM cost_ledger WHERE received_device_id = ? ORDER BY id ASC')
+    .bind(deviceId)
+    .all<Record<string, unknown>>()
+  return results
+}
+
+describe('G5 item 3 — repair cost posted to cost_ledger (append-only, coexisting NULL/populated source_bill_line_id)', () => {
+  it('posting twice for one device (once in-house/NULL, once attributed to a bill line) yields TWO rows with distinct ids, correct nullability + provenance on each, never one row updated', async () => {
+    const deviceId = await seedDevice('SORTING')
+    const billLineId = await seedBillLine()
+
+    // First post: in-house-only cost, no source bill line.
+    const firstRes = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/cost-ledger`, {
+      method: 'POST',
+      body: JSON.stringify({ amount_gbp: 30, note: 'In-house screen swap, no invoice' }),
+    })
+    expect(firstRes.status).toBe(201)
+    const { cost_ledger_entry: firstEntry } = await firstRes.json() as { cost_ledger_entry: { id: number } }
+
+    // Second post: same device, attributed to the seeded bill line.
+    const secondRes = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/cost-ledger`, {
+      method: 'POST',
+      body: JSON.stringify({ amount_gbp: 45.5, source_bill_line_id: billLineId }),
+    })
+    expect(secondRes.status).toBe(201)
+    const { cost_ledger_entry: secondEntry } = await secondRes.json() as { cost_ledger_entry: { id: number } }
+
+    // Core assertion: two rows, distinct ids — never one row updated.
+    const rows = await costLedgerFor(deviceId)
+    expect(rows).toHaveLength(2)
+    expect(firstEntry.id).not.toBe(secondEntry.id)
+    expect(rows.map(r => r.id).sort()).toEqual([firstEntry.id, secondEntry.id].sort())
+
+    const first = rows.find(r => r.id === firstEntry.id)!
+    const second = rows.find(r => r.id === secondEntry.id)!
+
+    // Both nullability branches + both provenance values fall out of this
+    // one fixture, per the accepted design decision.
+    expect(first).toMatchObject({
+      cost_type: 'repair',
+      amount_gbp: 30,
+      currency_code: 'GBP',
+      source_bill_line_id: null,
+      provenance: 'default-unverified',
+      created_by_user_id: MANAGER_USER.id,
+    })
+    expect(second).toMatchObject({
+      cost_type: 'repair',
+      amount_gbp: 45.5,
+      currency_code: 'GBP',
+      source_bill_line_id: billLineId,
+      provenance: 'supplier-invoiced',
+      created_by_user_id: MANAGER_USER.id,
+    })
+  })
+
+  it('non-manager (operator) attempting to post to the cost ledger → 403, zero rows written', async () => {
+    const deviceId = await seedDevice('SORTING')
+
+    const res = await apiAs(OPERATOR_USER, `/api/devices/${deviceId}/repair/cost-ledger`, {
+      method: 'POST',
+      body: JSON.stringify({ amount_gbp: 30 }),
+    })
+    expect(res.status).toBe(403)
+
+    const rows = await costLedgerFor(deviceId)
+    expect(rows).toHaveLength(0)
+  })
+})
