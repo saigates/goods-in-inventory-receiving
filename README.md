@@ -366,6 +366,34 @@ Redeploy: `npm run build && gsk hosted deploy` (user approves in the UI), then r
 secrets if the redeploy dropped bindings. D1 data ops: `gsk hosted d1_query` /
 `d1_execute`.
 
+**This project has no `.tables/schema.json` and a real `wrangler.jsonc` —
+it is a sandbox-backed project, not `code_sandbox_light`/`code_sandbox_light_git`.**
+`gsk hosted deploy`'s own `--help` text says that category "use[s] their
+normal sandbox deployment pipeline" — confirmed in practice by the redeploy
+command above: `npm run build` runs first, locally, in the invoking
+session's own sandbox (producing a git-ignored `dist/` that has never been
+committed), then `gsk hosted deploy` publishes whatever `dist/` that build
+just wrote. There is **no server-side Git-ref resolution** for this project
+category (that only applies to `code_sandbox_light_git`) — the deploying
+session's own checked-out commit and its own fresh build ARE the artifact
+that ships. (A prior chat turn incorrectly stated the opposite — that this
+project publishes from "a Git snapshot" server-side — before this
+distinction was checked; see the correction in
+`.deploy-checks/g5-phase2-live-half.md`'s closing section.)
+
+**Identity-stability checklist for any live-read session or the deploy
+call itself** (added 2026-08-21 after this session's Genspark-account
+identity flipped unprompted in *both* directions within a single turn —
+confirmed via `gsk login-info`, `gsk hosted list`'s resource count, and
+`gsk hosted list --type d1`'s count, not assumed from one command): run
+`gsk login-info` immediately **before** and immediately **after** any live
+D1 read sequence or a `gsk hosted deploy` call, and treat a mismatch
+between the two as invalidating everything read or attempted in between.
+For a deploy specifically, a post-call identity mismatch is grounds to
+re-verify via `gsk hosted worker_get` / `d1_schema` that the resource
+actually mutated belongs to the intended project (`d6aea290-...`) before
+reporting the deploy as successful.
+
 **2026-07-29 redeploy — fixed "new catalog SKUs invisible in the Catalog tab":**
 after migration 0017 expanded `sku_catalog` to 2,781 rows, the new iPhone 17/Air/
 SE/XR and Galaxy S26/Z Fold7/Flip7-family rows were correctly in D1 (confirmed via

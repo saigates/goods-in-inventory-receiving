@@ -271,6 +271,22 @@ source file, this pairing goes stale and must be re-run and re-recorded
 against the new HEAD — do not assume this hash still applies past the next
 source-touching commit.
 
+**What this reproducibility finding actually means for deploy, clarified
+2026-08-21**: this project's `gsk hosted deploy` publishes the invoking
+session's own local `npm run build` output, not a server-resolved Git
+snapshot (see `.deploy-checks/g5-phase2-live-half.md`'s closing section
+for the read-only correction and evidence). Given that, "any deploy from
+this commit, from any account/session, should produce this same artifact"
+is not a claim about the deploy mechanism pinning a hash — it is a claim
+about **build determinism**: because three independent local builds from
+`e73ea64` all hashed identically, a deploying session that (a) checks out
+the intended commit and (b) runs `npm run build` fresh should reproduce
+`d444aba2...` in its own `dist/`. The hash is therefore still useful as a
+pre-deploy check — confirm the deploying session's fresh build matches it
+before calling `gsk hosted deploy` — but it is a thing to *verify in that
+session*, not a value the deploy tooling looks up or guarantees on its
+own.
+
 ## Item 3: full test suite, re-run as its own explicit action this pass
 
 **Why re-run rather than cite the prior gate-check**: the last actual

@@ -348,6 +348,16 @@ question the user has flagged as still open is a distinct question from
 
 ## Closing item: does `gsk hosted deploy` source from the session's working tree, cross-account?
 
+**CORRECTION (2026-08-21, later same day) — the answer given below in this
+section's original text was wrong.** It read the "Git-backed projects...
+Git snapshot" sentence in `gsk hosted deploy --help` and applied it to
+this project without first checking which of the *two* categories that
+help text actually describes this project falls into. The help text names
+two distinct pipelines, and this project is in the other one. Corrected in
+place; the wrong original conclusion is struck through and kept for the
+record rather than silently deleted, since the wrong belief propagated
+into chat before being caught.
+
 Flagged by the user as worth answering before the atomicity question,
 answerable via read-only inspection of the tooling's own documentation.
 Checked via `gsk hosted deploy --help` (no live call, no side effects):
@@ -358,21 +368,91 @@ Checked via `gsk hosted deploy --help` (no live call, no side effects):
 > projects publish site files, `.tables/schema.json` for D1, binary R2
 > assets, and the strictly validated `.meta/access-control.json`
 > descriptor from the same Git snapshot.** Saved access rules are not live
-> before this approval flow completes... Other code-sandbox projects use
-> their normal sandbox deployment pipeline.
+> before this approval flow completes... **Other code-sandbox projects use
+> their normal sandbox deployment pipeline.**
 
-**Answer**: for a git-backed project (this one), `gsk hosted deploy`
+~~**Answer**: for a git-backed project (this one), `gsk hosted deploy`
 publishes from **a Git snapshot**, not from whatever happens to be sitting
-in the invoking session's working directory. This directly answers the
-user's logistics question: since GitHub (`origin`) already has everything
-through the current `HEAD` regardless of which Genspark account is
-driving, the deploy does not require that account's *sandbox* to have this
-exact working tree checked out by hand — it requires the deploy tooling to
-be pointed at the right Git snapshot (this repo's `origin/main` at the
-commit intended for deploy), which is a project/account configuration
-question, not a "does the other sandbox have the files" question.
+in the invoking session's working directory.~~ **This assumed the wrong
+category.** The help text's "Git-backed" / `code_sandbox_light_git`
+category is specifically the one with **no real sandbox and no
+`wrangler.jsonc`**, which provisions D1 from a `.tables/schema.json` file
+instead of migration files. Checked directly against this repo:
 
-**What remains genuinely unconfirmed**: exactly *which* Git ref/snapshot a
+```
+$ ls -la .tables
+ls: cannot access '.tables': No such file or directory
+$ cat wrangler.jsonc
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "webapp",
+  "compatibility_date": "2025-09-01",
+  "pages_build_output_dir": "./dist",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [ { "binding": "DB", "database_name": "webapp-production", "database_id": "local-stub-id" } ]
+}
+$ ls node_modules | wc -l
+69
+```
+
+No `.tables/schema.json`; a real `wrangler.jsonc` with bindings; a real
+`node_modules` (69 packages) from a real `npm install`. This project is
+**not** `code_sandbox_light`/`code_sandbox_light_git` — it is one of the
+**"other code-sandbox projects"** the same help text says explicitly
+**"use their normal sandbox deployment pipeline"** instead of the
+Git-snapshot one. That sentence was in the quoted block above the whole
+time; it just wasn't checked against which category applies here before
+answering.
+
+**Corrected answer, settled from material already in reach — no live
+access required**: this repo's own `README.md` has documented its redeploy
+procedure, unchanged since commit `d3930ae` and repeated verbatim at every
+subsequent redeploy note (2026-07-29, migration-0017 fix, 2026-08-11) as:
+
+```
+Redeploy: npm run build && gsk hosted deploy
+```
+
+i.e. the build step (`npm run build` → `vite build` → `dist/_worker.js`,
+`dist/_routes.json`, static assets) runs **first, locally, inside the
+invoking session's own sandbox**, producing `dist/` on that session's
+disk — `dist/` is git-ignored (confirmed: `.gitignore` line 2 is `dist/`;
+`git log --all --oneline -- dist/` returns zero commits, it has never been
+tracked). `gsk hosted deploy` is then called as a second, separate step
+against whatever `dist/` that build just wrote. This is the "normal
+sandbox deployment pipeline" the help text names for this category — it
+publishes **the session's locally-built output**, not a Git ref resolved
+server-side. Confirms, from documentation and repo history alone, that:
+
+1. **The deploy builds from source, not from a committed `dist/`.** There
+   is no committed `dist/` to publish even if the pipeline wanted to — the
+   only place a buildable `dist/` exists is whatever session just ran
+   `npm run build`.
+2. **The `d444aba2...` bundle hash is not "the shipping artefact" in any
+   Git-snapshot sense** — it is a hash of *a* local build from HEAD's
+   source, useful for reproducibility-across-builds evidence (three
+   independent rebuilds from `e73ea64` all produced the identical hash,
+   which is real evidence the build is deterministic), but the actual
+   bytes that ship are whatever `npm run build` produces in the session
+   that runs the deploy, not a hash pinned in advance from a different
+   session.
+3. **There is no "which Git ref does it resolve" question for this
+   project category** — that question only applies to the
+   `code_sandbox_light_git` pipeline, which this project is not on. The
+   original "what remains genuinely unconfirmed" paragraph below is
+   retracted for that reason, not merely left open.
+4. **This sharpens, rather than resolves, the identity-as-hard-prerequisite
+   point already raised**: because the pipeline publishes the invoking
+   session's own local build output, the deploy **must** be run from a
+   session that is (a) authenticated as `saigateslimited@gmail.com` and
+   (b) has `origin/main` at `75aa090` (or whatever commit is intended for
+   deploy) checked out and freshly built in that session's own sandbox —
+   not merely "some session somewhere has pushed to GitHub." A session
+   authenticated correctly but sitting on a stale or unbuilt working tree
+   would ship stale bytes with no server-side git-ref safety net to fall
+   back on.
+
+~~**What remains genuinely unconfirmed**: exactly *which* Git ref/snapshot a
 given `gsk hosted deploy` invocation resolves against for this specific
 project (e.g., whether it is scoped to this Hub/project's own tracked
 git state, which would already be current, or requires some other
@@ -381,7 +461,9 @@ project-level pointer to be updated first) is not fully spelled out in the
 approval, and is explicitly out of scope for this pass). This is worth
 confirming with a low-risk read-only check (if one exists) before the
 first real deploy of the held batch, rather than assumed from the general
-"git-backed projects deploy from git" statement above.
+"git-backed projects deploy from git" statement above.~~ **Superseded**:
+this question does not apply to this project's pipeline category (see
+above) and is retracted rather than left open.
 
 ## What this closes and what remains open
 
@@ -401,18 +483,62 @@ first real deploy of the held batch, rather than assumed from the general
   commit `5978311`/`6cbe4e2` (identical `app.js` across both) — upgrades
   "believed, per README" to "live-corroborated," short of a first-hand
   backend-commit confirmation (no such marker exists to check).
-- The cross-account deploy-sourcing question: answered from the tool's own
-  `--help` text — git-backed deploys publish from a Git snapshot, not the
-  invoking session's ad hoc working tree, so `origin`'s current state
-  being up to date is the operative fact, not which sandbox is driving.
+- ~~The cross-account deploy-sourcing question: answered from the tool's
+  own `--help` text — git-backed deploys publish from a Git snapshot, not
+  the invoking session's ad hoc working tree...~~ **CORRECTED** (see the
+  closing section above, edited later the same day): this project is a
+  sandbox-backed project, not the `code_sandbox_light_git` category the
+  Git-snapshot sentence describes. The corrected, settled-read-only
+  answer: `gsk hosted deploy` for this project publishes the invoking
+  session's own local `npm run build` output (per this repo's own
+  documented redeploy procedure, unbroken since commit `d3930ae`) — there
+  is no committed `dist/` and no server-side git-ref resolution in play.
+  This makes the deploying session's identity **and** its working-tree/
+  build freshness both hard prerequisites, not just the identity.
 
 **Still open, unchanged by this pass**:
 - The atomicity question for the ten-file batch as a whole (this doc
   answers "are the individual preconditions currently clean," not "is a
   deploy of this batch atomic/safe against a race between check and
   apply").
-- Exactly which Git ref a `gsk hosted deploy` call resolves against for
-  this project specifically — flagged above as worth a low-risk check
-  before the real deploy, not yet done.
 - No deployment of the held batch is authorised by this doc. This is a
   precondition/evidence check, not a go-ahead.
+
+**Retracted, not merely closed**:
+- "Exactly which Git ref a `gsk hosted deploy` call resolves against for
+  this project" — this question presupposed the Git-snapshot pipeline,
+  which does not apply to this project's category. There is no Git ref
+  for this pipeline to resolve; retracted rather than answered.
+
+## Identity-stability check, added retroactively (2026-08-21, later same day)
+
+**New hazard, caught by the user, not by this document's own process**:
+identity flipped unprompted in *both* directions during this single turn
+— resolved to `saigateslimited@gmail.com` mid-pass (documented above),
+then flipped back to `sagarsptl@gmail.com` later the same turn, confirmed
+three independent ways (five consecutive `gsk login-info` polls all
+returning the reverted email; `gsk hosted list` resource count dropping
+from 6 to 1 with a different `project_id`; `gsk hosted list --type d1`
+dropping from 2 to 0). This means **session identity cannot be assumed
+stable across a command sequence** — a read could begin under one account
+and continue under another mid-sequence, and in the worst case a deploy
+could be attempted from the wrong identity without any single command
+surfacing that fact on its own.
+
+**All identity checks in Step 1 and Step 2 above passed this test
+implicitly** — `gsk login-info` was re-confirmed three times across this
+pass (start, before the collision query, end) and the resource set stayed
+consistent (6 resources / `d6aea290-...` project / 2 D1s) throughout the
+live-query work — but that consistency was not verified by a deliberate
+before-and-after bracket around each live sequence; it held because the
+flip-back happened to occur after this pass's live reads were already
+complete, not because this document's process would have caught a
+flip occurring mid-sequence.
+
+**Mitigation, recorded for the next live/deploy session**: run
+`gsk login-info` immediately before *and* immediately after any live
+read sequence or the deploy call itself, and treat any mismatch between
+the two as invalidating everything read/attempted in between — including,
+for a deploy, treating a post-deploy identity mismatch as grounds to
+verify via `gsk hosted worker_get`/`d1_schema` that the resource actually
+mutated belongs to the intended project before reporting success.
