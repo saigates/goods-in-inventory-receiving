@@ -933,7 +933,7 @@ async function costLedgerFor(deviceId: number) {
 }
 
 describe('G5 item 3 — repair cost posted to cost_ledger (append-only, coexisting NULL/populated source_bill_line_id)', () => {
-  it('posting twice for one device (once in-house/NULL, once attributed to a bill line) yields TWO rows with distinct ids, correct nullability + provenance on each, never one row updated', async () => {
+  it('posting three times for one device (in-house/NULL, attributed to a bill line, then a THIRD post identical to the first) yields THREE rows with distinct ids, correct nullability + provenance on each, identical payloads still coexist, never one row updated', async () => {
     const deviceId = await seedDevice('SORTING')
     const billLineId = await seedBillLine()
 
@@ -953,14 +953,36 @@ describe('G5 item 3 — repair cost posted to cost_ledger (append-only, coexisti
     expect(secondRes.status).toBe(201)
     const { cost_ledger_entry: secondEntry } = await secondRes.json() as { cost_ledger_entry: { id: number } }
 
-    // Core assertion: two rows, distinct ids — never one row updated.
+    // Third post: SAME device, payload IDENTICAL to the first post in every
+    // column that reaches cost_ledger (amount_gbp, note, NULL
+    // source_bill_line_id → 'default-unverified' provenance). The first vs.
+    // second rows above coexist because they differ on source_bill_line_id
+    // and provenance — that alone cannot distinguish "no unique constraint
+    // exists" from "these two rows just happen to differ." This third POST
+    // removes that ambiguity: if any unique index over
+    // (received_device_id, provenance) or similar were ever added,
+    // THIS post would be the one to collide, not the second. Proving it
+    // still succeeds makes the append-only/no-collision guarantee
+    // load-bearing in the suite rather than resting solely on the
+    // point-in-time sqlite_master read.
+    const thirdRes = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/cost-ledger`, {
+      method: 'POST',
+      body: JSON.stringify({ amount_gbp: 30, note: 'In-house screen swap, no invoice' }),
+    })
+    expect(thirdRes.status).toBe(201)
+    const { cost_ledger_entry: thirdEntry } = await thirdRes.json() as { cost_ledger_entry: { id: number } }
+
+    // Core assertion: three rows, three distinct ids — never one row
+    // updated, and genuinely identical (except id/timestamp) rows coexist.
     const rows = await costLedgerFor(deviceId)
-    expect(rows).toHaveLength(2)
-    expect(firstEntry.id).not.toBe(secondEntry.id)
-    expect(rows.map(r => r.id).sort()).toEqual([firstEntry.id, secondEntry.id].sort())
+    expect(rows).toHaveLength(3)
+    const ids = [firstEntry.id, secondEntry.id, thirdEntry.id]
+    expect(new Set(ids).size).toBe(3)
+    expect(rows.map(r => r.id).sort()).toEqual([...ids].sort())
 
     const first = rows.find(r => r.id === firstEntry.id)!
     const second = rows.find(r => r.id === secondEntry.id)!
+    const third = rows.find(r => r.id === thirdEntry.id)!
 
     // Both nullability branches + both provenance values fall out of this
     // one fixture, per the accepted design decision.
@@ -978,6 +1000,16 @@ describe('G5 item 3 — repair cost posted to cost_ledger (append-only, coexisti
       currency_code: 'GBP',
       source_bill_line_id: billLineId,
       provenance: 'supplier-invoiced',
+      created_by_user_id: MANAGER_USER.id,
+    })
+    // Identical to `first` in every cost_ledger column except id/timestamp —
+    // the strict case task A was added to cover.
+    expect(third).toMatchObject({
+      cost_type: 'repair',
+      amount_gbp: 30,
+      currency_code: 'GBP',
+      source_bill_line_id: null,
+      provenance: 'default-unverified',
       created_by_user_id: MANAGER_USER.id,
     })
   })

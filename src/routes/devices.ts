@@ -510,6 +510,11 @@ app.post('/:id/repair/reopen', async (c) => {
   }
 })
 
+// CONTRAST WITH /:id/repair/cost-ledger BELOW: this route UPDATEs
+// repair_jobs' own mutable cost columns — recordRepairCost() is a
+// compatibility shim pending a future device_costs table (see
+// docs/plan/device-lifecycle-slice1.md), NOT the durable cost record.
+// The route below appends an immutable row to cost_ledger instead.
 app.post('/:id/repair/cost', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
@@ -526,6 +531,12 @@ app.post('/:id/repair/cost', async (c) => {
 })
 
 // POST /api/devices/:id/repair/cost-ledger — { amount_gbp, source_bill_line_id? }
+// CONTRAST WITH /:id/repair/cost ABOVE: that route UPDATEs repair_jobs'
+// mutable cost columns (a compatibility shim pending device_costs); THIS
+// route only ever INSERTs a new, immutable row into cost_ledger — the
+// durable path. Same near-identical name, opposite mutability semantics —
+// do not confuse the two (the exact collision risk repairWorkflow.ts's
+// header already warns about for OPR vs. in-house repair cost).
 // Manager-only, matching recordRepairCost() above (a ledger write is at
 // least as privileged as the repair_jobs cost-column write). Writes an
 // append-only cost_ledger row — see postRepairCostToLedger()'s header

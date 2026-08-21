@@ -340,6 +340,18 @@ export async function recordRepairCost(
 // billBuilder.ts for the query). The exported constants in billBuilder.ts
 // are therefore the ONLY guard against an out-of-vocabulary provenance
 // value reaching this column — always use them, never a bare literal.
+//
+// NO UI SURFACE (checked, not assumed, 2026-08-21): grep -n
+// "repair/cost-ledger" and grep -rn "postRepairCostToLedger" against
+// public/static/app.js (and public/ generally) both returned zero
+// matches — no call site anywhere in the frontend hits this endpoint.
+// That retires, as not-applicable rather than outstanding, the two
+// conditional requirements from this item's original scope: a browser
+// citation (BROWSER-CHECK-xxx with a SHA-256 of the recorded run) and a
+// new IMEI prefix registered in test/browser/README.md. Both applied
+// only "if any of this surfaces in the UI" — it doesn't, so neither is
+// owed. If a UI hook is ever added later, both requirements re-attach at
+// that point and must be satisfied before that change ships.
 export async function postRepairCostToLedger(
   db: D1Database,
   deviceId: number,
