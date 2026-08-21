@@ -32,8 +32,8 @@ kind in this doc's work.
 a separately-held file outside this batch, confirmed by directory listing
 before running) apply cleanly, with FK enforcement on, against a real
 snapshot of production data, and does the `0031` unique index actually
-create successfully (i.e. are there zero live sku_catalog collisions as of
-that snapshot)?
+create successfully (i.e. are there zero sku_catalog collisions in that
+snapshot — a snapshot fact, not a live one)?
 
 **Method**: fresh load of the export into a new, empty `/tmp` SQLite file
 via Python's stdlib `sqlite3`, `PRAGMA foreign_keys = ON`, then
@@ -101,16 +101,28 @@ ALL TEN FILES APPLIED CLEANLY, NO ABORT.
 
 2. **`sku_catalog` row count unchanged**: `2781` before and after — the
    index creation neither removed nor rejected any row, meaning there were
-   **zero live collisions** against the `(organisation_id, UPPER(brand),
-   UPPER(model), COALESCE(capacity,''), UPPER(COALESCE(color,'')),
-   COALESCE(grade,''))` key as of this snapshot.
+   **zero collisions in the 18 August export** against the
+   `(organisation_id, UPPER(brand), UPPER(model), COALESCE(capacity,''),
+   UPPER(COALESCE(color,'')), COALESCE(grade,''))` key. This is a snapshot
+   fact, not a live one — nothing has been read from any live session yet.
+   A collision arriving in production after 18 August is exactly the
+   scenario this offline check cannot see, and exactly the scenario that
+   would make migration `0031` fail mid-batch; the live collision query is
+   still required and is not superseded by this result.
 
-3. **`repair_jobs` / `zoho_batch_devices` still 0 rows after migration**:
-   both `0`, confirming the FK-repoint precondition these two `NO ACTION`
-   children of `received_devices` depend on was never stress-tested by
-   actual data in this snapshot (consistent with — not a new finding
-   beyond — `.deploy-checks/g5-offline-imei-and-repair-job-checks.md`'s
-   Checks B/C on the same export).
+3. **`repair_jobs` / `zoho_batch_devices` both 0 rows in the 18 August
+   export, before and after migration**: both `0`, confirming the
+   FK-repoint precondition these two `NO ACTION` children of
+   `received_devices` depend on was never stress-tested by actual data in
+   this snapshot. This is the **third** snapshot-level confirmation of the
+   same fact — the 2026-08-11 export and this same 2026-08-18 export were
+   already checked by `.deploy-checks/g5-offline-imei-and-repair-job-checks.md`'s
+   Checks B/C — not a live count, and not a new finding beyond what those
+   two prior snapshots already showed. Both tables are live, actively-
+   written surfaces (`repair_jobs` via `startRepair()`; `zoho_batch_devices`
+   via the Zoho batch-confirmation flow), so three snapshots agreeing is
+   evidence toward, not satisfaction of, the deploy precondition — the two
+   live counts are still required.
 
 4. **FK repoint correctness**, via `PRAGMA foreign_key_list`:
    ```
@@ -248,6 +260,16 @@ reproducibly. Any deploy from this commit, from any account/session, should
 produce this same artifact; if a future deploy's live hash (once the
 tooling under the correct account exposes one) differs, that is itself a
 signal worth investigating rather than assuming benign drift.
+
+**Staleness note**: this doc (`g5-phase2-offline-half.md`) was itself
+committed as `ae03bb3`, one commit after `e73ea64` — but `ae03bb3` is
+doc-only (added this file, touched no `src/`, no `migrations/`, no build
+config). It does not move HEAD's build output, so the hash above
+(`d444aba2...`, built from `e73ea64`) remains the correct, current hash for
+the repo's actual HEAD as of `ae03bb3`. If any future commit touches a
+source file, this pairing goes stale and must be re-run and re-recorded
+against the new HEAD — do not assume this hash still applies past the next
+source-touching commit.
 
 ## Item 3: full test suite, re-run as its own explicit action this pass
 

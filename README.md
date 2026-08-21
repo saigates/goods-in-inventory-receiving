@@ -473,7 +473,30 @@ moved past `6cbe4e2` with `f51ad4f` and `59728d8` (migration-0021 file
 correction, condition-6 no-grade-segment path, migration-0018 template
 wording fix, and the tracker's stale-claim corrections) — both are pushed to
 `origin/main` on GitHub, but **neither is deployed**; no deploy is authorised
-by this pass. Two workstreams are active in parallel and are kept strictly
+by this pass.
+
+**Live corroboration (2026-08-21)** — see
+`.deploy-checks/g5-phase2-live-half.md` for the full record. Until this
+date, the `6cbe4e2` claim above had never been checked from a live session
+(the account authenticated in earlier passes had zero D1 resources and no
+matching project). A live session under the correct account
+(`saigateslimited@gmail.com`) confirmed: production's `d1_migrations` table
+has exactly 22 rows, last entry `0022_repair_jobs_and_zoho_queue.sql`
+(matches the 22/22 claim above); `repair_jobs` and `zoho_batch_devices` are
+both live-confirmed 0 rows; the `0031` collision query returns zero groups
+live (not from a snapshot); and the deployed static bundle
+(`/static/app.js`, live SHA-256 `d53e5c16...`) byte-matches this repo's copy
+at every commit from `5978311` through `6cbe4e2` (zero diff), so the
+deployed frontend is corroborated as being at least `6cbe4e2`'s bytes for
+that file. **This upgrades the `6cbe4e2` claim from "believed, per this
+README's own prior deploy note" to "live-corroborated via migration count
+and bundle hash"** — it does not amount to a first-hand backend-commit
+proof, since the app exposes no version/commit marker to check directly
+(`/api/health` returns only `{ok, ts}`), and no such marker was added this
+pass. The atomicity question for deploying the ten-file held batch remains
+separately open and is not addressed by this corroboration.
+
+Two workstreams are active in parallel and are kept strictly
 separate (a change in one must never touch the other):
 
 1. **OPR Auth Batch** — CHIEF→OPR authorisation-number rename (migration

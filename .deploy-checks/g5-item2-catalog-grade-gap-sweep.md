@@ -38,15 +38,27 @@ assumption.
 
   | Brand | Model | Capacity | Color | Grades present |
   |---|---|---|---|---|
-  | SAMSUNG | GALAXY S20 FE | 128GB | Cloud Navy | UG |
-  | SAMSUNG | GALAXY S21 | 256GB | Phantom Gray | UG |
-  | SAMSUNG | GALAXY S23 FE | 256GB | Graphite | UG |
-  | SAMSUNG | GALAXY S24 | 256GB | Phantom Black | UG |
-  | SAMSUNG | GALAXY S24 | 512GB | Phantom Black | UG |
-  | SAMSUNG | GALAXY S24 FE | 256GB | Graphite | UG |
-  | SAMSUNG | GALAXY Z FLIP5 | 256GB | Graphite | UG |
-  | SAMSUNG | GALAXY Z FLIP5 | 512GB | Graphite | UG |
-  | SAMSUNG | GALAXY Z FOLD5 | 256GB | Phantom Black | UG |
+  | SAMSUNG | GALAXY S20 FE | 128GB | CLOUD NAVY | UG |
+  | SAMSUNG | GALAXY S21 | 256GB | PHANTOM GRAY | UG |
+  | SAMSUNG | GALAXY S23 FE | 256GB | GRAPHITE | UG |
+  | SAMSUNG | GALAXY S24 | 256GB | PHANTOM BLACK | UG |
+  | SAMSUNG | GALAXY S24 | 512GB | PHANTOM BLACK | UG |
+  | SAMSUNG | GALAXY S24 FE | 256GB | GRAPHITE | UG |
+  | SAMSUNG | GALAXY Z FLIP5 | 256GB | GRAPHITE | UG |
+  | SAMSUNG | GALAXY Z FLIP5 | 512GB | GRAPHITE | UG |
+  | SAMSUNG | GALAXY Z FOLD5 | 256GB | PHANTOM BLACK | UG |
+
+  **Casing note, corrected 2026-08-21**: `color` values above are shown
+  exactly as stored in `sku_catalog` (upper-case), not the mixed-case form
+  an earlier draft of this table used (e.g. "Phantom Black"). The mismatch
+  was caught during the Phase 2 offline rehearsal
+  (`.deploy-checks/g5-phase2-offline-half.md`) when a lookup using the
+  mixed-case literals returned a false "config not found" result for all
+  9 rows — SQLite (and D1) string equality is case-sensitive, so copying
+  the mixed-case literal into a query without `UPPER()` silently fails to
+  match. Corrected here so a future reader copying this table's literals
+  directly gets a correct match rather than repeating that mistake without
+  the suspicion that caught it the first time.
 
 This matches the pre-registered expectation exactly (9 configs / 27 rows).
 
@@ -67,7 +79,7 @@ gap-fills (`{error, existing}`, per `src/routes/catalog.ts`'s `POST /`
 decision-2 comment), the auto-generation route will **never self-heal**
 these 9 UG-only configurations on its own — a `POST /api/catalog` naming
 one of them (e.g. requesting grade A for `GALAXY S24 FE / 256GB /
-Graphite`) does not create the missing A/B/C rows; it simply returns
+GRAPHITE`) does not create the missing A/B/C rows; it simply returns
 `{error, existing}` because a row already exists for that config (the UG
 row) under Decision 2's mixed-case refusal. The 27 missing rows therefore
 remain reachable only through a separate, still-unapproved bulk
@@ -76,7 +88,7 @@ existing rows) is a different case from these 9 and does not touch them.
 
 **CORRECTION (2026-08-21) — the worked example above is wrong; checked,
 not assumed.** `POST /api/catalog` requesting grade A for `GALAXY S24 FE
-/ 256GB / Graphite` (or any of the other 8 UG-only configs) does **not**
+/ 256GB / GRAPHITE` (or any of the other 8 UG-only configs) does **not**
 hit Decision 2's refusal and does **not** return `{error, existing}` —
 it self-heals. Root cause: Decision 2's guard
 (`existingMatch.status === 'match'`, `src/routes/catalog.ts` line 290)
