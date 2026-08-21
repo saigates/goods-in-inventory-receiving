@@ -50,6 +50,17 @@ assumption.
 
 This matches the pre-registered expectation exactly (9 configs / 27 rows).
 
+**DECAYING FIGURE, noted 2026-08-21 alongside the Decision 2 correction
+below**: this 9-configs/27-rows count is a **point-in-time measurement
+of this snapshot, not a stable target**, precisely because the
+correction below shows the route self-heals these configs. Any A/B/C
+device received on one of these 9 models fills that config's remaining
+rows in the same call, so the true count can only ever fall from here —
+it will decay toward 0 as ordinary receiving happens post-deploy, not
+stay pinned at 9/27 for future sweeps to reconcile against. A future run
+finding fewer than 9 configs (or fewer than 27 rows) is expected
+organic drift, not a discrepancy to root-cause against this figure.
+
 **Decision 2 consequence (accepted wording)**: because the route's mixed
 case (requested grade exists, sibling grades missing) REFUSES rather than
 gap-fills (`{error, existing}`, per `src/routes/catalog.ts`'s `POST /`
