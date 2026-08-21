@@ -719,3 +719,15 @@ table+column via `SELECT name, sql FROM sqlite_master WHERE type='table'
 AND sql LIKE '%REFERENCES users%';` (8 tables/columns returned) rather
 than guessing, checking each for the value, and deleting the one
 blocking row before deleting the user.
+
+**Ordering note for future fixture accounts**: the FK that blocked deletion
+here was `device_events.user_id` specifically — of the 8 tables/columns
+enumerated, `device_events` is the one a normal login-and-scan-driven
+browser check is most likely to have populated for its own fixture user
+(every scan/status-transition writes a `device_events` row stamped with
+the acting user's id). So for the next disposable fixture account: clear
+`device_events` (`DELETE FROM device_events WHERE user_id = <fixture id>`)
+**before** deleting the `users` row, rather than rediscovering this via a
+blocked-delete error again. The full enumerate-then-check method above
+still applies for any *other* FK that happens to be populated — this is
+just the one that will recur most often.
