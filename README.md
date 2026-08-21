@@ -293,35 +293,36 @@ If you ever see an error toast when adding one of these to the catalogue instead
 
 ## Deployment
 
-> ⚠️ **Ten of the eleven pending migration files ship on the NEXT deploy,
-> for ANY reason — including an unrelated one-line code fix.** Only
-> `migrations-held/0030_...sql` is physically withheld; `0023a`, `0023b`,
-> `0023c`, `0024`–`0029`, and `0031` all already sit inside `migrations/`.
-> `gsk hosted deploy` auto-applies every file there that production's
-> `d1_migrations` table doesn't yet record, as one non-atomic batch of
-> ten independent auto-commit DDL statements (D1's HTTP API has no
-> atomic multi-statement DDL — see "How the ten held migrations apply"
-> in `.deploy-checks/g5-phase2-live-half.md`). **The standing "no deploy
-> without explicit go-ahead" instruction is currently the ONLY thing
-> preventing an incidental deploy from applying this batch** — there is
-> no code-only deploy path available while these files remain in
-> `migrations/`. Before making any deploy call for any reason, re-read
-> this paragraph and confirm the batch is actually meant to ship.
+> ✅ **DEPLOYED 2026-08-21, 16:11 UTC.** The ten-file migration batch
+> (`0023a`, `0023b`, `0023c`, `0024`–`0029`, `0031`) that this warning
+> used to describe as "ships on the next deploy, for any reason" has now
+> shipped, as one deploy action, with explicit user go-ahead. Production
+> `d1_migrations` carries all 32 rows (22 prior + these 10, ids 23–32,
+> `applied_at` 2026-08-21 16:11:44–47) in the exact expected order —
+> `0023a` → `0023b` → `0023c` → `0024`–`0029` → `0031` last. Direct
+> post-deploy checks (no leftover `_old`/`_new` scaffold tables; zero
+> orphaned `shipment_lines` rows against either recreated parent) found
+> no partial-migration defects. Only `migrations-held/0030_...sql`
+> remains withheld now — it needs renumbering (since `0031` has shipped
+> and now sits ahead of it) before it can be restored and deployed; see
+> `migrations-held/README.md`. Full deploy record, including the
+> pre-deploy build-hash gate and the smoke check, is in
+> `.deploy-checks/g5-phase2-live-half.md`'s "DEPLOYED" section.
 >
-> **Decision (2026-08-21): ship as one batch, not staged.** Staging via
-> `migrations-held/` was considered and rejected — the deploy applies
-> migrations and ships code in one action, so there is no "migrations
-> first, code after" available, and current `main` cannot run against
-> pre-`0023` schema (`src/types.ts`'s `shipment_type` union and
-> `received_at`/`RemovalFlag` fields, `src/lib/deviceLifecycle.ts`'s
-> `TEMP_EXPORTED_STANDARD` flow, all depend on it directly). Splitting
-> at the `0023a`/`0023b` boundary specifically would manufacture a
-> half-migrated `shipment_lines`-points-at-`shipments_old` state under
-> live traffic for a full deploy cycle — worse than the non-atomic-DDL
-> risk it would be avoiding, not safer. See "Decision: ship the ten as
-> one batch, not staged" in `.deploy-checks/g5-phase2-live-half.md` for
-> the full verification. **This decision does not itself authorise a
-> deploy** — the explicit go-ahead is still required separately.
+> **Decision that led here (2026-08-21): ship as one batch, not staged.**
+> Staging via `migrations-held/` was considered and rejected before this
+> deploy — the deploy applies migrations and ships code in one action,
+> so there was no "migrations first, code after" available, and `main`
+> at the time could not run against pre-`0023` schema (`src/types.ts`'s
+> `shipment_type` union and `received_at`/`RemovalFlag` fields,
+> `src/lib/deviceLifecycle.ts`'s `TEMP_EXPORTED_STANDARD` flow, all
+> depended on it directly). Splitting at the `0023a`/`0023b` boundary
+> specifically would have manufactured a half-migrated
+> `shipment_lines`-points-at-`shipments_old` state under live traffic
+> for a full deploy cycle — worse than the non-atomic-DDL risk it would
+> have been avoiding, not safer. See "Decision: ship the ten as one
+> batch, not staged" in `.deploy-checks/g5-phase2-live-half.md` for the
+> full verification that was done before this deploy was authorised.
 
 - **Platform**: Cloudflare Pages + Workers
 - **Status**: ✅ Running in sandbox (port 3000 via Wrangler)
@@ -340,12 +341,16 @@ pm2 start ecosystem.config.cjs   # serves on http://localhost:3000
 Then provision a local password (`node scripts/set-password.mjs owner@saigates.com <pw>` prints a hash-only `UPDATE` — run it with `npx wrangler d1 execute webapp-production --local --command="..."`), and get a token: `curl -X POST http://localhost:3000/api/auth/login -d '{"email":"owner@saigates.com","password":"<pw>"}' -H 'Content-Type: application/json'`. Use it as `Authorization: Bearer <token>` on every other `/api/*` call (the SPA does this automatically once you sign in through the UI).
 
 ### Production deploy (Genspark-hosted Cloudflare — current path)
-**Last deployed 2026-07-28** via `gsk hosted deploy` (Workers for Platform on a
-Genspark-managed Cloudflare account, approval-gated). Managed resources: worker + D1
-`d6aea290-bd61-4f82-aa8d-94378b9f2fec-db` (**all 16 migrations applied**; SKU seed
-loaded); `JWT_SECRET` set as a write-only worker secret (`gsk hosted secret_put`).
-Production is **level with `main`** as of this deploy — the CSV-export fixes and the
-credentialed-login pass (migration 0016) are both live.
+**Last deployed 2026-08-21, 16:11 UTC** via `gsk hosted deploy` (Workers for Platform
+on a Genspark-managed Cloudflare account, approval-gated), `Current Version ID:
+7bac1f76-fb7e-4e71-b73d-6b3b8d43990f`. Managed resources: worker + D1
+`d6aea290-bd61-4f82-aa8d-94378b9f2fec-db` (**32 of 32 migrations in `migrations/`
+applied** — `0001`–`0029` plus `0031`; only `0030` remains held, see the warning
+above; SKU seed loaded); `JWT_SECRET` set as a write-only worker secret
+(`gsk hosted secret_put`). Production is **level with `main`** as of this deploy
+(commit `f6de852`) — the CSV-export fixes, the credentialed-login pass (migration
+0016), and the ten-file OPR/repair/catalog batch above are all live. Full
+verification record: `.deploy-checks/g5-phase2-live-half.md`'s "DEPLOYED" section.
 
 > ⚠️ **Two environments, and until 2026-07-28 they had DIFFERENT passwords.** The
 > production Worker and the local sandbox preview (`localhost:3000` / the in-chat
@@ -500,7 +505,7 @@ npm run deploy
 
 ## Testing
 
-**Automated suite**: [Vitest](https://vitest.dev/) via [`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/), which runs tests inside the real `workerd`/Miniflare runtime against a real D1 binding (all migrations in `migrations/` applied before each test file — currently 29, `0001`-`0029`; `0030` is deliberately held at `migrations-held/` pending its own deploy, see that directory's README — see `vitest.config.ts` and `test/apply-migrations.ts`), not mocks.
+**Automated suite**: [Vitest](https://vitest.dev/) via [`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/), which runs tests inside the real `workerd`/Miniflare runtime against a real D1 binding (all migrations in `migrations/` applied before each test file — currently 32 files, `0001`-`0022`, `0023a`/`0023b`/`0023c`, `0024`-`0029`, `0031` (all 32 now also live in production as of the 2026-08-21 deploy, see **Deployment** above); `0030` is deliberately held at `migrations-held/` pending renumbering ahead of its own future deploy, see that directory's README — see `vitest.config.ts` and `test/apply-migrations.ts`), not mocks.
 
 ```bash
 npm test              # vitest run — runs once and exits
@@ -533,61 +538,60 @@ Current coverage (349 tests across 15 suites, run 2026-08-11: **342 passed, 7 sk
 
 **Manual/live verification (not yet automated)**: none outstanding — auth 401s are asserted in `auth.spec.ts` and the CSV export shape now has the dedicated suite above (it was additionally re-smoked with live `curl` against the running instance: 401 unauthenticated, correct `Content-Type`/`Content-Disposition`/`X-Export-Row-Count`, and the three new 400s). The webhook `X-Signature` HMAC and IMEI/serial validation, formerly in this list, are covered by the OPR 4 suite and `validate.spec.ts` respectively.
 
-## Active Workstreams (as of 2026-08-11)
+## Active Workstreams (as of 2026-08-21)
 
-**Deploy-hold posture**: production is on commit `6cbe4e2` (deployed
-2026-08-11 via an approved `gsk hosted deploy` action, 22/22 migrations
-applied — see **Production deploy** above). This paragraph previously said
-production "remains on `10f9544`" — that was stale: `10f9544` was the
-last-known-deployed commit as of the *prior* pass and was never corrected
-here after the 2026-08-11 deploy (the tracker's own equivalent claim was
-corrected in the same pass that produced this fix). Local `main` has since
-moved past `6cbe4e2` with `f51ad4f` and `59728d8` (migration-0021 file
-correction, condition-6 no-grade-segment path, migration-0018 template
-wording fix, and the tracker's stale-claim corrections) — both are pushed to
-`origin/main` on GitHub, but **neither is deployed**; no deploy is authorised
-by this pass.
-
-**Live corroboration (2026-08-21)** — see
-`.deploy-checks/g5-phase2-live-half.md` for the full record. Until this
-date, the `6cbe4e2` claim above had never been checked from a live session
-(the account authenticated in earlier passes had zero D1 resources and no
-matching project). A live session under the correct account
-(`saigateslimited@gmail.com`) confirmed: production's `d1_migrations` table
-has exactly 22 rows, last entry `0022_repair_jobs_and_zoho_queue.sql`
-(matches the 22/22 claim above); `repair_jobs` and `zoho_batch_devices` are
-both live-confirmed 0 rows; the `0031` collision query returns zero groups
-live (not from a snapshot); and the deployed static bundle
-(`/static/app.js`, live SHA-256 `d53e5c16...`) byte-matches this repo's copy
-at every commit from `5978311` through `6cbe4e2` (zero diff), so the
-deployed frontend is corroborated as being at least `6cbe4e2`'s bytes for
-that file. **This upgrades the `6cbe4e2` claim from "believed, per this
-README's own prior deploy note" to "live-corroborated via migration count
-and bundle hash"** — it does not amount to a first-hand backend-commit
-proof, since the app exposes no version/commit marker to check directly
-(`/api/health` returns only `{ok, ts}`), and no such marker was added this
+**Deploy-hold posture**: production is on commit `f6de852` (deployed
+2026-08-21, 16:11 UTC via an approved `gsk hosted deploy` action, 32/32
+migrations in `migrations/` applied — see **Production deploy** above and
+the "DEPLOYED" section of `.deploy-checks/g5-phase2-live-half.md` for the
+full verification). This paragraph previously said production was on
+`6cbe4e2` (deployed 2026-08-11, 22/22 migrations) with `main` having since
+moved ahead via `f51ad4f`/`59728d8` and no deploy authorised — that gap is
+now closed: the ten-file batch (`0023a`–`0023c`, `0024`–`0029`, `0031`) that
+had been sitting in `migrations/` unshipped has been deployed, along with
+all `main` commits up to and including `f6de852`. Only `migrations-held/
+0030_...sql` remains withheld (needs renumbering before restoration, see
+`migrations-held/README.md`); no other pending deploy exists as of this
 pass.
 
+**Live corroboration (2026-08-21, superseded same day by the deploy below)**
+— see `.deploy-checks/g5-phase2-live-half.md` for the full record. Before
+the deploy, the `6cbe4e2` claim above had never been checked from a live
+session (the account authenticated in earlier passes had zero D1 resources
+and no matching project). A live session under the correct account
+(`saigateslimited@gmail.com`) confirmed at that time: production's
+`d1_migrations` table had exactly 22 rows, last entry
+`0022_repair_jobs_and_zoho_queue.sql`; `repair_jobs` and
+`zoho_batch_devices` were both live-confirmed 0 rows; the `0031` collision
+query returned zero groups live; and the deployed static bundle
+byte-matched this repo's copy at every commit from `5978311` through
+`6cbe4e2`. This corroboration work is what the same-day deploy (below) was
+gated behind — it is retained here as the historical record of the
+pre-deploy state, not the current one.
+
 **How the ten held migrations apply, and what "the atomicity question"
-now specifically means (reconciled 2026-08-21):** `gsk hosted deploy` is
-the ONLY mechanism that applies pending migrations for this project — no
-separate `d1_migrate` subcommand exists, and production's own
+meant going into the 2026-08-21 deploy (reconciled 2026-08-21, resolved by
+the deploy itself later the same day):** `gsk hosted deploy` was confirmed
+to be the ONLY mechanism that applies pending migrations for this project —
+no separate `d1_migrate` subcommand exists, and production's own
 `d1_migrations` timestamps (0018/0019/0020 sharing one timestamp,
-0021/0022 sharing another) are direct evidence that one deploy action
+0021/0022 sharing another) were direct evidence that one deploy action
 applies a whole batch of previously-unapplied files together. **The ten
-"held" files are not held out of `migrations/` at all** — only `0030`
-is physically moved to `migrations-held/`; `0023a`/`0023b`/`0023c`,
-`0024`-`0029`, and `0031` all sit inside `migrations/` right now, so the
-next `gsk hosted deploy`, for any reason, ships all ten. What remains
-open is narrower than "how do they apply": D1's HTTP API has no atomic
-multi-statement DDL, so a batch of ten files applied by one deploy
-action is ten independent auto-commit operations, not one transaction —
-a mid-batch failure could leave production partially migrated (the
-deploy result's `schema_verification: incomplete` field is designed to
-detect this, not prevent it), and a check-then-apply race between a
-precondition check and the actual DDL execution is a distinct residual
-risk. See `.deploy-checks/g5-phase2-live-half.md`'s "How the ten held
-migrations apply" section for the full reconciliation and evidence.
+"held" files were not held out of `migrations/` at all** — only `0030`
+was physically moved to `migrations-held/`; `0023a`/`0023b`/`0023c`,
+`0024`-`0029`, and `0031` all sat inside `migrations/`, so any deploy, for
+any reason, would ship all ten — which is exactly what then happened,
+deliberately and with explicit go-ahead, at 16:11 UTC the same day (see
+the "DEPLOYED" section of `.deploy-checks/g5-phase2-live-half.md`). The
+atomicity concern this section narrowed to — D1's HTTP API having no
+atomic multi-statement DDL, so the batch is ten independent auto-commit
+operations, not one transaction — did not materialise as a defect: the
+deploy log showed all ten files ✅ with no `execution_failed` and no
+partial-DDL `statement_index`, and post-deploy direct queries (no leftover
+`_old`/`_new` tables, zero orphaned `shipment_lines` rows) independently
+confirmed a clean, complete migration. See `.deploy-checks/
+g5-phase2-live-half.md`'s "How the ten held migrations apply" section for
+the pre-deploy reconciliation and its "DEPLOYED" section for the outcome.
 
 Two workstreams are active in parallel and are kept strictly
 separate (a change in one must never touch the other):
