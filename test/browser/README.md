@@ -402,7 +402,10 @@ into this repo), `8604554` (opr6-ui), `8604555` (dbg-valui/manifest-val),
 `8604558` (devices-tab), `8604559` (devices-tab-2), `8604560` (bills-tab),
 `8604561` (manifest-bill-link), `8604562` (bill-detail-vacuous-check —
 claimed per convention though this script seeds no received_devices rows),
-`8604563` (upload-result-panel).
+`8604563` (upload-result-panel), `9900*` (G5 item 2 catalog auto-generation
+verification, 2026-08-21, disposable `browser_check.mjs` script — not
+checked into this repo, deleted after the citation was captured; see the
+citation record below).
 
 ### `devices-tab.browser.mjs` (15 checks)
 Devices tab — **All Devices** sub-view (status + legal transition via the
@@ -665,3 +668,54 @@ unrelated re-render and a navigation away (Manifests) and back (Receive)
 without a page reload, and that the zero-case manifest does not inherit
 the previous manifest's stale counts. `tsc --noEmit` clean; full vitest
 suite unchanged at 25 files / 511 passed / 8 skipped / 519 total.
+
+## Citation record: BROWSER-CHECK-002 (2026-08-21, G5 item 2 verification)
+
+Real Playwright-driven flow through the live dev server, run via a
+disposable script (`browser_check.mjs`, not checked into this repo —
+created and deleted the same session after the citation was captured):
+login → select the disposable manifest `BROWSER-CHECK-002` (id 5,
+brand `LiveCheckBrand2` / model `SAMSUNG BROWSERCHECKMODEL9000`, IMEI
+`990000000000002` — see the `9900*` prefix claim above; a first attempt,
+`BROWSER-CHECK-001`, failed the server's Luhn check on IMEI
+`990000000000001` and was superseded, not reused) → scan the IMEI →
+click "Add to catalogue & receive".
+
+**Result**: toast rendered "Added SMSG-BROWSERCHECKMODEL9000-128-TEA-A to
+catalogue" then "Received 990000000000002 · ... · label queued"; the
+label modal rendered with the correct grade "A" badge; zero console
+errors captured; a full-page screenshot was taken as evidence (deleted
+after review, not a retained artifact). Server-side, `sku_catalog`
+confirmed 4 new rows (ids 687-690, grades A/B/C/UG) created by the single
+click, i.e. `POST /api/catalog`'s auto-generation of missing sibling
+grades (`src/routes/catalog.ts`) fired correctly through the real UI, not
+just against a direct API call.
+
+**Precise scope of this proof** (see
+`.deploy-checks/g5-item2-catalog-grade-gap-sweep.md`'s own "Browser
+citation" section for the same wording): this proves the new response
+shape renders without regression against the existing UI flow. It does
+NOT prove `generated_siblings`/`sku_conflicts` are surfaced to the
+operator — the toast text did not mention the 3 sibling rows also
+created by this call, consistent with that UI enhancement being
+deliberately deferred. A non-empty `sku_conflicts` case remains
+unexercised in a browser (low-priority follow-up, not a gap, since UI
+surfacing itself is deferred).
+
+**Cleanup**: all disposable rows created for this check — the two test
+manifests (`BROWSER-CHECK-001` id 4, `BROWSER-CHECK-002` id 5) and their
+`expected_devices` rows, the `received_devices` row (imei
+`990000000000002`), the 4 `sku_catalog` rows (ids 687-690), the
+`device_events`/`scan_events`/`print_jobs` rows tied to them, and the
+disposable user `test-autogen2@example.local` (id 6) used to drive the
+login — were all deleted the same session. `users` table verified back
+to its exact 3-row incident-recovery baseline
+(`admin@goodsin.local`, `owner@saigates.com`, `ops@saigates.com`) via
+`SELECT id, email FROM users ORDER BY id;`, and `PRAGMA
+foreign_key_check;` confirmed clean. The disposable user's deletion was
+blocked initially by an FK reference from a leftover `device_events` row
+(`user_id=6`); resolved by enumerating every real FK-to-`users`
+table+column via `SELECT name, sql FROM sqlite_master WHERE type='table'
+AND sql LIKE '%REFERENCES users%';` (8 tables/columns returned) rather
+than guessing, checking each for the value, and deleting the one
+blocking row before deleting the user.

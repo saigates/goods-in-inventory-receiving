@@ -16,6 +16,17 @@ the INSERT statements directly sidesteps that entirely and reads the exact
 same source bytes). Row counts cross-checked against `grep -c` on the raw
 file and matched exactly (2781 / 538 / 193).
 
+**Independence caveat for the `grep -c` cross-check**: this cross-check is
+only genuinely independent of the Python parser if the dump emits one
+`INSERT` statement per row (not a multi-row `VALUES (...),(...),(...)`
+tuple, which `grep -c '^INSERT INTO'` would undercount against a
+per-row parse). Confirmed true for this dump by direct line sampling —
+`grep -n '^INSERT INTO "expected_devices"' backups/prod_backup_2026-08-11_1707.sql | head -1`
+and `| tail -1` both show a single `VALUES (id, ...)` tuple per line, not
+a batched multi-row statement. With that confirmed, the `grep -c` match
+is a real independent check, not two methods sharing an unstated
+assumption.
+
 ## Catalogue-side figure (a `sku_catalog`-only fact)
 
 - 702 distinct (organisation_id, brand, model, capacity, color) configs.
@@ -39,6 +50,19 @@ file and matched exactly (2781 / 538 / 193).
 
 This matches the pre-registered expectation exactly (9 configs / 27 rows).
 
+**Decision 2 consequence (accepted wording)**: because the route's mixed
+case (requested grade exists, sibling grades missing) REFUSES rather than
+gap-fills (`{error, existing}`, per `src/routes/catalog.ts`'s `POST /`
+decision-2 comment), the auto-generation route will **never self-heal**
+these 9 UG-only configurations on its own — a `POST /api/catalog` naming
+one of them (e.g. requesting grade A for `GALAXY S24 FE / 256GB /
+Graphite`) does not create the missing A/B/C rows; it simply returns
+`{error, existing}` because a row already exists for that config (the UG
+row) under Decision 2's mixed-case refusal. The 27 missing rows therefore
+remain reachable only through a separate, still-unapproved bulk
+remediation — auto-generation on the happy path (brand-new config, zero
+existing rows) is a different case from these 9 and does not touch them.
+
 ## Device-side ("bench-impact") figure — SEPARATE, do not substitute for the above
 
 Per spec: devices whose own grade has no corresponding variant row on
@@ -50,9 +74,13 @@ exist).
 
 Joined against both device tables in this snapshot:
 
-- `received_devices` (193 rows, already-confirmed devices): **0** matches.
-- `expected_devices` (538 rows, pending/not-yet-received manifest lines):
-  **0** matches.
+- `received_devices`: **0 of 193** rows checked matched (all 193 rows
+  independently confirmed present via `grep -c` before the join was
+  computed — this is not a bare zero over an unconfirmed or possibly
+  empty table).
+- `expected_devices`: **0 of 538** rows checked matched (all 538 rows
+  independently confirmed present via `grep -c` before the join was
+  computed, same discipline).
 
 Checked for a normalisation-mismatch false negative before accepting this
 as a real zero: none of the 9 under-populated models (GALAXY S20 FE, S21,
@@ -71,6 +99,67 @@ leave unaddressed indefinitely (a future shipment of any of these 9
 models in a non-UG grade would hard-stop immediately), only that fixing
 it is not blocking any device sitting in the pipeline as of 2026-08-11.
 
+## `expected_devices` count reconciliation (538 here vs 756 elsewhere)
+
+A later export, `/mnt/aidrive/prod-export-2026-08-18-pre-0029.sql`
+(2026-08-18, seven days after this sweep's 2026-08-11 snapshot), shows
+**756** `expected_devices` rows where this sweep's snapshot shows **538**.
+This was flagged for reconciliation rather than accepted on plausibility
+— confirmed, not assumed, as time-based growth via an independent
+id-set comparison (Python, `set()` difference, re-parsing both dumps
+freshly — not derived from either count above):
+
+- 0811 snapshot: 538 rows, ids all unique.
+- 0818 export: 756 rows, ids all unique.
+- Every one of the 538 ids from the 0811 snapshot is present, unchanged,
+  in the 0818 export (`0811_ids.issubset(0818_ids) == True`) — zero ids
+  were deleted or reused.
+- The 0818 export adds exactly 218 new ids not present in 0811
+  (538 + 218 = 756, reconciling exactly).
+- Corroborated independently by each dump's own max `created_at` for this
+  table: 0811 snapshot's latest `expected_devices.created_at` is
+  `2026-08-05 13:43:53`; the 0818 export's latest is `2026-08-13
+  15:00:10` — a later export with a later max timestamp and a strict
+  superset of ids is the expected shape of ordinary growth, not a
+  discrepancy.
+
+**Conclusion**: the 538/756 difference reconciles cleanly as
+manifest-upload growth between 2026-08-11 and 2026-08-18 — not a stale-
+count bug (unlike the five prior instances of this class on this
+project). Both figures are cited above with their source dump inline;
+the "0 of 538" bench-impact finding above is scoped explicitly to the
+2026-08-11 snapshot and is not claimed to hold against the later,
+larger 0818 export (which has not been swept).
+
+## Trailing-slash 404 (raised during this item's verification, not this item's bug)
+
+While cross-checking this item's route (`POST /api/catalog`) against a
+live dev server, a 404 was found on `POST /api/catalog/` (trailing
+slash) that does not occur on `POST /api/catalog` (no slash). This was
+root-caused to be a systemic, pre-existing Hono `app.route()` sub-mounting
+behaviour affecting every mounted sub-router in this app, not something
+introduced by or specific to this item's route rewrite, and confirmed not
+to affect the real UI (which never sends the trailing-slash form). It is
+**not detailed here** — see the general backlog entry in
+`public/tracker/index.html` (alongside the `held-0030` and `startRepair()`
+entries) for the full root-cause writeup.
+
+## Browser citation
+
+A real Playwright-driven browser flow (login → select manifest → scan
+IMEI → click "Add to catalogue & receive") was run against the live dev
+server and confirmed: toast and label modal render correctly, zero
+console errors, and the server independently confirmed all 4 grade
+variants (A/B/C/UG) were created by the one call. **What this proves,
+precisely**: the new response shape renders without regression against
+the existing UI flow. It does **not** prove the new `generated_siblings`
+/ `sku_conflicts` fields are surfaced to the operator — the toast text in
+this run did not mention the 3 sibling rows also created by the call,
+consistent with the UI-surfacing enhancement being deliberately deferred
+(not a bug). A non-empty `sku_conflicts` case remains unexercised in a
+browser — listed as a low-priority follow-up below, not as a gap, since
+surfacing these fields in the UI at all is itself deferred.
+
 ## Scope note
 
 Any bulk remediation (writing the 27 missing rows) is explicitly OUT of
@@ -78,3 +167,13 @@ this item's commit — a separate future approval, per this project's
 standing decision (see migration 0031's own header and
 `src/routes/catalog.ts`'s `POST /` decision-2 comment). This sweep is
 read-only reporting only.
+
+## Follow-ups (not gaps)
+
+- Exercise a non-empty `sku_conflicts` case through the real browser once
+  (or if) the UI is extended to surface `generated_siblings`/
+  `sku_conflicts` to the operator.
+- Re-run this sweep against a fresher export (e.g. the 2026-08-18 one
+  used for the count reconciliation above, or later) before relying on
+  the "zero bench impact" conclusion beyond scoping this item's original
+  commit.
