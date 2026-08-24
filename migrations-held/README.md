@@ -156,6 +156,22 @@ to "0030" in this README, the tracker backlog entry, and
 match the new filename at that time — this note does not pre-select the
 new number, since it depends on whatever else has shipped by then.
 
+**Numbering interaction with the `startRepair()` index fix below —
+added 2026-08-24, held position on reviewer request.** This restoration
+and the "Future migration `0032`" item below are two INDEPENDENT queued
+migrations that both currently describe themselves as claiming "the
+next available number" without accounting for each other. Whichever of
+the two is actually written/restored FIRST takes the true next-free
+number in `migrations/` at that moment; the SECOND one to be
+written/restored must then take the number after THAT (not whatever
+number either note names informally today, and not automatically
+"0032"/"0033" — those are placeholder labels, not reservations). Check
+the current `migrations/` listing fresh at the time each one is
+actually created, in case the other one, or anything else, has shipped
+in between. This paragraph is intentionally the single place both
+sections point back to, so the ordering rule survives even if only one
+of the two items is read at a time.
+
 ## Future migration `0032` — duplicate sweep required before the `startRepair()` index fix
 
 The `startRepair()` check-then-insert race (`src/lib/repairWorkflow.ts`
@@ -177,9 +193,17 @@ period during which `repair_jobs` could first become non-empty with the
 race still unfixed, and a live duplicate-open-job sweep from before that
 window says nothing about after it.
 
+**Numbering note**: "0032" here is an informal placeholder, not a
+reservation — see "Numbering interaction with the `startRepair()` index
+fix" above (in the `0030` restoration section) for why this may
+actually land as `0032`, `0033`, or later depending on which of the two
+queued items (this one, or `0030`'s restoration) is written first. Check
+the current `migrations/` listing fresh at the time this migration is
+actually written.
+
 **Requirement**: whatever migration eventually adds this index (next
-available number after this batch, referred to informally as "0032")
-MUST be preceded by a FRESH duplicate-open-job sweep of live
+free number in `migrations/` at the time it's written — do not assume
+"0032") MUST be preceded by a FRESH duplicate-open-job sweep of live
 `repair_jobs` — the same query shape as
 `.deploy-checks/g5-offline-imei-and-repair-job-checks.md` check (B), but
 against a live read taken immediately before that migration is written,
