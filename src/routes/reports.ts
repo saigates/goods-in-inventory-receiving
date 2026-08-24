@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
-import type { Bindings, AuthUser, DeviceStatus, CostLedgerProvenance } from '../types'
-import { DEVICE_STATUSES } from '../types'
+import type { Bindings, AuthUser, DeviceStatus, CostLedgerProvenance, VatType } from '../types'
+import { DEVICE_STATUSES, VAT_TYPES } from '../types'
 import { currentUser } from '../lib/auth'
 import { SUPPLIER_INVOICED, DEFAULT_UNVERIFIED_PROVENANCE } from '../lib/billBuilder'
 
@@ -25,28 +25,39 @@ function requireManager(c: any): boolean {
 // not assumed: 'REVERSE_CHARGE' and 'POSTPONED' both appear ONLY as
 // REJECTED junk values in test/manifestValuation.spec.ts (lines 138,
 // 263) — i.e. this system has already decided 'REVERSE_CHARGE' is not a
-// real vat_type, and PVAT (Postponed VAT / import accounting per
-// src/lib/validate.ts:115) is the closest thing this system has to a
-// deferred/reverse-charge-style VAT treatment.
+// real vat_type it stores.
 //
-// DECISION (this endpoint only, documented in the response's own
-// `basis` field so nobody has to remember this comment): PVAT is
-// combined into the "standard_and_reverse_charge" bucket alongside
-// STANDARD, since both are import/domestic non-margin VAT treatments
-// where VAT is accounted for outside the margin scheme. MARGIN stays
-// its own bucket per the spec. ZERO is not named by the spec at all;
-// rather than silently folding it into either named bucket (which would
-// misrepresent it either way), it gets its own third bucket so no
+// NAMING CORRECTION (reviewer feedback): the bucket below is NOT named
+// 'standard_and_reverse_charge' — that name would assert this schema can
+// hold a value it cannot, which is exactly the kind of thing that sends
+// a future reader hunting for a value that was never there. It is named
+// 'standard_and_net_recoverable' instead, and the response's own
+// `vat_bucket_basis` field says explicitly "no REVERSE_CHARGE value
+// exists in this schema" — recorded as an absence, not a mapping.
+//
+// DECISION (this endpoint only, for the GROUPED/human-reading view
+// only): STANDARD and PVAT are combined into one bucket for readability.
+// MARGIN stays its own bucket per spec. ZERO and unset vat_type each get
+// their own bucket rather than being folded into a named one, so no
 // device's value goes unaccounted-for or hidden inside a mislabelled
-// bucket. NULL vat_type (not yet set) also gets its own bucket for the
-// same reason. This mapping is a judgement call, not a spec-mandated
-// fact — flagged here and in the response body for review.
-const VAT_BUCKETS = ['margin', 'standard_and_reverse_charge', 'zero', 'unset'] as const
+// bucket. This grouping is a judgement call for human readability, not a
+// spec-mandated fact, and NOT a VAT calculation of any kind — the app
+// only groups a stored field, it never computes VAT liability, input-tax
+// recoverability, or reverse-charge applicability. That determination is
+// out of scope for this endpoint and belongs with the org's accountant.
+//
+// For any consumer that is NOT a human reading a report (e.g. an
+// external accounting-system integration), see `by_vat_type_raw` below —
+// the ungrouped, per-stored-value figures for all four VAT_TYPES values,
+// with no grouping/editorialising applied. Grouping a stored field is
+// not the same operation as calculating VAT; this endpoint does only the
+// former, on both counts.
+const VAT_BUCKETS = ['margin', 'standard_and_net_recoverable', 'zero', 'unset'] as const
 type VatBucket = typeof VAT_BUCKETS[number]
 
 function vatBucketFor(vatType: string | null): VatBucket {
   if (vatType === 'MARGIN') return 'margin'
-  if (vatType === 'STANDARD' || vatType === 'PVAT') return 'standard_and_reverse_charge'
+  if (vatType === 'STANDARD' || vatType === 'PVAT') return 'standard_and_net_recoverable'
   if (vatType === 'ZERO') return 'zero'
   return 'unset'
 }
@@ -71,6 +82,12 @@ type InventoryValuationResponse = {
   by_stage: Array<{ status: DeviceStatus; count: number; purchase_value_gbp: number; purchase_plus_repair_value_gbp: number }>
   by_provenance: Array<{ provenance: CostLedgerProvenance | 'none'; count: number; value_gbp: number }>
   by_vat_bucket: Array<{ bucket: VatBucket; count: number; value_gbp: number }>
+  // Ungrouped, per-stored-value figures for all four VAT_TYPES values
+  // (MARGIN/STANDARD/ZERO/PVAT) plus a null/unset row, with NO grouping
+  // applied — this is the field an external integration should read,
+  // per reviewer instruction that a data feed should not editorialise by
+  // bucketing. by_vat_bucket above remains for human reading only.
+  by_vat_type_raw: Array<{ vat_type: VatType | 'unset'; count: number; value_gbp: number }>
   data_quality: {
     devices_with_multiple_purchase_rows: number
     // Decision, documented per spec: multiple 'purchase' rows on one
@@ -82,6 +99,13 @@ type InventoryValuationResponse = {
     basis: string
   }
   exclusions: string[]
+  // Contract statement for any consumer of this response, human or
+  // machine (reviewer instruction: once this crosses an API boundary
+  // into another system, the receiving side has no way to know what's
+  // in it unless this response says so on its own face). Deliberately
+  // makes no claim about statutory/accounting standards — that
+  // determination belongs to the org's accountant, not this endpoint.
+  basis: string
   vat_bucket_basis: string
 }
 
@@ -112,6 +136,14 @@ function round2(v: number): number {
 //     (MARGIN/STANDARD/ZERO/PVAT). This is a per-device field, which is
 //     actually the more natural home for this report than the bill
 //     tables the spec guessed at.
+//
+// SCOPE, confirmed with reviewer: this endpoint captures and reports a
+// stored field; it never determines or calculates VAT treatment
+// (margin-scheme eligibility, input-tax recoverability, reverse-charge
+// applicability, etc). vat_type is data entered elsewhere and trusted as
+// given -- its accuracy at the point of capture is a data-entry concern,
+// not something this report investigates or corrects. Any VAT
+// determination question belongs with the org's accountant.
 app.get('/inventory-valuation', async (c) => {
   if (!requireManager(c)) return c.json({ error: 'Inventory valuation reporting is manager-only' }, 403)
   const user = currentUser(c)
@@ -181,6 +213,12 @@ app.get('/inventory-valuation', async (c) => {
   const vatAgg = new Map<VatBucket, { count: number; value: number }>()
   for (const b of VAT_BUCKETS) vatAgg.set(b, { count: 0, value: 0 })
 
+  // ── by_vat_type_raw accumulator, pre-seeded with all four VAT_TYPES
+  // values plus 'unset', UNGROUPED — the integration-facing figure. ──
+  const vatRawAgg = new Map<VatType | 'unset', { count: number; value: number }>()
+  for (const v of VAT_TYPES) vatRawAgg.set(v, { count: 0, value: 0 })
+  vatRawAgg.set('unset', { count: 0, value: 0 })
+
   for (const row of deviceRows) {
     const purchaseGbp = round2(row.purchase_gbp)
     const purchasePlusRepairGbp = round2(row.purchase_plus_repair_gbp)
@@ -217,6 +255,11 @@ app.get('/inventory-valuation', async (c) => {
     const vatEntry = vatAgg.get(bucket)!
     vatEntry.count++
     vatEntry.value += purchaseGbp
+
+    const rawKey: VatType | 'unset' = (row.vat_type as VatType | null) ?? 'unset'
+    const rawEntry = vatRawAgg.get(rawKey) ?? vatRawAgg.get('unset')!
+    rawEntry.count++
+    rawEntry.value += purchaseGbp
   }
 
   purchaseValue = round2(purchaseValue)
@@ -246,7 +289,15 @@ app.get('/inventory-valuation', async (c) => {
       costed: costedCount,
       uncosted: uncostedCount,
       total_devices: deviceRows.length,
-      note: 'This is the figure that determines whether the totals above mean anything yet — an uncosted device contributes zero to every value total.',
+      // Computed at runtime, not static prose, so this can never say one
+      // thing while the totals above say another (reviewer correction:
+      // an earlier draft's surrounding commentary asserted "device cost
+      // + repair cost" in one place and "£0 across the board" in
+      // another for the same all-uncosted state — those must not be
+      // able to diverge again).
+      note: uncostedCount === deviceRows.length && deviceRows.length > 0
+        ? `All ${deviceRows.length} device(s) in this organisation are currently uncosted (0 cost_ledger rows) — every value total in this response is £0 for that reason, not because purchase prices are actually zero.`
+        : 'An uncosted device contributes zero to every value total above; costed/uncosted counts determine how much of the headline figures reflect real data versus missing data.',
     },
     by_stage: DEVICE_STATUSES.map(status => {
       const s = stageAgg.get(status)!
@@ -262,6 +313,10 @@ app.get('/inventory-valuation', async (c) => {
       const v = vatAgg.get(bucket)!
       return { bucket, count: v.count, value_gbp: round2(v.value) }
     }),
+    by_vat_type_raw: ([...VAT_TYPES, 'unset'] as Array<VatType | 'unset'>).map(vatType => {
+      const v = vatRawAgg.get(vatType)!
+      return { vat_type: vatType, count: v.count, value_gbp: round2(v.value) }
+    }),
     data_quality: {
       devices_with_multiple_purchase_rows: multiPurchaseRowDeviceCount,
       basis: "Multiple cost_type='purchase' rows on one device are summed into the headline/stage totals above, not deduped or rejected — but this count exists because more than one acquisition row per device likely indicates a data-entry error, not a legitimate multi-invoice purchase, and should be reviewed if non-zero.",
@@ -272,7 +327,8 @@ app.get('/inventory-valuation', async (c) => {
       'VAT (the vat_type breakdown below is informational only — it does not adjust any value total)',
       'write-downs / impairment adjustments',
     ],
-    vat_bucket_basis: "STANDARD and PVAT (Postponed VAT / import accounting — the closest existing analog to a reverse-charge treatment in this system's vat_type vocabulary, which has no literal 'REVERSE_CHARGE' value) are combined into 'standard_and_reverse_charge'. MARGIN is its own bucket per spec. ZERO and unset vat_type each get their own bucket rather than being folded into a named one. This mapping is a documented decision, not a spec-mandated fact.",
+    basis: 'This is a management valuation at device purchase price plus any posted repair cost — an "item cost" figure, not a "landed cost" figure. It excludes freight, duty, VAT and write-downs, and is not a statutory inventory-cost figure under any accounting standard. Any system consuming this response should treat it as device purchase/repair cost only, not a balance-sheet or landed-cost number.',
+    vat_bucket_basis: "The grouped by_vat_bucket breakdown is for human reading only: STANDARD and PVAT are combined into 'standard_and_net_recoverable' for readability, MARGIN and ZERO stay separate, unset vat_type gets its own row. This system's vat_type vocabulary (MARGIN/STANDARD/ZERO/PVAT) has no 'REVERSE_CHARGE' value — that is recorded here as an absence, not something mapped onto another bucket. Grouping a stored field is not the same operation as calculating VAT: this endpoint only does the former. Any system consuming this response programmatically should use by_vat_type_raw (ungrouped, per-stored-value) instead of by_vat_bucket.",
   }
 
   return c.json(response)

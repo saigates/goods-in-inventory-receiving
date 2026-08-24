@@ -151,13 +151,29 @@ describe('GET /api/reports/inventory-valuation', () => {
     const supplierInvoiced = json.by_provenance.find((p: any) => p.provenance === 'supplier-invoiced')
     expect(supplierInvoiced.value_gbp).toBeGreaterThanOrEqual(300) // 100 + 200
 
-    // by_vat_bucket: MARGIN separate; STANDARD+PVAT combined
+    // by_vat_bucket: MARGIN separate; STANDARD+PVAT combined under the
+    // corrected bucket name (reviewer correction: 'standard_and_net_
+    // recoverable', NOT 'standard_and_reverse_charge' — this schema's
+    // vat_type vocabulary has no REVERSE_CHARGE value, so the bucket name
+    // must not assert one exists)
     const buckets = json.by_vat_bucket.map((b: any) => b.bucket)
-    expect(buckets).toEqual(['margin', 'standard_and_reverse_charge', 'zero', 'unset'])
+    expect(buckets).toEqual(['margin', 'standard_and_net_recoverable', 'zero', 'unset'])
     const marginBucket = json.by_vat_bucket.find((b: any) => b.bucket === 'margin')
     expect(marginBucket.value_gbp).toBeGreaterThanOrEqual(100) // deviceA
-    const stdBucket = json.by_vat_bucket.find((b: any) => b.bucket === 'standard_and_reverse_charge')
+    const stdBucket = json.by_vat_bucket.find((b: any) => b.bucket === 'standard_and_net_recoverable')
     expect(stdBucket.value_gbp).toBeGreaterThanOrEqual(275) // deviceB (200) + deviceC (75, PVAT)
+
+    // by_vat_type_raw: ungrouped, per-stored-value figures for the
+    // integration-facing consumer — MARGIN and PVAT/STANDARD must stay
+    // separable here even though they're combined in by_vat_bucket above
+    const rawTypes = json.by_vat_type_raw.map((r: any) => r.vat_type)
+    expect(rawTypes).toEqual(['MARGIN', 'STANDARD', 'ZERO', 'PVAT', 'unset'])
+    const rawMargin = json.by_vat_type_raw.find((r: any) => r.vat_type === 'MARGIN')
+    expect(rawMargin.value_gbp).toBeGreaterThanOrEqual(100) // deviceA only
+    const rawStandard = json.by_vat_type_raw.find((r: any) => r.vat_type === 'STANDARD')
+    expect(rawStandard.value_gbp).toBeGreaterThanOrEqual(200) // deviceB only, NOT combined with PVAT here
+    const rawPvat = json.by_vat_type_raw.find((r: any) => r.vat_type === 'PVAT')
+    expect(rawPvat.value_gbp).toBeGreaterThanOrEqual(75) // deviceC only, separable from STANDARD
 
     // exclusions block present and names all four
     expect(json.exclusions.join(' ')).toMatch(/freight/i)
