@@ -157,8 +157,15 @@ committed after it) are deployed via `gsk hosted deploy`:
    trust the local result as representative.** The `1 mismatch out of 16`
    figure reported in `4a6d16f`'s commit message (id 43 locally) is a
    **local-only finding with zero extrapolation value**: local D1 holds
-   only 16 `received_devices` rows total, while **production holds 193
-   `received_devices` rows, none of which are present in local D1**. The
+   only 16 `received_devices` rows total, while **production holds 398
+   `received_devices` rows** (confirmed via the 2026-08-24 export; grown
+   from the 193 figure this doc originally cited, itself the 2026-08-11
+   export's count — see `.deploy-checks/g5-offline-imei-and-repair-job-checks.md`
+   line 34 for the 398 figure already on file as of the 2026-08-18 export,
+   and this session's ID-set reconciliation, method matching the
+   538/756 precedent in `g5-item2-catalog-grade-gap-sweep.md`, confirming
+   193⊂398 with zero removed and the total stable since 2026-08-18),
+   **none of which are present in local D1**. The
    true production mismatch count is therefore genuinely **unknown** — it
    could be 0, it could be dozens — until the sweep is actually re-run
    against production data. After deploy:
