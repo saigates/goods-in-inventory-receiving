@@ -274,6 +274,15 @@ app.post('/:id/force-close', async (c) => {
 // from close() so a bill can be closed and reviewed before its costs are
 // posted to devices, and so repeat calls are safely idempotent (skips
 // serials that already have a ledger row for this bill).
+//
+// SIBLING WRITER, for devices with no bill to attribute a cost to:
+// POST /api/devices/:id/purchase/cost-ledger (src/routes/devices.ts,
+// backed by postPurchaseCostToLedger(), src/lib/costEntry.ts). That
+// route always writes provenance = 'default-unverified' and
+// source_bill_line_id = NULL — this route remains the ONLY writer that
+// can produce provenance = 'supplier-invoiced' for cost_type = 'purchase'.
+// Both coexist; a device can move from the no-bill path to a bill-backed
+// one later without either writer needing to know about the other.
 app.post('/:id/write-cost-ledger', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))

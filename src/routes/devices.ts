@@ -12,6 +12,7 @@ import { currentUser } from '../lib/auth'
 import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES } from '../lib/deviceLifecycle'
 import { dispatchDeviceStatusWebhooks } from '../lib/webhook'
 import { startRepair, scanBackRepair, recordQc, reopenRepair, recordRepairCost, postRepairCostToLedger, RepairJobError } from '../lib/repairWorkflow'
+import { postPurchaseCostToLedger, CostEntryError } from '../lib/costEntry'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -560,6 +561,44 @@ app.post('/:id/repair/cost-ledger', async (c) => {
     return c.json(result, 201)
   } catch (err) {
     if (err instanceof RepairJobError) return c.json({ error: err.message }, err.status)
+    throw err
+  }
+})
+
+// POST /api/devices/:id/purchase/cost-ledger —
+// { amount_gbp, note?, allow_duplicate_purchase_row? }
+// SIBLING OF /:id/repair/cost-ledger ABOVE: same append-only,
+// immutable-row, manager-only pattern, but for the ACQUISITION
+// ('purchase') cost rather than the repair cost, and via a writer
+// (postPurchaseCostToLedger(), src/lib/costEntry.ts) that has NO
+// bill-derived counterpart's nullable fields — source_bill_line_id is
+// always NULL and provenance is always DEFAULT_UNVERIFIED_PROVENANCE
+// here, since this writer exists specifically for devices with no bill
+// to attribute a cost to (see src/routes/bills.ts's write-cost-ledger
+// for the bill-derived 'purchase' writer this route does NOT replace —
+// both writers coexist; a device costed via a later-closed bill still
+// goes through that path, not this one).
+//
+// Manager-only, same authorisation level as /:id/repair/cost-ledger.
+// Writes an append-only cost_ledger row — see
+// postPurchaseCostToLedger()'s header comment in src/lib/costEntry.ts
+// for the full duplicate-guard/provenance-limitation contract.
+//
+// NO TRAILING SLASH: called as POST /api/devices/:id/purchase/cost-ledger,
+// never with a trailing slash — same sub-router trailing-slash 404
+// behaviour as every other route in this file (root-caused 2026-08-21,
+// public/tracker/index.html backlog).
+app.post('/:id/purchase/cost-ledger', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Cost-ledger entry is manager-only' }, 403)
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as any))
+  try {
+    const result = await postPurchaseCostToLedger(c.env.DB, id, body, user)
+    return c.json(result, 201)
+  } catch (err) {
+    if (err instanceof CostEntryError) return c.json({ error: err.message }, err.status)
     throw err
   }
 })
