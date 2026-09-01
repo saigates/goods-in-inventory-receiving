@@ -244,10 +244,51 @@ describe('POST /:id/transition — reject/un-reject gating is scoped to ONLY the
 // dropdown without a test noticing.
 describe('GET /devices/meta/statuses — reason_codes exposed for the UI (2026-09-01)', () => {
   it('exposes REJECTED and UNREJECT reason code lists matching the exported constants exactly', async () => {
-    const res = await apiAs(OPERATOR_USER, '/api/devices/meta/statuses', { method: 'GET' })
+    const res = await apiAs(MANAGER_USER, '/api/devices/meta/statuses', { method: 'GET' })
     expect(res.status).toBe(200)
     const body = await res.json() as { reason_codes: { REJECTED: string[]; UNREJECT: string[] } }
     expect(body.reason_codes.REJECTED).toEqual([...REJECT_REASON_CODES])
     expect(body.reason_codes.UNREJECT).toEqual([...UNREJECT_REASON_CODES])
+  })
+})
+
+// Role-filtered `transitions` (2026-09-01, second pass — the same failure
+// class caught one layer up: serving the unfiltered map to an operator
+// would let their "Move to" dropdown offer an edge that always 403s once
+// picked). This is the server-side fix, so the frontend needs no per-edge
+// role logic of its own — it just renders whatever transitions this
+// endpoint returns, exactly like it already does for reason_codes.
+describe('GET /devices/meta/statuses — transitions map is role-filtered on the reject/un-reject edges', () => {
+  it('manager/admin see the full map, including RECEIVED->REJECTED and REJECTED->RECEIVED', async () => {
+    for (const user of [MANAGER_USER, ADMIN_USER]) {
+      const res = await apiAs(user, '/api/devices/meta/statuses', { method: 'GET' })
+      expect(res.status).toBe(200)
+      const body = await res.json() as { transitions: Record<string, string[]> }
+      expect(body.transitions.RECEIVED).toContain('REJECTED')
+      expect(body.transitions.REJECTED).toEqual(['RECEIVED'])
+    }
+  })
+
+  it('operator does NOT see REJECTED as a RECEIVED-outbound edge, and REJECTED has no outbound edges at all', async () => {
+    const res = await apiAs(OPERATOR_USER, '/api/devices/meta/statuses', { method: 'GET' })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { transitions: Record<string, string[]> }
+    expect(body.transitions.RECEIVED).not.toContain('REJECTED')
+    expect(body.transitions.REJECTED).toEqual([])
+  })
+
+  it('operator still sees every OTHER edge unfiltered (RECEIVED->SORTING, SORTING->ACTIVE_INVENTORY, etc.) — filtering is scoped to exactly the two reject edges', async () => {
+    const res = await apiAs(OPERATOR_USER, '/api/devices/meta/statuses', { method: 'GET' })
+    const body = await res.json() as { transitions: Record<string, string[]> }
+    expect(body.transitions.RECEIVED).toContain('SORTING')
+    expect(body.transitions.SORTING).toEqual(expect.arrayContaining(['ACTIVE_INVENTORY', 'IN_HOUSE_REPAIR', 'READY_FOR_EXPORT']))
+    expect(body.transitions.IN_HOUSE_REPAIR).toEqual(expect.arrayContaining(['READY_FOR_ZOHO', 'QC_FAILED']))
+  })
+
+  it('the filtered view never mutates the shared ALLOWED_TRANSITIONS export (operator call followed by a manager call still shows the full map)', async () => {
+    await apiAs(OPERATOR_USER, '/api/devices/meta/statuses', { method: 'GET' })
+    const res = await apiAs(MANAGER_USER, '/api/devices/meta/statuses', { method: 'GET' })
+    const body = await res.json() as { transitions: Record<string, string[]> }
+    expect(body.transitions.REJECTED).toEqual(['RECEIVED'])
   })
 })

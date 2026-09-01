@@ -227,10 +227,50 @@ app.get('/export/csv', async (c) => {
 // the "client-side copy of the transition map" failure mode this endpoint
 // already exists to prevent for `transitions`) — it renders whichever list
 // this returns, so a future reason-code change here needs zero frontend edit.
+//
+// Role-filtered `transitions` (2026-09-01, second pass): the raw
+// ALLOWED_TRANSITIONS map is state-machine-only, with no concept of who
+// may drive an edge — but two of its edges (RECEIVED<->REJECTED) ARE
+// manager-gated in the route below. Serving the UNFILTERED map to an
+// operator caller would repeat the exact bug this endpoint's `reason_codes`
+// addition just fixed one layer up: the "Move to" dropdown would offer
+// REJECTED/RECEIVED, the operator would fill in a reason and submit, and
+// get a 403 they had no way to see coming. Filtering server-side (rather
+// than shipping the full map and trusting the client to also know the
+// role rule) keeps exactly one source of truth for "who may drive this
+// edge" — the same requireManager() check the route enforces — instead of
+// two copies that could drift. Only removes the two reject/un-reject
+// edges for a non-manager; every other edge in the map is unfiltered
+// because nothing else on the generic /transition route is role-gated yet
+// (that is the separate, still-unstarted commit pending the operator's
+// per-edge access answer — see ALLOWED_TRANSITIONS's own header comment
+// and devices.ts's isRejectEdge/isUnrejectEdge block). When that commit
+// lands, this same filter is the place its per-edge rules plug in too —
+// one endpoint, one role-aware view of the map, not per-edge frontend logic.
 app.get('/meta/statuses', (c) => {
+  const user = currentUser(c)
+  const managerOk = user.role === 'manager' || user.role === 'admin'
+  const transitions: Record<string, DeviceStatus[]> = managerOk
+    ? ALLOWED_TRANSITIONS
+    : Object.fromEntries(
+        Object.entries(ALLOWED_TRANSITIONS).map(([from, tos]) => [
+          from,
+          tos.filter((to) => !(
+            (from === 'RECEIVED' && to === 'REJECTED') ||
+            (from === 'REJECTED' && to === 'RECEIVED')
+          )),
+        ])
+      ) as Record<string, DeviceStatus[]>
   return c.json({
     statuses: DEVICE_STATUSES,
-    transitions: ALLOWED_TRANSITIONS,
+    transitions,
+    // reason_codes stays keyed off the FULL edge set regardless of role —
+    // it is a lookup table for the modal's <select> options, not itself a
+    // grant of permission (the manager gate already happened above, in
+    // which edges are visible to begin with). A manager caller still needs
+    // both lists; an operator caller sees neither reject edge in
+    // `transitions` in the first place, so their UI never opens the modal
+    // that would read this.
     reason_codes: {
       REJECTED: REJECT_REASON_CODES,   // required when moving RECEIVED -> REJECTED
       UNREJECT: UNREJECT_REASON_CODES, // required when moving REJECTED -> RECEIVED (keyed apart from RECEIVED, which has no reason requirement on its OTHER inbound edges)
