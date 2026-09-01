@@ -9,7 +9,7 @@
 import { Hono } from 'hono'
 import type { Bindings, AuthUser, DeviceStatus } from '../types'
 import { currentUser } from '../lib/auth'
-import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES } from '../lib/deviceLifecycle'
+import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES, REJECT_REASON_CODES, UNREJECT_REASON_CODES } from '../lib/deviceLifecycle'
 import { dispatchDeviceStatusWebhooks } from '../lib/webhook'
 import { startRepair, scanBackRepair, recordQc, reopenRepair, recordRepairCost, postRepairCostToLedger, RepairJobError } from '../lib/repairWorkflow'
 import { postPurchaseCostToLedger, CostEntryError } from '../lib/costEntry'
@@ -373,7 +373,7 @@ app.post('/:id/transition', async (c) => {
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
 
-  const body = await c.req.json<{ to_status?: string; reference?: string; metadata?: Record<string, unknown> }>().catch(() => ({} as any))
+  const body = await c.req.json<{ to_status?: string; reference?: string; metadata?: Record<string, unknown>; reason_code?: string }>().catch(() => ({} as any))
   const toStatus = String(body.to_status || '').toUpperCase() as DeviceStatus
   if (!DEVICE_STATUSES.includes(toStatus)) {
     return c.json({ error: `to_status must be one of: ${DEVICE_STATUSES.join(', ')}` }, 400)
@@ -392,16 +392,43 @@ app.post('/:id/transition', async (c) => {
   if (REPAIR_WORKFLOW_ONLY_STATUSES.includes(toStatus)) {
     return c.json({ error: `${toStatus} is managed by the repair workflow — use /api/devices/:id/repair/* instead of a direct transition` }, 409)
   }
-  {
-    const device = await c.env.DB.prepare(
-      'SELECT status FROM received_devices WHERE id = ? AND organisation_id = ?'
-    ).bind(id, user.organisation_id).first<{ status: DeviceStatus }>()
-    if (device && OPR_WORKFLOW_ONLY_STATUSES.includes(device.status)) {
-      return c.json({ error: `Device is ${device.status}, which is managed by the OPR consignment workflow — it cannot be transitioned via this endpoint` }, 409)
+
+  // Fetched once, reused both for the OPR/repair workflow guard below and
+  // for the reject/un-reject gating (need the device's CURRENT status to
+  // tell RECEIVED->REJECTED apart from every other ...->RECEIVED edge).
+  const device0 = await c.env.DB.prepare(
+    'SELECT status FROM received_devices WHERE id = ? AND organisation_id = ?'
+  ).bind(id, user.organisation_id).first<{ status: DeviceStatus }>()
+  if (device0 && OPR_WORKFLOW_ONLY_STATUSES.includes(device0.status)) {
+    return c.json({ error: `Device is ${device0.status}, which is managed by the OPR consignment workflow — it cannot be transitioned via this endpoint` }, 409)
+  }
+  if (device0 && REPAIR_WORKFLOW_ONLY_STATUSES.includes(device0.status)) {
+    return c.json({ error: `Device is ${device0.status}, which is managed by the repair workflow — it cannot be transitioned via this endpoint` }, 409)
+  }
+
+  // ── Reject / un-reject gating (2026-09-01 live-incident fix) ──
+  // Scoped to EXACTLY these two edges, not the whole route: every other
+  // transition here is untested against a non-admin caller today, so a
+  // blanket manager-gate would ship an unreviewed access restriction
+  // alongside an unrelated incident fix. A required reason code alone is
+  // not access control, so both edges are manager-gated AND require one
+  // of the enumerated reason codes — an unrecognised code is rejected
+  // (422), not silently stored.
+  const isRejectEdge = device0?.status === 'RECEIVED' && toStatus === 'REJECTED'
+  const isUnrejectEdge = device0?.status === 'REJECTED' && toStatus === 'RECEIVED'
+  if (isRejectEdge || isUnrejectEdge) {
+    if (!requireManager(c)) {
+      return c.json({ error: `${isRejectEdge ? 'Rejecting' : 'Un-rejecting'} a device is manager-only` }, 403)
     }
-    if (device && REPAIR_WORKFLOW_ONLY_STATUSES.includes(device.status)) {
-      return c.json({ error: `Device is ${device.status}, which is managed by the repair workflow — it cannot be transitioned via this endpoint` }, 409)
+    const reasonCode = typeof body.reason_code === 'string' ? body.reason_code.trim() : ''
+    const validCodes: readonly string[] = isRejectEdge ? REJECT_REASON_CODES : UNREJECT_REASON_CODES
+    if (!reasonCode) {
+      return c.json({ error: 'reason_code is required for this transition', valid_reason_codes: validCodes }, 422)
     }
+    if (!validCodes.includes(reasonCode)) {
+      return c.json({ error: `reason_code must be one of: ${validCodes.join(', ')}`, valid_reason_codes: validCodes }, 422)
+    }
+    body.metadata = { ...(body.metadata ?? {}), reason_code: reasonCode }
   }
 
   try {
@@ -409,7 +436,7 @@ app.post('/:id/transition', async (c) => {
       user,
       reference: body.reference ?? null,
       metadata: body.metadata ?? null,
-      eventType: 'STATUS_CHANGE',
+      eventType: isRejectEdge ? 'REJECT' : isUnrejectEdge ? 'UNREJECT' : 'STATUS_CHANGE',
     })
 
     // Fire-and-forget webhook. Not awaited-blocking the response would be

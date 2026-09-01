@@ -51,7 +51,20 @@ export const ALLOWED_TRANSITIONS: Record<DeviceStatus, DeviceStatus[]> = {
   EXPORTED_UNDER_OPR: ['RETURNED_UNDER_OPR'],
   RETURNED_UNDER_OPR: ['ACTIVE_INVENTORY'],
   SOLD: [],
-  REJECTED: [],
+  // REJECTED -> RECEIVED (added 2026-09-01, live-incident fix: devices 588
+  // and 619 were mistakenly rejected by an operator and had NO route back
+  // into the flow — REJECTED previously had zero outbound edges, an
+  // unintentional dead end reached only because the generic /transition
+  // endpoint happens to allow RECEIVED -> REJECTED by omission (REJECTED
+  // is not in either *_WORKFLOW_ONLY_STATUSES list) with no corresponding
+  // way back. Deliberate design, per instruction: REJECTED rejoins the
+  // flow at RECEIVED ONLY — never skips ahead to anywhere RECEIVED itself
+  // cannot reach — and scrap/write-off is explicitly out of scope, so this
+  // is the device's only two-state holding pattern (rejected, or back into
+  // the normal flow from the start). Both edges (RECEIVED->REJECTED and
+  // REJECTED->RECEIVED) require a mandatory REASON_CODE (see below),
+  // enforced in the route layer (src/routes/devices.ts), not here.
+  REJECTED: ['RECEIVED'],
   QC_FAILED: ['IN_HOUSE_REPAIR'],
   READY_FOR_ZOHO: [],
   // ── TEMP_EXPORTED_STANDARD consignment flow (migration 0023) ──
@@ -59,6 +72,34 @@ export const ALLOWED_TRANSITIONS: Record<DeviceStatus, DeviceStatus[]> = {
   TEMP_EXPORTED_STANDARD: ['RETURNED_UNDER_STANDARD'],
   RETURNED_UNDER_STANDARD: ['ACTIVE_INVENTORY'],
 }
+
+// Reason codes for the two reject/un-reject edges (2026-09-01). Stored as
+// device_events.metadata.reason_code (JSON — the column needs no schema
+// migration, confirmed directly from live production rows before this
+// edge existed: device 588/619's own RECEIVE events already carry a JSON
+// object in this column). Enforcement (mandatory-on-these-two-edges-only,
+// reject-unrecognised-codes) lives in the /:id/transition route, since
+// transitionDevice() itself is edge-agnostic about metadata contents.
+export const REJECT_REASON_CODES = [
+  'not_as_described',
+  'wrong_model_or_storage',
+  'imei_mismatch',
+  'cosmetic_grade_below_stated',
+  'faulty_on_test',
+  'blacklisted_or_locked',
+  'missing_items',
+  'damaged_in_transit',
+] as const
+
+export const UNREJECT_REASON_CODES = [
+  'rejected_in_error',
+  'retested_and_passed',
+  'regraded_and_accepted',
+  'vendor_issue_resolved',
+] as const
+
+export type RejectReasonCode = typeof REJECT_REASON_CODES[number]
+export type UnrejectReasonCode = typeof UNREJECT_REASON_CODES[number]
 
 // Statuses whose membership is DERIVED from consignment state (a device is
 // IN_EXPORT_CONSIGNMENT iff it has a line on a DRAFT export shipment;

@@ -100,12 +100,20 @@ describe('transitionDevice — disallowed transitions are rejected', () => {
   // Representative set spanning: the brief's explicit example, an
   // export-workflow jump that's out of scope, a same-status no-op, and a
   // transition out of every terminal/no-outgoing-transition status.
+  //
+  // NOTE (2026-09-01): REJECTED -> RECEIVED moved OUT of this list — it is
+  // now an allowed edge (live-incident fix, devices 588/619 stranded in
+  // REJECTED with no way back). See the dedicated
+  // 'transitionDevice — reject / un-reject edge' describe block below for
+  // its coverage, and REJECTED -> anywhere-else-RECEIVED-can-reach for the
+  // negative case proving the edge is scoped to RECEIVED only.
   const disallowed: [DeviceStatus, DeviceStatus][] = [
     ['RECEIVED', 'SOLD'], // explicitly named in the brief
     ['RECEIVED', 'ACTIVE_INVENTORY'], // skipping SORTING
     ['SORTING', 'EXPORTED_UNDER_OPR'], // must go via IN_EXPORT_CONSIGNMENT (OPR finalisation)
     ['ACTIVE_INVENTORY', 'IN_HOUSE_REPAIR'], // ACTIVE_INVENTORY has no outgoing transitions
-    ['REJECTED', 'RECEIVED'], // terminal status, no way back
+    ['REJECTED', 'SORTING'], // REJECTED may ONLY re-enter at RECEIVED, never skip ahead
+    ['REJECTED', 'ACTIVE_INVENTORY'], // same — must restart the flow from RECEIVED
     ['RECEIVED', 'RECEIVED'], // same-status no-op is not a valid transition
   ]
 
@@ -270,6 +278,45 @@ describe('transitionDevice — audit-trail invariant', () => {
         await assertInvariant(deviceId)
       }
     }
+  })
+})
+
+describe('transitionDevice — reject / un-reject edge (2026-09-01 live-incident fix)', () => {
+  // transitionDevice() itself is edge-agnostic about reason codes (that
+  // enforcement lives in the /:id/transition route — see
+  // test/devicesRejectRoute.spec.ts) — this block only proves the raw
+  // state-machine shape: REJECTED has exactly one outbound edge, back to
+  // RECEIVED, and the round trip works.
+  it('allows RECEIVED -> REJECTED -> RECEIVED, a full round trip', async () => {
+    const deviceId = await seedDevice('RECEIVED')
+
+    await transitionDevice(db(), deviceId, 'REJECTED', { user: ADMIN_USER })
+    expect((await db().prepare('SELECT status FROM received_devices WHERE id = ?').bind(deviceId).first<{ status: string }>())?.status).toBe('REJECTED')
+
+    await transitionDevice(db(), deviceId, 'RECEIVED', { user: ADMIN_USER })
+    expect((await db().prepare('SELECT status FROM received_devices WHERE id = ?').bind(deviceId).first<{ status: string }>())?.status).toBe('RECEIVED')
+
+    const events = await eventsFor(deviceId)
+    expect(events).toHaveLength(2)
+    expect(events[0]).toMatchObject({ from_status: 'RECEIVED', to_status: 'REJECTED' })
+    expect(events[1]).toMatchObject({ from_status: 'REJECTED', to_status: 'RECEIVED' })
+  })
+
+  it('REJECTED has exactly one outbound edge (RECEIVED), never a shortcut ahead', () => {
+    expect(ALLOWED_TRANSITIONS.REJECTED).toEqual(['RECEIVED'])
+  })
+
+  it('a device un-rejected back to RECEIVED can re-run the normal flow from scratch', async () => {
+    const deviceId = await seedDevice('RECEIVED')
+    await transitionDevice(db(), deviceId, 'REJECTED', { user: ADMIN_USER })
+    await transitionDevice(db(), deviceId, 'RECEIVED', { user: ADMIN_USER })
+
+    // Proves it isn't a dead-end-that-looks-alive: the device can proceed
+    // through the ordinary RECEIVED -> SORTING -> ACTIVE_INVENTORY chain
+    // exactly as if it had never been rejected.
+    await transitionDevice(db(), deviceId, 'SORTING', { user: ADMIN_USER })
+    await transitionDevice(db(), deviceId, 'ACTIVE_INVENTORY', { user: ADMIN_USER })
+    expect((await db().prepare('SELECT status FROM received_devices WHERE id = ?').bind(deviceId).first<{ status: string }>())?.status).toBe('ACTIVE_INVENTORY')
   })
 })
 
