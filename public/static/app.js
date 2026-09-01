@@ -185,6 +185,7 @@
     removalFlagsShowResolved: false,
     devicesBusy: false,          // in-flight guard for device-lifecycle mutations
     bulkTransitionOpen: false,   // bulk-transition-by-scan modal visibility
+    rejectReasonModal: null,     // { device, toStatus, edgeKind: 'reject'|'unreject' } — reason-code capture for RECEIVED<->REJECTED (2026-09-01)
     // ───── Bills tab (Sprint B §1 — ONE builder for purchase|repair) ─────
     bills: [],                   // GET /api/bills list rows
     billsFilterType: '',         // '' | 'purchase' | 'repair'
@@ -582,6 +583,7 @@
       state.oprFinaliseOpen ? OprFinaliseModal() : null,
       state.oprDraftDoc ? OprDraftDocModal() : null,
       state.bulkTransitionOpen ? BulkTransitionModal() : null,
+      state.rejectReasonModal ? RejectReasonModal() : null,
       state.billNewOpen ? BillNewModal() : null,
       state.billForceCloseOpen ? BillForceCloseModal() : null,
     );
@@ -751,11 +753,29 @@
   }
 
   // ─── All Devices — status + legal transitions ───
+  // RECEIVED->REJECTED and REJECTED->RECEIVED are manager-gated AND require
+  // a reason_code server-side (src/routes/devices.ts, 2026-09-01 live-
+  // incident fix) — a bare { to_status } POST always 422s on these two
+  // edges. Route them through RejectReasonModal to capture the code first;
+  // every other edge keeps going straight through as before.
   async function doTransition(device, toStatus) {
+    if (device.status === 'RECEIVED' && toStatus === 'REJECTED') {
+      state.rejectReasonModal = { device, toStatus, edgeKind: 'reject' };
+      render();
+      return;
+    }
+    if (device.status === 'REJECTED' && toStatus === 'RECEIVED') {
+      state.rejectReasonModal = { device, toStatus, edgeKind: 'unreject' };
+      render();
+      return;
+    }
+    await runTransition(device, toStatus, {});
+  }
+  async function runTransition(device, toStatus, extraBody) {
     if (state.devicesBusy) return;
     state.devicesBusy = true; render();
     try {
-      await api.post(`/devices/${device.id}/transition`, { to_status: toStatus });
+      await api.post(`/devices/${device.id}/transition`, { to_status: toStatus, ...extraBody });
       toast(`<span class="mono">${device.imei}</span> · ${device.status} → ${toStatus}`, 'ok');
       await refreshDevicesSubview(); render();
     } catch (err) {
@@ -763,6 +783,49 @@
     } finally {
       state.devicesBusy = false; render();
     }
+  }
+  function RejectReasonModal() {
+    const ctx = state.rejectReasonModal;
+    const { device, toStatus, edgeKind } = ctx;
+    const isReject = edgeKind === 'reject';
+    // reason_codes comes from GET /devices/meta/statuses (state.deviceStatuses)
+    // — never a hardcoded list here, so a server-side code change needs no
+    // frontend edit (same single-source-of-truth principle as `transitions`).
+    const codes = (state.deviceStatuses && state.deviceStatuses.reason_codes &&
+      state.deviceStatuses.reason_codes[isReject ? 'REJECTED' : 'UNREJECT']) || [];
+    if (!ctx._reasonCode) ctx._reasonCode = '';
+    const close = () => { state.rejectReasonModal = null; render(); };
+    const submit = async () => {
+      if (!ctx._reasonCode) { toast('Select a reason code', 'warn'); return; }
+      state.rejectReasonModal = null;
+      await runTransition(device, toStatus, { reason_code: ctx._reasonCode });
+    };
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-md' },
+        h('div', { class: 'flex items-center gap-3 mb-4' },
+          h('div', { class: `w-10 h-10 rounded-xl flex items-center justify-center ${isReject ? 'bg-red-500/10 text-red-400' : 'bg-green-500/10 text-green-400'}` },
+            h('i', { class: `fas ${isReject ? 'fa-ban' : 'fa-rotate-left'}` })),
+          h('div', {},
+            h('h2', { class: 'text-lg font-semibold' }, isReject ? 'Reject device' : 'Un-reject device'),
+            h('p', { class: 'text-xs text-slate-500 mono' }, `${device.imei} · ${device.status} → ${toStatus}`))
+        ),
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Reason *'),
+        h('select', {
+          id: 'reject-reason-select', class: 'input text-sm', autofocus: 'true',
+          onchange: (e) => { ctx._reasonCode = e.target.value; },
+        },
+          h('option', { value: '', selected: !ctx._reasonCode ? 'selected' : null }, '— select a reason —'),
+          codes.map(code => h('option', { value: code, selected: code === ctx._reasonCode ? 'selected' : null }, code))
+        ),
+        h('div', { class: 'mt-4 flex justify-end gap-2' },
+          h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
+          h('button', {
+            id: 'reject-reason-submit', class: `btn text-sm ${isReject ? '!bg-red-600/20 !text-red-300' : '!bg-green-600/20 !text-green-300'}`,
+            onclick: submit,
+          }, isReject ? 'Reject' : 'Un-reject')
+        )
+      )
+    );
   }
   async function doStartRepair(device) {
     const fault = prompt(`Fault code for ${device.imei} (${deviceLabel(device)}):`);

@@ -234,3 +234,20 @@ describe('POST /:id/transition — reject/un-reject gating is scoped to ONLY the
     expect(await deviceStatus(deviceId)).toBe('ACTIVE_INVENTORY')
   })
 })
+
+// GET /devices/meta/statuses is the frontend's ONLY source for the reason
+// codes (public/static/app.js's RejectReasonModal reads
+// state.deviceStatuses.reason_codes — no hardcoded list on the client, the
+// same single-source-of-truth principle already applied to `transitions`).
+// This locks the response shape so a future rename/refactor of
+// REJECT_REASON_CODES/UNREJECT_REASON_CODES can't silently break the UI's
+// dropdown without a test noticing.
+describe('GET /devices/meta/statuses — reason_codes exposed for the UI (2026-09-01)', () => {
+  it('exposes REJECTED and UNREJECT reason code lists matching the exported constants exactly', async () => {
+    const res = await apiAs(OPERATOR_USER, '/api/devices/meta/statuses', { method: 'GET' })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { reason_codes: { REJECTED: string[]; UNREJECT: string[] } }
+    expect(body.reason_codes.REJECTED).toEqual([...REJECT_REASON_CODES])
+    expect(body.reason_codes.UNREJECT).toEqual([...UNREJECT_REASON_CODES])
+  })
+})

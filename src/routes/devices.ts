@@ -221,8 +221,21 @@ app.get('/export/csv', async (c) => {
 
 // GET /api/devices/statuses — expose the enum + allowed transition map so a
 // CRM/UI can render valid next-states without hardcoding the state machine.
+// reason_codes (2026-09-01) is the SAME single-source-of-truth principle
+// applied to the two reject/un-reject edges: the UI must not carry its own
+// copy of REJECT_REASON_CODES/UNREJECT_REASON_CODES (that would be exactly
+// the "client-side copy of the transition map" failure mode this endpoint
+// already exists to prevent for `transitions`) — it renders whichever list
+// this returns, so a future reason-code change here needs zero frontend edit.
 app.get('/meta/statuses', (c) => {
-  return c.json({ statuses: DEVICE_STATUSES, transitions: ALLOWED_TRANSITIONS })
+  return c.json({
+    statuses: DEVICE_STATUSES,
+    transitions: ALLOWED_TRANSITIONS,
+    reason_codes: {
+      REJECTED: REJECT_REASON_CODES,   // required when moving RECEIVED -> REJECTED
+      UNREJECT: UNREJECT_REASON_CODES, // required when moving REJECTED -> RECEIVED (keyed apart from RECEIVED, which has no reason requirement on its OTHER inbound edges)
+    },
+  })
 })
 
 // POST /api/devices/bulk-transition — { target_status, imeis: string[] }
