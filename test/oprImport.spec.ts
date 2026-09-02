@@ -1400,6 +1400,22 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     // finalised import legs) so `exported`/`returned` are read back from
     // the same per-leg supplementary_units COALESCE the 2b fix introduced
     // — not asserted against a mocked or hand-computed total.
+    //
+    // Timeout budget (2026-09-02): this test does 162 + 90 + 72 = 324
+    // sequential, individually-awaited HTTP round-trips against the real
+    // Worker (one makeDevice()+scan per unit, times three passes), plus the
+    // finalise/discharge calls on top — there is no way to make that
+    // cheaper without changing what's being proven (per-unit scan gating on
+    // a real MRN, not a bulk shortcut). Isolated runs alone (zero suite
+    // contention) clock 24-27s against the 30s cap on this sandbox, so
+    // ~3-6s of headroom; under full-suite contention (shared workerd pool
+    // across 28 other files) that thin margin was observed to flip pass/fail
+    // run-to-run with no code change (530 vs 531 passed across two otherwise
+    // identical full-suite runs) — a real capacity problem, not flaky test
+    // logic. Raised to 45000ms to restore a deterministic zero-failure gate;
+    // if a future full-suite run still times this out, split R1/R2 into two
+    // tests sharing one makeFinalisedExport(162, ...) fixture (via
+    // beforeAll) rather than raising the budget again.
     const { shipment: exp, devices } = await makeFinalisedExport(162, '26GB7LKWO3QHFLCAA0')
 
     // Return leg R1: 90 devices scanned, declared supplementary_units: 90
@@ -1440,7 +1456,7 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     expect(row.returned).toBe(162)
     expect(row.outstanding).toBe(0)
     expect(row.status).toBe('discharged')
-  }, 30000)
+  }, 45000)
 
   it('import-proof records the 6121 MRN on a FINALISED import only; export-proof refuses imports', async () => {
     const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000AA10')
