@@ -15,6 +15,79 @@ function requireManager(c: any): boolean {
   return role === 'manager' || role === 'admin'
 }
 
+// ───────── Valuation status inclusion — DECISION, documented not derived ─────────
+//
+// Which of the 14 DEVICE_STATUSES count as "owned stock" for the headline
+// valuation totals. Written as an explicit list, NOT as "DEVICE_STATUSES
+// minus an exclusion list" — the deliberate reason is that a 15th status
+// added to the lifecycle in future must force whoever adds it to look at
+// this file and decide where it goes, rather than silently joining (or
+// silently leaving) the valuation total just because it wasn't named in
+// an exclusion array. The operator's own criterion: is this still the
+// operator's owned stock, capable of being sold from inventory? Goods
+// out under OPR or temporary standard export remain the operator's
+// stock throughout — that's the whole basis of "temporary" export — so
+// they stay included even though they're physically abroad.
+export const VALUATION_INCLUDED_STATUSES: readonly DeviceStatus[] = [
+  'RECEIVED',
+  'SORTING',
+  'ACTIVE_INVENTORY',
+  'IN_HOUSE_REPAIR',
+  'READY_FOR_EXPORT',
+  'IN_EXPORT_CONSIGNMENT',
+  'EXPORTED_UNDER_OPR',
+  'RETURNED_UNDER_OPR',
+  'QC_FAILED',
+  'READY_FOR_ZOHO',
+  'TEMP_EXPORTED_STANDARD',
+  'RETURNED_UNDER_STANDARD',
+]
+
+// REJECTED is still owned stock (it can be corrected back to RECEIVED
+// through the state machine — see REJECTED -> RECEIVED in
+// ALLOWED_TRANSITIONS, src/lib/deviceLifecycle.ts), so it is NOT a
+// valuation exclusion. It is reported on its OWN separate line instead
+// of folded into the main included-statuses total, so a manager can see
+// "how much value is currently sitting in rejected stock" as its own
+// figure rather than it disappearing into the same number as active
+// inventory.
+//
+// SOLD is the sole true exclusion: once sold, the device is no longer
+// the operator's stock. SOLD is currently unreachable — no
+// ALLOWED_TRANSITIONS entry produces it and no code path writes it
+// (confirmed via grep across deviceLifecycle.ts, every route, and every
+// test) — so this exclusion is inert today, but is written explicitly
+// now as a hard prerequisite for the future sales-import work, not
+// discovered retroactively once SOLD becomes reachable.
+//
+// Reconciliation invariant this endpoint enforces at runtime, not just
+// in a comment: VALUATION_INCLUDED_STATUSES + REJECTED + SOLD must
+// equal the full 14-value DEVICE_STATUSES set, with no status counted
+// twice and none omitted. Checked once at module load (not per-request)
+// so a future edit to either list that breaks the partition fails
+// loudly at import time (surfaces in tsc/test runs) rather than
+// silently producing a valuation total that quietly excludes or
+// double-counts a status.
+const VALUATION_EXCLUDED_AS_OWN_LINE: readonly DeviceStatus[] = ['REJECTED']
+const VALUATION_EXCLUDED_TOTALLY: readonly DeviceStatus[] = ['SOLD']
+;(() => {
+  const partition = [...VALUATION_INCLUDED_STATUSES, ...VALUATION_EXCLUDED_AS_OWN_LINE, ...VALUATION_EXCLUDED_TOTALLY]
+  const partitionSet = new Set(partition)
+  if (partition.length !== partitionSet.size) {
+    throw new Error('reports.ts: a DeviceStatus appears more than once across VALUATION_INCLUDED_STATUSES/REJECTED/SOLD')
+  }
+  const deviceStatusSet = new Set<string>(DEVICE_STATUSES)
+  for (const s of partition) {
+    if (!deviceStatusSet.has(s)) {
+      throw new Error(`reports.ts: '${s}' in the valuation partition is not a DeviceStatus`)
+    }
+  }
+  if (partitionSet.size !== DEVICE_STATUSES.length) {
+    const missing = DEVICE_STATUSES.filter(s => !partitionSet.has(s))
+    throw new Error(`reports.ts: DEVICE_STATUSES value(s) [${missing.join(', ')}] are in none of VALUATION_INCLUDED_STATUSES/REJECTED/SOLD — a status was added to the lifecycle without a valuation-inclusion decision being made for it`)
+  }
+})()
+
 // ───────── VAT bucket mapping — DECISION, documented not assumed ─────────
 //
 // The spec asked for "a VAT bucket with standard and reverse charge
@@ -67,9 +140,51 @@ type MoneyCount = { count: number; value_gbp: number }
 type InventoryValuationResponse = {
   generated_at: string
   headline: {
+    // purchase_only / purchase_plus_repair now cover ONLY devices whose
+    // status is in VALUATION_INCLUDED_STATUSES (see that constant's own
+    // comment for the full decision) — this is a behaviour change from
+    // this endpoint's first version, which summed every device
+    // regardless of status. REJECTED and SOLD devices are deliberately
+    // NOT part of these two totals; see the `rejected` / `sold` fields
+    // below for where their value goes instead.
     purchase_only: MoneyCount
     purchase_plus_repair: MoneyCount
     repair_delta_gbp: number
+    // REJECTED devices are still the operator's owned stock (they can
+    // be corrected back to RECEIVED through the state machine), so
+    // their value is not simply dropped — it is reported on this own
+    // separate line instead of being folded into purchase_only/
+    // purchase_plus_repair above, so a manager can see "how much value
+    // is sitting in rejected stock" as its own figure. Basis:
+    // purchase_plus_repair (the fuller cost figure), matching the same
+    // methodology as the main total.
+    rejected: MoneyCount
+    // SOLD is the sole true valuation exclusion (see
+    // VALUATION_INCLUDED_STATUSES's comment) — once sold, a device is
+    // no longer the operator's stock. SOLD is currently unreachable (no
+    // ALLOWED_TRANSITIONS entry produces it, no code path writes it),
+    // so this is expected to be {count: 0, value_gbp: 0} today. It
+    // exists now, ahead of that becoming reachable, so the future sales
+    // import has a place to reconcile against rather than this field
+    // being added retroactively once SOLD devices start appearing.
+    sold: MoneyCount
+  }
+  // The arithmetic invariant named in the valuation-inclusion decision,
+  // made a first-class checkable field rather than left as something a
+  // human has to eyeball across three different numbers: every device
+  // counts exactly once across included/rejected/sold, so their sum
+  // must equal the total device count. `balanced` is computed from the
+  // actual counts above, not asserted — if it is ever false, either the
+  // VALUATION_INCLUDED_STATUSES/REJECTED/SOLD partition has a gap that
+  // slipped past the module-load check, or (more likely, if this ever
+  // happens) a device row's status fell outside the live CHECK
+  // constraint's 14 values entirely.
+  reconciliation: {
+    included_count: number
+    rejected_count: number
+    sold_count: number
+    total_devices: number
+    balanced: boolean
   }
   costed_vs_uncosted: {
     costed: number
@@ -194,13 +309,34 @@ app.get('/inventory-valuation', async (c) => {
   ).bind(user.organisation_id).all<{ provenance: CostLedgerProvenance; row_count: number; value_gbp: number }>()
 
   // ── Headline ──
+  // These four now accumulate ONLY devices in VALUATION_INCLUDED_STATUSES
+  // — see that constant's comment for the full decision. REJECTED and
+  // SOLD devices are tracked in their own separate accumulators below
+  // and never added into these.
   let purchaseCount = 0
   let purchaseValue = 0
   let purchasePlusRepairCount = 0
   let purchasePlusRepairValue = 0
+  // costed_vs_uncosted intentionally covers EVERY device in the org
+  // regardless of valuation-inclusion category — it is a data-quality
+  // metric ("how much of our cost data is actually populated"), not a
+  // valuation total, so REJECTED/SOLD devices still count here even
+  // though their value is excluded from purchase_only/
+  // purchase_plus_repair above.
   let costedCount = 0
   let uncostedCount = 0
   let multiPurchaseRowDeviceCount = 0
+
+  // ── rejected / sold headline lines — own accumulators, same
+  // purchase-plus-repair basis as the main total, kept separate so
+  // their value never silently joins the main included-statuses sum. ──
+  let rejectedCount = 0
+  let rejectedValue = 0
+  let soldCount = 0
+  let soldValue = 0
+  const includedStatusSet = new Set<DeviceStatus>(VALUATION_INCLUDED_STATUSES)
+  const excludedAsOwnLineSet = new Set<DeviceStatus>(VALUATION_EXCLUDED_AS_OWN_LINE)
+  const excludedTotallySet = new Set<DeviceStatus>(VALUATION_EXCLUDED_TOTALLY)
 
   // ── by_stage accumulator, pre-seeded with every DEVICE_STATUSES value
   // at zero so stages with no devices still appear (spec requirement:
@@ -223,14 +359,33 @@ app.get('/inventory-valuation', async (c) => {
     const purchaseGbp = round2(row.purchase_gbp)
     const purchasePlusRepairGbp = round2(row.purchase_plus_repair_gbp)
 
-    // Headline totals: EVERY device contributes its count, even at zero
-    // value (spec: "devices with no ledger row contribute zero to value
-    // but must still appear in the stage and uncosted counts").
-    purchaseCount++
-    purchaseValue += purchaseGbp
-    purchasePlusRepairCount++
-    purchasePlusRepairValue += purchasePlusRepairGbp
+    // Headline totals: every device in VALUATION_INCLUDED_STATUSES
+    // contributes its count, even at zero value (spec: "devices with no
+    // ledger row contribute zero to value but must still appear in the
+    // stage and uncosted counts") — but REJECTED and SOLD devices are
+    // routed to their own separate accumulators below instead, per the
+    // valuation-inclusion decision (VALUATION_INCLUDED_STATUSES above).
+    if (includedStatusSet.has(row.status)) {
+      purchaseCount++
+      purchaseValue += purchaseGbp
+      purchasePlusRepairCount++
+      purchasePlusRepairValue += purchasePlusRepairGbp
+    } else if (excludedAsOwnLineSet.has(row.status)) {
+      rejectedCount++
+      rejectedValue += purchasePlusRepairGbp
+    } else if (excludedTotallySet.has(row.status)) {
+      soldCount++
+      soldValue += purchasePlusRepairGbp
+    }
+    // No `else`: the module-load partition check above guarantees every
+    // DeviceStatus lands in exactly one of the three branches, and the
+    // live CHECK constraint guarantees row.status is one of the 14
+    // known values — so falling through all three is not reachable.
 
+    // costed_vs_uncosted is a data-quality metric over EVERY device in
+    // the org, independent of valuation-inclusion category (see the
+    // accumulator declarations above) — REJECTED/SOLD devices still
+    // count here.
     if (row.purchase_row_count > 0) {
       costedCount++
     } else {
@@ -264,6 +419,8 @@ app.get('/inventory-valuation', async (c) => {
 
   purchaseValue = round2(purchaseValue)
   purchasePlusRepairValue = round2(purchasePlusRepairValue)
+  rejectedValue = round2(rejectedValue)
+  soldValue = round2(soldValue)
 
   const byProvenance: InventoryValuationResponse['by_provenance'] = provenanceRows.map(r => ({
     provenance: r.provenance,
@@ -284,6 +441,15 @@ app.get('/inventory-valuation', async (c) => {
       purchase_only: { count: purchaseCount, value_gbp: purchaseValue },
       purchase_plus_repair: { count: purchasePlusRepairCount, value_gbp: purchasePlusRepairValue },
       repair_delta_gbp: round2(purchasePlusRepairValue - purchaseValue),
+      rejected: { count: rejectedCount, value_gbp: rejectedValue },
+      sold: { count: soldCount, value_gbp: soldValue },
+    },
+    reconciliation: {
+      included_count: purchaseCount,
+      rejected_count: rejectedCount,
+      sold_count: soldCount,
+      total_devices: deviceRows.length,
+      balanced: purchaseCount + rejectedCount + soldCount === deviceRows.length,
     },
     costed_vs_uncosted: {
       costed: costedCount,
@@ -326,8 +492,9 @@ app.get('/inventory-valuation', async (c) => {
       'duty / customs charges',
       'VAT (the vat_type breakdown below is informational only — it does not adjust any value total)',
       'write-downs / impairment adjustments',
+      'SOLD devices (headline.sold; excluded because a sold device is no longer the operator\'s owned stock — currently always £0/0 because SOLD is unreachable by any transition today)',
     ],
-    basis: 'This is a management valuation at device purchase price plus any posted repair cost — an "item cost" figure, not a "landed cost" figure. It excludes freight, duty, VAT and write-downs, and is not a statutory inventory-cost figure under any accounting standard. Any system consuming this response should treat it as device purchase/repair cost only, not a balance-sheet or landed-cost number.',
+    basis: 'This is a management valuation at device purchase price plus any posted repair cost — an "item cost" figure, not a "landed cost" figure. It excludes freight, duty, VAT and write-downs, and is not a statutory inventory-cost figure under any accounting standard. Any system consuming this response should treat it as device purchase/repair cost only, not a balance-sheet or landed-cost number. LIMITATION: the "repair" component of "purchase plus repair" covers bought-in (third-party-invoiced) repair costs only — cost_ledger rows with cost_type=\'repair\' are written exclusively by postRepairCostToLedger() for bought-in work. Nothing is currently recorded anywhere in this system for in-house repair parts or labour, so purchase_plus_repair systematically UNDERSTATES true cost for any device repaired in-house, with no flag distinguishing an in-house-repaired device from one that was never repaired at all. Devices in headline.rejected and headline.sold are excluded from purchase_only/purchase_plus_repair above — see reconciliation for how every device is accounted for across included/rejected/sold.',
     vat_bucket_basis: "The grouped by_vat_bucket breakdown is for human reading only: STANDARD and PVAT are combined into 'standard_and_net_recoverable' for readability, MARGIN and ZERO stay separate, unset vat_type gets its own row. This system's vat_type vocabulary (MARGIN/STANDARD/ZERO/PVAT) has no 'REVERSE_CHARGE' value — that is recorded here as an absence, not something mapped onto another bucket. Grouping a stored field is not the same operation as calculating VAT: this endpoint only does the former. Any system consuming this response programmatically should use by_vat_type_raw (ungrouped, per-stored-value) instead of by_vat_bucket.",
   }
 

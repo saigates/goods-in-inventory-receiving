@@ -106,30 +106,67 @@ describe('GET /api/reports/inventory-valuation', () => {
     await seedCostLedgerRow(deviceB, 'purchase', 200, 'supplier-invoiced')
     await seedCostLedgerRow(deviceB, 'repair', 50, 'default-unverified')
 
-    // (c) default-unverified acquisition row
-    const deviceC = await seedDevice('SOLD', { vatType: 'PVAT' })
+    // (c) default-unverified acquisition row — QC_FAILED is one of the
+    // VALUATION_INCLUDED_STATUSES (still owned stock, mid-workflow), so
+    // this device's value still lands in the main headline totals.
+    const deviceC = await seedDevice('QC_FAILED', { vatType: 'PVAT' })
     await seedCostLedgerRow(deviceC, 'purchase', 75, 'default-unverified')
 
     // (d) no ledger row at all
     const deviceD = await seedDevice('RECEIVED', { vatType: null })
 
+    // (e) REJECTED device — still owned stock, but reported on its own
+    // separate headline.rejected line, NOT folded into purchase_only/
+    // purchase_plus_repair above (VALUATION_INCLUDED_STATUSES decision).
+    const deviceE = await seedDevice('REJECTED', { vatType: 'MARGIN' })
+    await seedCostLedgerRow(deviceE, 'purchase', 60, 'supplier-invoiced')
+
+    // (f) SOLD device — the sole true valuation exclusion. Unreachable
+    // via any real transition today, but seeded directly here (same
+    // bypass-the-API convention as every other status in this file) so
+    // the exclusion itself is exercised ahead of SOLD becoming reachable.
+    const deviceF = await seedDevice('SOLD', { vatType: 'ZERO' })
+    await seedCostLedgerRow(deviceF, 'purchase', 90, 'supplier-invoiced')
+
     // extra device across a >=2nd distinct lifecycle stage already
     // covered by deviceD (RECEIVED) vs deviceA/B/C above (three more
-    // distinct stages) — five stages total exercised in this test.
+    // distinct stages) — five stages total exercised in this test,
+    // plus REJECTED and SOLD as the two exclusion categories.
 
     const res = await apiAs(MANAGER_USER, '/api/reports/inventory-valuation')
     expect(res.status).toBe(200)
     const json = await res.json() as any
 
     // Headline: purchase-only = 100+200+75+0 = 375; purchase+repair = 375+50 = 425
+    // — deviceE (REJECTED, 60) and deviceF (SOLD, 90) are excluded from
+    // BOTH totals, per the valuation-inclusion decision.
     expect(json.headline.purchase_only.value_gbp).toBe(375)
     expect(json.headline.purchase_plus_repair.value_gbp).toBe(425)
     expect(json.headline.repair_delta_gbp).toBe(50)
-    // device counts include ALL org devices, costed or not
+    // device counts include only VALUATION_INCLUDED_STATUSES devices
     expect(json.headline.purchase_only.count).toBeGreaterThanOrEqual(4)
 
-    // costed vs uncosted: A, B, C are costed (>=1 purchase row); D is not
-    expect(json.costed_vs_uncosted.costed).toBeGreaterThanOrEqual(3)
+    // rejected: its own separate line, basis = purchase_plus_repair
+    // (deviceE has no repair row, so purchase == purchase_plus_repair here)
+    expect(json.headline.rejected.count).toBeGreaterThanOrEqual(1)
+    expect(json.headline.rejected.value_gbp).toBeGreaterThanOrEqual(60)
+
+    // sold: the sole true exclusion — deviceF's 90 must NOT appear in
+    // purchase_only/purchase_plus_repair above, only here.
+    expect(json.headline.sold.count).toBeGreaterThanOrEqual(1)
+    expect(json.headline.sold.value_gbp).toBeGreaterThanOrEqual(90)
+
+    // reconciliation: every device counted exactly once across
+    // included/rejected/sold, summing to the total device count.
+    expect(json.reconciliation.balanced).toBe(true)
+    expect(json.reconciliation.included_count + json.reconciliation.rejected_count + json.reconciliation.sold_count)
+      .toBe(json.reconciliation.total_devices)
+
+    // costed vs uncosted: A, B, C, E, F are costed (>=1 purchase row); D is not
+    // — this metric is independent of valuation-inclusion category, so
+    // REJECTED/SOLD devices still count here even though their value is
+    // excluded from the main headline totals.
+    expect(json.costed_vs_uncosted.costed).toBeGreaterThanOrEqual(5)
     expect(json.costed_vs_uncosted.uncosted).toBeGreaterThanOrEqual(1)
 
     // by_stage: all 14 DEVICE_STATUSES present, zero-count stages included
@@ -175,13 +212,45 @@ describe('GET /api/reports/inventory-valuation', () => {
     const rawPvat = json.by_vat_type_raw.find((r: any) => r.vat_type === 'PVAT')
     expect(rawPvat.value_gbp).toBeGreaterThanOrEqual(75) // deviceC only, separable from STANDARD
 
-    // exclusions block present and names all four
+    // exclusions block present and names all five (freight/duty/VAT/
+    // write-downs/SOLD)
     expect(json.exclusions.join(' ')).toMatch(/freight/i)
     expect(json.exclusions.join(' ')).toMatch(/duty/i)
     expect(json.exclusions.join(' ')).toMatch(/VAT/)
     expect(json.exclusions.join(' ')).toMatch(/write-down/i)
+    expect(json.exclusions.join(' ')).toMatch(/SOLD/)
+
+    // basis states the in-house-repair limitation explicitly: worked
+    // cost covers bought-in repairs only and understates in-house work,
+    // since no in-house parts/labour cost is recorded anywhere.
+    expect(json.basis).toMatch(/bought-in/i)
+    expect(json.basis).toMatch(/in-house/i)
+    expect(json.basis).toMatch(/understate/i)
 
     expect(json.data_quality.devices_with_multiple_purchase_rows).toBeGreaterThanOrEqual(0)
+  })
+
+  it('REJECTED and SOLD devices are excluded from the main headline but still appear in by_stage and costed_vs_uncosted', async () => {
+    const rejectedDevice = await seedDevice('REJECTED', { vatType: 'ZERO' })
+    await seedCostLedgerRow(rejectedDevice, 'purchase', 45, 'supplier-invoiced')
+
+    const soldDevice = await seedDevice('SOLD', { vatType: 'MARGIN' })
+    await seedCostLedgerRow(soldDevice, 'purchase', 55, 'supplier-invoiced')
+
+    const res = await apiAs(MANAGER_USER, '/api/reports/inventory-valuation')
+    const json = await res.json() as any
+
+    // by_stage still carries both statuses with their own totals — the
+    // exclusion is from the main headline only, never from by_stage.
+    const rejectedStage = json.by_stage.find((s: any) => s.status === 'REJECTED')
+    expect(rejectedStage).toBeDefined()
+    expect(rejectedStage.count).toBeGreaterThanOrEqual(1)
+    const soldStage = json.by_stage.find((s: any) => s.status === 'SOLD')
+    expect(soldStage).toBeDefined()
+    expect(soldStage.count).toBeGreaterThanOrEqual(1)
+
+    // Reconciliation partition still balances with these two added.
+    expect(json.reconciliation.balanced).toBe(true)
   })
 
   it('devices with multiple purchase rows are summed AND flagged as a data-quality anomaly', async () => {
