@@ -491,6 +491,42 @@ comparable to a whole-tree hash and should not be re-used as a pass/fail
 gate for any future commit — recompute the whole-tree hash fresh for
 whichever commit is actually being deployed.
 
+**Recomputed for the actual deploy commit (2026-09-02) — the `ec31bf6`
+hashes above are stale for this deploy.** `ec31bf6` was five commits
+behind the deploy set's tip; both `src/` and `public/static/app.js` moved
+again since then (`84a57e7`, `d64bc28`, `fc356c2`, `7d20d47`, `939b7a1`,
+`1c7586c`), so the recorded whole-tree hash no longer matches the
+artefact this deploy actually publishes — comparing against it would be
+the same class of blindness the whole-tree convention exists to catch,
+just approached from the other direction (a stale-but-present hash
+looks like a completed check, not an absent one). Two independent clean
+`rm -rf dist && npm run build` runs at `1c7586c` (the seven-commit deploy
+set's tip — `7d20d47`, `939b7a1`, `fc356c2`, `84a57e7`, `d64bc28`,
+`ec31bf6`, `1c7586c`, each touching `src/`; the pending inventory-valuation
+"status list" refinement could not be located and so was not added as an
+eighth commit, per the fallback of deploying the seven if the eighth
+doesn't finish cleanly — `origin/main` at `f1db90f`) produced the identical
+whole-tree hash — **`88ab8ab79b518518ef20c25e607396ec776a444a475de68a166149b89dd20405`
+is the correct whole-tree hash for commit `1c7586c`**. Per-file
+reference: `dist/_worker.js` →
+`fed7230c53c5b1e9c2cd9e9549ed5a6dc8b0f2427e56945f509e7a036d38d74f`,
+`dist/static/app.js` →
+`9ccd095122d805200fc5f31503e6ec92597a95ed0673f2803543bf7e8f22cb8b`,
+`dist/_routes.json` →
+`faae3ca654c8fa00f52b7311d3c9e1bdc36f39022ec6d4832ecc3d5d7da519ca`,
+`dist/static/favicon.svg` →
+`287dc951275876be22d043fa4ab1364c7cf03aea602c6f9495e51b9c135079dc`,
+`dist/static/style.css` →
+`be55b78ce2c4a16c3d4d12a4dfdab556f1b8753ab0a385a95f2bdbc7948383fd`,
+`dist/tracker/index.html` →
+`25f91f7a411424c78c01249221d28372d1b23ad2577c8a834cc75c68420e49f0` — all
+for reference only; the whole-tree hash is what to compare against
+immediately before running `gsk hosted deploy`. As with `ec31bf6`, this
+hash will itself go stale the moment another commit touches `src/` or
+`public/`; recompute fresh for whichever commit is the actual deploy
+target next time, rather than trusting this recorded value past this
+deploy.
+
 **2026-07-29 redeploy — fixed "new catalog SKUs invisible in the Catalog tab":**
 after migration 0017 expanded `sku_catalog` to 2,781 rows, the new iPhone 17/Air/
 SE/XR and Galaxy S26/Z Fold7/Flip7-family rows were correctly in D1 (confirmed via
