@@ -66,7 +66,19 @@ export const ALLOWED_TRANSITIONS: Record<DeviceStatus, DeviceStatus[]> = {
   // enforced in the route layer (src/routes/devices.ts), not here.
   REJECTED: ['RECEIVED'],
   QC_FAILED: ['IN_HOUSE_REPAIR'],
-  READY_FOR_ZOHO: [],
+  // READY_FOR_ZOHO -> ACTIVE_INVENTORY (added 2026-09-02, commit 2 of the
+  // repair-workflow pass): a human confirms a device is done with Zoho
+  // (uploaded by hand — the batch-upload flow is parked, see
+  // test/repairWorkflow.spec.ts Group D) and it returns to stock. This
+  // edge exists ONLY so transitionDevice()'s own validation accepts the
+  // call when driven by the dedicated route (repair/close-to-inventory,
+  // src/routes/devices.ts) — READY_FOR_ZOHO is a REPAIR_WORKFLOW_ONLY_STATUS
+  // (see below), so the GENERIC /api/devices/:id/transition endpoint
+  // still refuses this edge outright regardless of it being listed here.
+  // Do not read this edge's presence as meaning the generic route can
+  // drive it — see close-to-inventory's own comments for the full
+  // edge-versus-route distinction.
+  READY_FOR_ZOHO: ['ACTIVE_INVENTORY'],
   // ── TEMP_EXPORTED_STANDARD consignment flow (migration 0023) ──
   // Mirrors EXPORTED_UNDER_OPR/RETURNED_UNDER_OPR exactly.
   TEMP_EXPORTED_STANDARD: ['RETURNED_UNDER_STANDARD'],

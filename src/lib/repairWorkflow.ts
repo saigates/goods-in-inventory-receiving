@@ -255,6 +255,100 @@ export async function reopenRepair(
   return { repair_job: updatedJob ?? {}, device: updatedDevice }
 }
 
+// POST /api/devices/:id/repair/close-to-inventory — {}
+// READY_FOR_ZOHO -> ACTIVE_INVENTORY. A human confirms a device has been
+// (manually) uploaded to Zoho and is done with the repair-job flow; this
+// closes its repair_jobs row and returns it to stock. Manager-gated (see
+// the route handler in src/routes/devices.ts) — same authorisation level
+// as recordQc(), since this is the QC-adjacent action that completes the
+// job QC started.
+//
+// ORDERING (repair_jobs row closed FIRST, transitionDevice() SECOND):
+// matches the existing convention already established by startRepair(),
+// recordQc(), and reopenRepair() above — every one of them mutates the
+// job row before calling transitionDevice(), never after. The reasoning
+// carries over unchanged here: transitionDevice() is the single choke
+// point that also fires the device_events row and (via the route layer)
+// the webhook dispatch — those are the externally-visible signals that a
+// state change happened. Closing the job row first means that by the time
+// anything external observes the transition (an event listener, a
+// webhook subscriber, a concurrent read of repair_jobs), the job is
+// already in its finished state — there is no window where the device
+// reads ACTIVE_INVENTORY while its own repair_jobs row still claims
+// 'completed'-but-not-yet-closed_at, or (worse) 'awaiting_qc'/'open'.
+// Doing it in the reverse order would open exactly that window: a device
+// already back in ACTIVE_INVENTORY with a job row an external reader
+// could still catch mid-update.
+//
+// IDEMPOTENT ON RETRY: a second call for a device that has ALREADY fully
+// completed this action (job closed, device already ACTIVE_INVENTORY)
+// returns 200 with the current state rather than throwing. Two distinct
+// retry windows are covered:
+//   (a) the device already reads ACTIVE_INVENTORY with its job already
+//       closed — the whole action already finished; return that state.
+//   (b) the job row is closed but (in principle, e.g. a crash between the
+//       two writes) the device transition hadn't happened yet — the job
+//       UPDATE below is a no-op (closed_at already set, left untouched)
+//       and transitionDevice() still runs to complete the move.
+// The only genuine error case is the device being in some OTHER status
+// entirely (never reached READY_FOR_ZOHO, or moved on to something else
+// via a different route) — that is not a retry of this action, it is
+// calling it from the wrong state, and still 409s. This mirrors the
+// "skip, don't error, on an already-done item" precedent in
+// POST /shipments/:id/restock (src/routes/opr.ts).
+export async function closeToInventory(
+  db: D1Database,
+  deviceId: number,
+  user: AuthUser,
+): Promise<{ repair_job: Record<string, unknown> | null; device: Record<string, unknown> }> {
+  const device = await loadDevice(db, deviceId, user.organisation_id)
+  if (!device) throw new RepairJobError(`Device ${deviceId} not found`, 404)
+
+  // Not filtered by status (unlike openRepairJobFor) — the relevant job
+  // here is the one QC already marked 'completed' to reach READY_FOR_ZOHO
+  // in the first place, same "most recent job for this device" lookup
+  // reopenRepair()/recordRepairCost() already use above.
+  const job = await db.prepare(
+    `SELECT * FROM repair_jobs WHERE device_id = ? ORDER BY id DESC LIMIT 1`
+  ).bind(deviceId).first<Record<string, unknown>>()
+
+  // Retry case (a): already fully done. Return the current state as
+  // success rather than re-running (and rather than 409ing on a status
+  // check the device will never satisfy again after a successful call).
+  if (device.status === 'ACTIVE_INVENTORY' && job && job.closed_at) {
+    return { repair_job: job, device }
+  }
+
+  if (device.status !== 'READY_FOR_ZOHO') {
+    throw new RepairJobError(
+      `Device is ${device.status} — close-to-inventory is only valid from READY_FOR_ZOHO`,
+      409,
+    )
+  }
+
+  // Close the job row FIRST (see ordering comment above) — idempotent: a
+  // job already closed (closed_at already set, retry case (b)) is left
+  // untouched rather than re-stamped, so a retry never overwrites a
+  // genuine first closed_at with a later one.
+  if (job && !job.closed_at) {
+    await db.prepare(
+      `UPDATE repair_jobs SET status = 'completed', closed_at = CURRENT_TIMESTAMP WHERE id = ?`
+    ).bind(job.id).run()
+  }
+
+  // SECOND: transition the device.
+  const { device: updatedDevice } = await transitionDevice(db, deviceId, 'ACTIVE_INVENTORY', {
+    user,
+    eventType: 'CLOSED_TO_INVENTORY',
+  })
+
+  const updatedJob = job
+    ? await db.prepare('SELECT * FROM repair_jobs WHERE id = ?').bind(job.id).first<Record<string, unknown>>()
+    : null
+
+  return { repair_job: updatedJob, device: updatedDevice }
+}
+
 // POST /api/devices/:id/repair/cost — { repair_cost_gbp, parts_cost_gbp, labour_cost_gbp, cost_source, cost_source_reference }
 // Manager-only (see role check in the route handler). GBP-only by design
 // (slice 1) — no currency field, see docs/plan/device-lifecycle-slice1.md

@@ -457,10 +457,10 @@ into this repo), `8604554` (opr6-ui), `8604555` (dbg-valui/manifest-val),
 `8604558` (devices-tab), `8604559` (devices-tab-2), `8604560` (bills-tab),
 `8604561` (manifest-bill-link), `8604562` (bill-detail-vacuous-check —
 claimed per convention though this script seeds no received_devices rows),
-`8604563` (upload-result-panel), `9900*` (G5 item 2 catalog auto-generation
-verification, 2026-08-21, disposable `browser_check.mjs` script — not
-checked into this repo, deleted after the citation was captured; see the
-citation record below).
+`8604563` (upload-result-panel), `8604564` (close-to-inventory-ui), `9900*`
+(G5 item 2 catalog auto-generation verification, 2026-08-21, disposable
+`browser_check.mjs` script — not checked into this repo, deleted after the
+citation was captured; see the citation record below).
 
 ### `devices-tab.browser.mjs` (15 checks)
 Devices tab — **All Devices** sub-view (status + legal transition via the
@@ -576,6 +576,39 @@ fixture the same way as `g4-fixture@example.invalid` below, via
   the panel switches to an explicit "Clean upload" state — not an empty
   box, and not the prior manifest's stale coercion/discrepancy counts
   bleeding across the switch.
+
+### `close-to-inventory-ui.browser.mjs` (12 checks)
+Ready-for-Zoho subview (commit 2, 2026-09-02) — the "Close to inventory"
+button that drives `READY_FOR_ZOHO -> ACTIVE_INVENTORY` via the dedicated
+`POST /:id/repair/close-to-inventory` route. Seeds one device via the real
+API as admin (`/scan/manual` → `/transition` to `SORTING` →
+`/repair/start` → `/repair/scan-back` → `/repair/qc` PASSED, landing it on
+`READY_FOR_ZOHO`), then drives the UI as an operator and then as an admin
+using the real per-person local-dev accounts (`ops@saigates.com` /
+`owner@saigates.com`, local-dev test passwords only — never touches
+production per the standing constraint):
+
+- **Operator (absence)**: the `READY_FOR_ZOHO` row itself is visible (the
+  list is not role-filtered, only the action is), but the "Close to
+  inventory" button is absent and a "Manager-only" placeholder renders in
+  its place instead — checked by asserting `button:has-text(...)` count is
+  `0`, not just that some other button is present, since absence is the
+  half of a role gate that regresses silently.
+- **Admin (presence + effect)**: the button is visible, clicking it
+  produces a confirming toast, and — the row-disappearance assertion —
+  the device's row is no longer present in the Ready-for-Zoho subview
+  afterwards, since a device that has left `READY_FOR_ZOHO` should no
+  longer be listed there at all. Also asserts zero console errors across
+  the whole run and, server-side (not just optimistic UI state), that the
+  device's `status` really is `ACTIVE_INVENTORY` after the UI-driven
+  close.
+- **Cleanup**: prints the FK-ordered `DELETE` for the seeded row (this
+  script has no D1 binding, only `fetch()`, so it cannot run the DELETE
+  itself) plus a `SELECT COUNT(*)` re-query to run AFTER the DELETE, so
+  cleanup is confirmed by re-query rather than trusted from exit code
+  alone.
+
+IMEI prefix: `8604564`.
 
 ## Process note (2026-08-19): scope correction (0023-0029, not 0024-0029) + two owed browser assertions closed + local dev D1 reset side-effect
 

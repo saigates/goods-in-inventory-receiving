@@ -954,6 +954,24 @@
       toast(err.response?.data?.error || err.message, 'err', 5000);
     }
   }
+  // ─── Ready-for-Zoho: close to inventory ───
+  // READY_FOR_ZOHO -> ACTIVE_INVENTORY once a human has (manually)
+  // uploaded the device to Zoho. See src/routes/devices.ts's
+  // /:id/repair/close-to-inventory comment for why this button is gated
+  // via isManagerOrAdmin() (client-side, matching RepairQueueSubview()'s
+  // sibling repair-dedicated-route actions) rather than a server-filtered
+  // /meta/statuses map: READY_FOR_ZOHO's only outbound edge is only
+  // reachable through this dedicated route, never the generic transition
+  // endpoint, so that endpoint's role-filtered map doesn't apply here.
+  async function doCloseToInventory(device) {
+    try {
+      await api.post(`/devices/${device.id}/repair/close-to-inventory`, {});
+      toast(`<span class="mono">${device.imei}</span> closed to inventory — now in Active Inventory`, 'ok');
+      await refreshReadyForZohoDevices(); render();
+    } catch (err) {
+      toast(err.response?.data?.error || err.message, 'err', 5000);
+    }
+  }
 
   function RepairQueueSubview() {
     const managerOk = isManagerOrAdmin();
@@ -1036,6 +1054,7 @@
 
   // ─── Ready for Zoho ───
   function ReadyForZohoSubview() {
+    const managerOk = isManagerOrAdmin();
     return h('div', { class: 'space-y-4' },
       h('div', { class: 'text-sm text-slate-400' }, `${state.readyForZohoDevices.length} device${state.readyForZohoDevices.length === 1 ? '' : 's'} ready for Zoho upload`),
       h('div', { class: 'card overflow-hidden' },
@@ -1046,11 +1065,12 @@
               h('th', { class: 'text-left px-4 py-3' }, 'SKU / Device'),
               h('th', { class: 'text-left px-4 py-3' }, 'Grade'),
               h('th', { class: 'text-left px-4 py-3' }, 'Received'),
+              h('th', { class: 'text-right px-4 py-3' }, 'Actions'),
             )
           ),
           h('tbody', { class: 'divide-y divide-slate-800' },
             !state.readyForZohoDevices.length
-              ? h('tr', {}, h('td', { colspan: 4, class: 'text-center py-10 text-slate-500' }, 'No devices are ready for Zoho upload yet.'))
+              ? h('tr', {}, h('td', { colspan: 5, class: 'text-center py-10 text-slate-500' }, 'No devices are ready for Zoho upload yet.'))
               : state.readyForZohoDevices.map(d => h('tr', { class: 'row-strip' },
                   h('td', { class: 'px-4 py-2 mono text-xs' }, d.imei),
                   h('td', { class: 'px-4 py-2 text-xs' },
@@ -1058,6 +1078,10 @@
                     h('div', { class: 'text-slate-500' }, deviceLabel(d))),
                   h('td', { class: 'px-4 py-2' }, h('span', { class: gradeBadgeClass(d.grade) }, gradeLabel(d.grade))),
                   h('td', { class: 'px-4 py-2 text-xs text-slate-400' }, fmtDate(d.created_at)),
+                  h('td', { class: 'px-4 py-2 text-right' },
+                    managerOk
+                      ? h('button', { class: 'btn text-xs !bg-green-600/20 !text-green-300', title: 'Confirm Zoho upload done, return to Active Inventory', onclick: () => doCloseToInventory(d) }, h('i', { class: 'fas fa-check' }), 'Close to inventory')
+                      : h('span', { class: 'text-[11px] text-slate-500' }, 'Manager-only')),
                 ))
           )
         )

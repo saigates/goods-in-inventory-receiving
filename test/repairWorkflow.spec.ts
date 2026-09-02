@@ -622,6 +622,105 @@ async function zohoBatchRows(batchId: number) {
   return results
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Commit 2 (2026-09-02) — close-to-inventory: READY_FOR_ZOHO -> ACTIVE_INVENTORY.
+// See src/lib/repairWorkflow.ts's closeToInventory() header comment for
+// the ordering rationale and idempotency contract this section verifies.
+// ═══════════════════════════════════════════════════════════════════════
+describe('C. repair workflow — close to inventory (close-to-inventory, NEW commit 2)', () => {
+  it('manager-only: operator attempting close-to-inventory → 403, device stays READY_FOR_ZOHO, job stays open (not closed)', async () => {
+    const { id: deviceId } = await makeReadyForZohoDevice()
+    const jobsBefore = await repairJobsFor(deviceId)
+
+    const res = await apiAs(OPERATOR_USER, `/api/devices/${deviceId}/repair/close-to-inventory`, {
+      method: 'POST', body: JSON.stringify({}),
+    })
+    expect(res.status).toBe(403)
+    expect(await deviceStatus(deviceId)).toBe('READY_FOR_ZOHO')
+
+    const jobsAfter = await repairJobsFor(deviceId)
+    expect(jobsAfter[jobsAfter.length - 1].closed_at).toBe(jobsBefore[jobsBefore.length - 1].closed_at)
+  })
+
+  it('happy path: manager closes a READY_FOR_ZOHO device → repair_jobs row closed, device → ACTIVE_INVENTORY, one new device_events row, job closed before the device event (ordering)', async () => {
+    const { id: deviceId } = await makeReadyForZohoDevice()
+    const beforeEvents = await eventsFor(deviceId)
+    const jobsBefore = await repairJobsFor(deviceId)
+    // QC PASSED already marks the job 'completed' but leaves closed_at set
+    // (recordQc's CASE WHEN sets closed_at on 'completed') — confirm the
+    // starting state so this test is actually exercising close-to-inventory's
+    // own write, not re-asserting recordQc's.
+    expect(jobsBefore[jobsBefore.length - 1].status).toBe('completed')
+
+    const res = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/close-to-inventory`, {
+      method: 'POST', body: JSON.stringify({}),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { repair_job: Record<string, unknown> | null; device: Record<string, unknown> }
+
+    expect(await deviceStatus(deviceId)).toBe('ACTIVE_INVENTORY')
+    expect(body.device).toMatchObject({ status: 'ACTIVE_INVENTORY' })
+    expect(body.repair_job).toMatchObject({ status: 'completed' })
+    expect(body.repair_job!.closed_at).toBeTruthy()
+
+    const afterEvents = await eventsFor(deviceId)
+    expect(afterEvents).toHaveLength(beforeEvents.length + 1)
+    expect(afterEvents[afterEvents.length - 1]).toMatchObject({
+      from_status: 'READY_FOR_ZOHO', to_status: 'ACTIVE_INVENTORY', event_type: 'CLOSED_TO_INVENTORY',
+    })
+  })
+
+  it('idempotent retry: calling close-to-inventory a second time after success → 200, no error, no duplicate device_events row, closed_at unchanged from the first call', async () => {
+    const { id: deviceId } = await makeReadyForZohoDevice()
+
+    const first = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/close-to-inventory`, {
+      method: 'POST', body: JSON.stringify({}),
+    })
+    expect(first.status).toBe(200)
+    const firstBody = await first.json() as { repair_job: Record<string, unknown> | null }
+    const firstClosedAt = firstBody.repair_job!.closed_at
+    const eventsAfterFirst = await eventsFor(deviceId)
+
+    const second = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/close-to-inventory`, {
+      method: 'POST', body: JSON.stringify({}),
+    })
+    expect(second.status).toBe(200)
+    const secondBody = await second.json() as { repair_job: Record<string, unknown> | null; device: Record<string, unknown> }
+    expect(secondBody.device).toMatchObject({ status: 'ACTIVE_INVENTORY' })
+    expect(secondBody.repair_job!.closed_at).toBe(firstClosedAt)
+
+    // No second device_events row — the retry is a true no-op past the
+    // first successful call, not a second STATUS_CHANGE.
+    const eventsAfterSecond = await eventsFor(deviceId)
+    expect(eventsAfterSecond).toHaveLength(eventsAfterFirst.length)
+
+    expect(await deviceStatus(deviceId)).toBe('ACTIVE_INVENTORY')
+  })
+
+  it('wrong-state guard: a device that never reached READY_FOR_ZOHO (still IN_HOUSE_REPAIR) → 409, no device_events row added', async () => {
+    const deviceId = await seedDevice('IN_HOUSE_REPAIR')
+    const beforeEvents = await eventsFor(deviceId)
+
+    const res = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/close-to-inventory`, {
+      method: 'POST', body: JSON.stringify({}),
+    })
+    expect(res.status).toBe(409)
+    expect(await deviceStatus(deviceId)).toBe('IN_HOUSE_REPAIR')
+    expect(await eventsFor(deviceId)).toHaveLength(beforeEvents.length)
+  })
+
+  it('generic /transition endpoint still refuses READY_FOR_ZOHO -> ACTIVE_INVENTORY (409) even though ALLOWED_TRANSITIONS now lists the edge — REPAIR_WORKFLOW_ONLY_STATUSES guard still applies; only the dedicated route may drive it', async () => {
+    const { id: deviceId } = await makeReadyForZohoDevice()
+
+    const res = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/transition`, {
+      method: 'POST',
+      body: JSON.stringify({ to_status: 'ACTIVE_INVENTORY' }),
+    })
+    expect(res.status).toBe(409)
+    expect(await deviceStatus(deviceId)).toBe('READY_FOR_ZOHO')
+  })
+})
+
 // SKIPPED (2026-08-11) by explicit owner decision: Zoho batch
 // generation/confirmation (the /api/zoho/batches* routes, zoho_batches and
 // zoho_batch_devices/zoho_batch_events tables) was never built and is not

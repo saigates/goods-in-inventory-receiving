@@ -11,7 +11,7 @@ import type { Bindings, AuthUser, DeviceStatus } from '../types'
 import { currentUser } from '../lib/auth'
 import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES, REJECT_REASON_CODES, UNREJECT_REASON_CODES } from '../lib/deviceLifecycle'
 import { dispatchDeviceStatusWebhooks } from '../lib/webhook'
-import { startRepair, scanBackRepair, recordQc, reopenRepair, recordRepairCost, postRepairCostToLedger, RepairJobError } from '../lib/repairWorkflow'
+import { startRepair, scanBackRepair, recordQc, reopenRepair, closeToInventory, recordRepairCost, postRepairCostToLedger, RepairJobError } from '../lib/repairWorkflow'
 import { postPurchaseCostToLedger, CostEntryError } from '../lib/costEntry'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
@@ -584,6 +584,41 @@ app.post('/:id/repair/reopen', async (c) => {
   if (!id) return c.json({ error: 'Invalid id' }, 400)
   try {
     const result = await reopenRepair(c.env.DB, id, user)
+    return c.json(result, 200)
+  } catch (err) {
+    if (err instanceof RepairJobError) return c.json({ error: err.message }, err.status)
+    throw err
+  }
+})
+
+// POST /api/devices/:id/repair/close-to-inventory — {}
+// READY_FOR_ZOHO -> ACTIVE_INVENTORY. Manager-only, same authorisation
+// level as /:id/repair/qc (this is the action that completes the job QC
+// started). See closeToInventory()'s header comment in
+// src/lib/repairWorkflow.ts for the ordering rationale and idempotency
+// contract.
+//
+// EDGE-VERSUS-ROUTE NOTE: READY_FOR_ZOHO is a REPAIR_WORKFLOW_ONLY_STATUS
+// (see deviceLifecycle.ts), so even though ALLOWED_TRANSITIONS now lists
+// READY_FOR_ZOHO -> ACTIVE_INVENTORY (needed for transitionDevice()'s own
+// validation to accept the edge when called from here), the GENERIC
+// /:id/transition route above still refuses it outright (409) regardless
+// — see that route's REPAIR_WORKFLOW_ONLY_STATUSES guard. This route is
+// the ONLY way to drive this edge. Consequently GET /meta/statuses'
+// `transitions` map (scoped to what the generic route can execute) must
+// NOT be extended with this edge — doing so would advertise a move the
+// generic route will 409 on. The UI's role-gating for the corresponding
+// button therefore cannot reuse that server-filtered-map pattern; it
+// uses the same client-side isManagerOrAdmin() check RepairQueueSubview()
+// already uses for its sibling repair-dedicated-route actions (QC pass/
+// fail, cost recording) — see public/static/app.js's ReadyForZohoSubview().
+app.post('/:id/repair/close-to-inventory', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Closing a device to inventory is manager-only' }, 403)
+  try {
+    const result = await closeToInventory(c.env.DB, id, user)
     return c.json(result, 200)
   } catch (err) {
     if (err instanceof RepairJobError) return c.json({ error: err.message }, err.status)
