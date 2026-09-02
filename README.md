@@ -430,19 +430,64 @@ re-verify via `gsk hosted worker_get` / `d1_schema` that the resource
 actually mutated belongs to the intended project (`d6aea290-...`) before
 reporting the deploy as successful.
 
-**Mandatory pre-deploy build-determinism gate (added 2026-08-21):**
+**Mandatory pre-deploy build-determinism gate (added 2026-08-21, corrected
+2026-09-02 — see below):**
 because the deploy publishes the invoking session's own fresh
 `npm run build` output (not a pinned/committed artifact), the deploying
 session MUST: (1) confirm the intended commit is checked out; (2)
 `npm ci` — a fresh install from `package-lock.json` (confirmed present
 and git-tracked), not a `node_modules` carried over from a different
-session; (3) `rm -rf dist && npm run build`; (4) `sha256sum
-dist/_worker.js` and compare against the hash recorded for that commit
-in `.deploy-checks/g5-phase2-offline-half.md` (`d444aba2...` for
-`e73ea64`, re-derive if HEAD has moved since). **A hash mismatch is
-stop-and-investigate, not a curiosity** — it means either the lockfile
-didn't pin something that matters or the wrong commit is checked out;
-resolve the cause and re-confirm before calling `gsk hosted deploy`.
+session; (3) `rm -rf dist && npm run build`; (4) compute the **whole-tree
+hash** below and compare against the hash recorded for that commit. **A
+hash mismatch is stop-and-investigate, not a curiosity** — it means
+either the lockfile didn't pin something that matters or the wrong
+commit is checked out; resolve the cause and re-confirm before calling
+`gsk hosted deploy`.
+
+**Correction (2026-09-02): hash the whole `dist/` tree, not `dist/_worker.js`
+alone — that file is BLIND to any static-asset-only change.** `vite build`
+only bundles `src/`; everything under `public/` (today: `static/app.js`,
+`static/favicon.svg`, `static/style.css`, `tracker/index.html`) is copied
+into `dist/` untouched by that step. Reproduced directly, not asserted: two
+independent `rm -rf dist && npm run build` runs from the *same* commit
+produced byte-identical `dist/_worker.js` hashes whether `public/static/app.js`
+held its current content or content from two commits earlier — a real UI
+change with zero `_worker.js`-hash signature. A checklist recording only
+`sha256sum dist/_worker.js` would report the same hash whether or not a
+frontend fix like `d64bc28` had actually shipped, which defeats the
+purpose of recording a hash at all. Naming `app.js` specifically as a
+second file to also hash was considered and rejected — it only postpones
+the same blind spot to the next file that changes (e.g. `tracker/index.html`,
+`style.css`) unless the convention is re-amended every time. The fix
+instead covers the whole `dist/` tree, independent of which files exist:
+
+```bash
+find dist -type f | sort | xargs sha256sum | sha256sum
+```
+
+(sorted so file-enumeration order can never vary the result; per-file
+hashes first so a same-byte-count-different-content collision across two
+files can't cancel out; then hashed again to fold the whole listing into
+one comparable value.) Verified both required properties directly this
+session, not assumed: (a) **reproducible** — two independent clean builds
+from the same commit produced the identical whole-tree hash
+(`93cb79d9beced2844cee232c66cd86b480e0c3397b20d65ddefbe73caaa04cdd`); (b)
+**sensitive** — swapping only `public/static/app.js` for an earlier
+commit's version and rebuilding changed the whole-tree hash
+(`ec9ce0ba9d0537ffdae3b02881f4908c56644f699821f3777fc2a759701e220c`), while
+`dist/_worker.js`'s own hash stayed at `1b8ca7be4e31bdb0b3565924ac013fc6aaa3220c12840ece7645a8b2394b7f89`
+in both cases — proving the old single-file convention really was blind to
+that change. **`93cb79d9...` is the correct whole-tree hash for commit
+`ec31bf6`** (clean `rm -rf dist && npm run build`, `dist/_worker.js` alone
+hashes to `1b8ca7be...`, `dist/static/app.js` alone to
+`ae5ee4f05473af15fb3f900da6d2760e4e23bbe8904e00d81b6c78bedd59354a`, both
+recorded for reference but the whole-tree hash is the one to compare
+going forward). Older single-file hashes recorded before this correction
+(`d444aba2...` for `e73ea64` in `.deploy-checks/g5-phase2-offline-half.md`)
+remain historically accurate for what they measured, but are not
+comparable to a whole-tree hash and should not be re-used as a pass/fail
+gate for any future commit — recompute the whole-tree hash fresh for
+whichever commit is actually being deployed.
 
 **2026-07-29 redeploy — fixed "new catalog SKUs invisible in the Catalog tab":**
 after migration 0017 expanded `sku_catalog` to 2,781 rows, the new iPhone 17/Air/

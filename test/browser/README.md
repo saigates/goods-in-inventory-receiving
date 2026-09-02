@@ -6,6 +6,35 @@ vitest suite (deliberately named `.browser.mjs` so vitest's `*.spec.*` glob
 ignores it), because it needs a live server + Chromium rather than the
 workerd test pool.
 
+**Confirmed, not assumed (2026-09-02):** `npx vitest list --filesOnly` was
+run against this repo and returned exactly 29 files, all matching
+`test/*.spec.ts` — grepping that output for `browser.mjs` is a zero-match.
+`npx vitest run` therefore NEVER executes anything under `test/browser/`,
+in either direction: it can't be broken by a browser-test bug, and it
+can't be credited with having run one. **A deploy checklist that reports
+"suite green" from `npx vitest run` alone has said nothing about whether
+any `*.browser.mjs` check has ever been run, let alone passed** — every
+browser check needed for that deploy must be invoked explicitly, by name,
+in the same checklist, with its own pass/fail line.
+
+**Also confirmed, not assumed:** every file in this directory requires a
+**live, already-running dev server** (`pm2 start ecosystem.config.cjs`,
+serving `http://localhost:3000`) plus a real Chromium instance (via
+`playwright`) — `_harness.mjs`'s own first action is to force an
+`npm run build`, but it does not, and cannot, start the server itself.
+This means these checks **cannot run unattended inside an automated CI
+step or a bare `npx vitest run` invocation** the way the vitest suite can
+— they need a human/agent to have a server already up before invoking
+`node test/browser/<name>.browser.mjs`, and that invocation is what
+produces the only evidence that a rendered-UI claim is true (see the
+"any claim about a rendered verdict must be cited from a browser check"
+rule below). A checklist item that says "browser checks: N/A" or omits
+them silently is indistinguishable, to a later reader, from "checked and
+clean" — always state explicitly which `*.browser.mjs` files were run for
+a given deploy and what each one reported, or state explicitly that none
+were re-run for this change and why that's safe (e.g. the change touched
+no file any existing browser check exercises).
+
 ## Named process smell (2026-08-18): "vacuous same-side reconciliation" — any reconciliation where one side is derived from the other must never render a verdict
 
 **The smell, named explicitly so it stops recurring by accident:** if a
@@ -60,6 +89,32 @@ button, or piece of rendered text actually SHOWS a user. Any statement of
 the form "the UI now correctly displays X" must be backed by a
 `*.browser.mjs` script that reads the rendered DOM text and asserts on it,
 not by a green vitest run alone.
+
+## Standing process rule (2026-09-02): any manager-gated action needs its affordance filtered by role in the SAME commit that creates it
+
+**Named this session, after the third occurrence of the underlying failure
+class made it clear the fix was being applied one commit too late.** The
+route/UI-affordance gap has now shown up four times: (1) a dropdown reading
+a stale client-side copy instead of the server's; (2) a route requiring a
+field (`reason_code`) the client never sent, fixed in `d64bc28`; (3) a
+route that was manager-gated with zero client awareness, so an operator
+saw the control and got a 403 — fixed in `ec31bf6`, but as a FOLLOW-UP
+commit to the one (`d64bc28`) that had shipped the affordance; (4)
+[avoided, not occurred] the `close-to-inventory` button planned for
+`ReadyForZohoSubview()` would have repeated exactly the same pattern if its
+role-filtered data source were wired up after the button landed instead of
+in the same change.
+
+**The rule going forward:** when a commit adds a UI control (button, menu
+item, enabled state) for an action whose route is role-gated, that same
+commit must also filter — or otherwise correctly represent — who is
+allowed to use it, using the same role check the route itself enforces
+(reuse the `GET /devices/meta/statuses`-style role-filtered-endpoint
+pattern rather than duplicating a role check as new client-side logic).
+Shipping the affordance first and the role-awareness "shortly after" is
+not a smaller version of this bug — it's a full instance of it for
+however long the gap exists, and it is how instance (3) above happened in
+the first place (`d64bc28` → `ec31bf6` was two separate commits, not one).
 
 ## Process fix (2026-08-18): every script now enforces its own build + bundle freshness — not a documented step, an enforced one
 
