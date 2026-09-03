@@ -537,7 +537,14 @@ describe('C. repair workflow — QC_FAILED re-open (#27)', () => {
     // isolation from the full start→scan-back→QC-fail chain above.
     const deviceId = await seedDevice('QC_FAILED' as DeviceStatus)
 
-    const reopen = await api(`/api/devices/${deviceId}/repair/reopen`, { method: 'POST', body: JSON.stringify({}) })
+    // Manager-only as of commit 3 (2026-09-02) — reopen reverses a
+    // manager's own QC_FAILED verdict, so it's called as MANAGER_USER
+    // here rather than the default api()/ADMIN_USER, to keep this test
+    // honest about which role is actually required (ADMIN_USER also
+    // passes requireManager(), but asserting via the narrower role is
+    // the more informative choice — see #27b below for the operator
+    // rejection this same gate now produces).
+    const reopen = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/reopen`, { method: 'POST', body: JSON.stringify({}) })
     expect(reopen.status).toBe(200)
     expect(await deviceStatus(deviceId)).toBe('IN_HOUSE_REPAIR')
 
@@ -550,6 +557,13 @@ describe('C. repair workflow — QC_FAILED re-open (#27)', () => {
     // call (no intervening scan-back) must be refused.
     expect(skip.status).toBe(409)
     expect(await deviceStatus(deviceId)).not.toBe('READY_FOR_ZOHO')
+  })
+
+  it('#27b NEW (commit 3): operator attempting reopen -> 403, device stays QC_FAILED, job stays failed (not reopened)', async () => {
+    const deviceId = await seedDevice('QC_FAILED' as DeviceStatus)
+    const res = await apiAs(OPERATOR_USER, `/api/devices/${deviceId}/repair/reopen`, { method: 'POST', body: JSON.stringify({}) })
+    expect(res.status).toBe(403)
+    expect(await deviceStatus(deviceId)).toBe('QC_FAILED')
   })
 })
 

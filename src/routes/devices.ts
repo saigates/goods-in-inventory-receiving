@@ -578,10 +578,24 @@ app.post('/:id/repair/qc', async (c) => {
   }
 })
 
+// MANAGER-ONLY as of commit 3 (2026-09-02). Previously open to any role —
+// the only repair-workflow route with that shape apart from /repair/start
+// and /repair/scan-back (both deliberately operator-accessible, everyday
+// work; see this route's own history for why THIS edge is different).
+// reopenRepair() puts a QC_FAILED device straight back into IN_HOUSE_REPAIR
+// with no fresh inspection required to make that call — QC recording
+// itself (/repair/qc) is already manager-only for the same reason (test
+// #29's placeholder note), so leaving the re-open decision open to any
+// role let an operator silently reverse a manager's QC_FAILED verdict.
+// Not a new restriction on judgement calls in general: /repair/start and
+// /repair/scan-back stay exactly as open as they always were — this gate
+// is scoped to this one edge, same scoping discipline as the reject/
+// un-reject gate in the generic /transition route above.
 app.post('/:id/repair/reopen', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Re-opening a QC-failed repair is manager-only' }, 403)
   try {
     const result = await reopenRepair(c.env.DB, id, user)
     return c.json(result, 200)

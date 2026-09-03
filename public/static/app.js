@@ -1010,8 +1010,20 @@
                            h('button', { class: 'btn text-xs !bg-red-600/20 !text-red-300', onclick: () => doRecordQc(d, 'FAILED') }, h('i', { class: 'fas fa-xmark' }), 'QC fail')] : null,
                       d.status === 'IN_HOUSE_REPAIR' && d.repair_job_status === 'awaiting_qc' && !managerOk
                         ? h('span', { class: 'text-[11px] text-slate-500' }, 'QC is manager-only') : null,
-                      d.status === 'QC_FAILED'
+                      // Manager-only as of commit 3 (2026-09-02) — reopenRepair()
+                      // reverses a manager's QC_FAILED verdict with no fresh
+                      // inspection required, same reasoning as QC recording
+                      // itself being manager-only just above. Gated in the
+                      // SAME commit as the server-side check per the standing
+                      // rule (test/browser/README.md, "any manager-gated
+                      // action needs its affordance filtered by role in the
+                      // SAME commit that creates it") — this is the fourth
+                      // near-occurrence of that failure class, caught before
+                      // shipping rather than as a follow-up fix.
+                      d.status === 'QC_FAILED' && managerOk
                         ? h('button', { class: 'btn btn-ghost text-xs', onclick: () => doReopenRepair(d) }, h('i', { class: 'fas fa-arrow-rotate-right' }), 'Reopen') : null,
+                      d.status === 'QC_FAILED' && !managerOk
+                        ? h('span', { class: 'text-[11px] text-slate-500' }, 'Reopen is manager-only') : null,
                       managerOk ? h('button', { class: 'btn btn-ghost text-xs', title: 'Record repair cost', onclick: () => doRecordCost(d) }, h('i', { class: 'fas fa-sterling-sign' })) : null,
                     ))
                 ))
