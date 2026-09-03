@@ -37,7 +37,7 @@
 // Every *.browser.mjs must have `import './_harness.mjs'` as its very first
 // line, before any other import.
 import { execSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
@@ -58,6 +58,70 @@ try {
   console.error('[harness] BUILD FAILED — aborting before any check runs.')
   console.error('[harness] A stale or broken dist/ must never be tested against.')
   process.exit(2)
+}
+
+// ── 1b. Worker-staleness guard (2026-09-03 incident) ───────────────────
+// Guarantee #2 below only checks the STATIC bundle (app.js), which
+// `wrangler pages dev` re-reads from disk on every request. The WORKER
+// script (dist/_worker.js, all backend route logic) is loaded into the
+// V8 isolate ONCE at process startup and does NOT hot-reload — proven
+// empirically on 2026-09-03: a fresh `/repair/reopen` manager-gate was
+// rebuilt into dist/_worker.js (three separate rebuilds, correct content
+// confirmed by grep each time) while the PM2 "webapp" process kept
+// running from 23h earlier, and an operator token got a live 200 from
+// the newly-gated route instead of the expected 403 — the running
+// isolate still held the PRE-gate code, silently. The first run of the
+// new reopen-role-filter-ui.browser.mjs check below this guard's own
+// introduction is what surfaced this: it reported a false PASS on the
+// UI-only assertions (button correctly hidden) but a genuine FAIL on the
+// direct-API assertion, because the client gate ships in app.js (hot)
+// while the server gate ships in _worker.js (cold). `pm2 restart webapp`
+// immediately fixed it — nothing else changed; re-running the same
+// script then reported all 10 checks passing.
+//
+// This guard makes that failure loud and immediate instead of a
+// silently-wrong PASS: compare the PM2 process's start time (pm_uptime)
+// against the mtime of every tracked file under src/ (git ls-files, so
+// this can't be fooled by a stray untracked scratch file). If PM2
+// started BEFORE the newest of those mtimes, the running isolate
+// predates a backend source change that may or may not have made it
+// into a build yet, and MUST be restarted (after a build) before any
+// check below can claim anything true about backend/API behaviour.
+// Client-only UI checks would technically still be safe, but this
+// harness has no way to know in advance which kind a given script
+// needs, so it treats every script as backend-dependent.
+try {
+  const pm2Json = execSync('pm2 jlist', { cwd: REPO_ROOT }).toString()
+  const procs = JSON.parse(pm2Json)
+  const proc = procs.find((p) => p.name === 'webapp')
+  if (!proc || proc.pm2_env?.status !== 'online') {
+    console.error('[harness] PM2 process "webapp" not found or not online — cannot verify worker freshness.')
+    console.error('[harness] Start it with: pm2 start ecosystem.config.cjs')
+    process.exit(2)
+  }
+  const pmUptimeMs = proc.pm2_env.pm_uptime
+  const srcFiles = execSync('git ls-files src', { cwd: REPO_ROOT }).toString().trim().split('\n').filter(Boolean)
+  let newestSrcMtimeMs = 0
+  let newestSrcFile = ''
+  for (const f of srcFiles) {
+    const mtimeMs = statSyncSafe(join(REPO_ROOT, f))
+    if (mtimeMs > newestSrcMtimeMs) { newestSrcMtimeMs = mtimeMs; newestSrcFile = f }
+  }
+  if (newestSrcMtimeMs > 0 && pmUptimeMs < newestSrcMtimeMs) {
+    console.error('[harness] STALE WORKER PROCESS DETECTED.')
+    console.error(`[harness]   newest src/ file on disk: ${newestSrcFile} (mtime ${new Date(newestSrcMtimeMs).toISOString()})`)
+    console.error(`[harness]   PM2 "webapp" has been running since:  ${new Date(pmUptimeMs).toISOString()}`)
+    console.error('[harness] The running server started BEFORE that file was last modified, so it may be serving OLD backend code no matter what dist/ contains now (wrangler pages dev does not hot-reload _worker.js). Run: pm2 restart webapp')
+    process.exit(2)
+  }
+  console.log(`[harness] worker freshness OK — PM2 "webapp" has been running since ${new Date(pmUptimeMs).toISOString()}, at or after every tracked src/ file's mtime`)
+} catch (err) {
+  console.error(`[harness] WORKER-STALENESS CHECK COULD NOT RUN: ${err.message}`)
+  process.exit(2)
+}
+
+function statSyncSafe(path) {
+  try { return statSync(path).mtimeMs } catch { return 0 }
 }
 
 // ── 2. Bundle-freshness assertion (content hash, not a fixed marker) ──

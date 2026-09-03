@@ -116,6 +116,86 @@ not a smaller version of this bug — it's a full instance of it for
 however long the gap exists, and it is how instance (3) above happened in
 the first place (`d64bc28` → `ec31bf6` was two separate commits, not one).
 
+**(5) Confirmed, not avoided this time (2026-09-03, commit 3, `/repair/reopen`):**
+this is the case the rule was explicitly invoked to prevent, and the
+button DID exist, ungated, before this pass touched it — grepping
+`app.js` for the QC_FAILED "Reopen" control found a plain
+`d.status === 'QC_FAILED' ? h('button', ...) : null` with no role check
+at all, same shape as instance (3). Fixed in the same change as the new
+server-side `requireManager()` gate on `POST /:id/repair/reopen`
+(`src/routes/devices.ts`): the button is now
+`d.status === 'QC_FAILED' && managerOk ? h('button', ...) : null` with a
+sibling `!managerOk` fallback rendering "Reopen is manager-only" so
+`QC_FAILED` keeps a UI exit for operators (informational, not a dead
+end) rather than silently vanishing. Both edits landed in one commit
+(auto-captured as `6cab275`, alongside the matching
+`test/repairWorkflow.spec.ts` change), not two — this time the rule held.
+Browser-verified end-to-end by `reopen-role-filter-ui.browser.mjs` (see
+its own entry below) after an unrelated but real staleness bug (next
+section) was found and fixed first.
+
+## Process fix (2026-09-03): `_harness.mjs`'s bundle-freshness guarantee covered `app.js` but not `_worker.js` — a real false-PASS this exposed, now closed
+
+**What happened:** writing `reopen-role-filter-ui.browser.mjs` (see below)
+to verify the `/repair/reopen` manager-gate from the previous section, the
+first live run against the already-running `pm2` "webapp" process reported
+7 of 8 checks passing — including every UI-rendering assertion (operator
+correctly sees no "Reopen" button, sees the "Reopen is manager-only"
+fallback instead) — but the ONE check that called `POST
+/repair/reopen` directly with an operator token got back `200`, not the
+expected `403`. The server-side `requireManager()` gate really was in
+`src/routes/devices.ts` and really was in the freshly-rebuilt
+`dist/_worker.js` (confirmed by `grep` immediately after), yet the route
+behaved as if it weren't gated at all.
+
+**Root cause:** `wrangler pages dev dist` reads `dist/static/*` from disk
+on every request (which is exactly why guarantee #2 in `_harness.mjs`,
+the SHA-256 content-hash check against `public/static/app.js`, catches a
+stale frontend bundle) — but it loads `dist/_worker.js` into its V8
+isolate ONCE, at process startup, and never re-reads it. The `pm2`
+process serving `http://localhost:3000` had been running for 23 hours,
+well before the reopen-gate code was written; three separate
+`rm -rf dist && npm run build` cycles in that window had produced a
+correct, freshly-hashed `_worker.js` on disk, and `_harness.mjs`'s
+existing checks were satisfied by all of them, because neither one looks
+at `_worker.js` at all. The frontend gate (shipped in `app.js`, hot) was
+therefore being verified against live, current code; the backend gate
+(shipped in `_worker.js`, cold) was being verified against nothing —
+the running isolate still had the pre-gate route. This is precisely the
+"looks like a real check and always passes" shape named in the vacuous-
+reconciliation section above, just against a process-lifecycle staleness
+axis instead of a data-modeling one.
+
+**Fix, both parts:**
+1. **Immediate**: `pm2 restart webapp` (no code change) — re-running the
+   exact same script immediately afterward reported all 10 checks
+   passing (2 more assertions were added for the manager-side positive
+   case in the same pass — see the script's own entry below), including
+   the previously-false one now correctly returning `403`.
+2. **Structural**: `_harness.mjs` now has a THIRD guarantee (1b, ahead of
+   the existing static-bundle hash check) — before any script's checks
+   can run, it reads `pm2 jlist`, finds the "webapp" process, and compares
+   its `pm2_env.pm_uptime` against the newest mtime among every
+   git-tracked file under `src/` (via `git ls-files src`, so an untracked
+   scratch file can't trigger a false alarm). If the process started
+   before that mtime, the harness exits 2 with an explicit "STALE WORKER
+   PROCESS DETECTED" message and the exact `pm2 restart webapp` fix,
+   rather than letting any check run and produce a false PASS the way
+   the first attempt at this script just did. Verified both directions
+   before landing: `touch`-ing `src/routes/devices.ts` without
+   restarting `pm2` reproduced the exact detection and exit-2 abort;
+   restarting `pm2` afterward cleared it and the harness reported
+   "worker freshness OK" again.
+
+**Scope note:** this guard is deliberately conservative — it treats every
+`*.browser.mjs` script as backend-dependent (there is no cheap way for
+the harness to know in advance whether a given script only exercises
+client-rendered UI that never calls an API), so a purely-cosmetic src/
+change will also trigger a restart requirement for a script that
+wouldn't actually have been affected. That's an acceptable false-positive
+rate for a guard whose entire purpose is to make the corresponding
+false-negative (a silently-wrong PASS) impossible instead.
+
 ## Process fix (2026-08-18): every script now enforces its own build + bundle freshness — not a documented step, an enforced one
 
 **The incident this closes**: `dist/static/app.js` was found to be a stale
@@ -609,6 +689,47 @@ production per the standing constraint):
   alone.
 
 IMEI prefix: `8604564`.
+
+### `reopen-role-filter-ui.browser.mjs` (10 checks)
+Repair Queue subview (commit 3, 2026-09-03) — the "Reopen" button that
+drives `QC_FAILED -> IN_HOUSE_REPAIR` via the newly manager-gated `POST
+/:id/repair/reopen` route. Same shape as `close-to-inventory-ui.browser.mjs`
+just above and `reject-role-filter-ui.browser.mjs`: seeds one device via
+the real API as admin (`/scan/manual` → `/transition` to `SORTING` →
+`/repair/start` → `/repair/scan-back` → `/repair/qc` FAILED, landing it on
+`QC_FAILED`), then drives the UI first as the manager/admin
+(`owner@saigates.com`) and then as the operator (`ops@saigates.com`),
+both real per-person accounts with local-dev-only test passwords —
+never touches production per the standing constraint:
+
+- **Manager/admin (presence)**: the seeded row is visible and has a
+  working "Reopen" button, and does NOT show the operator-facing
+  "Reopen is manager-only" fallback text — this positive-case assertion
+  exists so the operator's absence below is provably role-filtering, not
+  something broken globally (the row/button could be missing for an
+  unrelated reason and every operator-side check would still spuriously
+  pass).
+- **Operator (absence)**: the same row is visible (the Repair Queue list
+  itself is not role-filtered, only the action is), but the "Reopen"
+  button is absent — checked by `button:has-text("Reopen")` count `=== 0`,
+  not just that some other button is present — and the "Reopen is
+  manager-only" fallback text renders in its place instead.
+- **Server backs up the UI (not just cosmetic)**: an operator token
+  hitting `POST /repair/reopen` directly (bypassing the UI entirely) still
+  gets `403`, confirmed via `fetch()` inside the same script against the
+  live dev server — this is the exact assertion that caught the
+  worker-staleness incident documented in the process-fix section above:
+  the first run of this script (before `_harness.mjs` gained its guard)
+  reported this one check as `FAIL` with a live `200`, against a `pm2`
+  process that had been running since before the gate was written.
+  `pm2 restart webapp` fixed it with no code change; re-running reported
+  all 10 checks passing.
+- Also asserts zero console errors across the whole run.
+- **Cleanup**: prints the FK-ordered `DELETE` for the seeded row (this
+  script has no D1 binding, only `fetch()`, so it cannot run the DELETE
+  itself).
+
+IMEI prefix: `8604565`.
 
 ## Process note (2026-08-19): scope correction (0023-0029, not 0024-0029) + two owed browser assertions closed + local dev D1 reset side-effect
 
