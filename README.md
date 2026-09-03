@@ -527,6 +527,53 @@ hash will itself go stale the moment another commit touches `src/` or
 target next time, rather than trusting this recorded value past this
 deploy.
 
+**Recomputed for the actual deploy commit (2026-09-03) — the `1c7586c`
+hash above is stale for this deploy.** `1c7586c` was three commits behind
+the deploy set's tip; both `src/` and `public/static/app.js` moved again
+since then (`fd200b9`: valuation-inclusion decision; `6cab275`: reopen
+manager-gate, server + client + tests; `8cfbb99`: browser-verified the
+reopen gate and hardened `test/browser/_harness.mjs` with a worker-process-
+staleness guard), so the recorded whole-tree hash no longer matches the
+artefact this deploy actually publishes. Two independent clean
+`rm -rf dist && npm run build` runs at `8cfbb99` (the deploy set's tip —
+`fd200b9`, `6cab275`, `8cfbb99` since the prior deploy at `1c7586c`/`bfcdf5f`;
+`origin/main` still at `1c7586c`) produced the identical whole-tree hash —
+**`7bdc89ec2fa308c5679ec554be9aeae9d8d9bd8d440d0ff9b0b6b1abb4f7b5bd`
+is the correct whole-tree hash for commit `8cfbb99`**. Per-file reference:
+`dist/_worker.js` →
+`a3013bfa283dfdf39e244b7f7aa6542e7b428568b1d40fe07793b1ceeeb9ed20`,
+`dist/static/app.js` →
+`bd83a33824d034752c44b0767a92fcfa1c7211e2f30f0b024cdc724cc0b16d6c`,
+`dist/_routes.json` →
+`faae3ca654c8fa00f52b7311d3c9e1bdc36f39022ec6d4832ecc3d5d7da519ca`
+(unchanged from `1c7586c` — no route surface change), `dist/static/favicon.svg`
+→ `287dc951275876be22d043fa4ab1364c7cf03aea602c6f9495e51b9c135079dc`
+(unchanged), `dist/static/style.css` →
+`be55b78ce2c4a16c3d4d12a4dfdab556f1b8753ab0a385a95f2bdbc7948383fd`
+(unchanged), `dist/tracker/index.html` →
+`25f91f7a411424c78c01249221d28372d1b23ad2577c8a834cc75c68420e49f0`
+(unchanged) — all for reference only; the whole-tree hash is what to
+compare against immediately before running `gsk hosted deploy`.
+
+Two scope decisions settled for this deploy batch, recorded here rather
+than left implicit: (1) export-staging/consignment-move operator-role
+test coverage (`opr.ts`'s `/shipments/:id/scan` and `/lines`) is
+**deliberately deferred**, not omitted — it would verify behaviour the
+operator has already confirmed should stay as-is, a prior attempt at it
+was already reverted, and the Zoho import files due this week are the
+higher-priority use of the same time; (2) "commit 3" is **complete,
+scoped to the `/repair/reopen` manager-gate** — investigation during this
+pass showed the other two originally-planned bullets (`/repair/start`,
+`/repair/scan-back` operator-accessibility) were already correct
+pre-existing behaviour needing no new code, so the commit intentionally
+shrank to just the reopen gate rather than adding tests for behaviour
+that was never broken.
+
+As with `1c7586c`, this hash will itself go stale the moment another
+commit touches `src/` or `public/`; recompute fresh for whichever commit
+is the actual deploy target next time, rather than trusting this
+recorded value past this deploy.
+
 **2026-07-29 redeploy — fixed "new catalog SKUs invisible in the Catalog tab":**
 after migration 0017 expanded `sku_catalog` to 2,781 rows, the new iPhone 17/Air/
 SE/XR and Galaxy S26/Z Fold7/Flip7-family rows were correctly in D1 (confirmed via
