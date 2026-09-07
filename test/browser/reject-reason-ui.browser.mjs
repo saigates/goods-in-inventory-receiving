@@ -18,6 +18,12 @@
 // nothing destructive to existing data. Local-only test password on
 // owner@saigates.com (scripts/set-password.mjs), never touches
 // production or the real per-person credentials.
+//
+// IMEI prefix (corrected 2026-09-07): 8604566. Originally claimed 8604560,
+// which collided with bills-tab.browser.mjs (44f6d4e, 2026-08-18) — a
+// registry violation present since this file was written (d64bc28,
+// 2026-09-01) and never caught until a routine housekeeping check. See
+// test/browser/README.md's prefix registry for the corrected assignment.
 import './_harness.mjs'
 import { chromium } from 'playwright'
 
@@ -37,7 +43,7 @@ function luhnDigit(b) {
   return String((10 - (s % 10)) % 10)
 }
 const mkImei = (n) => {
-  const body = ('8604560' + String(Date.now() % 1000000).padStart(6, '0').slice(0, 5) + String(n).padStart(2, '0')).slice(0, 14)
+  const body = ('8604566' + String(Date.now() % 1000000).padStart(6, '0').slice(0, 5) + String(n).padStart(2, '0')).slice(0, 14)
   return body + luhnDigit(body)
 }
 const IMEI_REJECT = mkImei(1)

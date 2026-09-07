@@ -13,6 +13,12 @@
 // test password provisioned via scripts/set-password.mjs — never touches
 // production, never the real per-person credential's meaning) and checks
 // what that role actually sees. Cleans up seeded rows after the run.
+//
+// IMEI prefix (corrected 2026-09-07): 8604567. Originally claimed 8604561,
+// which collided with manifest-bill-link.browser.mjs (14e1d06, 2026-08-18)
+// — a registry violation present since this file was written (ec31bf6,
+// 2026-09-01) and never caught until a routine housekeeping check. See
+// test/browser/README.md's prefix registry for the corrected assignment.
 import './_harness.mjs'
 import { chromium } from 'playwright'
 
@@ -32,7 +38,7 @@ function luhnDigit(b) {
   return String((10 - (s % 10)) % 10)
 }
 const mkImei = (n) => {
-  const body = ('8604561' + String(Date.now() % 1000000).padStart(6, '0').slice(0, 5) + String(n).padStart(2, '0')).slice(0, 14)
+  const body = ('8604567' + String(Date.now() % 1000000).padStart(6, '0').slice(0, 5) + String(n).padStart(2, '0')).slice(0, 14)
   return body + luhnDigit(body)
 }
 const IMEI_RECEIVED = mkImei(1)

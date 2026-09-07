@@ -537,10 +537,34 @@ into this repo), `8604554` (opr6-ui), `8604555` (dbg-valui/manifest-val),
 `8604558` (devices-tab), `8604559` (devices-tab-2), `8604560` (bills-tab),
 `8604561` (manifest-bill-link), `8604562` (bill-detail-vacuous-check —
 claimed per convention though this script seeds no received_devices rows),
-`8604563` (upload-result-panel), `8604564` (close-to-inventory-ui), `9900*`
-(G5 item 2 catalog auto-generation verification, 2026-08-21, disposable
-`browser_check.mjs` script — not checked into this repo, deleted after the
-citation was captured; see the citation record below).
+`8604563` (upload-result-panel), `8604564` (close-to-inventory-ui),
+`8604565` (reopen-role-filter-ui), `8604566` (reject-reason-ui — corrected
+2026-09-07, see below), `8604567` (reject-role-filter-ui — corrected
+2026-09-07, see below), `9900*` (G5 item 2 catalog auto-generation
+verification, 2026-08-21, disposable `browser_check.mjs` script — not
+checked into this repo, deleted after the citation was captured; see the
+citation record below).
+
+**Correction (2026-09-07): two prefix collisions found by routine
+housekeeping, present in the repo since the day each file was written.**
+`reject-reason-ui.browser.mjs` (`d64bc28`, 2026-09-01) claimed `8604560` in
+its own header comment without checking this registry first — `8604560`
+had already belonged to `bills-tab.browser.mjs` (`44f6d4e`, 2026-08-18).
+`reject-role-filter-ui.browser.mjs` (`ec31bf6`, 2026-09-01) made the same
+mistake with `8604561`, already claimed by `manifest-bill-link.browser.mjs`
+(`14e1d06`, 2026-08-18). Neither collision was noted in this registry text,
+so nothing here would have caught it without an explicit cross-check —
+`mkImei()`'s `Date.now()`-jitter component made an actual IMEI collision on
+any single historical run unlikely but not impossible (e.g. a same-second
+concurrent CI run), and the miscount investigation on `reject-reason-ui`
+this session (turned out to be a reporting slip, not a real defect — see
+process note below) is what prompted checking every prefix literal against
+this list directly rather than trusting the header comments. Reassigned
+both scripts to the next free prefixes: `reject-reason-ui.browser.mjs` →
+`8604566`, `reject-role-filter-ui.browser.mjs` → `8604567`. Re-ran both
+after the change (fresh `pm2 restart webapp`, hardened harness) — 15/15
+and 8/8, unchanged from their pre-correction counts, confirming the prefix
+swap touched only IMEI generation, nothing else.
 
 ### `devices-tab.browser.mjs` (15 checks)
 Devices tab — **All Devices** sub-view (status + legal transition via the
