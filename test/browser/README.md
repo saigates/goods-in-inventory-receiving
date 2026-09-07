@@ -540,7 +540,8 @@ claimed per convention though this script seeds no received_devices rows),
 `8604563` (upload-result-panel), `8604564` (close-to-inventory-ui),
 `8604565` (reopen-role-filter-ui), `8604566` (reject-reason-ui — corrected
 2026-09-07, see below), `8604567` (reject-role-filter-ui — corrected
-2026-09-07, see below), `9900*` (G5 item 2 catalog auto-generation
+2026-09-07, see below), `8604568` (bulk-transition-gate-ui, 2026-09-07),
+`9900*` (G5 item 2 catalog auto-generation
 verification, 2026-08-21, disposable `browser_check.mjs` script — not
 checked into this repo, deleted after the citation was captured; see the
 citation record below).

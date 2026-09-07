@@ -982,6 +982,118 @@ describe('E. POST /api/devices/bulk-transition (#38–#42, NEW)', () => {
     const body = await res.json() as { error: string }
     expect(body.error).toContain('500')
   })
+
+  // #44-#48 (2026-09-07) — closes the bulk-transition authorization
+  // bypass: this route used to call transitionDevice() directly with no
+  // manager-gate/reason_code check at all, so an operator token could
+  // bulk-reject or bulk-un-reject a device with a plain HTTP 200 (see
+  // checkRejectUnrejectGate's comment in deviceLifecycle.ts for the full
+  // incident writeup). Mirrors test/devicesRejectRoute.spec.ts's
+  // single-device coverage of the SAME gate, one call per batch instead
+  // of one call per device.
+  it('#44 operator bulk-rejecting (target_status REJECTED) -> 403, device unchanged, no event written', async () => {
+    const a = await seedDevice('RECEIVED')
+    const imeiA = (await db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(a).first<{ imei: string }>())!.imei
+    const res = await apiAs(OPERATOR_USER, '/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'REJECTED', imeis: [imeiA], reason_code: 'faulty_on_test' }),
+    })
+    expect(res.status).toBe(403)
+    expect(await deviceStatus(a)).toBe('RECEIVED')
+    expect(await eventsFor(a)).toHaveLength(0)
+  })
+
+  it('#45 operator bulk-un-rejecting (target_status RECEIVED, device currently REJECTED) -> 403, device unchanged', async () => {
+    const a = await seedDevice('REJECTED')
+    const imeiA = (await db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(a).first<{ imei: string }>())!.imei
+    const res = await apiAs(OPERATOR_USER, '/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'RECEIVED', imeis: [imeiA], reason_code: 'rejected_in_error' }),
+    })
+    expect(res.status).toBe(403)
+    expect(await deviceStatus(a)).toBe('REJECTED')
+  })
+
+  it('#46 manager bulk-rejecting with no reason_code -> 422, device unchanged, no event written', async () => {
+    const a = await seedDevice('RECEIVED')
+    const imeiA = (await db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(a).first<{ imei: string }>())!.imei
+    const res = await apiAs(MANAGER_USER, '/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'REJECTED', imeis: [imeiA] }),
+    })
+    expect(res.status).toBe(422)
+    expect(await deviceStatus(a)).toBe('RECEIVED')
+    expect(await eventsFor(a)).toHaveLength(0)
+  })
+
+  it('#47 manager bulk-rejecting with an unrecognised reason_code -> 422, device unchanged', async () => {
+    const a = await seedDevice('RECEIVED')
+    const imeiA = (await db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(a).first<{ imei: string }>())!.imei
+    const res = await apiAs(MANAGER_USER, '/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'REJECTED', imeis: [imeiA], reason_code: 'not_a_real_code' }),
+    })
+    expect(res.status).toBe(422)
+    expect(await deviceStatus(a)).toBe('RECEIVED')
+  })
+
+  it('#48 manager bulk-rejecting with a valid reason_code -> 200, devices REJECTED, metadata carries {bulk:true, reason_code}, other rows in the same batch unaffected by the gate', async () => {
+    const a = await seedDevice('RECEIVED')
+    const b = await seedDevice('RECEIVED')
+    const [imeiA, imeiB] = await Promise.all([
+      db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(a).first<{ imei: string }>(),
+      db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(b).first<{ imei: string }>(),
+    ])
+    const res = await apiAs(MANAGER_USER, '/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'REJECTED', imeis: [imeiA!.imei, imeiB!.imei], reason_code: 'faulty_on_test' }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { transitioned: number; failed: number }
+    expect(body.transitioned).toBe(2)
+    expect(body.failed).toBe(0)
+    expect(await deviceStatus(a)).toBe('REJECTED')
+    expect(await deviceStatus(b)).toBe('REJECTED')
+
+    const eventsA = await eventsFor(a)
+    expect(eventsA[eventsA.length - 1]).toMatchObject({ from_status: 'RECEIVED', to_status: 'REJECTED', event_type: 'REJECT' })
+    expect(JSON.parse(String(eventsA[eventsA.length - 1].metadata))).toMatchObject({ bulk: true, reason_code: 'faulty_on_test' })
+  })
+
+  it('#49 manager bulk-un-rejecting with a valid reason_code -> 200, device RECEIVED, metadata carries {bulk:true, reason_code}', async () => {
+    const a = await seedDevice('REJECTED')
+    const imeiA = (await db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(a).first<{ imei: string }>())!.imei
+    const res = await apiAs(MANAGER_USER, '/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'RECEIVED', imeis: [imeiA], reason_code: 'rejected_in_error' }),
+    })
+    expect(res.status).toBe(200)
+    expect(await deviceStatus(a)).toBe('RECEIVED')
+    const events = await eventsFor(a)
+    expect(events[events.length - 1]).toMatchObject({ from_status: 'REJECTED', to_status: 'RECEIVED', event_type: 'UNREJECT' })
+    expect(JSON.parse(String(events[events.length - 1].metadata))).toMatchObject({ bulk: true, reason_code: 'rejected_in_error' })
+  })
+
+  it('#50 a device NOT actually eligible for the reject edge (e.g. already ACTIVE_INVENTORY) in a manager-gated REJECTED batch still falls through to the ordinary per-row skip, unaffected by the once-per-call gate', async () => {
+    const rejectable = await seedDevice('RECEIVED')
+    const notEligible = await seedDevice('ACTIVE_INVENTORY') // no outbound edges at all
+    const [imeiOk, imeiBad] = await Promise.all([
+      db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(rejectable).first<{ imei: string }>(),
+      db().prepare('SELECT imei FROM received_devices WHERE id = ?').bind(notEligible).first<{ imei: string }>(),
+    ])
+    const res = await apiAs(MANAGER_USER, '/api/devices/bulk-transition', {
+      method: 'POST',
+      body: JSON.stringify({ target_status: 'REJECTED', imeis: [imeiOk!.imei, imeiBad!.imei], reason_code: 'faulty_on_test' }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { transitioned: number; failed: number; results: any[] }
+    expect(body.transitioned).toBe(1)
+    expect(body.failed).toBe(1)
+    expect(await deviceStatus(rejectable)).toBe('REJECTED')
+    expect(await deviceStatus(notEligible)).toBe('ACTIVE_INVENTORY') // unchanged
+    const skippedRow = body.results.find((r: any) => r.imei === imeiBad!.imei)
+    expect(skippedRow.outcome).toBe('skipped')
+  })
 })
 
 describe('E. GET /api/devices/repair-queue (#43, NEW)', () => {

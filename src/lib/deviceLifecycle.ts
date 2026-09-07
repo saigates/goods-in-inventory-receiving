@@ -156,6 +156,73 @@ export class DeviceNotFoundError extends Error {
   }
 }
 
+// Thrown by transitionDevice()'s own defence-in-depth check below (see
+// checkRejectUnrejectGate) when a caller reaches the reject/un-reject
+// edge without having passed the gate. Route callers are expected to run
+// the SAME check themselves first (via checkRejectUnrejectGate) so this
+// throws only as a backstop for a route that forgot to, or a future
+// caller that doesn't exist yet — never as the primary/expected path.
+export class TransitionGateError extends Error {
+  code = 'transition_gate_denied' as const
+  status: 403 | 422
+  validReasonCodes?: readonly string[]
+  constructor(status: 403 | 422, message: string, validReasonCodes?: readonly string[]) {
+    super(message)
+    this.status = status
+    this.validReasonCodes = validReasonCodes
+  }
+}
+
+export type RejectUnrejectGateResult =
+  | { applicable: false }
+  | { applicable: true; ok: true; edgeKind: 'reject' | 'unreject'; reasonCode: string }
+  | { applicable: true; ok: false; status: 403; error: string }
+  | { applicable: true; ok: false; status: 422; error: string; valid_reason_codes: readonly string[] }
+
+// Shared gate for the two manager-gated, reason-code-mandatory edges
+// (RECEIVED -> REJECTED, REJECTED -> RECEIVED). Originally lived ONLY in
+// devices.ts's /:id/transition handler (2026-09-01 live-incident fix) —
+// extracted here (2026-09-07) so the SAME check runs in both places it
+// must, rather than a second hand-copied implementation drifting from the
+// first:
+//   1. the route layer (single-device AND bulk-transition), for a clean,
+//      fast 403/422 before any DB write is attempted;
+//   2. transitionDevice() itself below, as a defence-in-depth backstop —
+//      so no future caller can reach either edge by skipping the
+//      route-level check, the same way POST /api/devices/bulk-transition
+//      did until this fix (it called transitionDevice() directly and
+//      never ran the single-device route's gate at all: an operator
+//      token could bulk-reject or bulk-un-reject with a plain HTTP 200,
+//      no reason_code, metadata = {"bulk":true} only — see #38-#42's
+//      sibling tests just below for the closed hole).
+export function checkRejectUnrejectGate(
+  fromStatus: DeviceStatus,
+  toStatus: DeviceStatus,
+  user: AuthUser,
+  reasonCodeInput: unknown,
+): RejectUnrejectGateResult {
+  const isRejectEdge = fromStatus === 'RECEIVED' && toStatus === 'REJECTED'
+  const isUnrejectEdge = fromStatus === 'REJECTED' && toStatus === 'RECEIVED'
+  if (!isRejectEdge && !isUnrejectEdge) return { applicable: false }
+
+  const isManager = user.role === 'manager' || user.role === 'admin'
+  if (!isManager) {
+    return {
+      applicable: true, ok: false, status: 403,
+      error: `${isRejectEdge ? 'Rejecting' : 'Un-rejecting'} a device is manager-only`,
+    }
+  }
+  const reasonCode = typeof reasonCodeInput === 'string' ? reasonCodeInput.trim() : ''
+  const validCodes: readonly string[] = isRejectEdge ? REJECT_REASON_CODES : UNREJECT_REASON_CODES
+  if (!reasonCode) {
+    return { applicable: true, ok: false, status: 422, error: 'reason_code is required for this transition', valid_reason_codes: validCodes }
+  }
+  if (!validCodes.includes(reasonCode)) {
+    return { applicable: true, ok: false, status: 422, error: `reason_code must be one of: ${validCodes.join(', ')}`, valid_reason_codes: validCodes }
+  }
+  return { applicable: true, ok: true, edgeKind: isRejectEdge ? 'reject' : 'unreject', reasonCode }
+}
+
 export type TransitionContext = {
   user: AuthUser
   reference?: string | null
@@ -192,6 +259,28 @@ export async function transitionDevice(
   const allowed = ALLOWED_TRANSITIONS[fromStatus] || []
   if (!allowed.includes(toStatus)) {
     throw new InvalidTransitionError(fromStatus, toStatus)
+  }
+
+  // Defence-in-depth (2026-09-07): re-run the reject/un-reject gate HERE,
+  // not just at the route layer, so no caller — present or future — can
+  // reach either edge ungated by calling this function directly. This is
+  // the concrete case that motivated it: POST /bulk-transition called
+  // transitionDevice() directly and never ran the single-device route's
+  // gate at all, so an operator token could bulk-reject or bulk-un-reject
+  // a device with a plain HTTP 200, no reason_code, no 403 — see
+  // checkRejectUnrejectGate's own comment. A well-behaved route caller is
+  // expected to have already run checkRejectUnrejectGate() itself for a
+  // fast, pre-write 403/422 (and to have folded the returned reasonCode
+  // into ctx.metadata.reason_code, exactly as this check reads it back
+  // out below) — this re-check is expected to confirm `ok: true` again in
+  // that case, not to be the first time the gate runs on the happy path.
+  const gate = checkRejectUnrejectGate(fromStatus, toStatus, ctx.user, ctx.metadata?.reason_code)
+  if (gate.applicable && !gate.ok) {
+    throw new TransitionGateError(
+      gate.status,
+      gate.error,
+      gate.status === 422 ? gate.valid_reason_codes : undefined,
+    )
   }
 
   const eventType = ctx.eventType || 'STATUS_CHANGE'

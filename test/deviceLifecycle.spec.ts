@@ -39,6 +39,19 @@ const OTHER_ORG_USER: AuthUser = {
   organisation_id: 2,
 }
 
+// Same-org (org 1) operator fixture for the transitionDevice()-level
+// reject/un-reject gate tests below — OTHER_ORG_USER above is
+// deliberately in a DIFFERENT org, so using it against an org-1-seeded
+// device would 404 before the gate is ever reached, not exercise the
+// gate itself.
+const SAME_ORG_OPERATOR_USER: AuthUser = {
+  id: 98,
+  email: 'same-org-operator@example.com',
+  name: 'Same-Org Operator',
+  role: 'operator',
+  organisation_id: 1,
+}
+
 let nextImei = 350000000000001
 
 // Inserts a received_devices row directly (bypassing the API) so each test
@@ -78,7 +91,26 @@ beforeEach(async () => {
     )
     .bind(OTHER_ORG_USER.id, OTHER_ORG_USER.email, OTHER_ORG_USER.name, OTHER_ORG_USER.role, OTHER_ORG_USER.organisation_id)
     .run()
+  await db()
+    .prepare(
+      `INSERT OR IGNORE INTO users (id, email, name, role, organisation_id) VALUES (?, ?, ?, ?, ?)`
+    )
+    .bind(SAME_ORG_OPERATOR_USER.id, SAME_ORG_OPERATOR_USER.email, SAME_ORG_OPERATOR_USER.name, SAME_ORG_OPERATOR_USER.role, SAME_ORG_OPERATOR_USER.organisation_id)
+    .run()
 })
+
+// The two reject/un-reject edges now require a reason_code even at this
+// raw transitionDevice() layer (2026-09-07 defence-in-depth — see
+// checkRejectUnrejectGate's comment). ADMIN_USER already satisfies the
+// role half of that gate (role check is manager-or-admin); this helper
+// supplies a syntactically-valid reason_code for exactly those two edges
+// so the generic sweeps below keep exercising every OTHER edge with a
+// plain, reason-code-free call, unaffected by the gate.
+function reasonMetadataFor(from: DeviceStatus, to: DeviceStatus): Record<string, unknown> | undefined {
+  if (from === 'RECEIVED' && to === 'REJECTED') return { reason_code: 'faulty_on_test' }
+  if (from === 'REJECTED' && to === 'RECEIVED') return { reason_code: 'rejected_in_error' }
+  return undefined
+}
 
 describe('transitionDevice — allowed transitions', () => {
   for (const [from, tos] of Object.entries(ALLOWED_TRANSITIONS) as [DeviceStatus, DeviceStatus[]][]) {
@@ -86,7 +118,7 @@ describe('transitionDevice — allowed transitions', () => {
       it(`allows ${from} → ${to}`, async () => {
         const deviceId = await seedDevice(from)
 
-        const { device, event } = await transitionDevice(db(), deviceId, to, { user: ADMIN_USER })
+        const { device, event } = await transitionDevice(db(), deviceId, to, { user: ADMIN_USER, metadata: reasonMetadataFor(from, to) })
 
         expect(device.status).toBe(to)
         expect(event.from_status).toBe(from)
@@ -274,7 +306,7 @@ describe('transitionDevice — audit-trail invariant', () => {
     for (const [from, tos] of Object.entries(ALLOWED_TRANSITIONS) as [DeviceStatus, DeviceStatus[]][]) {
       for (const to of tos) {
         const deviceId = await seedDevice(from)
-        await transitionDevice(db(), deviceId, to, { user: ADMIN_USER })
+        await transitionDevice(db(), deviceId, to, { user: ADMIN_USER, metadata: reasonMetadataFor(from, to) })
         await assertInvariant(deviceId)
       }
     }
@@ -282,18 +314,27 @@ describe('transitionDevice — audit-trail invariant', () => {
 })
 
 describe('transitionDevice — reject / un-reject edge (2026-09-01 live-incident fix)', () => {
-  // transitionDevice() itself is edge-agnostic about reason codes (that
-  // enforcement lives in the /:id/transition route — see
-  // test/devicesRejectRoute.spec.ts) — this block only proves the raw
+  // Route-level manager-gating/reason-code enforcement is covered in
+  // test/devicesRejectRoute.spec.ts — this block's own focus is the raw
   // state-machine shape: REJECTED has exactly one outbound edge, back to
   // RECEIVED, and the round trip works.
+  //
+  // CORRECTED (2026-09-07): this file's own comment used to claim
+  // "transitionDevice() itself is edge-agnostic about reason codes" — that
+  // was true until this same commit added a defence-in-depth re-check of
+  // checkRejectUnrejectGate() INSIDE transitionDevice() (closing the
+  // bulk-transition bypass — see deviceLifecycle.ts's own comment on the
+  // check). ADMIN_USER already satisfies the role half of that gate, so
+  // every call on these two specific edges below now also supplies a
+  // valid reason_code via metadata, same as a well-behaved route caller
+  // would; every OTHER edge in this file is unaffected and untouched.
   it('allows RECEIVED -> REJECTED -> RECEIVED, a full round trip', async () => {
     const deviceId = await seedDevice('RECEIVED')
 
-    await transitionDevice(db(), deviceId, 'REJECTED', { user: ADMIN_USER })
+    await transitionDevice(db(), deviceId, 'REJECTED', { user: ADMIN_USER, metadata: { reason_code: 'faulty_on_test' } })
     expect((await db().prepare('SELECT status FROM received_devices WHERE id = ?').bind(deviceId).first<{ status: string }>())?.status).toBe('REJECTED')
 
-    await transitionDevice(db(), deviceId, 'RECEIVED', { user: ADMIN_USER })
+    await transitionDevice(db(), deviceId, 'RECEIVED', { user: ADMIN_USER, metadata: { reason_code: 'rejected_in_error' } })
     expect((await db().prepare('SELECT status FROM received_devices WHERE id = ?').bind(deviceId).first<{ status: string }>())?.status).toBe('RECEIVED')
 
     const events = await eventsFor(deviceId)
@@ -308,8 +349,8 @@ describe('transitionDevice — reject / un-reject edge (2026-09-01 live-incident
 
   it('a device un-rejected back to RECEIVED can re-run the normal flow from scratch', async () => {
     const deviceId = await seedDevice('RECEIVED')
-    await transitionDevice(db(), deviceId, 'REJECTED', { user: ADMIN_USER })
-    await transitionDevice(db(), deviceId, 'RECEIVED', { user: ADMIN_USER })
+    await transitionDevice(db(), deviceId, 'REJECTED', { user: ADMIN_USER, metadata: { reason_code: 'faulty_on_test' } })
+    await transitionDevice(db(), deviceId, 'RECEIVED', { user: ADMIN_USER, metadata: { reason_code: 'rejected_in_error' } })
 
     // Proves it isn't a dead-end-that-looks-alive: the device can proceed
     // through the ordinary RECEIVED -> SORTING -> ACTIVE_INVENTORY chain
@@ -317,6 +358,56 @@ describe('transitionDevice — reject / un-reject edge (2026-09-01 live-incident
     await transitionDevice(db(), deviceId, 'SORTING', { user: ADMIN_USER })
     await transitionDevice(db(), deviceId, 'ACTIVE_INVENTORY', { user: ADMIN_USER })
     expect((await db().prepare('SELECT status FROM received_devices WHERE id = ?').bind(deviceId).first<{ status: string }>())?.status).toBe('ACTIVE_INVENTORY')
+  })
+})
+
+// 2026-09-07 — closes the bulk-transition bypass (POST /devices/bulk-
+// transition called transitionDevice() directly with no gate at all).
+// This block proves the backstop lives INSIDE transitionDevice() itself,
+// by calling it directly (bypassing every route) exactly the way the
+// defective bulk-transition handler used to — an operator role and a
+// missing/invalid reason_code must still be refused even with no route
+// in front of it at all.
+describe('transitionDevice — reject/un-reject gate is enforced INSIDE transitionDevice() itself (defence-in-depth, 2026-09-07)', () => {
+  it('operator role calling transitionDevice() directly for RECEIVED -> REJECTED is refused, device unchanged, no event written', async () => {
+    const deviceId = await seedDevice('RECEIVED')
+    await expect(
+      transitionDevice(db(), deviceId, 'REJECTED', { user: SAME_ORG_OPERATOR_USER, metadata: { reason_code: 'faulty_on_test' } })
+    ).rejects.toMatchObject({ status: 403 })
+    expect((await db().prepare('SELECT status FROM received_devices WHERE id = ?').bind(deviceId).first<{ status: string }>())?.status).toBe('RECEIVED')
+    expect(await eventsFor(deviceId)).toHaveLength(0)
+  })
+
+  it('admin/manager role but missing reason_code is refused with 422, device unchanged', async () => {
+    const deviceId = await seedDevice('RECEIVED')
+    await expect(
+      transitionDevice(db(), deviceId, 'REJECTED', { user: ADMIN_USER })
+    ).rejects.toMatchObject({ status: 422 })
+    expect((await db().prepare('SELECT status FROM received_devices WHERE id = ?').bind(deviceId).first<{ status: string }>())?.status).toBe('RECEIVED')
+    expect(await eventsFor(deviceId)).toHaveLength(0)
+  })
+
+  it('admin/manager role but an unrecognised reason_code is refused with 422, device unchanged', async () => {
+    const deviceId = await seedDevice('RECEIVED')
+    await expect(
+      transitionDevice(db(), deviceId, 'REJECTED', { user: ADMIN_USER, metadata: { reason_code: 'not_a_real_code' } })
+    ).rejects.toMatchObject({ status: 422 })
+    expect((await db().prepare('SELECT status FROM received_devices WHERE id = ?').bind(deviceId).first<{ status: string }>())?.status).toBe('RECEIVED')
+  })
+
+  it('operator role calling transitionDevice() directly for REJECTED -> RECEIVED (un-reject) is refused, device unchanged', async () => {
+    const deviceId = await seedDevice('REJECTED')
+    await expect(
+      transitionDevice(db(), deviceId, 'RECEIVED', { user: SAME_ORG_OPERATOR_USER, metadata: { reason_code: 'rejected_in_error' } })
+    ).rejects.toMatchObject({ status: 403 })
+    expect((await db().prepare('SELECT status FROM received_devices WHERE id = ?').bind(deviceId).first<{ status: string }>())?.status).toBe('REJECTED')
+  })
+
+  it('every OTHER edge is unaffected by this gate — no role/reason_code required (the gate is scoped to exactly these two edges)', async () => {
+    const deviceId = await seedDevice('RECEIVED')
+    await expect(
+      transitionDevice(db(), deviceId, 'SORTING', { user: SAME_ORG_OPERATOR_USER })
+    ).resolves.toMatchObject({ device: { status: 'SORTING' } })
   })
 })
 

@@ -9,7 +9,7 @@
 import { Hono } from 'hono'
 import type { Bindings, AuthUser, DeviceStatus } from '../types'
 import { currentUser } from '../lib/auth'
-import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES, REJECT_REASON_CODES, UNREJECT_REASON_CODES } from '../lib/deviceLifecycle'
+import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, TransitionGateError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES, REJECT_REASON_CODES, UNREJECT_REASON_CODES, checkRejectUnrejectGate } from '../lib/deviceLifecycle'
 import { dispatchDeviceStatusWebhooks } from '../lib/webhook'
 import { startRepair, scanBackRepair, recordQc, reopenRepair, closeToInventory, recordRepairCost, postRepairCostToLedger, RepairJobError } from '../lib/repairWorkflow'
 import { postPurchaseCostToLedger, CostEntryError } from '../lib/costEntry'
@@ -313,7 +313,7 @@ const BULK_TRANSITION_CAP = 500
 
 app.post('/bulk-transition', async (c) => {
   const user = currentUser(c)
-  const body = await c.req.json<{ target_status?: string; imeis?: unknown[] }>().catch(() => ({} as any))
+  const body = await c.req.json<{ target_status?: string; imeis?: unknown[]; reason_code?: string }>().catch(() => ({} as any))
 
   const targetStatus = String(body.target_status || '').toUpperCase() as DeviceStatus
   if (!DEVICE_STATUSES.includes(targetStatus)) {
@@ -324,6 +324,48 @@ app.post('/bulk-transition', async (c) => {
   }
   if (REPAIR_WORKFLOW_ONLY_STATUSES.includes(targetStatus)) {
     return c.json({ error: `${targetStatus} is managed by the repair workflow — it cannot be set via bulk transition` }, 409)
+  }
+
+  // ── Reject / un-reject gating (2026-09-07 — closes the bulk bypass) ──
+  // Bug this replaces: this route used to call transitionDevice() directly
+  // for every row with no check at all, so an operator token could
+  // bulk-reject or bulk-un-reject with a plain HTTP 200 and no reason_code
+  // recorded — the single-device /:id/transition route's manager-gate and
+  // mandatory reason_code (2026-09-01) simply had no equivalent here.
+  //
+  // Gated ONCE per call, not per IMEI: role and reason_code are properties
+  // of the CALLER and the CALL, not of any individual device, and (per
+  // ALLOWED_TRANSITIONS in deviceLifecycle.ts) REJECTED and RECEIVED are
+  // each reachable from exactly one other status via a bulk-eligible edge
+  // — RECEIVED->REJECTED and REJECTED->RECEIVED respectively — so a batch
+  // whose target_status is REJECTED or RECEIVED IS, in its entirety, a
+  // bulk reject/un-reject request; there is no other transition a bulk
+  // call to either target could represent. Individual rows whose device
+  // is NOT actually eligible for that edge (e.g. already ACTIVE_INVENTORY
+  // when target_status is REJECTED) still fail per-row with the ordinary
+  // InvalidTransitionError skip below (#40), unaffected by this gate.
+  //
+  // Deliberately NOT a blanket refusal like the OPR/REPAIR_WORKFLOW_ONLY
+  // checks above (which always 409, no caller can ever pass) — rejecting
+  // or un-rejecting a scanned batch is a legitimate manager operation, so
+  // this GATES the call (403 non-manager, 422 missing/invalid reason) and
+  // then PERMITS it, rather than refusing it outright. Uses the exact same
+  // checkRejectUnrejectGate() the single-device route calls, so the two
+  // never drift; transitionDevice() itself also re-checks per-row as a
+  // defence-in-depth backstop (see its own comment) — this is not the
+  // only place the rule is enforced, just the fast, pre-write check.
+  const bulkGateFromStatus: DeviceStatus | null =
+    targetStatus === 'REJECTED' ? 'RECEIVED' : targetStatus === 'RECEIVED' ? 'REJECTED' : null
+  let batchReasonCode: string | undefined
+  if (bulkGateFromStatus) {
+    const gate = checkRejectUnrejectGate(bulkGateFromStatus, targetStatus, user, body.reason_code)
+    if (gate.applicable && !gate.ok) {
+      return c.json(
+        gate.status === 422 ? { error: gate.error, valid_reason_codes: gate.valid_reason_codes } : { error: gate.error },
+        gate.status,
+      )
+    }
+    if (gate.applicable && gate.ok) batchReasonCode = gate.reasonCode
   }
 
   if (!Array.isArray(body.imeis)) return c.json({ error: 'Body must be { target_status, imeis: [...] }' }, 422)
@@ -373,11 +415,25 @@ app.post('/bulk-transition', async (c) => {
       continue
     }
 
+    // Per-row edge kind, purely for event_type/metadata labelling — the
+    // gate itself already ran once above (see its comment for why a
+    // once-per-call check is exhaustive for these two specific edges: the
+    // state machine has exactly one valid from-status for each of
+    // target_status REJECTED / RECEIVED, so every row that could possibly
+    // succeed here already matches bulkGateFromStatus). A row whose
+    // CURRENT status doesn't match (e.g. ACTIVE_INVENTORY when target is
+    // REJECTED) still falls through to the ordinary InvalidTransitionError
+    // skip in the catch block below, unaffected by this gate.
+    const rowIsRejectEdge = device.status === 'RECEIVED' && targetStatus === 'REJECTED'
+    const rowIsUnrejectEdge = device.status === 'REJECTED' && targetStatus === 'RECEIVED'
+    const metadata: Record<string, unknown> = { bulk: true }
+    if (batchReasonCode) metadata.reason_code = batchReasonCode
+
     try {
       const { device: updated, event } = await transitionDevice(c.env.DB, device.id, targetStatus, {
         user,
-        eventType: 'STATUS_CHANGE',
-        metadata: { bulk: true },
+        eventType: rowIsRejectEdge ? 'REJECT' : rowIsUnrejectEdge ? 'UNREJECT' : 'STATUS_CHANGE',
+        metadata,
       })
       results.push({ imei, ok: true, outcome: 'transitioned', device_id: device.id, from_status: device.status })
       notifyPromises.push(dispatchDeviceStatusWebhooks(c.env.DB, {
@@ -396,6 +452,13 @@ app.post('/bulk-transition', async (c) => {
         results.push({ imei, ok: false, outcome: 'skipped', device_id: device.id, from_status: device.status, message: err.message })
       } else if (err instanceof DeviceNotFoundError) {
         results.push({ imei, ok: false, outcome: 'error', message: err.message })
+      } else if (err instanceof TransitionGateError) {
+        // Backstop only (see transitionDevice()'s own comment) — the
+        // route-level gate above should already have returned before this
+        // row is ever reached. Reported as a per-row error, not a whole-
+        // call failure, so one row's gate re-check can never silently
+        // swallow the rest of an otherwise-valid batch.
+        results.push({ imei, ok: false, outcome: 'error', device_id: device.id, from_status: device.status, message: err.message })
       } else {
         results.push({ imei, ok: false, outcome: 'error', message: err instanceof Error ? err.message : String(err) })
       }
@@ -459,7 +522,11 @@ app.post('/:id/transition', async (c) => {
     return c.json({ error: `Device is ${device0.status}, which is managed by the repair workflow — it cannot be transitioned via this endpoint` }, 409)
   }
 
-  // ── Reject / un-reject gating (2026-09-01 live-incident fix) ──
+  // ── Reject / un-reject gating (2026-09-01 live-incident fix; extracted
+  // into checkRejectUnrejectGate() 2026-09-07 so bulk-transition below —
+  // and transitionDevice() itself, as a defence-in-depth backstop — run
+  // the exact same check instead of a hand-copied second implementation
+  // drifting from this one) ──
   // Scoped to EXACTLY these two edges, not the whole route: every other
   // transition here is untested against a non-admin caller today, so a
   // blanket manager-gate would ship an unreviewed access restriction
@@ -467,21 +534,17 @@ app.post('/:id/transition', async (c) => {
   // not access control, so both edges are manager-gated AND require one
   // of the enumerated reason codes — an unrecognised code is rejected
   // (422), not silently stored.
-  const isRejectEdge = device0?.status === 'RECEIVED' && toStatus === 'REJECTED'
-  const isUnrejectEdge = device0?.status === 'REJECTED' && toStatus === 'RECEIVED'
-  if (isRejectEdge || isUnrejectEdge) {
-    if (!requireManager(c)) {
-      return c.json({ error: `${isRejectEdge ? 'Rejecting' : 'Un-rejecting'} a device is manager-only` }, 403)
-    }
-    const reasonCode = typeof body.reason_code === 'string' ? body.reason_code.trim() : ''
-    const validCodes: readonly string[] = isRejectEdge ? REJECT_REASON_CODES : UNREJECT_REASON_CODES
-    if (!reasonCode) {
-      return c.json({ error: 'reason_code is required for this transition', valid_reason_codes: validCodes }, 422)
-    }
-    if (!validCodes.includes(reasonCode)) {
-      return c.json({ error: `reason_code must be one of: ${validCodes.join(', ')}`, valid_reason_codes: validCodes }, 422)
-    }
-    body.metadata = { ...(body.metadata ?? {}), reason_code: reasonCode }
+  const gate = device0 ? checkRejectUnrejectGate(device0.status, toStatus, user, body.reason_code) : { applicable: false as const }
+  if (gate.applicable && !gate.ok) {
+    return c.json(
+      gate.status === 422 ? { error: gate.error, valid_reason_codes: gate.valid_reason_codes } : { error: gate.error },
+      gate.status,
+    )
+  }
+  const isRejectEdge = gate.applicable && gate.ok && gate.edgeKind === 'reject'
+  const isUnrejectEdge = gate.applicable && gate.ok && gate.edgeKind === 'unreject'
+  if (gate.applicable && gate.ok) {
+    body.metadata = { ...(body.metadata ?? {}), reason_code: gate.reasonCode }
   }
 
   try {
@@ -521,6 +584,16 @@ app.post('/:id/transition', async (c) => {
   } catch (err) {
     if (err instanceof InvalidTransitionError) return c.json({ error: err.message, code: err.code }, 409)
     if (err instanceof DeviceNotFoundError) return c.json({ error: err.message, code: err.code }, 404)
+    // Backstop only — the route-level gate check above should already
+    // have returned before transitionDevice() is ever called on this
+    // route. Kept so a future edit here fails the same way bulk-transition
+    // did rather than an unhandled 500 (see TransitionGateError's comment).
+    if (err instanceof TransitionGateError) {
+      return c.json(
+        err.status === 422 ? { error: err.message, valid_reason_codes: err.validReasonCodes } : { error: err.message },
+        err.status,
+      )
+    }
     throw err
   }
 })

@@ -1159,19 +1159,48 @@
   }
 
   // ─── Bulk transition by scan ───
+  // RECEIVED<->REJECTED via this endpoint is manager-gated AND requires a
+  // batch-level reason_code, mirroring the single-device RejectReasonModal
+  // gate exactly (src/routes/devices.ts POST /bulk-transition, 2026-09-07
+  // — closes the bulk-transition bypass; see
+  // checkRejectUnrejectGate/TransitionGateError in
+  // src/lib/deviceLifecycle.ts for the server-side half). Per
+  // ALLOWED_TRANSITIONS, REJECTED's only inbound edge is RECEIVED and
+  // RECEIVED's only OTHER inbound edge is REJECTED, so a bulk call whose
+  // target_status is either one is ALWAYS a reject/un-reject batch — there
+  // is no legitimate non-gated use of either target via this endpoint.
+  // Standing rule (test/browser/README.md, "any manager-gated action
+  // needs its affordance filtered by role in the SAME commit that creates
+  // it" — 6th instance): operators don't get offered these two targets at
+  // all; managers/admins get them plus a mandatory reason-code select,
+  // same list source (state.deviceStatuses.reason_codes) as the
+  // single-device modal, never a hardcoded client-side copy.
+  const BULK_GATED_TARGETS = { REJECTED: 'REJECTED', RECEIVED: 'RECEIVED' };
   function BulkTransitionModal() {
     const ctx = state._bulkTransCtx ||= {
-      raw: '', target_status: '', busy: false,
+      raw: '', target_status: '', reason_code: '', busy: false,
       resultsByImei: new Map(),
     };
     const close = () => { state.bulkTransitionOpen = false; state._bulkTransCtx = null; render(); };
     const parsedImeis = () => parseBulkImeis(ctx.raw).unique;
-    const statuses = (state.deviceStatuses && state.deviceStatuses.statuses) || [];
+    const managerOk = isManagerOrAdmin();
+    const allStatuses = (state.deviceStatuses && state.deviceStatuses.statuses) || [];
+    // Operators never see REJECTED/RECEIVED as bulk targets — same
+    // reasoning as /meta/statuses' role-filtered `transitions` map: an
+    // operator who picked one and scanned a batch would only ever get a
+    // batch of 403s, which is worse than not offering it.
+    const statuses = managerOk ? allStatuses : allStatuses.filter(s => !(s in BULK_GATED_TARGETS));
+    const isGatedTarget = ctx.target_status in BULK_GATED_TARGETS;
+    const reasonCodes = isGatedTarget
+      ? ((state.deviceStatuses && state.deviceStatuses.reason_codes &&
+          state.deviceStatuses.reason_codes[ctx.target_status === 'REJECTED' ? 'REJECTED' : 'UNREJECT']) || [])
+      : [];
 
     const run = async () => {
       const parsed = parseBulkImeis(ctx.raw);
       const imeis = parsed.unique;
       if (!ctx.target_status) { toast('Pick a target status first', 'warn'); return; }
+      if (isGatedTarget && !ctx.reason_code) { toast('Select a reason code', 'warn'); return; }
       if (imeis.length === 0) { toast('Nothing to scan — add an IMEI', 'warn'); return; }
       if (imeis.length > BULK_IMEI_CAP) { toast(`${imeis.length} unique IMEIs — maximum is ${BULK_IMEI_CAP} per batch.`, 'warn'); return; }
       if (parsed.duplicates > 0) {
@@ -1179,7 +1208,9 @@
       }
       ctx.busy = true; state._bulkTransCtx = ctx; render();
       try {
-        const r = await api.post('/devices/bulk-transition', { target_status: ctx.target_status, imeis });
+        const body = { target_status: ctx.target_status, imeis };
+        if (isGatedTarget) body.reason_code = ctx.reason_code;
+        const r = await api.post('/devices/bulk-transition', body);
         for (const row of r.results) ctx.resultsByImei.set(row.imei, row);
         // drop settled (successfully transitioned) IMEIs so a retry only resends the outstanding ones
         ctx.raw = parsedImeis().filter(i => ctx.resultsByImei.get(i)?.outcome !== 'transitioned').join('\n');
@@ -1210,12 +1241,24 @@
         h('div', { class: 'mt-3' },
           h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Target status *'),
           h('select', {
-            class: 'input', onchange: (e) => { ctx.target_status = e.target.value; state._bulkTransCtx = ctx; },
+            class: 'input',
+            onchange: (e) => { ctx.target_status = e.target.value; ctx.reason_code = ''; state._bulkTransCtx = ctx; render(); },
           },
             h('option', { value: '', selected: !ctx.target_status ? 'selected' : null }, '— select —'),
             statuses.map(s => h('option', { value: s, selected: s === ctx.target_status ? 'selected' : null }, s))
-          )
+          ),
+          !managerOk ? h('p', { class: 'text-[11px] text-slate-500 mt-1' }, 'Bulk reject / un-reject is manager-only — those targets aren\'t offered here.') : null
         ),
+        isGatedTarget ? h('div', { class: 'mt-3' },
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, `Reason for this whole batch (applies to every device) *`),
+          h('select', {
+            id: 'bulk-transition-reason-select', class: 'input text-sm',
+            onchange: (e) => { ctx.reason_code = e.target.value; state._bulkTransCtx = ctx; },
+          },
+            h('option', { value: '', selected: !ctx.reason_code ? 'selected' : null }, '— select a reason —'),
+            reasonCodes.map(code => h('option', { value: code, selected: code === ctx.reason_code ? 'selected' : null }, code))
+          )
+        ) : null,
         h('div', { class: 'mt-3' },
           h('label', { class: 'text-xs text-slate-400 mb-1 block flex items-center justify-between' },
             h('span', {}, 'IMEIs *'),
