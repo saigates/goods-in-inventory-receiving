@@ -514,3 +514,5 @@ issued between the two checks could plausibly have caused a control-plane
 identity change, which is itself the evidence that this is a session/
 account-binding property of the sandbox, external to anything this project
 does.**
+
+**+12 test-delta breakdown (562→574, 2026-09-07)** — verified by `git diff 76c51e8 89fb02b` line-count, not retyped from memory: exactly 5 new `it()` blocks added to `test/deviceLifecycle.spec.ts` (the H0 direct-call gate + its "every other edge unaffected" scope test) and exactly 7 new `it()` blocks added to `test/repairWorkflow.spec.ts` (the bulk-path gate cases, numbered #44-#50 in-file) = 12, confirmed as the ONLY two files touched in that diff and the only source of new `it()` blocks — the pre-existing `ALLOWED_TRANSITIONS` data-driven sweep had its loop body edited (added `reasonMetadataFor()` calls) but not its iteration bounds, so it contributed zero to the count. Fresh full-suite re-run this session: 574 passed, 8 skipped, 29 files, 0 failed.
