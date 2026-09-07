@@ -756,3 +756,90 @@ IMEIs, single organisation), the roster growth from 398 (24 Aug) to 1133
 (now) is fully explained as genuine intake — no inflation mechanism
 found. The Zoho reconciliation can proceed sized against ~1133 devices
 without a data-integrity caveat on the row count itself.
+
+## Task C investigation — ANSWERED: single-device REJECTED reachability, 2026-09-07
+
+**Question**: was REJECTED reachable by a single tap / no confirmation on the
+single-device screen, and does that explain devices 588/619's NULL-metadata
+rejects?
+
+**Finding — the reject mechanism, fully traced via git history + code**:
+
+1. `POST /scan/reject` (src/routes/scan.ts:830) is NOT the culprit — it only
+   logs a `scan_events`/`device_events` row with `deviceId: null` for a
+   pre-receipt unreconciled-manifest-line rejection. It NEVER writes
+   `received_devices.status`. Grep of the whole `src/` tree confirms the
+   ONLY code path that can ever write `status = 'REJECTED'` is
+   `transitionDevice()`, called from either the generic
+   `POST /:id/transition` route or `POST /bulk-transition` — both gated by
+   `checkRejectUnrejectGate()`.
+
+2. That gate (manager-only + mandatory `reason_code`) was added in commit
+   `84a57e7` ("Add REJECTED -> RECEIVED transition with scoped manager gate
+   + reason codes"), timestamped **2026-09-01 15:40:04 UTC** — and its own
+   commit message says explicitly it was written BECAUSE of devices 588 and
+   619 (REJECTED previously had zero outbound edges, an unintentional dead
+   end).
+
+3. The corresponding UI change — `RejectReasonModal()` / `doTransition()`'s
+   special-casing of the RECEIVED<->REJECTED edges — landed in `d64bc28`
+   ("Add reject/un-reject reason-code UI"), **2026-09-01 16:14:11 UTC**,
+   34 minutes later.
+
+4. Device 588's reject event: **2026-08-28 14:10:22** — 4 days BEFORE the
+   gate existed.
+   Device 619's reject event: **2026-09-01 ~14:03** — same day but ~1h37m
+   BEFORE `84a57e7` (15:40:04), and ~2h11m before the UI modal (16:14:11).
+
+**Conclusion**: both incidents predate the fix entirely. At the time each
+occurred, `AllDevicesSubview()`'s "Move to" `<select>` fired
+`doTransition()` on a single `onchange` with NO special-casing — `doTransition()`
+went straight to `runTransition(device, toStatus, {})` for every edge,
+including RECEIVED->REJECTED, with no manager check, no reason-code
+requirement, and no confirmation step of any kind. A single accidental
+dropdown selection was sufficient. This is the exact "single-device mis-tap"
+mechanism the forensic finding already inferred from the NULL metadata —
+now confirmed against source history rather than inferred from data alone.
+
+**Current code already closes this hole** (has done since 2026-09-01,
+6 days before this session): `checkRejectUnrejectGate()` requires (a) the
+caller be manager/admin, (b) an explicit reason_code from the enumerated
+list, enforced server-side on both the single-device and bulk routes, with
+`transitionDevice()` itself re-checking as a defence-in-depth backstop. The
+UI additionally requires the operator to open `RejectReasonModal()` and
+pick a reason before the request is even sent. A repeat of 588/619's exact
+mechanism (accidental dropdown selection instantly firing the transition)
+is no longer possible — the accidental selection now only opens a modal
+requiring a deliberate second action.
+
+**Task C recommendation**: no code change needed. The hardening the task
+asked for is already live, predates this session, and structurally
+prevents the reproduced mechanism. Recording this as investigated-and-
+closed rather than shipping a redundant second layer. Flagging for the
+user to confirm/override if they want additional hardening (e.g. a
+generic "confirm this transition" step on ALL edges, not just
+reject/unreject) — that would be a materially bigger change than "modest"
+and was explicitly out of scope per the task's own instruction to defer
+rather than expand.
+
+## Session cutoff — iteration budget reached, work handed back
+
+Identity flip **#8** observed this session (`gsk login-info` read
+`sagarsptl@gmail.com` when `saigateslimited@gmail.com` was expected).
+Per standing rule: no retry attempted. This blocked:
+- Task A1's `genspark` remote push of commit `8cc3561` (the `origin` push
+  DID succeed this session — confirmed by push output, `e0e26e9..8cc3561`).
+- Task A2 (placeholder-row query) — skipped per its own explicit
+  contingency instruction ("if the identity bracket fails, skip A2, go
+  straight to Task B").
+
+Work completed this session: Task A1 (partial — origin only),
+Task B1 (carried over, reported to user), Task C (investigated and
+answered in full, see above — recommend closing without a code change).
+
+Work NOT started this session: B2 (pagination code), B3 (export fix
+code), B4 (tests), D (deploy), E (H1 repro), F (docs filler). No source
+files were modified this session — `src/routes/devices.ts`,
+`src/routes/inventory.ts`, and `public/static/app.js` were read in full
+but zero edits applied, so there is no uncommitted code risk to carry
+into the next turn.
