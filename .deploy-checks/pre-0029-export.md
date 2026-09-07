@@ -731,3 +731,28 @@ not be re-queried for provenance purposes going forward — 1120/13
 (1133 total) is the current, accepted figure. The Zoho reconciliation
 scope should be sized against ~1133 devices, not ~398 — roughly 3x the
 previously-assumed scale.
+
+---
+
+## Placeholder-row hypothesis — DISPROVEN (2026-09-07)
+
+Follow-up to the roster provenance finding above. Query (read-only,
+org-scoped, bracketed):
+
+```sql
+SELECT COUNT(*) FROM received_devices rd
+ WHERE rd.organisation_id = 1
+   AND NOT EXISTS (SELECT 1 FROM device_events de
+                    WHERE de.device_id = rd.id
+                      AND de.event_type = 'RECEIVE');
+```
+
+Result: `cnt = 0`.
+
+Every one of the 1133 `received_devices` rows has a corresponding
+`RECEIVE` event. There are no manifest-created placeholder rows lacking
+a physical-receipt act. Combined with the earlier finding (no duplicate
+IMEIs, single organisation), the roster growth from 398 (24 Aug) to 1133
+(now) is fully explained as genuine intake — no inflation mechanism
+found. The Zoho reconciliation can proceed sized against ~1133 devices
+without a data-integrity caveat on the row count itself.
