@@ -555,6 +555,56 @@ is the correct whole-tree hash for commit `8cfbb99`**. Per-file reference:
 (unchanged) — all for reference only; the whole-tree hash is what to
 compare against immediately before running `gsk hosted deploy`.
 
+**Recomputed for the actual deploy commit (2026-09-07) — the `8cfbb99`
+hash above is stale for this deploy.** `8cfbb99` was six commits behind
+the deploy set's tip; both `src/` and `public/static/app.js` moved again
+since then (`89fb02b`: fixed the bulk-transition reject/un-reject
+authorization bypass, H0 — shared `checkRejectUnrejectGate()` gate helper
+in `src/lib/deviceLifecycle.ts`, defense-in-depth inside
+`transitionDevice()`, bulk-route gating and UI-affordance role-filtering
+in `src/routes/devices.ts`/`public/static/app.js`; `2c906d0`, `31ec566`,
+`d6c81e0`, `b37ad9b`: docs-only / test-harness-only, no `src/`/`public/`
+changes), so the recorded whole-tree hash no longer matches the artefact
+this deploy actually publishes. Two independent clean
+`rm -rf dist && npm run build` runs at `b37ad9b` (the deploy set's tip —
+`89fb02b`, `2c906d0`, `31ec566`, `d6c81e0`, `b37ad9b` since the prior
+deploy at `8cfbb99`/`b9310dd`; `origin/main` and `genspark/main` still at
+`76c51e8`) produced the identical whole-tree hash —
+**`c6e68b33c286e5dac0ae90f4588be9ae7616eebb02096c182b1b688eaaf8a6a9`
+is the correct whole-tree hash for commit `b37ad9b`**. Per-file reference:
+`dist/_worker.js` →
+`d9872783f3f32831dca8254838cf75e0d804d48cef9f1336140b64a1ca984750`,
+`dist/static/app.js` →
+`c6460563ee6a82fdb74472ba4cd1cf1b6891564e10df6c64db6bc94b3cd7fc23`,
+`dist/_routes.json` →
+`faae3ca654c8fa00f52b7311d3c9e1bdc36f39022ec6d4832ecc3d5d7da519ca`
+(unchanged — no route surface change), `dist/static/favicon.svg` →
+`287dc951275876be22d043fa4ab1364c7cf03aea602c6f9495e51b9c135079dc`
+(unchanged), `dist/static/style.css` →
+`be55b78ce2c4a16c3d4d12a4dfdab556f1b8753ab0a385a95f2bdbc7948383fd`
+(unchanged), `dist/tracker/index.html` →
+`25f91f7a411424c78c01249221d28372d1b23ad2577c8a834cc75c68420e49f0`
+(unchanged) — all for reference only; the whole-tree hash is what to
+compare against immediately before running `gsk hosted deploy`. As with
+prior recomputations, this hash will itself go stale the moment another
+commit touches `src/` or `public/`; recompute fresh for whichever commit
+is the actual deploy target next time, rather than trusting this recorded
+value past this deploy.
+
+**This is the deploy this hash is for.** `b37ad9b` ships the H0
+bulk-transition authorization-bypass fix — currently live and
+unpatched in production `b9310dd` — as the sole code change in the set;
+`2c906d0`/`31ec566`/`d6c81e0`/`b37ad9b` on top are docs/test-harness only.
+`migrations/` re-checked immediately before this build: tip is `0031`,
+`migrations-held/0030_...` remains correctly held per its own README
+(no migration to apply for this deploy). No further code, docs, or
+investigation work is queued before the live deploy sequence — this
+commit closes the offline lane for this deploy; the next actions are the
+unbroken live sequence (`gsk login-info` → `git push origin main` →
+`git push genspark main` → `wrangler deploy` naming `d6aea290-...`
+explicitly → `gsk login-info`), issued as the FIRST live commands of a
+fresh turn with nothing preceding them.
+
 Two scope decisions settled for this deploy batch, recorded here rather
 than left implicit: (1) export-staging/consignment-move operator-role
 test coverage (`opr.ts`'s `/shipments/:id/scan` and `/lines`) is
