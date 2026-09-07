@@ -516,3 +516,49 @@ account-binding property of the sandbox, external to anything this project
 does.**
 
 **+12 test-delta breakdown (562→574, 2026-09-07)** — verified by `git diff 76c51e8 89fb02b` line-count, not retyped from memory: exactly 5 new `it()` blocks added to `test/deviceLifecycle.spec.ts` (the H0 direct-call gate + its "every other edge unaffected" scope test) and exactly 7 new `it()` blocks added to `test/repairWorkflow.spec.ts` (the bulk-path gate cases, numbered #44-#50 in-file) = 12, confirmed as the ONLY two files touched in that diff and the only source of new `it()` blocks — the pre-existing `ALLOWED_TRANSITIONS` data-driven sweep had its loop body edited (added `reasonMetadataFor()` calls) but not its iteration bounds, so it contributed zero to the count. Fresh full-suite re-run this session: 574 passed, 8 skipped, 29 files, 0 failed.
+
+**STEP 5(b) finding (2026-09-07) — H2 eliminated, H1 promoted to rank 1.**
+Checked whether `public/static/app.js`'s `BulkTransitionModal()` renders
+`skipped` per-row outcomes distinctly from `transitioned`/`error` (H2's
+stated premise: "if app.js does not render skipped rows, that presents as
+nothing happened, no error"). It DOES:
+
+```js
+// public/static/app.js:1227 (current HEAD) / :1196 (production b9310dd)
+const outcomeCls = { transitioned: 'badge-green', skipped: 'badge-amber', error: 'badge-red' };
+...
+// public/static/app.js:1286-1291 (current HEAD) / :1244 area (b9310dd)
+allResults.map(r => h('div', { class: 'py-1.5 px-1 text-xs flex items-center gap-3' },
+  h('span', { class: 'badge ' + (outcomeCls[r.outcome] || 'badge-slate') }, r.outcome),
+  h('code', { class: 'mono flex-1' }, r.imei),
+  r.from_status ? h('span', { class: 'text-slate-500' }, r.from_status) : null,
+  r.message ? h('span', { class: 'text-slate-400 truncate max-w-xs' }, r.message) : null
+))
+```
+
+Confirmed present since `278299b` (2026-08-12, `git log -S BulkTransitionModal`)
+and byte-verified present, unchanged in shape, in production's currently-deployed
+bundle `b9310dd` (`git show b9310dd:public/static/app.js` lines 1196/1244).
+An amber badge, the literal word "skipped", the row's `from_status`, and any
+server `message` are all rendered per-row in the same progress panel as
+successful (`transitioned`, green) and `error` (red) rows — a skipped row is
+not silent or indistinguishable, it is a differently-coloured row in the same
+list.
+
+**Conclusion: H2 is eliminated as written.** The premise "app.js does not
+render skipped rows" is false for both the current codebase and the
+currently-deployed production bundle. This finding is a UI-code citation
+(source-level, confirming what ships), not yet a live browser-rendered
+screenshot citation — a live browser check of the actual bulk-transition
+modal showing a mixed batch (some skipped, some transitioned) has NOT been
+run this session; per the standing rule that a rendered-verdict claim must
+come from a browser check not source inspection, that browser run is the
+next step before treating "operators can see skipped rows" as fully proven,
+though the source evidence alone is already sufficient to eliminate H2's
+specific mechanism as stated.
+
+**H1 (Luhn checksum gate vs iPad alphanumeric Apple serials) is now rank 1**
+by elimination, pending its own reproduction — not yet attempted. The
+original operator complaint ("nothing happened, no error") remains
+UNREPRODUCED under any hypothesis so far; H2's elimination narrows but does
+not resolve it.
