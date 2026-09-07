@@ -473,3 +473,44 @@ was found in migration 0023 itself (missing `repair_jobs`/
 now stopped for that reason, not merely the control-plane instability
 described above (which remains separately true and would have held the
 deploy regardless).
+
+**AMENDED (2026-09-07) — the "every `gsk hosted` read returns
+`resource_not_found` for d6aea290-..., worker/D1/stats/custom_domain all
+report nothing provisioned, while production is independently confirmed
+live over plain HTTPS" pattern documented above (2026-08-18 entry) is now
+understood NOT to be a D1/control-plane fault.** This session's sandbox
+account context is shared between two unrelated Genspark accounts
+(`saigateslimited@gmail.com`, owner of this project, and a second account
+owning an unrelated worker `ff2edf75-...`) and can flip mid-session with
+no warning. A `gsk hosted` read issued while the session context had
+silently flipped to the OTHER account would see that account's own
+resources (correctly reporting `ff2edf75-...` as found, per the `list`
+output logged above) and correctly report `resource_not_found` for
+`d6aea290-...` — because, from that account's point of view, it genuinely
+owns no such resource. This reproduces every symptom recorded above
+exactly: total control-plane blindness for this project's id specifically,
+zero effect on the actual live Cloudflare Worker (which the flipped
+session context has no authority over either way), and the earlier,
+milder D1-only version of the same failure a few hours before it. The
+original attribution to a "session/control-plane visibility gap" was a
+reasonable inference at the time from the evidence available, but the
+actual root cause is an identity/session-binding issue on the sandbox
+side, not a Cloudflare/D1-side fault. Standing mitigation adopted this
+session (Task 0, "Identity gate"): bracket every live `gsk hosted`
+command with `gsk login-info` immediately before AND after, and require
+`worker_get d6aea290-...` to resolve before trusting any other read for
+this project; on failure of either, stop rather than retry, switch
+accounts, or fall back to an unqualified command.
+
+**This mechanism is no longer an inference — it has now been directly
+OBSERVED three times: the 2026-08-18 incident documented above, a second
+occurrence surfaced during the 588/619 forensic investigation, and a third
+today (2026-09-07) caught one call apart from a clean success (`gsk
+login-info` read `saigateslimited@gmail.com`, `worker_get` resolved
+correctly, then a single subsequent `login-info` bracket check — with only
+a local file edit in between, no live call — read `sagarsptl@gmail.com`).
+The flip is time-driven, not triggered by any specific command: nothing
+issued between the two checks could plausibly have caused a control-plane
+identity change, which is itself the evidence that this is a session/
+account-binding property of the sandbox, external to anything this project
+does.**
