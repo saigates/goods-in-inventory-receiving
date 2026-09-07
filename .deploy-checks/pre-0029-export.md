@@ -562,3 +562,172 @@ by elimination, pending its own reproduction — not yet attempted. The
 original operator complaint ("nothing happened, no error") remains
 UNREPRODUCED under any hypothesis so far; H2's elimination narrows but does
 not resolve it.
+
+---
+
+## Deploy of the H0 fix (89fb02b) to production — completed 2026-09-07
+
+Deployed via `gsk hosted deploy d6aea290-bd61-4f82-aa8d-94378b9f2fec`, NOT
+raw `wrangler deploy` — this project is hosted on Genspark's managed
+Cloudflare account (`account_id: 7d2579beb52424d39cdd02c0983151e9`,
+confirmed via `gsk hosted worker_get`), not the user's own BYOK account.
+**`gsk hosted deploy` is accepted as the deploy command for this project
+going forward.** `account_id 7d2579beb52424d39cdd02c0983151e9` is recorded
+here as the durable identity anchor for this project — more reliable than
+asserting against an email string, since the shared-sandbox identity
+binding has now been observed to flip mid-session (see below).
+
+Sequence: `gsk login-info` (saigateslimited@gmail.com) → `gsk hosted
+worker_get` (resolved) → both git remotes confirmed already at `d9d6f61`
+(no push needed — `git ls-remote` is independent of `gsk` identity and
+was verified separately) → `gsk hosted deploy d6aea290-...` → returned
+`code=pending_approval` (destructive-action handshake, not a single
+atomic call as originally assumed) → user approved via the sandbox UI
+banner → `gsk hosted action_wait` returned `code=ok, state=completed`,
+version `f5707718-45bc-4ab2-9c5f-8f4e824e5203` → closing `gsk login-info`
+held clean (saigateslimited@gmail.com) — **first clean bracket close in
+six attempts.** Deploy log: preflight passed, `No migrations to apply!`
+(consistent with the pre-deploy migrations re-check — tip `0031`, nothing
+pending), only `/static/app.js` uploaded as a changed asset (3 unchanged).
+
+Post-deploy verification, three independent checks, all agree:
+- `curl` production root → HTTP 200.
+- Local rebuild at `d9d6f61` (4 independent `rm -rf dist && npm run
+  build` runs across two turns) → whole-tree hash
+  `c6e68b33c286e5dac0ae90f4588be9ae7616eebb02096c182b1b688eaaf8a6a9`,
+  identical every time.
+- `curl`'d production's live `/static/app.js` directly → SHA-256
+  `c6460563ee6a82fdb74472ba4cd1cf1b6891564e10df6c64db6bc94b3cd7fc23`,
+  byte-identical to the local build's `dist/static/app.js`.
+
+**The H0 bulk-transition reject/un-reject authorization-bypass fix is
+confirmed live in production.** Bulk transitions to/from REJECTED are now
+manager-only and reason-code-required, matching the single-device path.
+The interim operational instruction to avoid the bulk screen for REJECTED
+is withdrawn.
+
+Both `origin/main` (GitHub) and `genspark/main` (SB-Git) reconciled and
+confirmed at `d9d6f61` via `git ls-remote`, checked independently across
+two separate turns with identical results both times — no commit exists
+only on sandbox disk.
+
+### Identity flip #7 — new failure mode observed
+
+Immediately after the successful deploy and its closing `login-info`
+check, a subsequent `gsk hosted d1_query` call (unrelated to the deploy
+itself, part of the queued forensic work) failed with
+`resource_not_found: "No D1 database deployed for project
+d6aea290-..."`, and a follow-up `gsk hosted worker_get` on the same
+project failed with `resource_not_found: "No worker deployed for
+project d6aea290-..."` — for a project that had returned a clean
+`code=completed` with a live deployment_url twice earlier in the same
+turn, and was independently confirmed reachable via a direct `curl` to
+its public URL around the same time. `gsk login-info` immediately after
+confirmed the binding had flipped to `sagarsptl@gmail.com`. This is the
+same flip mechanism observed on 2026-08-18 and in the 588/619
+investigation, producing `resource_not_found` (not a permission error)
+because from the wrong account's perspective the project genuinely isn't
+in its namespace — consistent across all observed instances, not a new
+error shape. **Confirmed: this flip occurred strictly AFTER the
+deploy's own closing bracket had already succeeded** — the irreversible
+action (the deploy itself) completed and was verified under a
+confirmed-correct identity before the flip happened; only the
+subsequent read-only forensic queries were interrupted and had to be
+re-run in a later turn under a freshly re-opened, separately-verified
+bracket.
+
+---
+
+## Forensic re-run — bulk-flag distribution and 588/619 history (2026-09-07)
+
+Read-only, UUID-pinned (`--project-id d6aea290-bd61-4f82-aa8d-94378b9f2fec`),
+run under a confirmed-clean bracket (`login-info` + `worker_get` both
+checked immediately before).
+
+**Bulk-flag distribution** (`device_events` where `metadata LIKE
+'%"bulk":true%'`, grouped by `to_status`):
+```
+SORTING: 345   (100% of all bulk-flagged events)
+```
+Zero bulk-flagged events of any other `to_status`, and separately, only
+2 REJECTED-direction events exist anywhere in the entire `device_events`
+table (`RECEIVED→REJECTED`), neither of which is bulk-flagged (see below).
+
+**Conclusion: H0 was a real authorization bypass but was never actually
+exploited via the bulk path.** No historical bulk-REJECTED transition
+ever occurred in production, so no audit remediation of past bulk
+rejections is needed — this closes that question.
+
+**Devices 588 and 619 — full event history** (the entire REJECTED-direction
+event set in the table; these two rows are not a sample, they are the
+complete set):
+
+| device_id | event | from→to | when | metadata | bulk? |
+|---|---|---|---|---|---|
+| 588 | RECEIVE | null→RECEIVED | 2026-08-28 14:10:15 | sku APL-I15P-256-BLT-UG, grade UG, vat_type MARGIN, buy_price 323 | — |
+| 588 | STATUS_CHANGE | RECEIVED→REJECTED | 2026-08-28 14:10:22 (7s later) | null | no |
+| 619 | RECEIVE | null→RECEIVED | 2026-09-01 13:53:21 | sku APL-I13-128-BLU-A, grade A, vat_type MARGIN, buy_price 180 | — |
+| 619 | STATUS_CHANGE | RECEIVED→REJECTED | 2026-09-01 14:03:41 (~10 min later) | null | no |
+
+Both rejections: `user_id=2`, no bulk metadata, `metadata: null` on the
+reject event itself. **Conclusion: 588 and 619 were single-device
+mis-taps on the receive screen, not bulk-transition casualties.** The
+7-second gap on 588 in particular reads as an immediate accidental tap
+right after receiving. This redirects the operator's original "bulk did
+nothing" complaint away from the bulk UI entirely for these two specific
+devices — whatever produced the complaint, it did not go through the
+bulk path for 588/619. H1 (Luhn/iPad-serial) reproduction remains the
+open lead for the complaint itself; these two devices are now understood
+as a separate, already-explained issue (operator UI slip), correctable
+via the single-device UI with reason code `rejected_in_error` now that
+the route is live.
+
+---
+
+## Roster provenance — 397/1 retired, 1120/13 (now 1133-total) is current
+
+`by_vat_type_raw`'s per-org, status-unfiltered device count was queried
+directly against `received_devices` this session (bypassing the
+manager-gated HTTP endpoint, which the standing "no per-person account as
+disposable fixture" rule puts off-limits for a login-based call): as of
+2026-09-07, MARGIN 1120 / PVAT 13, table total 1133.
+
+This does not match the previously-referenced "MARGIN 397 / PVAT 1"
+figures used earlier in the project's history. Four targeted queries
+(read-only, org-scoped, run under a single confirmed-clean bracket)
+resolve the discrepancy exactly rather than leaving it open:
+
+```
+SELECT COUNT(*), COUNT(DISTINCT imei) FROM received_devices WHERE organisation_id=1
+  → total_rows=1133, distinct_imei=1133   (no duplicate IMEI imports)
+
+SELECT status, COUNT(*) ... GROUP BY status
+  → RECEIVED 533, SORTING 401, IN_EXPORT_CONSIGNMENT 155,
+    ACTIVE_INVENTORY 25, IN_HOUSE_REPAIR 17, REJECTED 2   (sums to 1133)
+
+SELECT COUNT(*) WHERE created_at <= '2026-08-24 23:59:59'
+  → 398   (exact match to the historical 24-Aug snapshot total)
+
+SELECT DISTINCT organisation_id FROM received_devices
+  → {1}   (single organisation, no cross-org contamination)
+```
+
+**Conclusion: 397/1 was the 24 August snapshot, now superseded by
+genuine growth to 1133 total (1120 MARGIN / 13 PVAT).** The +735-device
+delta since 24 Aug has a clean row-level explanation consistent with
+organic growth: every row has a distinct IMEI (duplicate-import
+hypothesis eliminated at the row level), the growth concentrates in
+early-lifecycle statuses (RECEIVED + SORTING = 934 of 1133, i.e. mostly
+recent/unprocessed intake, not stuck duplicates), and there is only one
+organisation in the table. This does not fully rule out a subtler
+placeholder-row mechanism (manifest-created rows for devices not
+physically received) without a further cross-reference against
+`expected_devices`/manifest scan events, which has NOT been run and is
+noted here as optional follow-up, not yet needed to accept the
+row-level duplicate-import hypothesis as eliminated.
+
+**397/1 is retired from further reproduction.** `by_vat_type_raw` should
+not be re-queried for provenance purposes going forward — 1120/13
+(1133 total) is the current, accepted figure. The Zoho reconciliation
+scope should be sized against ~1133 devices, not ~398 — roughly 3x the
+previously-assumed scale.
