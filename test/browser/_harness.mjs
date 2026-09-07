@@ -12,7 +12,7 @@
 // provably against the code it claimed to test, only "not necessarily
 // wrong". This file exists so that can never happen again, undetected.
 //
-// Two guarantees, both enforced — not documented — by running as soon as any
+// Three guarantees, all enforced — not documented — by running as soon as any
 // *.browser.mjs imports this module as its FIRST import (top-level code in
 // an ES module runs synchronously on import, before the rest of the calling
 // file's body executes):
@@ -149,3 +149,54 @@ if (servedHash !== sourceHash) {
   process.exit(2)
 }
 console.log(`[harness] bundle freshness OK — served /static/app.js matches current source (sha256 ${sourceHash.slice(0, 12)}...)`)
+
+// ── 3. IMEI-prefix uniqueness assertion (2026-09-07) ────────────────────
+// Two silent registry collisions were found by a manual housekeeping pass
+// this session, both in files dated 2026-08-18 (reject-reason-ui claimed
+// 8604560, already bills-tab's; reject-role-filter-ui claimed 8604561,
+// already manifest-bill-link's) — present in the repo undetected for
+// weeks, because the only source of truth was test/browser/README.md's
+// prose registry, read and updated by hand, with nothing to actually
+// enforce it. mkImei()'s Date.now()-jitter component makes an ACTUAL
+// IMEI collision on any single historical run unlikely but not
+// impossible (e.g. two scripts' fixtures landing in the same second in a
+// shared CI run) — a markdown list a human has to remember to check
+// before adding a new script will collide again. This closes that gap
+// mechanically: every *.browser.mjs file's own claimed prefix (the
+// literal 7-digit string inside its mkImei() function, extracted by
+// static grep — this does not execute any script, just reads the
+// prefix each one declares for itself) must be unique across the whole
+// directory. A duplicate aborts EVERY script's run, not just the new
+// one, since either script's fixtures could now collide with the
+// other's on any given run — there is no way to know which one is
+// "wrong" without a human decision, so this is a hard stop, not a
+// warning.
+try {
+  const { readdirSync } = await import('node:fs')
+  const dir = join(REPO_ROOT, 'test', 'browser')
+  const files = readdirSync(dir).filter((f) => f.endsWith('.browser.mjs'))
+  const byPrefix = new Map() // prefix -> [filenames]
+  for (const file of files) {
+    const content = readFileSync(join(dir, file), 'utf8')
+    // Matches the mkImei() pattern every script in this directory uses:
+    // const mkImei = (n) => { const body = ('8604568' + ... ) ... }
+    const m = content.match(/mkImei\s*=\s*\([^)]*\)\s*=>\s*\{[^}]*?\(\s*'(\d{7})'/s)
+    if (!m) continue // scripts with no mkImei() (no received_devices fixtures) are exempt
+    const prefix = m[1]
+    if (!byPrefix.has(prefix)) byPrefix.set(prefix, [])
+    byPrefix.get(prefix).push(file)
+  }
+  const collisions = [...byPrefix.entries()].filter(([, fs]) => fs.length > 1)
+  if (collisions.length > 0) {
+    console.error('[harness] IMEI PREFIX COLLISION DETECTED across test/browser/*.browser.mjs:')
+    for (const [prefix, fs] of collisions) {
+      console.error(`[harness]   '${prefix}' claimed by: ${fs.join(', ')}`)
+    }
+    console.error('[harness] Fixtures from these scripts can collide on the received_devices.imei UNIQUE constraint on any run where their Date.now() jitter lines up. Reassign one of each colliding pair to the next free prefix in test/browser/README.md\'s registry before running anything in this directory.')
+    process.exit(2)
+  }
+  console.log(`[harness] IMEI prefix uniqueness OK — ${byPrefix.size} distinct prefixes across ${files.length} scripts (${files.length - [...byPrefix.values()].flat().length} exempt, no mkImei())`)
+} catch (err) {
+  console.error(`[harness] IMEI-PREFIX-UNIQUENESS CHECK COULD NOT RUN: ${err.message}`)
+  process.exit(2)
+}
