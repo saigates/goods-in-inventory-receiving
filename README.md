@@ -331,6 +331,8 @@ If you ever see an error toast when adding one of these to the catalogue instead
 - **Tech Stack**: Hono · TypeScript · Cloudflare D1 · vanilla JS SPA · Tailwind CDN
 - **Last Updated**: 2026-07-29 — `sku_catalog` uppercase-normalized + expanded with 14 latest Apple/Samsung models (668 new rows; production 2,118 → 2,781 rows; migration 0017, applied directly to prod/local D1 and captured in the migration file for future fresh-environment sync). Previously 2026-07-28 (OPR 6) (OPR 5 frontend UI — full OPR tab in the SPA, browser-proven by 30 Playwright checks; identifier rule tightened to strict 15-digit IMEI + Luhn / 10-character alphanumeric serial; previously OPR 1–4 API-level, JWT auth + multi-tenancy, device status lifecycle + `device_events` audit log, valuation fields, server-side authoritative validation, `/api/devices` read+CSV-export API, outbound signed webhooks)
 
+  > **CORRECTION (2026-09-08)**: the date above went stale without being updated — this line stopped being touched after the `0017` catalog pass even though many deploys have shipped since (`.deploy-checks/` alone has dated records through 2026-09-08, including the H0 fix deploy on 2026-09-07 and the CSV-export deploy today). Rather than re-date this line again to a value that will just as quietly go stale, treat **git log on `main`** and **`.deploy-checks/*.md`** as the live sources of truth for "what changed when"; this front-matter line is kept only as a historical record of the last time it was hand-maintained.
+
 ### Local dev
 ```bash
 npm install
@@ -353,6 +355,22 @@ above; SKU seed loaded); `JWT_SECRET` set as a write-only worker secret
 (commit `f6de852`) — the CSV-export fixes, the credentialed-login pass (migration
 0016), and the ten-file OPR/repair/catalog batch above are all live. Full
 verification record: `.deploy-checks/g5-phase2-live-half.md`'s "DEPLOYED" section.
+
+> **CORRECTION (2026-09-08)**: `f6de852` is now stale by 28 commits — production has
+> moved on since this paragraph was written and was NOT re-checked at each
+> subsequent deploy. Verified this pass by app.js hash-match (curl production's
+> live `/static/app.js`, sha256, match against `git show <commit>:public/static/app.js`
+> for candidate commits): the live asset is byte-identical to `aae5b1f` ("B3/B4:
+> CSV export column-set correction...", 2026-09-08), which is 28 commits ahead of
+> `f6de852` and itself an ancestor of a later deploy recorded in
+> `.deploy-checks/pre-0029-export.md` (`89fb02b`, deployed 2026-09-07, version
+> `f5707718-45bc-4ab2-9c5f-8f4e824e5203`) and of `.deploy-checks/csv-export-deploy-2026-09-08.md`
+> (today's deploy, built from `aae5b1f`). The user-cited comparison hash `6a9810a4`
+> does not exist as a git object in this repo (`git cat-file -t 6a9810a4` → "fatal:
+> Not a valid object name") — flagging as unresolved/possibly a typo or truncation
+> rather than guessing at intent. Treat `f6de852` throughout this file as a
+> historical marker, not a current fact; re-derive the live commit via the
+> hash-match method above before relying on any "production is on commit X" claim.
 
 > ⚠️ **Two environments, and until 2026-07-28 they had DIFFERENT passwords.** The
 > production Worker and the local sandbox preview (`localhost:3000` / the in-chat
@@ -732,6 +750,24 @@ had been sitting in `migrations/` unshipped has been deployed, along with
 all `main` commits up to and including `f6de852`. Only `migrations-held/
 0030_...sql` remains withheld (needs renumbering before restoration, see
 `migrations-held/README.md`); no other pending deploy exists as of this
+
+> **CORRECTION (2026-09-08) — this posture paragraph is itself now stale,
+> exactly the pattern its own `sku_catalog` correction above warns about.**
+> At least two more deploys have shipped since `f6de852`: `89fb02b` (H0 fix,
+> 2026-09-07, `.deploy-checks/pre-0029-export.md`) and the commit backing
+> today's CSV-export deploy, `aae5b1f` (`.deploy-checks/csv-export-deploy-2026-09-08.md`).
+> Live-asset hash-match (curl production `/static/app.js`, sha256
+> `e45e4afdb4688dcd73504293bc5eff5982976d124e7588abd29702000192fd99`) matches
+> `git show aae5b1f:public/static/app.js` and `HEAD`'s copy of the same file
+> byte-for-byte, and `f6de852` is a confirmed ancestor of `aae5b1f` (28 commits
+> back) — so **production's frontend is provably at `aae5b1f` or a later
+> no-app.js-change deploy, not `f6de852`.** No authenticated production API
+> call was made to corroborate this (the only two real per-person accounts are
+> off-limits as fixtures); this is a source-level proof, not a live-endpoint
+> proof. A hash cited elsewhere as `6a9810a4` does not exist in this repo's git
+> history and could not be reconciled — flagged rather than guessed at. Trust
+> `.deploy-checks/*.md` and the hash-match method over this paragraph's prose
+> until it is rewritten against a fresh live check.
 pass.
 
 **Live corroboration (2026-08-21, superseded same day by the deploy below)**
