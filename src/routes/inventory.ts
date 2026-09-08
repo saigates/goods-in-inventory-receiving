@@ -13,13 +13,14 @@ const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 // PAGINATED (2026-09-07 — "Inventory only shows devices when scanned/
 // filtered" fix, part B2): this endpoint previously had no total-count or
 // offset support at all — a bare `limit` (capped 500) with no way to see
-// or reach anything past it, so with 1133 real devices the Inventory page
-// could only ever render the newest ~200-500 and had no way to tell the
-// operator more existed. Now mirrors GET /api/devices's page/page_size/
-// total contract exactly (same param names, same 200 cap) so the two
-// list endpoints behave identically from a caller's perspective. `total`
-// is always returned so the UI can render "Showing 1-200 of 1133" and
-// never silently present a truncated list as complete.
+// or reach anything past it, so once the org's device count grew past that
+// cap the Inventory page could only ever render the newest ~200-500 and had
+// no way to tell the operator more existed. Now mirrors GET /api/devices's
+// page/page_size/total contract exactly (same param names, same 200 cap) so
+// the two list endpoints behave identically from a caller's perspective.
+// `total` is always returned so the UI can render e.g. "Showing 1-200 of
+// 1,412" — the LIVE count from the server, never a value fixed at
+// fix-time — and never silently present a truncated list as complete.
 app.get('/', async (c) => {
   const user = currentUser(c)
   const q = c.req.query()

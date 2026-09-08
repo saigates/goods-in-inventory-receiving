@@ -210,7 +210,7 @@
     devicesAll: [],              // GET /api/devices?status=... rows for the current filter (All Devices sub-view)
     devicesAllFilter: '',        // status filter for All Devices ('' = no filter, show a curated default set)
     devicesAllSearch: '',        // q= search box for All Devices
-    devicesAllPage: 1,           // current page (B2, 2026-09-07 — "only 200 shown of 1133" fix)
+    devicesAllPage: 1,           // current page (B2, 2026-09-07 — "only 200 of N shown" fix)
     devicesAllTotal: 0,          // total row count matching the current filter, from the server
     repairQueue: [],             // GET /api/devices/repair-queue rows
     qcFailedDevices: [],         // GET /api/devices?status=QC_FAILED

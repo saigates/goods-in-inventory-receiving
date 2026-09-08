@@ -858,11 +858,12 @@ describe('GET /api/devices/export/csv — organisation scoping', () => {
 
 // The old "the row cap refuses truncation" describe block asserted an
 // EXPORT_ROW_CAP=5000 → 413 contract that no longer exists — B3 removed the
-// cap entirely (see src/routes/devices.ts's module comment point 1: the org
-// now has 1133+ devices and growing, so refusing large exports is not an
-// option; the route streams instead). That test asserted a real invariant
-// ("count > cap ⇒ refuse, and say how many") which is simply gone now, not
-// replaced by an equivalent — there is no cap left to test. Removed here
+// cap entirely (see src/routes/devices.ts's module comment point 1: the
+// org's device count is well past four figures and growing, so refusing
+// large exports is not an option; the route streams instead). That test
+// asserted a real invariant ("count > cap ⇒ refuse, and say how many")
+// which is simply gone now, not replaced by an equivalent — there is no
+// cap left to test. Removed here
 // rather than left in place asserting dead behaviour, per the standing
 // instruction to say explicitly when a case no longer has meaning rather
 // than silently deleting it. Its replacement invariant — "every matching

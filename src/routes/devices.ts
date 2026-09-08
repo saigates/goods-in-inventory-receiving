@@ -137,11 +137,11 @@ app.get('/:id', async (c) => {
 // the same standing "export must never lie about what it contains" rule:
 //   1. NO row cap / no LIMIT-OFFSET anywhere in this path. The previous
 //      EXPORT_ROW_CAP=5000-then-413 pattern refused large selections
-//      outright; the org now has 1133+ devices and growing, so refusing is
-//      not an option — the query is a plain unbounded SELECT and the
-//      response is STREAMED (hono/streaming's `stream()`) row-by-row so an
-//      arbitrarily large result set never has to live in memory as one
-//      giant string/array before being sent.
+//      outright; the org's device count is well past four figures and
+//      growing, so refusing is not an option — the query is a plain
+//      unbounded SELECT and the response is STREAMED (hono/streaming's
+//      `stream()`) row-by-row so an arbitrarily large result set never has
+//      to live in memory as one giant string/array before being sent.
 //   2. Column set is a SUPERSET of the old 16-column shape plus the new
 //      lifecycle/costing fields — NOT a replacement (the first draft of
 //      this rewrite wrongly dropped uuid/created_at/brand/capacity/color;
