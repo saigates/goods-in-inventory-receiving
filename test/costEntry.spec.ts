@@ -286,3 +286,103 @@ describe('POST /api/devices/:id/purchase/cost-ledger', () => {
     expect(rows).toHaveLength(0)
   })
 })
+
+// ───────── §3 write-once acquisition cost, across a full repair cycle ─────────
+// Explicit instruction (2026-09-08 brief): acquisition cost is write-once —
+// mandatory at first goods-in, never re-required, never null-on-rescan,
+// changeable only by an explicit correction row. Prove this by driving a
+// device out to repair and back and asserting the cost_ledger 'purchase'
+// row is BYTE-IDENTICAL afterwards (same id, same amount, same
+// created_at/created_by — i.e. genuinely untouched, not just "still equal
+// by coincidence" after a delete+reinsert).
+//
+// Structural precondition already confirmed by grep (function+line cited
+// in the session's own report): postPurchaseCostToLedger() is reachable
+// ONLY via POST /:id/purchase/cost-ledger (devices.ts:926) — nothing in
+// scan.ts's repair start/scan-back/qc/close-to-inventory path calls it —
+// so this test is confirming that structural fact holds under a real HTTP
+// round trip through the repair routes, not re-deriving it from scratch.
+describe('acquisition cost is write-once across a repair scan-out/scan-back cycle (§3)', () => {
+  it('cost_ledger purchase row is byte-identical after start repair → scan-back → QC pass → close-to-inventory', async () => {
+    // SORTING is one of the two REPAIR_STARTABLE_STATUSES
+    // (src/lib/repairWorkflow.ts:35) with a real outbound
+    // ALLOWED_TRANSITIONS edge to IN_HOUSE_REPAIR (deviceLifecycle.ts:42).
+    // NOTE: the OTHER startable status, ACTIVE_INVENTORY, has ZERO
+    // outbound edges in ALLOWED_TRANSITIONS (deviceLifecycle.ts:43, `[]`)
+    // — confirmed by reproduction: starting repair from ACTIVE_INVENTORY
+    // passes REPAIR_STARTABLE_STATUSES' own check but then 500s inside
+    // transitionDevice(), an existing inconsistency between the two lists,
+    // NOT something this test fixes (out of scope for a write-once-cost
+    // test; flagged here for whoever next touches repairWorkflow.ts).
+    // RECEIVED (this file's seedDevice default) is not startable at all —
+    // test/repairWorkflow.spec.ts's own #19 uses SORTING for the same
+    // reason, matching that established convention here.
+    const deviceId = await seedDevice('SORTING' as DeviceStatus)
+
+    // Model is required by the READY_FOR_ZOHO gate's condition 3, and SKU
+    // must not end '-UG' per gate condition 6/7 — seedDevice() already
+    // sets sku='SAM-S26-256-CVT-A' (grade A suffix) and model, so those
+    // gate conditions should clear on QC PASS without extra setup here.
+    const acquisition = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/purchase/cost-ledger`, {
+      method: 'POST',
+      body: JSON.stringify({ amount_gbp: 137.5, note: 'Original acquisition cost' }),
+    })
+    expect(acquisition.status).toBe(201)
+    const beforeRows = await costLedgerFor(deviceId)
+    expect(beforeRows).toHaveLength(1)
+    const before = beforeRows[0]
+    expect(before.cost_type).toBe('purchase')
+    expect(before.amount_gbp).toBe(137.5)
+
+    // Scan the device OUT to repair.
+    const start = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/start`, {
+      method: 'POST',
+      body: JSON.stringify({ fault_code: 'SCREEN_CRACK' }),
+    })
+    expect(start.status).toBe(201)
+
+    // ... acquisition cost must not move mid-repair either, not just at
+    // the end — check immediately after scan-out, before scan-back.
+    const midRepairRows = await costLedgerFor(deviceId)
+    expect(midRepairRows).toHaveLength(1)
+    expect(midRepairRows[0]).toEqual(before)
+
+    // Scan the device BACK from repair.
+    const scanBack = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/scan-back`, { method: 'POST' })
+    expect(scanBack.status).toBe(200)
+
+    // QC PASS → READY_FOR_ZOHO, then close to inventory — completes the
+    // full cycle the instruction described ("scan a device out to repair
+    // and back"), going all the way back to a normal inventory status
+    // rather than stopping mid-cycle.
+    const qc = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/qc`, {
+      method: 'POST',
+      body: JSON.stringify({ result: 'PASSED' }),
+    })
+    expect(qc.status).toBe(200)
+    const qcBody = await qc.json() as { device: Record<string, unknown> }
+    expect(qcBody.device.status).toBe('READY_FOR_ZOHO')
+
+    const close = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/repair/close-to-inventory`, { method: 'POST' })
+    expect(close.status).toBe(200)
+
+    // Byte-identical assertion: the exact same row (id, amount, currency,
+    // provenance, created_by_user_id, created_at, note — every column),
+    // proving nothing DELETEd-and-reinserted it either.
+    const afterRows = await costLedgerFor(deviceId)
+    expect(afterRows).toHaveLength(1)
+    expect(afterRows[0]).toEqual(before)
+
+    // A second purchase-cost POST for the SAME positive amount without the
+    // override flag must still be refused (409) — the write-once guard
+    // itself is unaffected by having gone through a repair cycle.
+    const secondAttempt = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/purchase/cost-ledger`, {
+      method: 'POST',
+      body: JSON.stringify({ amount_gbp: 200 }),
+    })
+    expect(secondAttempt.status).toBe(409)
+    const afterRejectedAttempt = await costLedgerFor(deviceId)
+    expect(afterRejectedAttempt).toHaveLength(1)
+    expect(afterRejectedAttempt[0]).toEqual(before)
+  })
+})
