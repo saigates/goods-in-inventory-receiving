@@ -794,6 +794,38 @@ button), so this check proves presence for both, not an absence for one:
 
 IMEI prefix: `8604569`.
 
+**Two platform facts found writing this script, standing for every future
+role-gated/download browser check in this directory, not just this one:**
+
+1. **`Content-Disposition: attachment` never produces a popup navigation
+   to assert against.** Any route that streams a file download (this one,
+   and any future print/export route reached via `openWithDocToken()`) will
+   make the popup Playwright's `page.waitForEvent('popup')` hands back sit
+   at `about:blank` for its entire life — `page.on('response')` /
+   `popup.waitForLoadState()` on that popup will never fire for the real
+   request. The download instead surfaces as a `download` event on the
+   owning browser **context** (`context.on('download')` /
+   `context.waitForEvent('download')`). `download.url()` still carries the
+   exact requested URL (including query string, so `?excel=1` is still
+   assertable there) and `download.createReadStream()` still reads the
+   real response body — the assertions are the same, just attached to the
+   wrong event object will silently time out or hang, not fail loudly.
+2. **One shared `browser.newContext()` (or `browser.newPage()` off a
+   pre-existing context) across two logins silently authenticates as the
+   FIRST role for the second login attempt**, because the session token is
+   stored in that context's storage and the second `#login-submit` click
+   just reuses it — the login form doesn't even error, it just never
+   appears (the "wait for `#login-email`" step times out because the app
+   has already routed past the login screen). Any script driving two
+   different roles/accounts through the same UI must give each role its
+   own `browser.newContext()`, not just a new tab/page.
+
+Both were caught only because this script's assertions failed loudly
+(12/13 FAIL, or a hard timeout) rather than silently passing against the
+wrong thing — worth remembering when a *new* role-gated download check's
+first run reports something that looks like an unrelated infra failure
+rather than a real assertion mismatch.
+
 ## Process note (2026-08-19): scope correction (0023-0029, not 0024-0029) + two owed browser assertions closed + local dev D1 reset side-effect
 
 **Scope correction**: earlier deploy-hold documentation (`.deploy-checks/pre-0029-export.md`,
