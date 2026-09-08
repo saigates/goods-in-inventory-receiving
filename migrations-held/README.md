@@ -333,3 +333,43 @@ precedent already established for the other two queued items.
   number at write time, per the three-way numbering-collision risk noted
   above. No migration file has been written this pass; this is a finding
   only, per the task's own instruction.
+
+## `0032` — now WRITTEN and CLAIMED (2026-09-08): `zoho_sku_mapping`, not the sale-attribution work above
+
+**Update to the three-way "0032" numbering-collision note above**: this
+session actually wrote `migrations/0032_zoho_sku_mapping.sql` — a FOURTH
+claimant that arrived first and took the true next-free number (`0032`)
+at write time, per this file's own stated rule ("whichever is actually
+written first takes the true next-free number"). It implements the
+`Z-G-MAPPING.csv` load architecture (`zoho_items`, `sku_map`,
+`sku_map_audit`, `sku_map_version` tables) — an UNRELATED body of work to
+either the `startRepair()` duplicate-index fix or the sale-attribution
+columns described above. **All three of those still-informal claimants
+(the held `0030` restoration, the `startRepair()` index fix, and the
+sale-attribution/custody columns from the W2.3 finding) must now take
+`0033` or later** — re-check the live `migrations/` listing fresh at the
+time each is actually written, exactly as this file's existing notes
+already require; do not assume `0033` either, since more than one of
+those three could still land in either order.
+
+**Three-shared-Zoho-item-ID header note (verbatim reconciliation finding,
+carried from chat into this file per instruction)**: independent
+re-verification of `Z-G-MAPPING.csv` (747 data rows, confirmed via three
+separate methods: `csv.DictReader` row count, raw `\r\n`/CRLF count, and
+`wc -l`) found **exactly 3 Zoho Item IDs each shared by 2 goods-in SKUs**
+— i.e. 3 genuine, expected many-to-one cases where a single Zoho catalog
+item is deliberately mapped from two distinct physical/eSIM goods-in
+SKUs. These are NOT bijection breaks (each goods-in SKU still maps to
+exactly one Zoho Item ID; only the reverse direction is 1-to-many for
+these three IDs) and are explicitly allowed by `validateSkuMapCsv()`
+(reported informationally via `sharedZohoItems`, never rejected). The
+three pairs:
+- `251444000431996049` → `APL-I14PL-128-RED-B`, `APL-I14PL-128-RED-ESIM-B`
+- `251444000336178047` → `APL-I14P-1TB-SBK-A`, `APL-I14P-1TB-SBK-ESIM-A`
+- `251444000367388740` → `APL-I14PM-1TB-SBK-A`, `APL-I14PM-1TB-SBK-ESIM-A`
+
+All three pairs are physical/eSIM variants of the same underlying
+capacity/color/grade config sharing one Zoho catalog item — consistent
+with `0032`'s own header-comment rationale for why the FK lives on
+`sku_map` (many-to-one) rather than a unique constraint that would
+otherwise reject this legitimate pattern.
