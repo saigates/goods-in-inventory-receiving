@@ -213,3 +213,123 @@ resolved (which job stays open is an app-level decision, not a migration
 concern) before the unique index is added, or `CREATE UNIQUE INDEX` will
 abort exactly as `0031`'s did for `sku_catalog` collisions — the same
 failure mode, on a table that by then may no longer be empty.
+
+## W2.3 (read-only finding, 2026-09-08) — custody + sale-attribution schema check for a future `0032`
+
+**Question asked**: can `repair_jobs` plus the existing device schema
+already express the four custody states the margin/reconciliation work
+needs (in-house repair, outsourced/overseas repair, fulfilment/FBA
+custody, customer/sold), and can the device roster already hold the five
+importer-written sale columns (`sold_invoice_no`, `sold_date`,
+`sold_channel`, `sold_price`, `attribution`) — or does a new migration
+need to add fields for either? Read-only: no migration written this pass.
+
+### Custody state coverage — 3 of 4 already representable, 1 is not
+
+Walked `DEVICE_STATUSES` (`src/types.ts`) and `ALLOWED_TRANSITIONS`
+(`src/lib/deviceLifecycle.ts`) state by state against the four target
+custody buckets:
+
+1. **In-house repair** — ✅ already representable. `IN_HOUSE_REPAIR` is a
+   dedicated status, gated by its own `repair_jobs` row
+   (`REPAIR_WORKFLOW_ONLY_STATUSES`, `src/lib/repairWorkflow.ts`). No gap.
+2. **Outsourced/overseas repair custody** — ✅ already representable.
+   `EXPORTED_UNDER_OPR` / `TEMP_EXPORTED_STANDARD` (both driven by
+   `shipments.shipment_type IN ('OPR_REPAIR','TEMP_EXPORT_STANDARD')`,
+   `migrations/0023a`) exist specifically for "goods temporarily exported
+   for repair and return" (`src/lib/oprDocs.ts` line 118's own customs
+   wording) — this already IS the "outsourced repair" custody bucket, not
+   something to add. `RETURNED_UNDER_OPR` / `RETURNED_UNDER_STANDARD`
+   close the loop back to `ACTIVE_INVENTORY`. No gap.
+3. **Customer custody (sold)** — ✅ already representable, but currently
+   inert. `SOLD` exists in `DEVICE_STATUSES` and is excluded from
+   valuation (`VALUATION_EXCLUDED_TOTALLY`, `src/routes/reports.ts:72`),
+   but `ALLOWED_TRANSITIONS.SOLD = []` and **no status is currently
+   allowed to transition INTO `SOLD`** — confirmed by grep across
+   `ALLOWED_TRANSITIONS`'s own values: `SOLD` appears only as a key, never
+   as a member of any other status's edge list. The column/status exists;
+   the edge into it does not. §4/§5's importer will need either (a) a new
+   transition edge into `SOLD` wired from whichever statuses can
+   legitimately sell (most likely `ACTIVE_INVENTORY`, possibly
+   `IN_EXPORT_CONSIGNMENT`/`TEMP_EXPORTED_STANDARD` for FBA-custody stock
+   sold while physically overseas — not yet decided), or (b) the importer
+   writes `SOLD` directly via a dedicated route bypassing
+   `transitionDevice()`'s edge check the way OPR/repair routes already do
+   for their own workflow-only statuses. Either way this is an
+   **application-code decision for the importer, not a schema gap** — no
+   new column is needed to represent "sold," only a new edge/route.
+4. **Fulfilment / Amazon FBA custody** — 🔴 **genuine gap, no existing
+   status represents this.** Grepped `DEVICE_STATUSES`,
+   `ALLOWED_TRANSITIONS`, and the whole `src/`/`migrations/` tree for
+   `custody`, `fulfil(l)`, and `fba` (case-insensitive) — zero matches
+   anywhere. FBA custody transfer (§5: "custody transfers, not sales") is
+   not a repair-purpose export (`shipment_type` only has `OPR_REPAIR` /
+   `TEMP_EXPORT_STANDARD`, both customs/repair-framed, not a commercial
+   fulfilment-transfer concept) and is not any existing status. **This is
+   the one custody bucket that needs a new `DeviceStatus` value** (e.g.
+   `IN_FBA_CUSTODY`, name not decided) plus at least one new transition
+   edge (`ACTIVE_INVENTORY` → new status, at minimum) if the app is ever
+   going to track FBA custody transfers as device state rather than only
+   as an excluded-from-revenue invoice classification. §5's current scope
+   only requires classifying FBA invoices as non-revenue at the reporting
+   layer — it does NOT require this status to exist yet for the deferred
+   work in §7 to remain deferred. Recording the gap now so `0032` (or
+   whichever migration eventually adds it) doesn't have to rediscover it.
+
+### Sale-column coverage — 0 of 5 present, all five need to be added
+
+Grepped `received_devices`' full column list (latest recreate,
+`migrations/0023b`) and every later additive migration
+(`0024`-`0029`, `0031`) for any of the five columns §4 lists
+(`sold_invoice_no`, `sold_date`, `sold_channel`, `sold_price`,
+`attribution`) or any near-synonym (`invoice`, `channel`, `sale_price`,
+`sold_at`) — **zero matches**. None of the five sale-attribution columns
+exist anywhere in the schema today, on `received_devices` or any other
+table. This confirms §4's own premise directly rather than assuming it:
+**a new migration is required** to add these five columns before the
+importer described in §4/§6 can write anything. No existing table (not
+`bills`, not `cost_ledger`, not `repair_jobs`) is a plausible home for
+them — they are per-device sale facts, so `received_devices` itself (or
+a new 1:1 child table keyed on `received_device_id`, mirroring the
+`cost_ledger` pattern's append-only style if history/audit of sale
+corrections is ever wanted) are the two realistic shapes; picking between
+those two is a migration-design decision, not part of this read-only
+finding.
+
+### Numbering check against the held `0030`
+
+Current `migrations/` listing (fresh, this pass): highest applied number
+is `0031` (`0031_sku_catalog_unique_config_grade.sql`). `0030` itself
+remains held in `migrations-held/`, not in `migrations/` — so **`0030` is
+NOT a live collision** for a new migration today; the next free number in
+`migrations/` right now is `0032`. However, `migrations-held/`'s own
+existing notes above ("Numbering interaction with the `startRepair()`
+index fix") already flag that **two other queued items** — 0030's own
+eventual restoration-under-a-new-number, and the `startRepair()` duplicate
+sweep informally called "0032" — are competing for "the next free number"
+without knowing about each other or about this new custody/sale-column
+work. **This finding adds a THIRD claimant to the same informal "0032"
+slot.** Per those existing notes' own stated rule: whichever of the three
+is actually written first takes the true next-free number at that moment;
+each subsequent one takes the number after. This report does not
+pre-assign a number to the custody/sale-column migration — re-check the
+live `migrations/` listing at the time it is actually written, per the
+precedent already established for the other two queued items.
+
+### Conclusion
+
+- No migration needed to represent in-house repair, outsourced repair
+  custody, or (at the status-existence level) customer/sold custody —
+  all three already have a `DeviceStatus` value; `SOLD` additionally
+  needs a new transition edge (app-code decision, not schema).
+- A migration IS needed for: (a) a new FBA/fulfilment-custody
+  `DeviceStatus` value + edge, if that custody state is ever tracked as
+  device state (not required for §5's current invoice-classification-only
+  scope); (b) the five sale-attribution columns from §4, unconditionally
+  required before the importer can be built.
+- Whatever migration adds (b) — and optionally (a) in the same file, since
+  both are part of the same "close the sale-side gap" body of work — is
+  informally "0032" but must re-check `migrations/` for the true next-free
+  number at write time, per the three-way numbering-collision risk noted
+  above. No migration file has been written this pass; this is a finding
+  only, per the task's own instruction.
