@@ -90,3 +90,58 @@ in this repo.
   is needed again later, since production's goods-in set moves (see the
   existing 1133→1135 note in `pre-0029-export.md` for precedent on why a
   stored count goes stale).
+
+## Deploy-manifest note — 0032 needs an explicit "first application" step
+
+Because migration `0032_zoho_sku_mapping.sql` had never been applied to
+production or local persisted D1 before this session (only ever exercised
+inside `vitest-pool-workers`' in-memory per-test D1), the next real
+production deploy that includes it is **not a no-op migration run** —
+`zoho_items`/`sku_map`/`sku_map_audit`/`sku_map_version` will be created
+in production for the first time, with zero rows, and someone will need
+to run the real CSV import against production afterwards (via the
+eventual `/imports` page, or the existing `src/routes/skuMap.ts` API
+directly) to reach the same 747-row state this session's local-D1 test
+achieved. The deploy record for that release should say "0032 applied for
+the first time, tables created empty, import still pending" rather than
+treating it as routine schema drift — routine migrations in this repo are
+usually additive/inert on data that already fits; this one starts a
+brand-new feature's data from zero.
+
+## Directional coverage checks (2026-09-08 follow-up) — both structurally blocked, not just unrun
+
+Two narrower checks were requested to separate "cosmetic gap" from
+"revenue-affecting gap": (A) restrict the 95 unmapped SKUs to ones with at
+least one device that left `ACTIVE_INVENTORY` toward a sale; (B, critical
+path) reverse-join every distinct Zoho item ID appearing on an invoice
+line against `sku_map` to catch unresolvable sold-invoice lines.
+
+Both are correctly-designed checks with **no data to run against yet**,
+confirmed two ways:
+- Live production device-status distribution (`gsk hosted d1_query`,
+  bracketed by clean `gsk login-info` before/after, identity
+  `saigateslimited@gmail.com` both times): `RECEIVED=532, SORTING=393,
+  IN_EXPORT_CONSIGNMENT=155, ACTIVE_INVENTORY=27, IN_HOUSE_REPAIR=17,
+  READY_FOR_EXPORT=10, REJECTED=1`. Seven statuses total; `SOLD` is not
+  among them — zero devices have ever reached `SOLD`.
+- Schema-wide grep confirms no invoice-line/sales-ingestion table exists
+  anywhere (`sold_*` columns don't exist on `received_devices`; no
+  `sales_invoice`/`invoice_line` table in any migration; `SOLD` has zero
+  inbound edges in `ALLOWED_TRANSITIONS`, `src/lib/deviceLifecycle.ts`).
+
+Re-run both once real sales start flowing through the system (i.e. once
+something actually writes a path into `SOLD` and an invoice-line table
+exists to reverse-join against) — this note exists so that work isn't
+silently reattempted against the same empty domain later.
+
+## Regrade / UG-mapping interaction (resolved)
+
+Regrade **does** rewrite a device's `sku`, not only its `grade`:
+`src/routes/inventory.ts:290-294` — `UPDATE received_devices SET grade =
+?, sku = ? WHERE id = ? AND organisation_id = ?`, using a freshly-resolved
+`sku_catalog` lookup for the new `(model, capacity, color, grade)`
+combination. So a UG device regraded to A/B/C acquires a new SKU at that
+moment, which may already be mapped in `sku_map` even though the UG form
+never was. This is *consistent with* Cause 1 above being largely benign,
+but is not full proof without real regrade-then-sale history (which per
+the directional-check finding above doesn't exist yet either).
