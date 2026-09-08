@@ -1,0 +1,134 @@
+-- Migration 0033 — sale attribution columns on received_devices.
+--
+-- FIRST item in the reordered plan (2026-09-08 brief): the sale side does
+-- not exist at all today — zero devices in status SOLD (confirmed live,
+-- production `gsk hosted d1_query`: RECEIVED/SORTING/IN_EXPORT_CONSIGNMENT/
+-- ACTIVE_INVENTORY/IN_HOUSE_REPAIR/READY_FOR_EXPORT/REJECTED only, 7
+-- statuses, SOLD absent), no sold_* columns anywhere (confirmed, W2.3
+-- finding below), no invoice-line table anywhere. This migration closes
+-- the schema half of that gap; it is the precondition for revenue,
+-- margin, the two directional sku_map coverage checks, and the FIFO
+-- fallback logic — none of which can be built before a sold device can
+-- be recorded at all.
+--
+-- Numbering: fresh `ls migrations/ | sort -V | tail` immediately before
+-- writing this file confirms 0032 (zoho_sku_mapping) is the highest
+-- applied migration and this is the first of the three informal "0032"
+-- claimants noted in migrations-held/README.md to actually land — so
+-- this file correctly takes 0033, not 0032. The other two claimants
+-- (the held 0030 restoration, the startRepair() duplicate-index fix)
+-- must re-check fresh and take 0034 or later, per that file's own
+-- numbering rule (deliberately NOT rewritten here — the README's
+-- informal "0032" prose is left exactly as previously instructed).
+--
+-- ── Column-shape decision: direct columns on received_devices, not a
+--    child table ──
+-- W2.3 (migrations-held/README.md) explicitly left this open: "columns
+-- directly on received_devices, or a new 1:1 child table keyed on
+-- received_device_id (mirroring cost_ledger's append-only pattern if
+-- sale-correction history/audit is ever wanted)". Deciding now: direct
+-- columns. Reasoning:
+--   1. SOLD is terminal (ALLOWED_TRANSITIONS.SOLD = []) — a device sells
+--      at most ONCE in current scope, so this is a single fact-at-a-point
+--      -in-time, not a repeating event series like cost_ledger's
+--      purchase/repair/freight/customs rows (which a device can
+--      legitimately accumulate more than one of, e.g. two repair trips).
+--      The append-only-ledger shape earns its complexity precisely
+--      because those events repeat; a one-time sale fact does not need
+--      it.
+--   2. received_devices already carries other one-time-per-device facts
+--      as plain nullable columns with exactly this shape — received_at
+--      (0023), label_printed_at (0001) — not child tables. This is
+--      consistent with that existing precedent, not a new pattern.
+--   3. If sale-correction audit history is ever wanted later, the
+--      grade/grade_audit precedent (0007 added `grade` as a plain
+--      column; a LATER migration added grade_audit alongside it,
+--      disturbing nothing) shows this can be layered on non-destructively
+--      whenever that need actually arises — it does not have to be
+--      decided today, and deferring it is not a schema commitment we
+--      cannot walk back.
+--
+-- ── The five sale columns (§4 of W2.3, unconditionally required) ──
+-- sold_invoice_no, sold_date, sold_channel, sold_price, attribution.
+-- All nullable (NULL = not sold / not yet attributed), matching the
+-- existing nullable-until-known convention (buy_price, supplier_id, etc).
+-- `attribution` is deliberately plain TEXT, not an enum: the FIFO
+-- fallback logic (referenced from an earlier pass, not re-derived here)
+-- needs to record which attribution method actually produced this sale's
+-- cost match (e.g. exact-IMEI vs FIFO-fallback vs manual), and the full
+-- set of values that logic will emit has not been finalised in this
+-- migration's scope — same "don't invent the enum before the consumer
+-- exists" discipline already used for cost_ledger.cost_type (TEXT, no DB
+-- CHECK, TypeScript union is the authority).
+--
+-- ── vat_treatment — decided now: TEXT, app-validated, DEFAULT
+--    'unclassified' ──
+-- The brief left enum-vs-free-text and the exact default literal
+-- explicitly undecided; deciding both here rather than leaving the
+-- column half-built. Follows the EXACT existing precedent set by
+-- received_devices.vat_type (0009): TEXT, NOT NULL, a DEFAULT literal,
+-- no DB-level CHECK constraint — validation (once the real value set is
+-- chosen) belongs server-side in src/lib/validate.ts, the same authority
+-- vat_type already uses (isValidVatType). 'unclassified' is chosen as
+-- the default literal (not NULL) so that every historical/pre-existing
+-- received_devices row reads as "known-not-yet-classified" rather than
+-- a bare NULL that could be misread as "not applicable" — mirrors why
+-- currency defaults to 'GBP' rather than NULL (0009) rather than leaving
+-- ambiguity for every consumer to re-derive.
+--
+-- ── sold_shipment_id — the batch/shipment grouping the freight/customs
+--    allocation needs ──
+-- Explicit requirement from the brief, phrase and all: "the batch/
+-- shipment grouping the freight allocation needs". Worked out from
+-- apportionFreightByValue()/apportionCustomsByValue()'s own
+-- `allDeviceIdsInConsignment` input (src/lib/freightApportionment.ts,
+-- src/lib/customsApportionment.ts) — both take a single named
+-- consignment (a shipments.id) and apportion across every device on it.
+--
+-- Why this needs its OWN column rather than being derived from existing
+-- joins at read time: a device can appear as a shipment_lines row on
+-- MORE THAN ONE shipment over its life (shipment_lines' own unique
+-- constraint is (shipment_id, received_device_id), not
+-- (received_device_id) alone — e.g. a device that went out under one
+-- OPR consignment, came back, and was later re-exported under a second
+-- one would have two shipment_lines rows). Joining shipment_lines by
+-- received_device_id alone is therefore AMBIGUOUS about which leg's
+-- freight/customs allocation is the one that actually applies to this
+-- particular sale's cost basis. received_devices.manifest_id (0001) is
+-- similarly the wrong join for this: it identifies the INBOUND PURCHASE
+-- batch, not a return/import consignment's freight/customs charge.
+--
+-- sold_shipment_id is therefore an explicit, nullable FK to shipments(id)
+-- — the return/import shipment (per the customs-bill design decision:
+-- "a bill record keyed to the shipment — the return/import shipment")
+-- whose freight_invoices/customs-bill cost_ledger rows this device's cost
+-- basis should draw from, once apportionFreightByValue()/
+-- apportionCustomsByValue() are actually wired (§ pending — see
+-- .deploy-checks; neither function has any call site yet). NULL is valid
+-- and expected for a plain domestic purchase sold with no OPR/temp-export
+-- leg at all — there is no consignment to link and none is owed.
+-- Deliberately NOT NOT NULL, deliberately NOT defaulted to any shipment.
+--
+-- ── SOLD transition edge — explicitly NOT part of this migration ──
+-- W2.3 already classifies this as "an application-code decision for the
+-- importer, not a schema gap" (ALLOWED_TRANSITIONS.SOLD = [] in
+-- src/lib/deviceLifecycle.ts is TypeScript, not SQL). No new DeviceStatus
+-- value is needed (SOLD already exists, migrations/0023b) and no
+-- database CHECK constraint touches ALLOWED_TRANSITIONS, so there is
+-- nothing here for a migration to change. That edge/route decision is
+-- deferred to the /imports importer work (next in the resume order), not
+-- silently skipped.
+--
+-- (No explicit transaction wrapper: remote D1 rejects BEGIN/COMMIT
+-- [CF 7500]; wrangler applies this file as a single batch.)
+
+ALTER TABLE received_devices ADD COLUMN sold_invoice_no TEXT;
+ALTER TABLE received_devices ADD COLUMN sold_date DATE;
+ALTER TABLE received_devices ADD COLUMN sold_channel TEXT;
+ALTER TABLE received_devices ADD COLUMN sold_price REAL;
+ALTER TABLE received_devices ADD COLUMN attribution TEXT;
+ALTER TABLE received_devices ADD COLUMN vat_treatment TEXT NOT NULL DEFAULT 'unclassified';
+ALTER TABLE received_devices ADD COLUMN sold_shipment_id INTEGER REFERENCES shipments(id);
+
+CREATE INDEX IF NOT EXISTS idx_received_devices_sold_shipment ON received_devices(sold_shipment_id);
+CREATE INDEX IF NOT EXISTS idx_received_devices_sold_date ON received_devices(sold_date);

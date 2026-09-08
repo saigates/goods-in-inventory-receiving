@@ -141,6 +141,21 @@ export type ReceivedDevice = {
   // Physical receipt time (migration 0023) — backdatable, distinct from
   // created_at (row-insert time).
   received_at: string | null
+  // Sale attribution (migration 0033) — all nullable/defaulted; NULL/
+  // 'unclassified' means "not sold yet" / "not yet VAT-classified". No
+  // DB CHECK on any of these — same "TypeScript union is the authority,
+  // not a schema constraint" convention as vat_type/CostType. See
+  // migration 0033's header for the full column-shape reasoning
+  // (direct columns, not a child table) and why sold_shipment_id exists
+  // (the freight/customs consignment a sold device's allocation should
+  // draw from — distinct from manifest_id, the INBOUND purchase batch).
+  sold_invoice_no: string | null
+  sold_date: string | null
+  sold_channel: string | null
+  sold_price: number | null
+  attribution: string | null
+  vat_treatment: string
+  sold_shipment_id: number | null
 }
 
 // ───────── Device event log (Priority 3) ─────────
