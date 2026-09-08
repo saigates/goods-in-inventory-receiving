@@ -9,10 +9,23 @@ import { resolveCatalogSkuBulk, parseSkuGradeSuffix } from '../lib/catalog'
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
 // Browse all received devices with filters (org-scoped)
+//
+// PAGINATED (2026-09-07 — "Inventory only shows devices when scanned/
+// filtered" fix, part B2): this endpoint previously had no total-count or
+// offset support at all — a bare `limit` (capped 500) with no way to see
+// or reach anything past it, so with 1133 real devices the Inventory page
+// could only ever render the newest ~200-500 and had no way to tell the
+// operator more existed. Now mirrors GET /api/devices's page/page_size/
+// total contract exactly (same param names, same 200 cap) so the two
+// list endpoints behave identically from a caller's perspective. `total`
+// is always returned so the UI can render "Showing 1-200 of 1133" and
+// never silently present a truncated list as complete.
 app.get('/', async (c) => {
   const user = currentUser(c)
   const q = c.req.query()
-  const limit = Math.min(Number(q.limit) || 100, 500)
+  const pageSize = Math.min(Math.max(Number(q.page_size) || Number(q.limit) || 100, 1), 200)
+  const page = Math.max(Number(q.page) || 1, 1)
+  const offset = (page - 1) * pageSize
   const where: string[] = ['organisation_id = ?']
   const binds: unknown[] = [user.organisation_id]
 
@@ -30,15 +43,22 @@ app.get('/', async (c) => {
     binds.push(Number(q.manifest_id))
   }
 
-  const sql = `
-    SELECT * FROM received_devices
-    WHERE ${where.join(' AND ')}
-    ORDER BY id DESC
-    LIMIT ?
-  `
-  binds.push(limit)
-  const { results } = await c.env.DB.prepare(sql).bind(...binds).all()
-  return c.json({ devices: results })
+  const whereSql = `WHERE ${where.join(' AND ')}`
+
+  const countRow = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS total FROM received_devices ${whereSql}`
+  ).bind(...binds).first<{ total: number }>()
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT * FROM received_devices ${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`
+  ).bind(...binds, pageSize, offset).all()
+
+  return c.json({
+    devices: results,
+    page,
+    page_size: pageSize,
+    total: countRow?.total ?? 0,
+  })
 })
 
 // Delete a received device. Restores the original manifest line to 'pending'

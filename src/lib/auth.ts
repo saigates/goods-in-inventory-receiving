@@ -78,6 +78,12 @@ const DOC_TOKEN_ALLOWED_PATHS: RegExp[] = [
   /^\/api\/print\/labels$/,
   /^\/api\/opr\/shipments\/\d+\/invoice$/,
   /^\/api\/opr\/shipments\/\d+\/ce1154$/,
+  // B3 (2026-09-07): the CSV export button is a plain browser navigation
+  // (window.open(), same reason as the print/OPR routes above — a
+  // download can't carry an Authorization header), so it needs the same
+  // short-lived, route-scoped doc-token fallback rather than the old
+  // full-session-token-in-a-URL exposure this mechanism was built to close.
+  /^\/api\/devices\/export\/csv$/,
 ]
 
 export async function signDocToken(

@@ -106,6 +106,34 @@
     return sel;
   }
 
+  // Shared "Showing X-Y of Z" + prev/next bar (B2, 2026-09-07). Used by both
+  // InventoryView and AllDevicesSubview so the 200-row page cap is never
+  // presented as if it were the complete list. `onPage(newPage)` is called
+  // with the 1-based page number to navigate to; the caller is responsible
+  // for clamping/refetching/re-rendering.
+  function PaginationBar(page, pageSize, total, onPage) {
+    if (!total) return null;
+    const start = (page - 1) * pageSize + 1;
+    const end = Math.min(page * pageSize, total);
+    const lastPage = Math.max(Math.ceil(total / pageSize), 1);
+    return h('div', { class: 'flex items-center justify-between gap-3 text-xs text-slate-400 px-1' },
+      h('div', {}, `Showing ${start}-${end} of ${total}`),
+      h('div', { class: 'flex items-center gap-2' },
+        h('button', {
+          class: 'btn btn-ghost text-xs',
+          disabled: page <= 1 ? 'disabled' : null,
+          onclick: () => { if (page > 1) onPage(page - 1); },
+        }, h('i', { class: 'fas fa-chevron-left' })),
+        h('span', {}, `Page ${page} of ${lastPage}`),
+        h('button', {
+          class: 'btn btn-ghost text-xs',
+          disabled: page >= lastPage ? 'disabled' : null,
+          onclick: () => { if (page < lastPage) onPage(page + 1); },
+        }, h('i', { class: 'fas fa-chevron-right' })),
+      )
+    );
+  }
+
   // ───────── State ─────────
   const state = {
     authUser: null,       // { id, email, name, role, organisation_id } once logged in
@@ -135,6 +163,10 @@
     lastUploadResult: null,
     events: [],
     inventory: [],
+    inventoryPage: 1,               // current page for the Inventory list (B2, 2026-09-07)
+    inventoryTotal: 0,               // total row count matching the current Inventory filter
+    inventoryPageSize: 200,          // mirrors GET /api/inventory's page_size cap (200)
+    inventorySearchQ: '',            // last search box value, needed so pagination clicks reuse it
     inventorySelected: new Set(),   // Set<deviceId> for bulk operations on Inventory view
     bulkGradeOpen: false,            // bulk grade modal visibility
     catalog: [],                     // sku_catalog rows
@@ -178,6 +210,8 @@
     devicesAll: [],              // GET /api/devices?status=... rows for the current filter (All Devices sub-view)
     devicesAllFilter: '',        // status filter for All Devices ('' = no filter, show a curated default set)
     devicesAllSearch: '',        // q= search box for All Devices
+    devicesAllPage: 1,           // current page (B2, 2026-09-07 — "only 200 shown of 1133" fix)
+    devicesAllTotal: 0,          // total row count matching the current filter, from the server
     repairQueue: [],             // GET /api/devices/repair-queue rows
     qcFailedDevices: [],         // GET /api/devices?status=QC_FAILED
     readyForZohoDevices: [],     // GET /api/devices?status=READY_FOR_ZOHO
@@ -313,6 +347,26 @@
     return win;
   }
 
+  // ───────── CSV export (B3, 2026-09-07) ─────────
+  // GET /api/devices/export/csv is a plain browser download (same
+  // Authorization-header limitation as the print/OPR doc-token routes
+  // above), so it reuses openWithDocToken() rather than a raw fetch.
+  // Always targets ?excel=1 — a human clicking this button is headed for
+  // Excel/Sheets, so the IMEI column must arrive in the ="..." text-forcing
+  // form (see src/routes/devices.ts's module comment for the full
+  // default-vs-?excel=1 rationale). The endpoint is open to any
+  // authenticated role — operators and managers both hit this SAME URL —
+  // but the backend (requireManager() there) narrows the header row itself
+  // when the caller isn't a manager, so no separate operator-only variant
+  // exists here to keep in sync.
+  async function doExportCsv() {
+    try {
+      await openWithDocToken('/api/devices/export/csv?excel=1');
+    } catch (err) {
+      toast(err.response?.data?.error || err.message, 'err', 5000);
+    }
+  }
+
   async function refreshManifests() {
     const r = await api.get('/manifests');
     state.manifests = r.manifests || [];
@@ -337,9 +391,19 @@
     const ev = await api.get(`/scan/events/${state.activeManifestId}`);
     state.events = ev.events || [];
   }
+  // PAGINATED (B2, 2026-09-07): GET /api/inventory now returns `total` and
+  // accepts page/page_size, mirroring GET /api/devices exactly. This was
+  // previously a flat `?limit=200` fetch with no way to see or reach
+  // anything past the cap — the root cause of "devices only appear when
+  // scanned/filtered" for the Inventory page specifically (unlike the
+  // Devices page's All-Devices sub-view, this endpoint had NO total-count
+  // support server-side at all until this fix).
   async function refreshInventory() {
-    const r = await api.get('/inventory?limit=200');
+    const params = new URLSearchParams({ page: String(state.inventoryPage), page_size: String(state.inventoryPageSize) });
+    if (state.inventorySearchQ) params.set('q', state.inventorySearchQ);
+    const r = await api.get(`/inventory?${params.toString()}`);
     state.inventory = r.devices || [];
+    state.inventoryTotal = r.total ?? state.inventory.length;
     // Drop any selected ids that are no longer present (e.g. deleted in another tab).
     const present = new Set(state.inventory.map(d => d.id));
     for (const id of Array.from(state.inventorySelected)) {
@@ -390,12 +454,17 @@
   // OPR/repair-workflow-only statuses, which have their own sub-views/tabs,
   // and terminal SOLD/REJECTED, which have nowhere left to go).
   const ALL_DEVICES_DEFAULT_STATUSES = ['RECEIVED', 'SORTING', 'ACTIVE_INVENTORY', 'READY_FOR_EXPORT'];
+  // PAGINATED (B2, 2026-09-07): GET /api/devices was already correctly
+  // paginated server-side (real LIMIT/OFFSET + total) — the defect here was
+  // 100% client-side: this function never sent `page`, never read `total`,
+  // so the UI silently rendered page 1 of 200 as if it were the whole list.
   async function refreshDevicesAll() {
     const statusParam = state.devicesAllFilter || ALL_DEVICES_DEFAULT_STATUSES.join(',');
-    const params = new URLSearchParams({ status: statusParam, page_size: '200' });
+    const params = new URLSearchParams({ status: statusParam, page_size: '200', page: String(state.devicesAllPage) });
     if (state.devicesAllSearch) params.set('q', state.devicesAllSearch);
     const r = await api.get(`/devices?${params.toString()}`);
     state.devicesAll = r.devices || [];
+    state.devicesAllTotal = r.total ?? state.devicesAll.length;
   }
   async function refreshRepairQueue() {
     const r = await api.get('/devices/repair-queue');
@@ -849,7 +918,7 @@
       h('div', { class: 'flex items-center gap-2 flex-wrap' },
         h('select', {
           class: 'input text-sm w-auto',
-          onchange: (e) => { state.devicesAllFilter = e.target.value; refreshDevicesAll().then(render); },
+          onchange: (e) => { state.devicesAllFilter = e.target.value; state.devicesAllPage = 1; refreshDevicesAll().then(render); },
         },
           h('option', { value: '', selected: !state.devicesAllFilter ? 'selected' : null }, 'Default (active statuses)'),
           h('option', { value: statuses.join(','), selected: state.devicesAllFilter === statuses.join(',') ? 'selected' : null }, 'All statuses'),
@@ -858,11 +927,17 @@
         h('input', {
           class: 'input text-sm flex-1 max-w-xs', placeholder: 'Search IMEI / SKU / UUID',
           value: state.devicesAllSearch,
-          oninput: (e) => { state.devicesAllSearch = e.target.value; refreshDevicesAll().then(render); },
+          oninput: (e) => { state.devicesAllSearch = e.target.value; state.devicesAllPage = 1; refreshDevicesAll().then(render); },
         }),
         h('button', { class: 'btn btn-primary text-xs ml-auto', onclick: () => { state.bulkTransitionOpen = true; render(); } },
           h('i', { class: 'fas fa-layer-group' }), 'Bulk transition by scan'),
       ),
+
+      PaginationBar(state.devicesAllPage, 200, state.devicesAllTotal, (p) => {
+        state.devicesAllPage = p;
+        refreshDevicesAll().then(render);
+      }),
+
       h('div', { class: 'card overflow-hidden' },
         h('table', { class: 'w-full text-sm' },
           h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
@@ -4528,6 +4603,16 @@ into each Condition, each VAT Type, and each Currency.`;
             onclick: () => { state.manualReceiveOpen = true; render(); },
             title: 'Receive a device without a manifest',
           }, h('i', { class: 'fas fa-plus' }), 'Quick receive'),
+          // B3 (2026-09-07): open to every role — the backend narrows the
+          // header row for non-managers (cost columns omitted entirely),
+          // not this button.
+          h('button', {
+            class: 'btn btn-ghost text-xs',
+            onclick: doExportCsv,
+            title: isManagerOrAdmin()
+              ? 'Export all matching devices to CSV (includes cost columns)'
+              : 'Export all matching devices to CSV',
+          }, h('i', { class: 'fas fa-file-csv' }), 'Export CSV'),
           h('input', {
             class: 'input', placeholder: 'Search IMEI / SKU / UUID',
             oninput: (e) => debouncedSearch(e.target.value),
@@ -4553,6 +4638,11 @@ into each Condition, each VAT Type, and each Currency.`;
           onclick: () => { selected.clear(); render(); },
         }, 'Clear selection')
       ) : null,
+
+      PaginationBar(state.inventoryPage, state.inventoryPageSize, state.inventoryTotal, (p) => {
+        state.inventoryPage = p;
+        refreshInventory().then(render);
+      }),
 
       h('div', { class: 'card overflow-hidden' },
         h('table', { class: 'w-full text-sm' },
@@ -4625,7 +4715,12 @@ into each Condition, each VAT Type, and each Currency.`;
               ))
           )
         )
-      )
+      ),
+
+      PaginationBar(state.inventoryPage, state.inventoryPageSize, state.inventoryTotal, (p) => {
+        state.inventoryPage = p;
+        refreshInventory().then(render);
+      }),
     );
   }
 
@@ -5509,11 +5604,17 @@ into each Condition, each VAT Type, and each Currency.`;
   }
 
   let searchTimer;
+  // PAGINATED (B2, 2026-09-07): the search box previously bypassed
+  // refreshInventory() entirely and called a flat `?limit=200` fetch that
+  // discarded `total` — same truncation defect as the plain browse path.
+  // Now resets to page 1 and delegates to refreshInventory() so both code
+  // paths share one pagination contract and both report `total` correctly.
   function debouncedSearch(q) {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(async () => {
-      const r = await api.get(`/inventory?q=${encodeURIComponent(q)}&limit=200`);
-      state.inventory = r.devices || [];
+      state.inventorySearchQ = q;
+      state.inventoryPage = 1;
+      await refreshInventory();
       render();
     }, 200);
   }

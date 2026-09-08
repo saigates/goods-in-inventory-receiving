@@ -7,6 +7,7 @@
 // customs workflows (explicitly out of scope for this pass).
 
 import { Hono } from 'hono'
+import { stream } from 'hono/streaming'
 import type { Bindings, AuthUser, DeviceStatus } from '../types'
 import { currentUser } from '../lib/auth'
 import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, TransitionGateError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES, REJECT_REASON_CODES, UNREJECT_REASON_CODES, checkRejectUnrejectGate } from '../lib/deviceLifecycle'
@@ -128,19 +129,111 @@ app.get('/:id', async (c) => {
 //     for parity with `GET /api/devices`.
 //   - a non-numeric entry in `ids` is a 400, never silently dropped — the
 //     operator must never believe they exported a selection they didn't.
-//   - exceeding the row cap is a 413 carrying the true total, never a
-//     silently truncated file.
 // Values are written byte-faithfully: the only transformation is RFC 4180
 // quoting (which must include `\r`, not just `\n` — a bare CR terminates a
 // record in Excel and would corrupt one device into two malformed rows).
-const EXPORT_ROW_CAP = 5000
+//
+// B3 (2026-09-07) rewrite — four changes from the prior shape, all part of
+// the same standing "export must never lie about what it contains" rule:
+//   1. NO row cap / no LIMIT-OFFSET anywhere in this path. The previous
+//      EXPORT_ROW_CAP=5000-then-413 pattern refused large selections
+//      outright; the org now has 1133+ devices and growing, so refusing is
+//      not an option — the query is a plain unbounded SELECT and the
+//      response is STREAMED (hono/streaming's `stream()`) row-by-row so an
+//      arbitrarily large result set never has to live in memory as one
+//      giant string/array before being sent.
+//   2. Column set is a SUPERSET of the old 16-column shape plus the new
+//      lifecycle/costing fields — NOT a replacement (the first draft of
+//      this rewrite wrongly dropped uuid/created_at/brand/capacity/color;
+//      that was corrected before this landed). Two of the restored columns
+//      are load-bearing for existing offline workflows, not just "nice to
+//      keep": `created_at` is the field an earlier reconciliation pass
+//      matched 398 rows against a 24 August roster snapshot — it is the
+//      only full-roster export and losing that column would make that
+//      class of check impossible without a fresh D1 query window.  `uuid`
+//      is the natural idempotency key for append-only Zoho batch-insert
+//      seeding (stable across any future IMEI correction, unlike IMEI
+//      itself). `brand`/`capacity`/`color` are kept because they are free
+//      to carry and Zoho item matching may want them un-parsed even though
+//      the SKU likely encodes the same information.
+//      DROPPED deliberately (not restored): `buy_price` — this column was
+//      in the pre-B3 16-column shape and is dropped here NOT because it
+//      was overlooked but because `purchase_cost_gbp` (this rewrite's new
+//      cost_ledger-derived column, below) is its superseding aggregate:
+//      buy_price is a single mutable field on received_devices with no
+//      history and no source attribution, while purchase_cost_gbp sums
+//      the append-only cost_ledger 'purchase' rows for the same device —
+//      the more trustworthy figure for exactly the Zoho-reconciliation
+//      audience this export serves, and the two are NOT meant to be
+//      exported side by side (that would invite exactly the kind of
+//      "which number is right" confusion a reconciliation file must
+//      avoid). Neither of the user's two explicit column lists (restore /
+//      developer's-call) named buy_price either way; this is the explicit
+//      decision, recorded here rather than left silent. `currency` —
+//      every remaining money column here (purchase_cost_gbp/
+//      repair_cost_gbp) is a GBP-only cost_ledger aggregate, so a
+//      per-device currency code has nothing left to qualify once
+//      buy_price itself is gone from this export.
+//      `label_printed_at` — a label-printing/warehouse-workflow field with
+//      no bearing on the financial/Zoho reconciliation this export exists
+//      for; dropping it keeps the shape focused. `source` is KEPT — it is
+//      free, already validated as a filter on this same route, and is
+//      useful provenance (manifest/unreconciled/manual) for the same
+//      reconciliation use case that keeps uuid/created_at.
+//        - `vendor`: suppliers.name via received_devices.supplier_id.
+//        - `bill_ref`: bills.invoice_number for this device's cost_ledger
+//          'purchase' row's source_bill_line_id, when one exists (bill-
+//          backed costing, src/routes/bills.ts write-cost-ledger). NULL for
+//          devices costed via the no-bill path (postPurchaseCostToLedger,
+//          source_bill_line_id always NULL there) or not yet costed at all.
+//        - cost fields: purchase_cost_gbp, repair_cost_gbp — summed from
+//          cost_ledger by cost_type, same aggregation shape as
+//          GET /api/reports/inventory-valuation (COALESCE(SUM(...),0) over
+//          a LEFT JOIN so an uncosted device is 0.00, not an absent row).
+//        - `received_date`: COALESCE(received_at, created_at) — the
+//          genuine physical-receipt timestamp (migration 0023b) where
+//          populated, falling back to created_at for historical rows that
+//          predate that column. This sits ALONGSIDE created_at (both are
+//          exported now), not in place of it — they answer different
+//          questions and the roster-matching use case above needs the
+//          original created_at specifically, not this fallback-blended one.
+//   3. IMEI ENCODING IS QUERY-CONTROLLED, not fixed:
+//        - default (no query param): plain digits in a normal quoted CSV
+//          field — this is what machine consumers (the Zoho gap diff,
+//          vitest) need, because the `="..."` form makes IMEI compare as
+//          a 7-longer literal string in any downstream diff.
+//        - `?excel=1`: emits `="<digits>"`, the Excel/Sheets text-forcing
+//          formula form, which stops a 15-digit IMEI silently rendering as
+//          8.6E+14 and being corrupted on re-save. This is what the UI
+//          export button below targets, because a human clicking Export in
+//          a browser is headed for Excel.
+//      One route, one flag — no second endpoint for the two audiences.
+// COST-COLUMN GATING (7th instance of the standing rule — see
+// isManagerOrAdmin() in app.js for the matching UI-side gate, added in this
+// SAME commit): purchase_cost_gbp/repair_cost_gbp/bill_ref are financial
+// data and are OMITTED FROM THE HEADER ROW ENTIRELY for a non-manager
+// caller — not blanked-out cells (a blank cell still confirms the column
+// exists and invites probing), a narrower CSV with fewer columns.
 const DEVICE_SOURCES = ['manifest', 'unreconciled', 'manual'] as const
+
+// `?excel=1` formula-prefix wrapper, forcing Excel/Sheets to treat a
+// numeric-looking string as text rather than re-parsing it into scientific
+// notation. The bare (non-excel) path never calls this — see STEP 2 above.
+const imeiAsText = (imei: unknown) => `="${String(imei ?? '')}"`
+
+const escapeCsv = (v: unknown) => {
+  if (v == null) return ''
+  const s = String(v)
+  return /["\r\n,]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
 
 app.get('/export/csv', async (c) => {
   const user = currentUser(c)
   const q = c.req.query()
+  const includeCostColumns = requireManager(c)
+  const excelSafe = q.excel === '1'
 
-  const where: string[] = ['organisation_id = ?']
+  const where: string[] = ['rd.organisation_id = ?']
   const binds: unknown[] = [user.organisation_id]
 
   if (q.ids) {
@@ -153,7 +246,7 @@ app.get('/export/csv', async (c) => {
       return c.json({ error: `ids must be positive integers — invalid: ${invalid.join(', ')}` }, 400)
     }
     const ids = raw.map(Number)
-    where.push(`id IN (${ids.map(() => '?').join(',')})`)
+    where.push(`rd.id IN (${ids.map(() => '?').join(',')})`)
     binds.push(...ids)
   } else {
     if (q.status) {
@@ -163,7 +256,7 @@ app.get('/export/csv', async (c) => {
         return c.json({ error: `Invalid status value(s): ${invalid.join(', ')}` }, 400)
       }
       if (statuses.length) {
-        where.push(`status IN (${statuses.map(() => '?').join(',')})`)
+        where.push(`rd.status IN (${statuses.map(() => '?').join(',')})`)
         binds.push(...statuses)
       }
     }
@@ -172,51 +265,84 @@ app.get('/export/csv', async (c) => {
       if (!DEVICE_SOURCES.includes(source as typeof DEVICE_SOURCES[number])) {
         return c.json({ error: `Invalid source value: ${q.source} — must be one of: ${DEVICE_SOURCES.join(', ')}` }, 400)
       }
-      where.push('source = ?')
+      where.push('rd.source = ?')
       binds.push(source)
     }
   }
 
   const whereSql = where.join(' AND ')
 
-  // Count first so truncation can be refused instead of silently delivered.
-  const countRow = await c.env.DB.prepare(
-    `SELECT COUNT(*) AS total FROM received_devices WHERE ${whereSql}`
-  ).bind(...binds).first<{ total: number }>()
-  const total = countRow?.total ?? 0
-  if (total > EXPORT_ROW_CAP) {
-    return c.json({
-      error: `Export matches ${total} devices, above the ${EXPORT_ROW_CAP}-row cap — narrow the selection with status, source or ids rather than accepting a truncated audit file`,
-      total,
-      cap: EXPORT_ROW_CAP,
-    }, 413)
-  }
+  // No LIMIT/OFFSET, no row cap — unbounded by design (see comment above).
+  // bill_ref and the two cost sums are correlated subqueries rather than a
+  // JOIN+GROUP BY: each device has at most one 'purchase' cost_ledger row
+  // under the current guard (postPurchaseCostToLedger's duplicate-row
+  // guard, src/lib/costEntry.ts), so a scalar subquery is exact and keeps
+  // this a plain per-row streamed SELECT rather than an aggregate query.
+  const sql = `
+    SELECT
+      rd.id AS id,
+      rd.uuid AS uuid,
+      rd.imei AS imei,
+      rd.sku AS sku,
+      rd.brand AS brand,
+      rd.model AS model,
+      rd.capacity AS capacity,
+      rd.color AS color,
+      rd.grade AS grade,
+      rd.status AS status,
+      rd.source AS source,
+      rd.vat_type AS vat_type,
+      rd.created_at AS created_at,
+      COALESCE(rd.received_at, rd.created_at) AS received_date,
+      s.name AS vendor,
+      (SELECT b.invoice_number
+         FROM cost_ledger cl
+         JOIN bill_lines bl ON bl.id = cl.source_bill_line_id
+         JOIN bills b ON b.id = bl.bill_id
+        WHERE cl.received_device_id = rd.id AND cl.cost_type = 'purchase'
+        LIMIT 1) AS bill_ref,
+      COALESCE((SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
+                 WHERE cl.received_device_id = rd.id AND cl.cost_type = 'purchase'), 0) AS purchase_cost_gbp,
+      COALESCE((SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
+                 WHERE cl.received_device_id = rd.id AND cl.cost_type = 'repair'), 0) AS repair_cost_gbp
+    FROM received_devices rd
+    LEFT JOIN suppliers s ON s.id = rd.supplier_id
+    WHERE ${whereSql}
+    ORDER BY rd.id ASC
+  `
 
-  const { results } = await c.env.DB.prepare(
-    `SELECT id, uuid, imei, sku, brand, model, capacity, color, grade, status, source,
-            buy_price, currency, vat_type, label_printed_at, created_at
-       FROM received_devices
-      WHERE ${whereSql}
-      ORDER BY id ASC LIMIT ?`
-  ).bind(...binds, EXPORT_ROW_CAP).all<Record<string, unknown>>()
-
-  const headers = ['id', 'uuid', 'imei', 'sku', 'brand', 'model', 'capacity', 'color', 'grade', 'status', 'source', 'buy_price', 'currency', 'vat_type', 'label_printed_at', 'created_at']
-  const escapeCsv = (v: unknown) => {
-    if (v == null) return ''
-    const s = String(v)
-    return /["\r\n,]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
-  }
-  const lines = [headers.join(',')]
-  for (const row of results) {
-    lines.push(headers.map(h => escapeCsv(row[h])).join(','))
-  }
-  const csv = lines.join('\r\n')
+  // Superset shape (STEP 1 correction, 2026-09-07): restores uuid/
+  // created_at/brand/capacity/color/source alongside the new lifecycle +
+  // costing columns — see the module comment above for exactly what was
+  // dropped (currency, label_printed_at) and why.
+  const baseHeaders = ['id', 'uuid', 'imei', 'sku', 'brand', 'model', 'capacity', 'color', 'grade', 'status', 'source', 'vat_type', 'created_at', 'received_date', 'vendor']
+  const costHeaders = ['bill_ref', 'purchase_cost_gbp', 'repair_cost_gbp']
+  const headers = includeCostColumns ? [...baseHeaders, ...costHeaders] : baseHeaders
 
   c.header('Content-Type', 'text/csv; charset=utf-8')
   c.header('Content-Disposition', `attachment; filename="devices-export-${Date.now()}.csv"`)
-  // Lets a caller cross-check that it received every row the server counted.
-  c.header('X-Export-Row-Count', String(results.length))
-  return c.body(csv)
+
+  return stream(c, async (writer) => {
+    await writer.write(headers.join(',') + '\r\n')
+    let rowCount = 0
+
+    const { results } = await c.env.DB.prepare(sql).bind(...binds).all<Record<string, unknown>>()
+    for (const row of results) {
+      // STEP 2: IMEI encoding is query-controlled — see module comment.
+      // Default = plain digits (machine-readable); ?excel=1 = ="..." form.
+      const cells = headers.map(h => (h === 'imei' && excelSafe ? imeiAsText(row[h]) : escapeCsv(row[h])))
+      await writer.write(cells.join(',') + '\r\n')
+      rowCount++
+    }
+
+    // Row count can only be surfaced as a trailing custom header once the
+    // stream has been fully written (Cloudflare Workers does not support
+    // adding response headers after streaming has started) — a JS-style
+    // comment line, prefixed so a spreadsheet importer trims/ignores it,
+    // carrying the same cross-check value the old X-Export-Row-Count
+    // header gave a non-streamed caller.
+    await writer.write(`# row_count=${rowCount}\r\n`)
+  })
 })
 
 // GET /api/devices/statuses — expose the enum + allowed transition map so a

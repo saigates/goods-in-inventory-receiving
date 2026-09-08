@@ -541,10 +541,10 @@ claimed per convention though this script seeds no received_devices rows),
 `8604565` (reopen-role-filter-ui), `8604566` (reject-reason-ui — corrected
 2026-09-07, see below), `8604567` (reject-role-filter-ui — corrected
 2026-09-07, see below), `8604568` (bulk-transition-gate-ui, 2026-09-07),
-`9900*` (G5 item 2 catalog auto-generation
-verification, 2026-08-21, disposable `browser_check.mjs` script — not
-checked into this repo, deleted after the citation was captured; see the
-citation record below).
+`8604569` (csv-export-btn-ui, 2026-09-08), `9900*` (G5 item 2 catalog
+auto-generation verification, 2026-08-21, disposable `browser_check.mjs`
+script — not checked into this repo, deleted after the citation was
+captured; see the citation record below).
 
 **Correction (2026-09-07): two prefix collisions found by routine
 housekeeping, present in the repo since the day each file was written.**
@@ -755,6 +755,44 @@ never touches production per the standing constraint:
   itself).
 
 IMEI prefix: `8604565`.
+
+### `csv-export-btn-ui.browser.mjs` (13 checks)
+The CSV export button (B3/STEP 3, 2026-09-07) on the Inventory toolbar —
+`GET /api/devices/export/csv`, wired through `app.js`'s `doExportCsv()` ->
+`openWithDocToken()`. Unlike most scripts in this directory, this button is
+deliberately visible to BOTH roles (the backend narrows the header, not the
+button), so this check proves presence for both, not an absence for one:
+
+- **Both operator and admin** see the "Export CSV" button in the Inventory
+  toolbar, and clicking it triggers a real browser `download` event (found
+  empirically while writing this check: the response's
+  `Content-Disposition: attachment` header means Chromium fires a
+  context-level `download`, not a popup page navigation — the popup itself
+  stays at `about:blank` throughout, so this check listens on
+  `context.on('download')`/`waitForEvent('download')` rather than
+  `page.on('response')` on the popup).
+- The download URL is `/api/devices/export/csv?excel=1&token=...` for both
+  roles — the button hardcodes `?excel=1` regardless of caller role.
+- **Operator**: downloaded body's first line is the 15-column header with
+  `bill_ref`/`purchase_cost_gbp`/`repair_cost_gbp` entirely absent, and the
+  seeded row's IMEI cell renders in the `="..."` Excel text-forcing form
+  (proving `?excel=1` took effect for a genuine button click, not just a
+  hand-built query string in `test/csvExport.spec.ts`).
+- **Admin**: downloaded body's first line is the full 18-column header,
+  cost columns included.
+- Also asserts zero console errors across the whole run.
+- Each role is driven in its OWN browser context (not just a new page) —
+  an earlier draft of this script shared one context across both logins and
+  the second (`owner@saigates.com`) login silently no-opped against the
+  first role's (`ops@saigates.com`) still-valid session token, which this
+  fix closes.
+- **Cleanup**: prints the FK-ordered `DELETE` for the seeded row (this
+  script has no D1 binding, only `fetch()`, so it cannot run the DELETE
+  itself); cleanup for this run's own fixture (device id 40) was applied
+  and confirmed by re-query (`devices_remaining`/`events_remaining`/
+  `scan_events_remaining` all `0`) before this entry was written.
+
+IMEI prefix: `8604569`.
 
 ## Process note (2026-08-19): scope correction (0023-0029, not 0024-0029) + two owed browser assertions closed + local dev D1 reset side-effect
 
