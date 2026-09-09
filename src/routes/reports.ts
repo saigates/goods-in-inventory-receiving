@@ -53,12 +53,13 @@ export const VALUATION_INCLUDED_STATUSES: readonly DeviceStatus[] = [
 // inventory.
 //
 // SOLD is the sole true exclusion: once sold, the device is no longer
-// the operator's stock. SOLD is currently unreachable — no
-// ALLOWED_TRANSITIONS entry produces it and no code path writes it
-// (confirmed via grep across deviceLifecycle.ts, every route, and every
-// test) — so this exclusion is inert today, but is written explicitly
-// now as a hard prerequisite for the future sales-import work, not
-// discovered retroactively once SOLD becomes reachable.
+// the operator's stock. SOLD became reachable on 2026-09-09 (see the SOLD
+// transition edge header comment above ALLOWED_TRANSITIONS in
+// src/lib/deviceLifecycle.ts) via applyZohoSaleImport's direct
+// transitionDevice() call — it is not yet written by any code path today
+// (that write path is still being built), but this exclusion is written
+// explicitly here as a hard prerequisite for that work, not discovered
+// retroactively once the write path lands.
 //
 // Reconciliation invariant this endpoint enforces at runtime, not just
 // in a comment: VALUATION_INCLUDED_STATUSES + REJECTED + SOLD must

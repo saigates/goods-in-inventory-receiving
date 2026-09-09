@@ -25,8 +25,7 @@ export { DEVICE_STATUSES }
 // All of these are OPR-WORKFLOW-ONLY: the generic /api/devices/:id/transition
 // endpoint refuses them (see OPR_WORKFLOW_ONLY_STATUSES below) because they
 // must stay in lockstep with shipment_lines — only src/routes/opr.ts may
-// drive them. Sale transitions (→ SOLD) remain NOT enabled: selling is a
-// downstream sales flow, not part of the OPR tracks.
+// drive them.
 // Device Lifecycle slice 1 (docs/plan/device-lifecycle-slice1.md,
 // "Amendment 2 resolution — New transition edges"): the old direct
 // IN_HOUSE_REPAIR -> ACTIVE_INVENTORY edge is REMOVED for devices going
@@ -37,12 +36,54 @@ export { DEVICE_STATUSES }
 // the repair-workflow routes (src/routes/devices.ts repair/* handlers via
 // src/lib/repairWorkflow.ts), never by the generic /transition endpoint —
 // see REPAIR_WORKFLOW_ONLY_STATUSES below.
+//
+// ── SOLD transition edge (2026-09-09 — Zoho sale-import workstream) ──
+// Previously ALLOWED_TRANSITIONS had NO edge into SOLD from anywhere (the
+// 0033 migration's header comment explicitly deferred this decision to
+// "the /imports importer work"). Resolved now, as part of building
+// applyZohoSaleImport (src/lib/zohoSaleImport.ts):
+//
+// SOLD is reachable from exactly the statuses below — every status that
+// represents currently-owned, non-consignment-locked, non-rejected stock:
+// RECEIVED, SORTING, ACTIVE_INVENTORY, IN_HOUSE_REPAIR, READY_FOR_EXPORT,
+// QC_FAILED, READY_FOR_ZOHO. Deliberately EXCLUDED:
+//   - The five OPR/temp-export consignment statuses
+//     (IN_EXPORT_CONSIGNMENT / EXPORTED_UNDER_OPR / RETURNED_UNDER_OPR /
+//     TEMP_EXPORTED_STANDARD / RETURNED_UNDER_STANDARD) — these are
+//     OPR_WORKFLOW_ONLY_STATUSES precisely because they must stay in
+//     lockstep with shipment_lines. A Zoho sale row matching a device
+//     physically abroad under a tracked consignment must surface as a
+//     named conflict from applyZohoSaleImport (the device cannot be
+//     silently yanked to SOLD out from under an open consignment line),
+//     never a silent status write.
+//   - REJECTED — not sellable stock by definition; a device must go
+//     REJECTED -> RECEIVED (the one existing outbound edge) before it can
+//     ever reach SOLD. A Zoho sale row matching a REJECTED device is also
+//     a named conflict for applyZohoSaleImport to surface, not a target
+//     this edge list makes reachable.
+// Reasoning for allowing it from this many source statuses (wider than a
+// single "ACTIVE_INVENTORY only" edge): Zoho is the authoritative EXTERNAL
+// record of the sale FACT itself (this app has no point-of-sale of its
+// own) — a real sale can legitimately be recorded in Zoho while this
+// app's own internal workflow tracking hasn't yet caught up to
+// ACTIVE_INVENTORY (e.g. a device sold same-day, before an operator has
+// finished sorting/QC/export-prep inside this app). Restricting the edge
+// to ACTIVE_INVENTORY-only would make every one of those ordinary races
+// an unmatched conflict on the very first day the real (1 Aug 2026+) file
+// is imported.
+// SOLD itself remains terminal (ALLOWED_TRANSITIONS.SOLD stays []) — no
+// edge OUT of SOLD is added by this change. A second Zoho sale-outcome
+// hitting an already-SOLD device (e.g. a re-run, or a genuine data
+// oddity) must be a named "already sold" conflict/no-op in
+// applyZohoSaleImport, never a second transitionDevice() call (which
+// would throw InvalidTransitionError since ALLOWED_TRANSITIONS.SOLD is
+// still empty) and never a silent overwrite of the first sale's columns.
 export const ALLOWED_TRANSITIONS: Record<DeviceStatus, DeviceStatus[]> = {
-  RECEIVED: ['SORTING', 'REJECTED'],
-  SORTING: ['ACTIVE_INVENTORY', 'IN_HOUSE_REPAIR', 'READY_FOR_EXPORT'],
-  ACTIVE_INVENTORY: [],
-  IN_HOUSE_REPAIR: ['READY_FOR_ZOHO', 'QC_FAILED'],
-  READY_FOR_EXPORT: ['IN_EXPORT_CONSIGNMENT'],
+  RECEIVED: ['SORTING', 'REJECTED', 'SOLD'],
+  SORTING: ['ACTIVE_INVENTORY', 'IN_HOUSE_REPAIR', 'READY_FOR_EXPORT', 'SOLD'],
+  ACTIVE_INVENTORY: ['SOLD'],
+  IN_HOUSE_REPAIR: ['READY_FOR_ZOHO', 'QC_FAILED', 'SOLD'],
+  READY_FOR_EXPORT: ['IN_EXPORT_CONSIGNMENT', 'SOLD'],
   // IN_EXPORT_CONSIGNMENT is a SHARED precursor for both the OPR export
   // flow and the TEMP_EXPORTED_STANDARD flow — only the finalise-time
   // target diverges, keyed off shipment.shipment_type (see
@@ -65,7 +106,7 @@ export const ALLOWED_TRANSITIONS: Record<DeviceStatus, DeviceStatus[]> = {
   // REJECTED->RECEIVED) require a mandatory REASON_CODE (see below),
   // enforced in the route layer (src/routes/devices.ts), not here.
   REJECTED: ['RECEIVED'],
-  QC_FAILED: ['IN_HOUSE_REPAIR'],
+  QC_FAILED: ['IN_HOUSE_REPAIR', 'SOLD'],
   // READY_FOR_ZOHO -> ACTIVE_INVENTORY (added 2026-09-02, commit 2 of the
   // repair-workflow pass): a human confirms a device is done with Zoho
   // (uploaded by hand — the batch-upload flow is parked, see
@@ -78,7 +119,14 @@ export const ALLOWED_TRANSITIONS: Record<DeviceStatus, DeviceStatus[]> = {
   // Do not read this edge's presence as meaning the generic route can
   // drive it — see close-to-inventory's own comments for the full
   // edge-versus-route distinction.
-  READY_FOR_ZOHO: ['ACTIVE_INVENTORY'],
+  // READY_FOR_ZOHO -> SOLD (2026-09-09, SOLD transition edge note above):
+  // a device that has passed QC and is only waiting on the (manual)
+  // Zoho-upload step is still legitimately sellable stock — applyZohoSaleImport
+  // may drive this edge directly (transitionDevice() call, same pattern
+  // as close-to-inventory's own direct call below), independent of the
+  // REPAIR_WORKFLOW_ONLY_STATUSES restriction, which only blocks the
+  // GENERIC /transition route, not a direct transitionDevice() caller.
+  READY_FOR_ZOHO: ['ACTIVE_INVENTORY', 'SOLD'],
   // ── TEMP_EXPORTED_STANDARD consignment flow (migration 0023) ──
   // Mirrors EXPORTED_UNDER_OPR/RETURNED_UNDER_OPR exactly.
   TEMP_EXPORTED_STANDARD: ['RETURNED_UNDER_STANDARD'],

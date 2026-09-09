@@ -2,8 +2,8 @@
 //
 // Covers:
 //   - every allowed transition in ALLOWED_TRANSITIONS succeeds
-//   - a representative set of disallowed transitions (incl. RECEIVED→SOLD)
-//     are rejected with InvalidTransitionError
+//   - a representative set of disallowed transitions (incl.
+//     IN_EXPORT_CONSIGNMENT→SOLD) are rejected with InvalidTransitionError
 //   - each transition writes exactly one device_events row with the
 //     correct from_status/to_status/user_id/organisation_id
 //   - the audit-trail invariant holds as an automated assertion:
@@ -129,9 +129,9 @@ describe('transitionDevice — allowed transitions', () => {
 })
 
 describe('transitionDevice — disallowed transitions are rejected', () => {
-  // Representative set spanning: the brief's explicit example, an
-  // export-workflow jump that's out of scope, a same-status no-op, and a
-  // transition out of every terminal/no-outgoing-transition status.
+  // Representative set spanning: an export-workflow jump that's out of
+  // scope, a same-status no-op, a transition out of every
+  // terminal/no-outgoing-transition status, and a SOLD-edge exclusion.
   //
   // NOTE (2026-09-01): REJECTED -> RECEIVED moved OUT of this list — it is
   // now an allowed edge (live-incident fix, devices 588/619 stranded in
@@ -139,8 +139,18 @@ describe('transitionDevice — disallowed transitions are rejected', () => {
   // 'transitionDevice — reject / un-reject edge' describe block below for
   // its coverage, and REJECTED -> anywhere-else-RECEIVED-can-reach for the
   // negative case proving the edge is scoped to RECEIVED only.
+  //
+  // NOTE (2026-09-09): RECEIVED -> SOLD moved OUT of this list — it is now
+  // an allowed edge (SOLD transition edge decision, see the header comment
+  // above ALLOWED_TRANSITIONS in src/lib/deviceLifecycle.ts: Zoho is the
+  // authoritative external record of a sale, so a real sale can legitimately
+  // be recorded before this app's own workflow has caught up to
+  // ACTIVE_INVENTORY). IN_EXPORT_CONSIGNMENT -> SOLD substituted below as
+  // the equivalent negative case: a device under an open OPR/temp-export
+  // consignment must surface a named conflict on a Zoho sale match, never
+  // a silent status overwrite, so that edge stays deliberately excluded.
   const disallowed: [DeviceStatus, DeviceStatus][] = [
-    ['RECEIVED', 'SOLD'], // explicitly named in the brief
+    ['IN_EXPORT_CONSIGNMENT', 'SOLD'], // consignment-locked stock, excluded by design
     ['RECEIVED', 'ACTIVE_INVENTORY'], // skipping SORTING
     ['SORTING', 'EXPORTED_UNDER_OPR'], // must go via IN_EXPORT_CONSIGNMENT (OPR finalisation)
     ['ACTIVE_INVENTORY', 'IN_HOUSE_REPAIR'], // ACTIVE_INVENTORY has no outgoing transitions
