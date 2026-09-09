@@ -373,3 +373,46 @@ capacity/color/grade config sharing one Zoho catalog item — consistent
 with `0032`'s own header-comment rationale for why the FK lives on
 `sku_map` (many-to-one) rather than a unique constraint that would
 otherwise reject this legitimate pattern.
+
+## Money-column convention (Amendment 1) — binding on every migration from here on
+
+**Rule**: every NEW money column added to the schema from this point
+forward MUST be `INTEGER` pence with a `_pence` suffix (e.g.
+`sold_price_pence`, and — for the freight/customs apportionment work still
+to come — `allocated_freight_pence`, `allocated_customs_pence`,
+`allocation_basis_pence`, `freight_amount_pence`, `customs_amount_pence`).
+Any value arriving as a decimal string (e.g. Zoho's net line value) must
+be parsed straight to an integer number of pence, never round-tripped
+through a float.
+
+**Why**: cost basis and margin are being built pence-exact on purpose.
+Once revenue (`sold_price_pence`) and cost (freight/customs pence columns)
+are both integers, every margin figure computed from them is exact
+integer arithmetic. If either operand were a float, margin would be a
+float too, and the planned per-invoice net-plus-tax-equals-total
+reconciliation check could fail on rounding noise alone — masking
+genuinely malformed lines instead of catching them.
+
+**What this does NOT touch**: the existing `_gbp` `REAL` columns on
+`cost_ledger`, `repair_jobs`, and `bills` predate this rule and stay
+exactly as they are — `REAL`, named `_gbp`, untouched. This is a
+deliberate split, not an oversight:
+
+- Columns named `..._gbp` and typed `REAL` → pre-existing convention,
+  left alone.
+- Columns named `..._pence` and typed `INTEGER` → every money column
+  added from Amendment 1 onward.
+
+Conversion between the two happens **at the boundary** (e.g. when a
+pence figure needs to be combined with or displayed alongside a `_gbp`
+figure), not by changing either convention to match the other. Do not
+"tidy" the `_gbp REAL` columns into pence retroactively, and do not add
+a new `REAL` money column going forward — if a future migration appears
+to need one, that's a signal to re-read this section, not a reason to
+deviate from it.
+
+`migrations/0033_sale_attribution.sql` is the first migration written
+under this rule (`sold_price_pence INTEGER`, corrected in place before it
+reached anywhere beyond local dev D1 — see that file's own header for the
+full correction). Treat it as the canonical example of the pattern for
+any migration that follows.
