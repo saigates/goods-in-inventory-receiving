@@ -462,16 +462,85 @@ dev D1 is now caught up `0001` → `0034` in full sequence. This is a local
 remains clean); no schema or code file changed as part of this step, and
 no deploy/remote command was run.
 
+**A9. STILL OPEN #3 resolved, then the SOLD transition edge (the
+genuinely-blocking architectural gap flagged for this exact point)
+resolved.** `test/zohoSaleImport.spec.ts` was written and committed
+(`3b14f6d`, 39 tests) ahead of any write-path code, per A8's closing gate.
+Full-suite reconciliation at that point: 650 passed / 8 skipped / 0
+failed. User instruction: "Continue" — interpreted, per pick-and-note, as
+proceeding to the one remaining item in the roadmap: writing
+`applyZohoSaleImport`.
+
+Before that function could be written, `src/lib/deviceLifecycle.ts`'s
+`ALLOWED_TRANSITIONS.SOLD` was found to have no inbound edges from
+anywhere — no status could transition INTO `SOLD`, which would prevent
+`applyZohoSaleImport`'s `matched_sale` write path from ever completing.
+Migration `0033`'s own header comment explicitly deferred this decision
+to "the /imports importer work (next in the resume order)" — confirming
+this was the right point to resolve it.
+
+**Decision** (commit `b3d9401`): `SOLD` is now reachable from `RECEIVED,
+SORTING, ACTIVE_INVENTORY, IN_HOUSE_REPAIR, READY_FOR_EXPORT, QC_FAILED,
+READY_FOR_ZOHO` — every status representing currently-owned,
+non-consignment-locked, non-rejected stock. Deliberately excluded:
+- The five OPR/temp-export consignment statuses
+  (`IN_EXPORT_CONSIGNMENT`/`EXPORTED_UNDER_OPR`/`RETURNED_UNDER_OPR`/
+  `TEMP_EXPORTED_STANDARD`/`RETURNED_UNDER_STANDARD`) — these must stay in
+  lockstep with `shipment_lines`; a Zoho sale row matching a device under
+  an open consignment must surface as a named conflict from
+  `applyZohoSaleImport`, never a silent status overwrite.
+- `REJECTED` — not sellable stock by definition; must go
+  `REJECTED -> RECEIVED` first. A Zoho sale row matching a REJECTED
+  device is also a named conflict to surface, not a target this edge
+  list makes reachable.
+
+`SOLD` itself remains terminal (`SOLD: []` unchanged) — a second
+sale-outcome against an already-SOLD device must be a named
+conflict/no-op in `applyZohoSaleImport`, never a second
+`transitionDevice()` call.
+
+Rationale for the wide reachability (not `ACTIVE_INVENTORY`-only): Zoho
+is the authoritative EXTERNAL record of the sale FACT (no in-app POS
+exists), so a real sale can legitimately be recorded before this app's
+own internal workflow has caught up to `ACTIVE_INVENTORY` — restricting
+the edge to `ACTIVE_INVENTORY`-only would turn every ordinary
+same-day-sale race into an unmatched conflict on day one of the real (1
+Aug 2026+) file.
+
+Follow-up fixes bundled into the same commit:
+- `test/deviceLifecycle.spec.ts`: the disallowed-transitions negative
+  case `['RECEIVED', 'SOLD']` is now an allowed edge, so it was replaced
+  with `['IN_EXPORT_CONSIGNMENT', 'SOLD']` (the equivalent
+  consignment-locked-exclusion negative case); header comment updated to
+  match. The pre-existing generic `ALLOWED_TRANSITIONS` sweep test picked
+  up all 7 new SOLD edges automatically (no fixture change needed) — main
+  suite count moved from 585 to 592 passed accordingly.
+- `src/routes/reports.ts`: corrected the stale "SOLD is currently
+  unreachable" comment above `VALUATION_EXCLUDED_TOTALLY` — SOLD is now
+  reachable (though still unwritten by any code path until
+  `applyZohoSaleImport` lands).
+
+Verification: `tsc --noEmit` clean. Full two-command vitest gate green:
+main suite 592 passed / 8 skipped (was 585), serial suite 65 passed / 0
+skipped (unchanged). **New combined baseline: 657 passed / 8 skipped / 0
+failed** (was 650/8/0 — the +7 delta is exactly the 7 new SOLD edges,
+confirmed via the generic sweep test, not a masked regression).
+
 ## Status
 
-Read-only reconnaissance plus one operator scope-ruling pass (this
-addendum). Schema (migration `0034_zoho_sale_import.sql`) and a pure
-classification module (`src/lib/zohoSaleImport.ts`) are written and
+Read-only reconnaissance plus two operator/continuation passes (this
+addendum, A1–A9). Schema (migration `0034_zoho_sale_import.sql`) and a
+pure classification module (`src/lib/zohoSaleImport.ts`) are written and
 committed (`975a5c7`, then edited for the INNER JOIN contract in
 `6320f0e`) — both changes are local-only, migrations `0032`/`0033`/`0034`
 remain UNAUTHORISED for deploy. Local dev D1 is now fully caught up
-(`0001`→`0034`, verified A8). Still open, per operator ruling: write
-`test/zohoSaleImport.spec.ts` (shape classifier, disposition map incl.
-UNCLASSIFIED, pence parsing) with a registry-registered IMEI prefix,
-BEFORE `applyZohoSaleImport` (the D1 write function) may be written. No
-write-path code exists yet — correctly, per this gate.
+(`0001`→`0034`, verified A8). `test/zohoSaleImport.spec.ts` (39 tests,
+commit `3b14f6d`) and the `SOLD` transition edge (commit `b3d9401`, A9)
+are both resolved and committed. Combined vitest baseline: 657 passed / 8
+skipped / 0 failed.
+
+**Still open**: `applyZohoSaleImport` itself (the D1-backed write
+function in `src/lib/zohoSaleImport.ts`) and its route have not been
+written yet — this is the next deliverable, now unblocked by A9. No
+write-path code exists yet — correctly, per the STILL-OPEN-#3 /
+SOLD-edge gates both now being satisfied in the right order.
