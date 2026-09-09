@@ -12,5 +12,5 @@
     "jsx": "react-jsx",
     "jsxImportSource": "hono/jsx"
   },
-  "exclude": ["test", "vitest.config.ts", "node_modules", "dist"]
+  "exclude": ["test", "vitest.config.ts", "vitest.serial.config.ts", "node_modules", "dist"]
 }
