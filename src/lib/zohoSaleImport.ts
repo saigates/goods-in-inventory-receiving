@@ -101,6 +101,10 @@
 // for a non-matching serial, and classifyZohoCsvRows() filters those nulls
 // out before they ever reach `outcomes` or any count.
 
+import { newUuid } from './uuid'
+import { transitionDevice, InvalidTransitionError } from './deviceLifecycle'
+import type { AuthUser } from '../types'
+
 // ───────── CSV parsing ─────────
 
 export const ZOHO_CSV_HEADERS = [
@@ -466,5 +470,234 @@ export function classifyZohoCsvRows(
     matchedUnclassifiedCount,
     skippedAvailableCount,
     outcomes,
+  }
+}
+
+// ───────── D1-backed apply (write path) ─────────
+//
+// Not pure — looks up received_devices by IMEI to build the known-IMEI set
+// classifyRow()/classifyZohoCsvRows() need, then writes outcomes. Same
+// two-phase shape as applySkuMapImport (skuMapImport.ts): parse -> validate
+// -> (dry-run: return diff-equivalent preview) -> (write: batch statements).
+//
+// Per-outcome write behaviour (design-basis + 2026-09-09 scope rulings):
+//   matched_sale (SALE_EXTERNAL):
+//     - related-row-first, transitionDevice()-second (repairWorkflow.ts
+//       closeToInventory() ordering convention) — write the sale columns
+//       (sold_invoice_no, sold_date, sold_channel='zoho_import',
+//       sold_price_pence, attribution='zoho_import', disposition,
+//       zoho_out_contact_id, zoho_out_entity_number) BEFORE calling
+//       transitionDevice(..., 'SOLD', ...), so no external observer can
+//       catch a SOLD device with blank sale columns.
+//     - transitionDevice() throws InvalidTransitionError for a device
+//       already outside the reachable-to-SOLD source set (the five
+//       OPR/temp-export consignment statuses, REJECTED) or already SOLD
+//       (ALLOWED_TRANSITIONS.SOLD = []) — both are caught and surfaced as
+//       a NAMED conflict entry, never a thrown error that aborts the
+//       whole batch and never a silent skip.
+//   matched_non_revenue (FBA_TRANSFER / GRADE_CHANGE_OUT / RETURN_TO_SUPPLIER):
+//     - writes disposition/creditValuePence/zoho_out_contact_id/
+//       zoho_out_entity_number ONLY. Never calls transitionDevice() into
+//       SOLD — these are custody moves or vendor credits, not sales (see
+//       design-basis note above classifyRow()). sold_price_pence and every
+//       other 0033 sale column stay untouched.
+//   matched_unclassified:
+//     - no write at all. Reported back in the result for operator review;
+//       UNCLASSIFIED is the correct destination for an unmapped
+//       out_contact_id (2026-09-09 scope ruling) and needs no schema
+//       write until a human maps it into ZOHO_CONTACT_DISPOSITION_MAP.
+//   skipped_available:
+//     - no write. The device hasn't been sold in Zoho yet (blank
+//       out_contact_id, status=available) — nothing to attribute this run.
+//
+// CONFLICT SURFACING (never a thrown error, never a silent skip): a
+// matched_sale outcome whose target device is not currently in one of the
+// seven reachable-to-SOLD source statuses (already SOLD, or on a locked
+// consignment leg, or REJECTED) is recorded as a `ZohoImportConflict` and
+// excluded from the write batch — the rest of the import still proceeds.
+//
+// dryRun=true classifies every row and reports what WOULD happen
+// (soldCount/nonRevenueCount/unclassifiedCount/skippedCount/conflicts)
+// without writing anything or calling transitionDevice().
+
+export type ZohoImportConflict = {
+  serialCode: string
+  imei: string
+  reason: 'already_sold' | 'locked_consignment' | 'rejected' | 'device_not_found'
+  currentStatus: string | null
+}
+
+export type ZohoImportApplyResult = {
+  ok: boolean
+  errors: string[]
+  dryRun: boolean
+  importBatchId: string | null
+  totalRows: number
+  matchedSaleCount: number
+  matchedNonRevenueCount: number
+  matchedUnclassifiedCount: number
+  skippedAvailableCount: number
+  soldCount: number // subset of matchedSaleCount actually written (dryRun: what WOULD write)
+  conflicts: ZohoImportConflict[]
+  unclassified: Array<{ serialCode: string; imei: string; outContactId: string; outContactName: string }>
+}
+
+// Statuses a device may be in when a matched_sale outcome targets it.
+// Mirrors deviceLifecycle.ts's ALLOWED_TRANSITIONS SOLD-edge note exactly
+// (RECEIVED, SORTING, ACTIVE_INVENTORY, IN_HOUSE_REPAIR, READY_FOR_EXPORT,
+// QC_FAILED, READY_FOR_ZOHO) — kept as a local literal rather than derived
+// from ALLOWED_TRANSITIONS at runtime so a future edit to that table
+// cannot silently widen/narrow this importer's own conflict-detection
+// without a matching, reviewed change here.
+const SOLD_REACHABLE_STATUSES = new Set([
+  'RECEIVED', 'SORTING', 'ACTIVE_INVENTORY', 'IN_HOUSE_REPAIR',
+  'READY_FOR_EXPORT', 'QC_FAILED', 'READY_FOR_ZOHO',
+])
+
+function conflictReasonFor(status: string): ZohoImportConflict['reason'] {
+  if (status === 'SOLD') return 'already_sold'
+  if (status === 'REJECTED') return 'rejected'
+  return 'locked_consignment' // the five OPR/temp-export consignment statuses
+}
+
+export async function applyZohoSaleImport(
+  db: D1Database,
+  organisationId: number,
+  csvText: string,
+  opts: { dryRun: boolean; actorUserId: number; user: AuthUser },
+): Promise<ZohoImportApplyResult> {
+  const empty = {
+    ok: false, errors: [] as string[], dryRun: opts.dryRun, importBatchId: null,
+    totalRows: 0, matchedSaleCount: 0, matchedNonRevenueCount: 0,
+    matchedUnclassifiedCount: 0, skippedAvailableCount: 0, soldCount: 0,
+    conflicts: [] as ZohoImportConflict[], unclassified: [] as ZohoImportApplyResult['unclassified'],
+  }
+
+  const parsed = parseZohoCsv(csvText)
+  if (!parsed.ok) return { ...empty, errors: [parsed.error] }
+
+  // Build the known-IMEI set from received_devices for this organisation —
+  // classifyRow()'s INNER JOIN CONTRACT needs this to decide match/no-match.
+  const { results: deviceRows } = await db.prepare(
+    'SELECT id, imei, status FROM received_devices WHERE organisation_id = ?'
+  ).bind(organisationId).all<{ id: number; imei: string; status: string }>()
+  const byImeiUpper = new Map(deviceRows.map(d => [d.imei.trim().toUpperCase(), d]))
+  const knownImeisUpper = new Set(byImeiUpper.keys())
+
+  const summary = classifyZohoCsvRows(parsed.rows, knownImeisUpper)
+
+  const unclassified = summary.outcomes
+    .filter((o): o is Extract<ZohoImportOutcome, { outcome: 'matched_unclassified' }> => o.outcome === 'matched_unclassified')
+    .map(o => ({ serialCode: o.serialCode, imei: o.imei, outContactId: o.outContactId, outContactName: o.outContactName }))
+
+  const saleOutcomes = summary.outcomes
+    .filter((o): o is Extract<ZohoImportOutcome, { outcome: 'matched_sale' }> => o.outcome === 'matched_sale')
+  const nonRevenueOutcomes = summary.outcomes
+    .filter((o): o is Extract<ZohoImportOutcome, { outcome: 'matched_non_revenue' }> => o.outcome === 'matched_non_revenue')
+
+  // Conflict detection — same rule for dry-run preview and real write, so
+  // the preview is a truthful predictor of what a real run will do.
+  const conflicts: ZohoImportConflict[] = []
+  const writableSales: Array<{ outcome: Extract<ZohoImportOutcome, { outcome: 'matched_sale' }>; device: { id: number; imei: string; status: string } }> = []
+  for (const o of saleOutcomes) {
+    const device = byImeiUpper.get(o.imei)
+    if (!device) {
+      // Should not happen (o.imei came from knownImeisUpper), but keep the
+      // contract explicit rather than assume.
+      conflicts.push({ serialCode: o.serialCode, imei: o.imei, reason: 'device_not_found', currentStatus: null })
+      continue
+    }
+    if (!SOLD_REACHABLE_STATUSES.has(device.status)) {
+      conflicts.push({ serialCode: o.serialCode, imei: o.imei, reason: conflictReasonFor(device.status), currentStatus: device.status })
+      continue
+    }
+    writableSales.push({ outcome: o, device })
+  }
+
+  if (opts.dryRun) {
+    return {
+      ok: true, errors: [], dryRun: true, importBatchId: null,
+      totalRows: summary.totalRows,
+      matchedSaleCount: summary.matchedSaleCount,
+      matchedNonRevenueCount: summary.matchedNonRevenueCount,
+      matchedUnclassifiedCount: summary.matchedUnclassifiedCount,
+      skippedAvailableCount: summary.skippedAvailableCount,
+      soldCount: writableSales.length,
+      conflicts,
+      unclassified,
+    }
+  }
+
+  const importBatchId = newUuid()
+  const now = new Date().toISOString()
+
+  // non_revenue writes: disposition/creditValuePence/zoho_out_contact_id/
+  // zoho_out_entity_number ONLY. Never touches sold_price_pence or any
+  // other 0033 sale column, never calls transitionDevice() into SOLD.
+  const nonRevenueStatements = nonRevenueOutcomes.map(o => {
+    const device = byImeiUpper.get(o.imei)!
+    return db.prepare(
+      `UPDATE received_devices SET
+         disposition = ?, credit_value_pence = ?, zoho_out_contact_id = ?,
+         zoho_out_entity_number = ?, updated_at = ?
+       WHERE id = ? AND organisation_id = ?`
+    ).bind(o.disposition, o.creditValuePence, o.outContactId, o.entityNumber, now, device.id, organisationId)
+  })
+
+  if (nonRevenueStatements.length > 0) {
+    await db.batch(nonRevenueStatements)
+  }
+
+  // sale writes: related-row (sale columns) FIRST, transitionDevice()
+  // SECOND per repairWorkflow.ts closeToInventory()'s ordering convention
+  // — each device processed independently so one device's transition
+  // failure cannot abort another's, matching the bulk-transition route's
+  // per-row-independent precedent (src/routes/devices.ts).
+  let soldCount = 0
+  for (const { outcome: o, device } of writableSales) {
+    await db.prepare(
+      `UPDATE received_devices SET
+         sold_invoice_no = ?, sold_date = ?, sold_channel = 'zoho_import',
+         sold_price_pence = ?, attribution = 'zoho_import',
+         disposition = ?, zoho_out_contact_id = ?, zoho_out_entity_number = ?,
+         updated_at = ?
+       WHERE id = ? AND organisation_id = ?`
+    ).bind(
+      o.invoiceNo, o.saleDate, o.soldPricePence, o.disposition,
+      o.outContactId, o.invoiceNo, now, device.id, organisationId,
+    ).run()
+
+    try {
+      await transitionDevice(db, device.id, 'SOLD', {
+        user: opts.user,
+        eventType: 'ZOHO_SALE_IMPORT',
+        reference: importBatchId,
+        metadata: { zoho_invoice_no: o.invoiceNo, zoho_out_contact_id: o.outContactId },
+      })
+      soldCount++
+    } catch (err) {
+      // A device that changed status between the conflict check above and
+      // this write (race) surfaces as a conflict rather than aborting the
+      // whole import — the sale columns just written stand as a record of
+      // the attempt; they are not rolled back (matches the "no partial
+      // rollback across independent devices" precedent in bulk-transition).
+      conflicts.push({
+        serialCode: o.serialCode, imei: o.imei,
+        reason: err instanceof InvalidTransitionError ? conflictReasonFor(device.status) : 'device_not_found',
+        currentStatus: device.status,
+      })
+    }
+  }
+
+  return {
+    ok: true, errors: [], dryRun: false, importBatchId,
+    totalRows: summary.totalRows,
+    matchedSaleCount: summary.matchedSaleCount,
+    matchedNonRevenueCount: summary.matchedNonRevenueCount,
+    matchedUnclassifiedCount: summary.matchedUnclassifiedCount,
+    skippedAvailableCount: summary.skippedAvailableCount,
+    soldCount,
+    conflicts,
+    unclassified,
   }
 }

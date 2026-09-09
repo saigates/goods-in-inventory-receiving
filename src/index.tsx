@@ -15,6 +15,7 @@ import oprRoute from './routes/opr'
 import billsRoute from './routes/bills'
 import reportsRoute from './routes/reports'
 import skuMapRoute from './routes/skuMap'
+import zohoSaleImportRoute from './routes/zohoSaleImport'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -55,6 +56,7 @@ app.route('/api/opr', oprRoute)
 app.route('/api/bills', billsRoute)
 app.route('/api/reports', reportsRoute)
 app.route('/api/sku-map', skuMapRoute)
+app.route('/api/zoho-sale-import', zohoSaleImportRoute)
 
 // SPA shell — all UI rendered client-side from /static/app.js
 app.get('/', (c) => {
