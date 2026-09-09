@@ -305,9 +305,130 @@ never be coerced through `validateImei()`, which would reject all of them
    this path — only needed for reporting rollups and any future
    unmatched-fallback attribution, per explicit instruction.
 
+## Addendum (2026-09-09, same day, later pass) — operator scope ruling
+
+This addendum records a subsequent operator ruling that supersedes parts
+of Sections 5–7 above. The original sections are left UNEDITED above (as
+a historical record of what was measured and reasoned at the time); this
+addendum states what changed and why, rather than rewriting history.
+
+**A1. Section 5's 33.8% match-rate figure is RETIRED — do not quote it
+again.** Operator ruling: it measured overlap between a FORMAT SAMPLE and
+the app's lifetime, which is not a decision-relevant quantity. The
+underlying computation (506/1499 matched, 993 unattributed) stands as a
+historical fact about the sample file, but must not be cited as
+informative about the real file's expected match rate, and must not be
+recomputed/monitored as a KPI going forward under that assumption.
+
+**A2. `Serial Number Details_Inwards.csv` / `Serial Number Details_Outwards.csv`
+are reclassified as FORMAT SAMPLE ONLY.** The real file — full data from
+1 August 2026 onward — arrives separately and supersedes this sample for
+any volume/rate/match-rate decision. Every row-count-derived figure in
+Sections 1–6 above (1635, 1581, 1066, 1499, 954, 3216, etc.) remains valid
+as a STRUCTURAL fact (header shape, bijections, shape distribution,
+disposition-mapping completeness) but must not be treated as
+representative of the real file's actual volumes.
+
+**A3. Expectation INVERTS for the real file.** In the sample, a low
+match rate was expected/benign because the sample's Outwards window
+reached back to 2022-11-04 (Section 1), predating this business's own
+goods-in tracking (`received_devices`, MIN `in_entity_date` =
+2026-08-03). The real file's window (1 Aug 2026 onward) sits ENTIRELY
+INSIDE both the app's lifetime and goods-in's own window. Therefore, in
+the real file, a low match rate is NOT benign and must be investigated,
+not assumed away. "Low match is expected" from Section 5/7 must not be
+carried forward as an assumption when the real file lands.
+
+**A4. Importer contract change — INNER JOIN, no unmatched tracking.**
+Section 7 point 4 and point 6 above (documenting `UNMATCHED_SERIAL_SHAPE`
+as a counted/reported outcome, and an "unattributed-count placard") are
+SUPERSEDED. Operator ruling: the importer is an INNER JOIN on the
+goods-in roster (`received_devices.imei`). A Zoho row with no matching
+IMEI produces NOTHING — no outcome, no counter, no report line, no
+staging table. `src/lib/zohoSaleImport.ts` (commit `975a5c7`) has been
+edited to remove the `unmatched_no_device` / `unmatched_serial_shape`
+`ZohoImportOutcome` variants and the `unmatchedNoDeviceCount` /
+`unmatchedSerialShapeCount` / `unattributedTotal` counts from
+`classifyRow()` / `classifyZohoCsvRows()` / `ZohoImportSummary` —
+`classifyRow()` now returns `null` for a non-matching serial, and the
+batch classifier filters those nulls out before they reach `outcomes` or
+any count.
+
+**A5. FBA_TRANSFER hard rule — confirmed, now firm.** Operator confirms
+Amazon FBA sales are exportable separately from the FBA dashboard —
+FBA_TRANSFER is a genuine custody move, with the real revenue for that
+unit living in a SEPARATE, not-yet-built data source. The flat £450
+`sold_price` on FBA_TRANSFER rows (Section 3) must be written to NO money
+column at all — not `sold_price_pence`, not `credit_value_pence`, not any
+future revenue column. `classifyRow()` already set `creditValuePence:
+null` for `FBA_TRANSFER` prior to this ruling (compliant by construction,
+not by new edit) — this has now been documented explicitly in the
+module's design-basis comment and must be preserved into the not-yet-built
+`applyZohoSaleImport` D1 write function. **Double-count risk, recorded for
+the future**: when a future Amazon-FBA-sales importer attributes real
+revenue to the same physical unit, that unit will carry both a Zoho
+FBA_TRANSFER leg and an Amazon sale — if the £450 (or any FBA-leg value)
+is ever written to a money column, that unit is double-counted. The
+disposition model must stay able to accept a later Amazon-sourced sale
+against a device already marked FBA_TRANSFER — FBA_TRANSFER must never be
+treated as a terminal/locking state. No FBA-sales-importer work has begun
+under this ruling.
+
+**A6. Parse-by-header-name — confirmed compliant, now a documented hard
+requirement.** Operator instruction: since only one sample of the format
+has been seen and the real file's column order may shift, the parser must
+never rely on column position, and must fail loudly at parse time if an
+expected header is missing. Re-inspected `parseZohoCsv()`
+(`src/lib/zohoSaleImport.ts`): it builds row objects via
+`header.forEach((h, idx) => row[h] = cells[idx])` — i.e. keyed by the
+header ROW's own text, never a hardcoded index — and validates every
+`ZOHO_CSV_HEADERS` entry is present in the file's own header line before
+reading any data row, returning `{ ok: false, error: 'Missing required
+column: <name>' }` otherwise. This was written before this instruction was
+stated (coincidental, not directed, compliance) — now explicitly confirmed
+against the wording and documented in the module's header comment.
+
+**A7. STILL OPEN #1 resolved — `out_contact_id` alone remains sufficient,
+no composite key needed.** Re-ran the Section 3 aggregation grouped by
+`out_contact_id` alone, checking for any id spanning more than one
+`out_entity_type` (which would have required a composite
+`(out_contact_id, out_entity_type)` classification key). Script:
+`/tmp/zoho_analysis/contact_entity_check.py` (ephemeral, outside repo).
+Verbatim output:
+```
+Total distinct out_contact_id values (including blank): 22
+Total distinct out_contact_id values (excluding blank): 21
+
+Contact IDs where count(distinct out_entity_type) > 1:
+  NONE FOUND -- every non-blank out_contact_id maps to exactly one out_entity_type.
+
+Contact IDs where count(distinct out_contact_name) > 1 (name drift under one ID):
+
+Total (id,name,type) groups (incl blank-id availability bucket): 22
+Non-blank-id groups: 21
+Non-blank distinct contact_ids: 21
+```
+**Conclusion: 0 of 21 non-blank `out_contact_id` values span more than one
+`out_entity_type`; no name drift either.** The "22 groups vs 21 contacts"
+gap (Section 3) is fully explained by the single blank-`out_contact_id`
+availability bucket (525 unsold rows) — not a hidden collision. No code
+change to `ZOHO_CONTACT_DISPOSITION_MAP` / `classifyDisposition()` is
+needed; `out_contact_id` alone remains the classification key. Per
+operator instruction, the `UNCLASSIFIED` fallback branch is kept
+regardless of this result — "zero [collisions/UNCLASSIFIED contacts]
+today is not zero in the 1 August file."
+
 ## Status
 
-Read-only reconnaissance. No schema, route, or importer code written yet.
-Next: design + build the serial-first importer module and its D1 write
-path (new migration for the vendor-credit value column), with unit tests
-covering the shape/disposition/dedupe edge cases documented above.
+Read-only reconnaissance plus one operator scope-ruling pass (this
+addendum). Schema (migration `0034_zoho_sale_import.sql`) and a pure
+classification module (`src/lib/zohoSaleImport.ts`) are written and
+committed (`975a5c7`), and have now been edited to enforce the INNER JOIN
+contract (A4) — both changes are local-only, migrations `0032`/`0033`/
+`0034` remain UNAUTHORISED for deploy. Still open, per operator ruling:
+(1) verify local dev D1 has migrations `0032`/`0033` actually applied
+before any write-path testing (fresh-DB replay risk, not yet checked);
+(2) write `test/zohoSaleImport.spec.ts` (shape classifier, disposition
+map incl. UNCLASSIFIED, pence parsing) with a registry-registered IMEI
+prefix, BEFORE `applyZohoSaleImport` (the D1 write function) may be
+written. No write-path code exists yet — correctly, per this gate.

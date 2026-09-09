@@ -12,22 +12,49 @@
 // - out_entity_type is the WRONG revenue classifier (FBA transfers and
 //   internal grade changes both carry out_entity_type='invoice' alongside
 //   real sales). out_contact_id is the correct classifier, mapped to
-//   exactly one of four dispositions below. Any out_contact_id NOT in the
+//   exactly one of five dispositions below. Any out_contact_id NOT in the
 //   mapping table produces UNCLASSIFIED — it must NEVER silently default
 //   to SALE_EXTERNAL (a silent default there is an uncaught revenue
-//   overstatement).
+//   overstatement). CONFIRMED 2026-09-09 (scope-ruling verification): 0 of
+//   21 non-blank out_contact_id values in the sample span more than one
+//   out_entity_type — out_contact_id ALONE remains a sufficient
+//   classification key; no composite (out_contact_id, out_entity_type) key
+//   is needed. The "22 groups vs 21 contacts" gap is fully explained by the
+//   single blank-out_contact_id/available-status bucket, not a collision.
+//   Re-check this on the real (1 Aug 2026+) file when it arrives — a future
+//   file may still introduce a genuine collision, which is why
+//   UNCLASSIFIED stays as a permanent fallback branch regardless.
 // - Vendor credits (RETURN_TO_SUPPLIER): do NOT set status=SOLD, do NOT
 //   populate sold_price_pence. Credit value goes in credit_value_pence
 //   (migration 0034), never sold_price_pence. Price equality
 //   (sold_price==cost_price) is explicitly NOT a detection heuristic —
 //   disproven empirically (58/95 SW001 rows differ) — out_contact_id
 //   membership is the only correct detector.
+// - FBA_TRANSFER hard rule (operator-confirmed 2026-09-09, scope ruling):
+//   Amazon FBA sales are exportable separately from the FBA dashboard, so
+//   the flat £450 sold_price on every FBA_TRANSFER row is a CUSTODY-MOVE
+//   placeholder, not revenue, not a cost, and not a credit. It must be
+//   written to NO money column anywhere — not sold_price_pence, not
+//   credit_value_pence, not any future revenue column. classifyRow()
+//   enforces this by setting creditValuePence to null for FBA_TRANSFER
+//   (see matched_non_revenue below) — this must stay null even if a future
+//   edit adds more fields to that variant. DOUBLE-COUNT RISK: a future,
+//   not-yet-built Amazon-FBA-sales importer will eventually attribute real
+//   revenue to the SAME physical unit that already carries an
+//   FBA_TRANSFER leg here. The disposition model must therefore stay able
+//   to accept a later Amazon-sourced sale against a device already marked
+//   FBA_TRANSFER — FBA_TRANSFER must never be treated as a terminal/locking
+//   state for a device. Do not begin the FBA-sales-importer workstream
+//   from this file.
 // - Serial shape: NO Luhn validation on Zoho-supplied serials (a real
 //   counter-example, 861669048498974, is Luhn-invalid and must still be
-//   considered for matching). NEVER coerce through validateImei() — a
-//   non-matching-shape code gets UNMATCHED_SERIAL_SHAPE, counted and
-//   reported, never silently dropped or forced through the app's IMEI
-//   validator.
+//   considered for matching). NEVER coerce through validateImei().
+//   classifySerialShape()/SerialShape are kept as standalone, unit-testable
+//   reporting utilities (see STILL OPEN #3 — the disposition/shape/pence
+//   test file must cover the shape classifier), but as of the 2026-09-09
+//   scope ruling below, shape is NO LONGER used to produce, count, or
+//   report an outcome for a non-matching serial — see the INNER JOIN
+//   CONTRACT note directly above classifyRow().
 // - serial_number_code alone is not a safe leg-identifier WITHIN the Zoho
 //   export (a physical device can be re-graded and get a new
 //   serial_number_item_id/sku while keeping the same serial_number_code —
@@ -36,6 +63,43 @@
 //   OUR side), but the importer must not assume a matched code has only
 //   one candidate Zoho row if the Zoho data itself contains more than one
 //   for that code — see resolveZohoRowForCode below.
+// - PARSE BY HEADER NAME, NEVER BY COLUMN POSITION (operator instruction,
+//   scope ruling 2026-09-09): only one sample of this CSV format has been
+//   seen (Serial Number Details_Inwards/Outwards.csv, explicitly
+//   reclassified as a FORMAT SAMPLE ONLY — the real file, full data from
+//   1 August 2026, arrives separately and may shift column order). Every
+//   row read in parseZohoCsv() below is built by indexing into the
+//   HEADER ROW's own positions (`header.forEach((h, idx) => row[h] = ...)`),
+//   never by a hardcoded column index — and parseZohoCsv() fails loudly
+//   (`ok: false`) at parse time if any ZOHO_CSV_HEADERS name is missing
+//   from the file's own header row, rather than silently reading the wrong
+//   column into the wrong field name.
+// - REAL-FILE EXPECTATION INVERSION (operator instruction, scope ruling
+//   2026-09-09): the low match rate measured against the FORMAT-SAMPLE
+//   Outwards file (retired figure, do not quote — see CLOSED note below)
+//   was benign ONLY because that sample's out-side window reached back to
+//   2022, before this app's own goods-in tracking existed. The REAL file's
+//   window (1 Aug 2026 onward) sits INSIDE both the app's lifetime and
+//   goods-in's own window (MIN in_entity_date = 2026-08-03) — so "low match
+//   rate is expected/benign" must NOT be assumed for the real file. Any
+//   future match-rate monitoring against the real file must treat a low
+//   rate as a signal to investigate, not as expected background noise.
+//
+// ───────── INNER JOIN CONTRACT (operator instruction, scope ruling 2026-09-09) ─────────
+// The importer is an INNER JOIN on the goods-in roster (received_devices.
+// imei). Only a Zoho row whose serial_number_code matches a known IMEI
+// produces ANY output — a classification outcome, a counter increment, or
+// a report line. A Zoho row with no matching IMEI produces NOTHING: no
+// outcome object, no count, no staging-table entry, no report line. This
+// is a hard contract on output cardinality (bounded by the goods-in
+// roster, never by the Outwards file's own row count), not a default that
+// a future edit may loosen by re-adding an "unmatched" counter. The
+// previously-committed `unmatched_no_device` / `unmatched_serial_shape`
+// ZohoImportOutcome variants (and their unmatchedNoDeviceCount /
+// unmatchedSerialShapeCount / unattributedTotal counts) have been REMOVED
+// to enforce this — classifyRow() now returns `null` (produces nothing)
+// for a non-matching serial, and classifyZohoCsvRows() filters those nulls
+// out before they ever reach `outcomes` or any count.
 
 // ───────── CSV parsing ─────────
 
@@ -117,10 +181,12 @@ export function parseZohoCsv(raw: string): ZohoCsvParseResult {
 // would silently reject legitimate matches.
 //
 // The importer's own matching rule is exact case-insensitive string
-// equality against received_devices.imei — shape is classified here only
-// for REPORTING (so an operator can see why a code produced
-// UNMATCHED_SERIAL_SHAPE at match time), never as a gate on whether the
-// match attempt itself is made.
+// equality against received_devices.imei. classifySerialShape() is kept as
+// a standalone, unit-testable utility (required by STILL OPEN #3's test
+// coverage), but per the 2026-09-09 INNER JOIN CONTRACT it is no longer
+// consulted by classifyRow()/classifyZohoCsvRows() to produce, count, or
+// report any outcome for a non-matching serial — a non-match now produces
+// nothing at all, not a shape-tagged report line.
 
 export type SerialShape = 'imei_15_digit' | 'alnum_10' | 'other'
 
@@ -237,20 +303,15 @@ export type ZohoImportOutcome =
       outContactName: string
     }
   | {
-      outcome: 'unmatched_no_device'
-      serialCode: string
-      shape: SerialShape
-    }
-  | {
-      outcome: 'unmatched_serial_shape'
-      serialCode: string
-      shape: SerialShape
-    }
-  | {
       outcome: 'skipped_available'
       serialCode: string
       imei: string
     }
+// INNER JOIN CONTRACT: there is deliberately NO "unmatched"/"no device"
+// outcome variant here. A serial with no matching received_devices.imei
+// produces no ZohoImportOutcome at all — classifyRow() returns null for
+// it, and classifyZohoCsvRows() drops the null before it reaches
+// `outcomes` or any count. See the design-basis comment above.
 
 // Converts a decimal GBP string ("260.00") to integer pence. Parses
 // straight to an integer via string-splitting, never through a float
@@ -271,26 +332,27 @@ export function gbpStringToPence(value: string): number | null {
 // classifyRow: pure classification of ONE (already-resolved) Zoho row
 // against the set of known received_devices IMEIs (case-insensitive).
 // Does not decide DB writes — see applyZohoSaleImport for that.
+//
+// INNER JOIN CONTRACT (2026-09-09 scope ruling): returns null when the
+// row's serial_number_code has no matching received_devices.imei. A null
+// return means "produce nothing" — no outcome object, no counter, no
+// report line. Callers (classifyZohoCsvRows) MUST filter out null before
+// counting/reporting; they must never re-introduce an "unmatched" count.
 export function classifyRow(
   row: ZohoCsvRow,
   knownImeisUpper: ReadonlySet<string>,
-): ZohoImportOutcome {
+): ZohoImportOutcome | null {
   const serialCode = row.serial_number_code
   const normalised = normaliseSerialForMatch(serialCode)
-  const shape = classifySerialShape(serialCode)
   const matchedImei = knownImeisUpper.has(normalised) ? normalised : null
 
   if (!matchedImei) {
-    // Unmatched: distinguish "looked like a device identifier but we don't
-    // hold that device" from "doesn't look like a device identifier at
-    // all" — both are reported, never silently dropped, but the shape
-    // distinction is preserved for the operator to act on differently
-    // (a missing goods-in device vs. a genuinely non-device serial, e.g.
-    // an accessory or SIM-card style code).
-    if (shape === 'other') {
-      return { outcome: 'unmatched_serial_shape', serialCode, shape }
-    }
-    return { outcome: 'unmatched_no_device', serialCode, shape }
+    // No matching goods-in device: the INNER JOIN contract means this row
+    // produces NOTHING — not a counted "unmatched" outcome, not a report
+    // line, not a staging-table entry. classifySerialShape() still exists
+    // as a standalone reporting utility (unit-tested per STILL OPEN #3)
+    // but is deliberately NOT consulted here anymore.
+    return null
   }
 
   // Matched an IMEI we hold. If this row hasn't been sold yet (status
@@ -349,20 +411,21 @@ export function classifyRow(
 
 // ───────── Batch classification over a full CSV ─────────
 
+// INNER JOIN CONTRACT (2026-09-09 scope ruling): totalRows is the RAW
+// input row count from the CSV — kept only as a parse-time fact ("we read
+// N lines"), never as a denominator implying N outcomes are expected.
+// `outcomes` contains ONLY matched rows (matched_sale / matched_non_revenue
+// / matched_unclassified / skipped_available) — there is deliberately NO
+// unmatched count anywhere on this type. A non-matching serial is absent
+// from `outcomes` and from every count below; it is not represented by a
+// zero, a null entry, or a placard figure. Do not re-add one.
 export type ZohoImportSummary = {
   totalRows: number
   matchedSaleCount: number
   matchedNonRevenueCount: number
   matchedUnclassifiedCount: number
-  unmatchedNoDeviceCount: number
-  unmatchedSerialShapeCount: number
   skippedAvailableCount: number
   outcomes: ZohoImportOutcome[]
-  // Placard counts: unattributed = every row this run did not turn into a
-  // matched_sale/matched_non_revenue/matched_unclassified write. Reported
-  // explicitly (never silently absorbed) per the reconnaissance note's
-  // "expect a low match rate, don't treat it as failure" framing.
-  unattributedTotal: number
 }
 
 export function classifyZohoCsvRows(
@@ -378,19 +441,22 @@ export function classifyZohoCsvRows(
     byCode.get(key)!.push(r)
   }
 
+  // INNER JOIN CONTRACT: classifyRow() returns null for any serial with no
+  // matching received_devices.imei. Filter it out here, immediately —
+  // nulls must never reach `outcomes` or any count below.
   const outcomes: ZohoImportOutcome[] = []
   for (const [, codeRows] of byCode) {
     const resolved = resolveZohoRowForCode(codeRows)
     if (!resolved) continue
-    outcomes.push(classifyRow(resolved, knownImeisUpper))
+    const outcome = classifyRow(resolved, knownImeisUpper)
+    if (outcome === null) continue
+    outcomes.push(outcome)
   }
 
   const count = (o: ZohoImportOutcome['outcome']) => outcomes.filter(x => x.outcome === o).length
   const matchedSaleCount = count('matched_sale')
   const matchedNonRevenueCount = count('matched_non_revenue')
   const matchedUnclassifiedCount = count('matched_unclassified')
-  const unmatchedNoDeviceCount = count('unmatched_no_device')
-  const unmatchedSerialShapeCount = count('unmatched_serial_shape')
   const skippedAvailableCount = count('skipped_available')
 
   return {
@@ -398,10 +464,7 @@ export function classifyZohoCsvRows(
     matchedSaleCount,
     matchedNonRevenueCount,
     matchedUnclassifiedCount,
-    unmatchedNoDeviceCount,
-    unmatchedSerialShapeCount,
     skippedAvailableCount,
     outcomes,
-    unattributedTotal: unmatchedNoDeviceCount + unmatchedSerialShapeCount,
   }
 }
