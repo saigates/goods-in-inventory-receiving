@@ -418,17 +418,60 @@ operator instruction, the `UNCLASSIFIED` fallback branch is kept
 regardless of this result — "zero [collisions/UNCLASSIFIED contacts]
 today is not zero in the 1 August file."
 
+**A8. STILL OPEN #2 resolved — local dev D1 migration-replay state
+checked, was NOT a stack of unapplied migrations.** Ran
+`npx wrangler d1 migrations apply webapp-production --local` in list-only
+mode first (`d1 migrations list ... --local`):
+```
+Migrations to be applied:
+┌───────────────────────────┐
+│ Name                      │
+├───────────────────────────┤
+│ 0034_zoho_sale_import.sql │
+└───────────────────────────┘
+```
+Only `0034` was pending — `0032_zoho_sku_mapping.sql` and
+`0033_sale_attribution.sql` were ALREADY applied (confirmed both via the
+migration log itself, `SELECT * FROM d1_migrations`, showing sequential
+`applied_at` timestamps `2026-09-09 08:49:22` / `08:49:24`, and
+independently via schema inspection — `sqlite_master` shows
+`zoho_items`/`sku_map`/`sku_map_audit`/`sku_map_version` [0032's tables]
+already present, and `PRAGMA table_info(received_devices)` shows
+`sold_invoice_no`/`sold_price_pence` [0033's columns] already present).
+The "three-deep unapplied migration stack, never replayed end-to-end"
+risk flagged in STILL OPEN #2 did **not** materialize — the local dev DB
+was current up to `0033` already; only the brand-new `0034` (created this
+session, not yet applied anywhere) needed applying.
+
+Applied `0034` (local-only; not authorised for and not run against
+production):
+```
+🚣 6 commands executed successfully.
+┌───────────────────────────┬────────┐
+│ name                      │ status │
+├───────────────────────────┼────────┤
+│ 0034_zoho_sale_import.sql │ ✅     │
+└───────────────────────────┴────────┘
+```
+Verified post-apply: `PRAGMA table_info(received_devices)` now includes
+`disposition` (TEXT), `credit_value_pence` (INTEGER),
+`zoho_out_contact_id` (TEXT), `zoho_out_entity_number` (TEXT); a follow-up
+`d1 migrations list --local` returns `✅ No migrations to apply!`. Local
+dev D1 is now caught up `0001` → `0034` in full sequence. This is a local
+`.wrangler/` state change only (gitignored — confirmed `git status`
+remains clean); no schema or code file changed as part of this step, and
+no deploy/remote command was run.
+
 ## Status
 
 Read-only reconnaissance plus one operator scope-ruling pass (this
 addendum). Schema (migration `0034_zoho_sale_import.sql`) and a pure
 classification module (`src/lib/zohoSaleImport.ts`) are written and
-committed (`975a5c7`), and have now been edited to enforce the INNER JOIN
-contract (A4) — both changes are local-only, migrations `0032`/`0033`/
-`0034` remain UNAUTHORISED for deploy. Still open, per operator ruling:
-(1) verify local dev D1 has migrations `0032`/`0033` actually applied
-before any write-path testing (fresh-DB replay risk, not yet checked);
-(2) write `test/zohoSaleImport.spec.ts` (shape classifier, disposition
-map incl. UNCLASSIFIED, pence parsing) with a registry-registered IMEI
-prefix, BEFORE `applyZohoSaleImport` (the D1 write function) may be
-written. No write-path code exists yet — correctly, per this gate.
+committed (`975a5c7`, then edited for the INNER JOIN contract in
+`6320f0e`) — both changes are local-only, migrations `0032`/`0033`/`0034`
+remain UNAUTHORISED for deploy. Local dev D1 is now fully caught up
+(`0001`→`0034`, verified A8). Still open, per operator ruling: write
+`test/zohoSaleImport.spec.ts` (shape classifier, disposition map incl.
+UNCLASSIFIED, pence parsing) with a registry-registered IMEI prefix,
+BEFORE `applyZohoSaleImport` (the D1 write function) may be written. No
+write-path code exists yet — correctly, per this gate.
