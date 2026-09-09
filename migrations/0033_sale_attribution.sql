@@ -49,7 +49,7 @@
 --      cannot walk back.
 --
 -- ── The five sale columns (§4 of W2.3, unconditionally required) ──
--- sold_invoice_no, sold_date, sold_channel, sold_price, attribution.
+-- sold_invoice_no, sold_date, sold_channel, sold_price_pence, attribution.
 -- All nullable (NULL = not sold / not yet attributed), matching the
 -- existing nullable-until-known convention (buy_price, supplier_id, etc).
 -- `attribution` is deliberately plain TEXT, not an enum: the FIFO
@@ -60,6 +60,25 @@
 -- migration's scope — same "don't invent the enum before the consumer
 -- exists" discipline already used for cost_ledger.cost_type (TEXT, no DB
 -- CHECK, TypeScript union is the authority).
+--
+-- CORRECTION (amended in place before this migration reached anywhere
+-- other than local dev D1 — see the numbering note above): the sale
+-- price column is `sold_price_pence INTEGER`, not `sold_price REAL`.
+-- Amendment 1 requires every NEW money column to be INTEGER pence with
+-- a `_pence` suffix, explicitly naming this column; the `_gbp` REAL
+-- convention on cost_ledger/repair_jobs/bills is untouched — that split
+-- is deliberate (existing REAL GBP columns stay REAL GBP; every money
+-- column added from here on is INTEGER pence) and is recorded in
+-- migrations-held/README.md so it isn't tidied back later. This matters
+-- more on this column than anywhere else in the schema so far: it is
+-- one of the two operands of every margin figure the system will ever
+-- produce, and cost basis is being built pence-exact on purpose — a
+-- float revenue figure would make margin a float too, and would let the
+-- planned per-invoice net-plus-tax-equals-total reconciliation check
+-- fail on rounding noise alone, masking genuinely malformed lines.
+-- Zoho's net line value arrives as a decimal string; the importer must
+-- parse it straight to pence (integer cents-of-a-pound arithmetic),
+-- never through a float.
 --
 -- ── vat_treatment — decided now: TEXT, app-validated, DEFAULT
 --    'unclassified' ──
@@ -98,16 +117,35 @@
 -- similarly the wrong join for this: it identifies the INBOUND PURCHASE
 -- batch, not a return/import consignment's freight/customs charge.
 --
--- sold_shipment_id is therefore an explicit, nullable FK to shipments(id)
--- — the return/import shipment (per the customs-bill design decision:
--- "a bill record keyed to the shipment — the return/import shipment")
--- whose freight_invoices/customs-bill cost_ledger rows this device's cost
--- basis should draw from, once apportionFreightByValue()/
--- apportionCustomsByValue() are actually wired (§ pending — see
--- .deploy-checks; neither function has any call site yet). NULL is valid
--- and expected for a plain domestic purchase sold with no OPR/temp-export
--- leg at all — there is no consignment to link and none is owed.
--- Deliberately NOT NOT NULL, deliberately NOT defaulted to any shipment.
+-- sold_shipment_id is therefore an explicit, nullable FK to shipments(id).
+-- NULL is valid and expected for a plain domestic purchase sold with no
+-- OPR/temp-export leg at all — there is no consignment to link and none
+-- is owed.
+--
+-- CORRECTION to this column's originally-stated purpose (caught before
+-- any consumer was built against it): this is NOT the read path for a
+-- device's cost basis, and valuation must never be computed by
+-- resolving allocations through this single pointer. A device that has
+-- been out and back on more than one OPR/temp-export leg accumulates a
+-- freight/customs cost_ledger row PER LEG — its true cost basis is the
+-- SUM of every such row that attaches to it, not the allocation on one
+-- selected shipment. Reading through sold_shipment_id alone would
+-- silently understate cost on any twice-travelled device. There is also
+-- a second, structural mismatch: inbound PURCHASE freight (the
+-- acquisition-side leg) is keyed on `manifests`, not `shipments` —
+-- shipment_lines/shipments cover only the export and return legs — so
+-- sold_shipment_id cannot reach that allocation at all, however it is
+-- read.
+--
+-- The column is kept: it is nullable, additive, and legitimately answers
+-- "which leg did this device leave the country on most recently before
+-- being sold" for reporting/traceability. It must NOT be treated as the
+-- lookup key for cost/valuation. The correct valuation read, once
+-- freight/customs are wired, is: sum every cost_ledger row attaching to
+-- received_device_id across cost_type IN ('freight','customs') for every
+-- leg the device was ever on, PLUS the manifest-scoped inbound-freight
+-- allocation keyed off received_devices.manifest_id — never a lookup
+-- through this single-valued pointer.
 --
 -- ── SOLD transition edge — explicitly NOT part of this migration ──
 -- W2.3 already classifies this as "an application-code decision for the
@@ -125,7 +163,7 @@
 ALTER TABLE received_devices ADD COLUMN sold_invoice_no TEXT;
 ALTER TABLE received_devices ADD COLUMN sold_date DATE;
 ALTER TABLE received_devices ADD COLUMN sold_channel TEXT;
-ALTER TABLE received_devices ADD COLUMN sold_price REAL;
+ALTER TABLE received_devices ADD COLUMN sold_price_pence INTEGER;
 ALTER TABLE received_devices ADD COLUMN attribution TEXT;
 ALTER TABLE received_devices ADD COLUMN vat_treatment TEXT NOT NULL DEFAULT 'unclassified';
 ALTER TABLE received_devices ADD COLUMN sold_shipment_id INTEGER REFERENCES shipments(id);

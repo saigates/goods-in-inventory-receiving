@@ -152,9 +152,20 @@ export type ReceivedDevice = {
   sold_invoice_no: string | null
   sold_date: string | null
   sold_channel: string | null
-  sold_price: number | null
+  // INTEGER pence (Amendment 1: every new money column is INTEGER pence
+  // with a _pence suffix — never REAL). Parse Zoho's decimal-string net
+  // line value straight to pence; never through a float. This is one of
+  // the two operands of every margin figure the system will ever
+  // produce, so it must never be a float — see migration 0033's header
+  // for the reconciliation-noise reasoning.
+  sold_price_pence: number | null
   attribution: string | null
   vat_treatment: string
+  // NOT the cost-basis lookup key — see migration 0033's header
+  // ("CORRECTION to this column's originally-stated purpose") for why
+  // valuation must sum every cost_ledger freight/customs row across all
+  // legs (plus the manifest-scoped inbound allocation) rather than
+  // reading through this single pointer.
   sold_shipment_id: number | null
 }
 
