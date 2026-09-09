@@ -416,3 +416,60 @@ under this rule (`sold_price_pence INTEGER`, corrected in place before it
 reached anywhere beyond local dev D1 — see that file's own header for the
 full correction). Treat it as the canonical example of the pattern for
 any migration that follows.
+
+## Test gate — now TWO commands, not one (2026-09-09)
+
+**Rule**: the test suite no longer passes with a single green
+`npx vitest run`. As of this date the gate is **both** of the following
+commands, run separately, both green:
+
+```
+npm test           # main suite — everything except test/oprImport.spec.ts
+npm run test:serial  # test/oprImport.spec.ts alone, fileParallelism: false
+```
+
+Passing means the two runs **combined** total **611 passed / 8 skipped /
+0 failed** — not one run of 611. Do not read a green `npm test` alone
+(546/8/0) as the whole suite passing; the serial command is not optional,
+and its own green result (65/0/0) is the other half of the same gate.
+`npm run test:all` runs both in sequence (`npm test && npm run
+test:serial`) for convenience, but the two are still logically separate
+gates — a CI/reviewer check should verify both, not just the exit code of
+`test:all`, in case that script itself is ever changed to `||` instead of
+`&&` by mistake.
+
+**Why the split**: `test/oprImport.spec.ts`'s largest test does 324
+sequential real HTTP round-trips against the real Worker. Under
+full-suite parallel execution (this project has 31 spec files competing
+for one shared `workerd` pool) it twice hit the 60s per-test timeout;
+run alone, with no sibling files contending for the pool, it passed
+65/65 in 72.76s with zero timeout, both times it was tried. A bounded,
+time-boxed search for a plugin-level per-file-serial-execution option
+(`poolOptions` / `singleWorker` / a per-file `fileParallelism` override
+inside `@cloudflare/vitest-pool-workers` 0.18.8's own exposed config
+surface) found `fileParallelism: false` only as a top-level Vitest
+option, not one scopable to a single file within this plugin's schema —
+so the fallback taken was splitting the file into its own
+`vitest.serial.config.ts` (top-level `fileParallelism: false`, `include`
+limited to that one file) and excluding it from the main
+`vitest.config.ts`, run as a second npm script rather than folded back
+into one command.
+
+**Working assumption, stated explicitly**: this is shared-runner/sandbox
+CPU or connection-pool contention, not a latent timing dependency in the
+code under test. Evidence for this: the file passes cleanly in isolation
+every time it's been tried (2 for 2), with no code changes between the
+failing full-suite runs and the passing isolated runs. If a future
+isolated (`test:serial`) run ever times out on its own — i.e. with no
+other spec files running — that would kill this assumption and point at
+a real bug in the test or the code it exercises; the correct response at
+that point is to stop and investigate, not to raise the per-test timeout
+again. (As of this writing, `test:serial` has never timed out; the
+tripwire has not fired.)
+
+**Numbers to check against**: `546 + 65 = 611` passed, `8 + 0 = 8`
+skipped, `0 + 0 = 0` failed — identical to the pre-split single-command
+baseline. If either command's totals ever drift from 546/8 or 65/0
+respectively, treat that as a real change in test count (a test was
+added, removed, or newly skipped) and update this note, not as gate
+breakage on its own.

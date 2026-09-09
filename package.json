@@ -9,6 +9,8 @@
     "deploy": "npm run build && wrangler pages deploy dist",
     "cf-typegen": "wrangler types --env-interface CloudflareBindings",
     "test": "vitest run",
+    "test:serial": "vitest run --config vitest.serial.config.ts",
+    "test:all": "npm test && npm run test:serial",
     "test:watch": "vitest",
     "db:migrate:local": "wrangler d1 migrations apply webapp-production --local",
     "db:migrate:prod": "wrangler d1 migrations apply webapp-production",

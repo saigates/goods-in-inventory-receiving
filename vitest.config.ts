@@ -22,5 +22,15 @@ export default defineConfig({
   ],
   test: {
     setupFiles: ['./test/apply-migrations.ts'],
+    // test/oprImport.spec.ts is run separately, serially, by
+    // vitest.serial.config.ts (see that file's header and
+    // migrations-held/README.md's "Test gate" section for why: its
+    // largest test does 324 sequential real HTTP round-trips and has
+    // twice timed out at 60s under full-suite parallel contention while
+    // passing 65/65 in isolation both times — a shared-runner capacity
+    // problem, not a flaky test). Excluded here so the main suite stays
+    // parallel; run BOTH `npm test` and `npm run test:serial` to satisfy
+    // the full gate.
+    exclude: ['**/node_modules/**', '**/.git/**', 'test/oprImport.spec.ts'],
   },
 })
