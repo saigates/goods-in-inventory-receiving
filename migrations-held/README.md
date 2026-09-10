@@ -374,6 +374,36 @@ with `0032`'s own header-comment rationale for why the FK lives on
 `sku_map` (many-to-one) rather than a unique constraint that would
 otherwise reject this legitimate pattern.
 
+## `0032` — HELD then UN-HELD (2026-09-09 hold, 2026-09-10 resolution)
+
+**Hold placed 2026-09-09** (commit `c7737ee`, `git mv migrations/0032... →
+migrations-held/0032...`) on the pre-check belief that the 3 shared-Zoho-
+item-ID duplicates documented above could block 0032 from applying to
+production. **That belief was categorically wrong, retracted by the
+instructing party and independently confirmed by empirical test**: 0032's
+DDL only `CREATE TABLE IF NOT EXISTS`/`CREATE INDEX IF NOT EXISTS`s four
+brand-new tables (`zoho_items`, `sku_map`, `sku_map_audit`,
+`sku_map_version`) that hold zero rows anywhere in the applied migration
+set — a `CREATE TABLE ... UNIQUE(...)` on an empty table always succeeds
+regardless of what data is later loaded into it. Uniqueness constraints
+bind at INSERT/UPDATE time, never at CREATE TABLE time. The 3 duplicate
+pairs are, separately, not even a violation risk at import time: each of
+the 3 `zoho_item_id`s maps to exactly one `zoho_sku`, colliding with
+neither `zoho_items.zoho_item_id` (PRIMARY KEY) nor `zoho_items.zoho_sku`
+(UNIQUE) — they are precisely the eSIM/physical-pair sharing case
+`sku_map.zoho_item_id`'s deliberately-non-unique index was designed to
+permit (see 0032's own header comment, lines 33-39/44-48). Full DDL
+quote and (i)-(iv) analysis: `.deploy-checks/
+zoho-outbound-reconnaissance-2026-09-09.md`, Addendum A13. Empirical
+confirmation that all 10 previously-failing `skuMapImport.spec.ts` tests
+pass unchanged with 0032 restored: same addendum, part (iv).
+
+**Un-held 2026-09-10** (`git mv migrations-held/0032... → migrations/0032...`,
+see the commit restoring this file for the exact SHA). The hold rested on
+nothing from the start — this is a correction of a pre-check error, not a
+resolved defect. Production apply of 0032 proceeds separately, export-gated
+per Amendment F in the reconnaissance doc, tracked in Addendum A17 there.
+
 ## Money-column convention (Amendment 1) — binding on every migration from here on
 
 **Rule**: every NEW money column added to the schema from this point

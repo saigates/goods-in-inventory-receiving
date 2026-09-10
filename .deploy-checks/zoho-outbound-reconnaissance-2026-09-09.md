@@ -1298,3 +1298,106 @@ No further action on Item B until this is resolved. Proceeding to Item C
 (already complete, read-only, reported in Addendum A13) per the G-order,
 since it does not depend on Item B's resolution.
 
+**CLOSED 2026-09-10 — rollback authorization WITHDRAWN.** Both open
+questions above are answered by subsequent developer instruction, not by
+further investigation: the rationale this authorization rested on was void
+(Finding 1 above), and a hard-reset variant is separately rejected outright
+(would leave the tree without 0033/0034 while production has them applied —
+tree-vs-ledger divergence). See Addendum A17 for the forward path taken
+instead (0032 un-hold + export-gated apply + unmount-only deploy, no
+rollback of any kind).
+
+
+---
+
+## Addendum A16 — standing lesson: path-scoped diffs must never answer a blast-radius question, 2026-09-10
+
+**Recorded per developer instruction, third time a re-check has overturned a
+premise acted on in this thread** (the other two: the 0032-hold premise
+itself, Item C; and the "678 total" test-count reading, Item A/4).
+
+**Standing rule**: a blast-radius question — "what does reverting/rolling
+back to commit X actually change?" — must ALWAYS be answered with the
+UNSCOPED diff (`git diff --stat <base> <head>`, no path filter), never a
+path-scoped one. A path-scoped diff (e.g. `-- src/routes/ src/index.tsx`) can
+only ever answer a narrower, different question — "what changed within this
+path" — and silently substituting that narrower answer for the blast-radius
+question is exactly the failure this thread made in Addendum A11.1/A11's
+route-diff table, which fed directly into an authorization built on a false
+premise of narrowness (Addendum A15, Finding 1).
+
+**Rule of practice going forward**: any time a diff is used to characterize
+"what would change" as the basis for a decision (rollback scope, revert
+scope, "is this safe" reasoning), run the unscoped diff first and explicitly
+state the file/line-count totals from it, before any scoped diff is used to
+drill into specific areas of interest. A scoped diff may supplement the
+unscoped one; it must never replace it as the answer to a blast-radius
+question.
+
+
+---
+
+## Addendum A17 — Item B (un-hold, done) executed; Item D gate check — STOP, not the predicted 613/8/0
+
+### 0032 un-held (Item B of this developer instruction)
+
+`git mv migrations-held/0032_zoho_sku_mapping.sql migrations/0032_zoho_sku_mapping.sql`
+executed. `migrations-held/` now contains only `0030` (unrelated, separately
+held) and `README.md`. `migrations-held/README.md` updated with a new
+section documenting the hold-then-unhold sequence and pointing at Addendum
+A13 for the full analysis. `npx tsc --noEmit` clean after the file move and
+README edit (no source code touched, doc/migration files only).
+
+### Item D gate check — STOP CONDITION MET, not adjusted
+
+Predicted (this developer instruction, Item D): main 613/8/0, serial 65/0/0,
+combined 678/8/0 — full green Candidate B.
+
+**Actual main run** (`/tmp/main_test_run_4.log`, fresh, 0032 restored,
+local D1 state wiped before the run to force a schema rebuild):
+
+```
+Test Files  1 failed | 31 passed (32)
+     Tests  1 failed | 612 passed | 8 skipped (621)
+  Start at  14:10:06
+  Duration  282.57s
+```
+
+One failure, in a DIFFERENT file to any of the 10 named in Addendum A12:
+`test/csvExport.spec.ts > ... streams every one of 200+ rows with no
+truncation and a correct trailing row_count` — `Error: Test timed out in
+5000ms` at line 873.
+
+**This is not one of the 10 previously-failing `skuMapImport.spec.ts` tests
+— those all pass now** (confirmed: `test/csvExport.spec.ts` is a distinct
+file; grep of the run-4 log confirms zero `SQLITE_ERROR: no such table`
+failures anywhere in this run). The 0032 restoration did what it was
+predicted to do for its own 10 tests. This is a NEW, unrelated single
+failure.
+
+**Diagnostic run performed** (not a fix, not a number-adjustment — checking
+the failure's nature before reporting): `test/csvExport.spec.ts` run alone,
+fresh D1 state: `1 passed (1)`, `35 passed (35)`, including the exact same
+test, in 2125ms (well under the 5000ms timeout). This matches the SAME
+contention-class shape already documented and accepted for
+`test/oprImport.spec.ts` in `migrations-held/README.md`'s "Test gate — now
+TWO commands" section (a single test doing many round-trips, competing for
+one shared `workerd` pool under full-suite parallel execution, passes
+cleanly alone). Evidence is suggestive of the same class of flake, not
+confirmed as identical — `csvExport.spec.ts` was not previously identified
+as needing serial isolation, and this is the first time it has been seen to
+fail.
+
+**STOP, per explicit instruction ("if the total is not 613 main, STOP and
+report — do not adjust anything to reach the number")**: numbers recorded
+verbatim from `/tmp/main_test_run_4.log`, not retyped, not adjusted. Serial
+run was started prematurely (before main had finished) and was killed
+immediately on discovering the overlap — not run to completion this pass;
+no serial numbers are reported here because none were validly captured.
+**Items C1/C2/C3 (export, apply 0032 to production, unmount routes and
+deploy) are NOT started.** Per standing gates, no production action proceeds
+while a test-gate discrepancy is open and unexplained. A12's DEGRADED
+baseline stays in place, unchanged, pending resolution of this new,
+single-test discrepancy — this addendum points at it rather than replacing
+it, per instruction.
+
