@@ -2031,3 +2031,186 @@ means this row never reaches the `conflicts.push(...)` call sites (lines
 counter and outcome variant, and does NOT increment the conflict count.**
 No blocker.
 
+## Addendum A27 (2026-09-10) — Item 6: FILE-SHAPE GATE, first attempt STOPped, then relocated to the submission boundary per user ruling
+
+### First attempt (test run 10) — STOPped, not fixed silently
+
+Predicted (before running): +3 tests, all in `test/zohoSaleImport.spec.ts`
+(41→44), zero effect elsewhere. **Actual** (`/tmp/main_test_run_10.log`):
+**617 passed / 1 failed / 8 skipped (626), 31/32 files** — the 3 new tests
+passed exactly as predicted, but a PRE-EXISTING, UNCHANGED test in
+`test/zohoSaleImportApply.spec.ts:405` broke: a single-row fixture of
+genuinely idle stock (no out-side data, by definition) collided with the
+gate's absence-only condition, because with one row "no row has it" and
+"every row lacks it" coincide. Disagreement reported with both numbers
+per standing rule; no fix attempted in that pass. First-attempt gate lived
+directly inside `parseZohoCsv()`.
+
+### User ruling — gate relocated, condition strengthened
+
+User instruction, verbatim ruling: (1) the gate is a SUBMISSION POLICY,
+not a parsing concern, and must not live inside `parseZohoCsv()` — moved
+to a standalone function `assertOutwardsShape(rows)`, called once by
+`applyZohoSaleImport()` after a successful parse, before
+`classifyZohoCsvRows()`; `parseZohoCsv()` reverted to having zero
+knowledge of this policy. (2) the condition must require a POSITIVE
+Inwards counter-signal, not mere absence of outwards signal: reject only
+when BOTH (a) no row has `out_entity_date` or `out_contact_id` populated,
+AND (b) at least one row has a populated `in_entity_date` with
+`item_status = 'available'`. (3) reject with a reason naming the
+diagnosis, the total row count, and the count carrying the Inwards
+signature.
+
+**Implementation** (`src/lib/zohoSaleImport.ts`): `assertOutwardsShape()`
+added (own exported type `OutwardsShapeCheckResult`), `parseZohoCsv()`'s
+gate code fully reverted (back to its pre-item-6 body, confirmed by
+re-reading — no `ok:false` path added for this condition). Wired into
+`applyZohoSaleImport()` immediately after `parseZohoCsv()` succeeds.
+
+**⚠️ Factual flag, noted not silently substituted**: the reconnaissance
+note's own confirmed finding (Section 3, line 34: `item_status='active'`
+in 100% of rows in both real files sampled, blank-`out_contact_id` rows
+included) means the positive-Inwards-signature clause as specified
+(`item_status = 'available'`) may never fire against a real Zoho export
+matching the observed sample — only against a fixture deliberately
+constructed with `item_status: 'available'`. Implemented literally per
+instruction; flagged here rather than quietly changed to `status`
+(the field that DOES discriminate in the real data, per line 385-386's
+existing code). If a real mis-submitted Inwards file needs to trip this
+gate in production, this clause's field choice should be revisited —
+not done in this pass (no such instruction given).
+
+### Second attempt — test delta prediction and actual (test run 11)
+
+Tests relocated: the 3 gate tests removed from `parseZohoCsv`'s describe
+block; 4 tests written against `assertOutwardsShape()` directly (the 3
+original cases plus the required 4th — the `:405` shape passing through
+unchanged) in a new describe block in `test/zohoSaleImport.spec.ts`.
+`test/zohoSaleImportApply.spec.ts` left completely untouched — its `:405`
+test needed no edit under the relocated/strengthened gate.
+
+**Predicted (before running):** baseline 615/0/8 (623, pre-item-6) + 4
+new tests, all in `test/zohoSaleImport.spec.ts` (41→45), zero effect on
+any other file. **619 passed / 0 failed / 8 skipped (627), 32 files.**
+
+**Actual** (`/tmp/main_test_run_11.log`): **619 passed / 0 failed / 8
+skipped (627), 32 files**, 274.59s, Start 17:10:58. **Matches prediction
+exactly.** Delta by file: `zohoSaleImport.spec.ts` 41→45 (+4, all pass);
+every other file unchanged, including `zohoSaleImportApply.spec.ts`
+(still 20, `:405` passes).
+
+**Serial** (`/tmp/serial_test_run_4.log`): **65 passed / 0 failed / 0
+skipped, 1 file**, 58.38s, Start 17:16:00 — main's process had already
+exited (~17:15:32); no overlap.
+
+**Combined: 684 passed / 0 failed / 8 skipped (692 total).**
+
+`tsc --noEmit`: clean, 44.0s (checked after the relocation, before this
+run).
+
+**No production action of any kind taken this pass.**
+
+### Lesson recorded alongside A21/A23 (item E)
+
+A validation rule that rejects an entire submission is a POLICY at the
+submission boundary — it must never live inside a shared parser or
+classifier that unit tests exercise with deliberately minimal fixtures.
+Anything called directly by such tests (e.g. `parseZohoCsv()`) must stay
+free of whole-file acceptance/rejection policy; that policy belongs in
+the function that OWNS the submission (here, `applyZohoSaleImport()`),
+as its own separately-testable unit (`assertOutwardsShape()`).
+
+Separately: a rule written as the ABSENCE of a signal collides with
+legitimate minimal cases, because a small enough fixture is
+indistinguishable from "signal missing everywhere." A rule written as the
+PRESENCE of a positive counter-signal does not have this problem — a file
+with neither signal is correctly treated as "not diagnosable either way,"
+and passes through unchanged rather than being rejected by default.
+
+## Addendum A28 (2026-09-10) — Item 7: three-part .deploy-checks addendum (QC_FAILED ruling / six-of-seven SOLD-edges query / path-scoped-diff lesson)
+
+Read-only. No code, test, or production change in this addendum.
+
+### (i) QC_FAILED ruling
+
+A `matched_sale` row targeting a `QC_FAILED` device is NOT excluded from
+revenue by a separate rule — `SOLD_REACHABLE_STATUSES` (line 673-676,
+`src/lib/zohoSaleImport.ts`) explicitly includes `QC_FAILED` as a valid
+source for the `SOLD` edge; the transition itself is fine. What gates it
+is a human acknowledgment, not a status-based exclusion: every
+QC_FAILED-source row is recorded in `qcFailedPreview` unconditionally
+(line 719-722), and if `opts.acknowledgeQcFailed` is not `true` the row is
+ALSO excluded from the write batch and recorded in `warningUnacknowledged`
+(line 723-730) — every OTHER row in the same import still proceeds.
+
+**Ruling**: a device sold via this path, once acknowledged and written, is
+ordinary revenue — blended into the same `status='SOLD' AND
+disposition='SALE_EXTERNAL'` condition as any other sale (A26's ruling),
+with no separate flag distinguishing "sold despite a QC failure" from any
+other sale at the `received_devices` row level. This is acceptable
+because the split stays fully **reconstructable by query** without a
+dedicated column: `device_events.from_status` captures the pre-sale
+status on the very row that recorded the `SOLD` transition (bound at
+`transitionDevice()`'s call site, `deviceLifecycle.ts` lines ~343/384 —
+`from_status` is the device's status immediately before this event).
+A device whose `SOLD` transition has `from_status = 'QC_FAILED'` is
+identifiable after the fact by joining `device_events` back to
+`received_devices` on `device_id`, filtering `to_status = 'SOLD'`, with no
+schema change and no loss of information, despite the sale itself
+carrying no dedicated "was QC_FAILED" marker.
+
+### (ii) Six-of-seven permitted-but-unobserved SOLD edges
+
+`SOLD_REACHABLE_STATUSES` (line 673-676) lists **seven** statuses a
+device may be in when a `matched_sale` outcome targets it: `RECEIVED`,
+`SORTING`, `ACTIVE_INVENTORY`, `IN_HOUSE_REPAIR`, `READY_FOR_EXPORT`,
+`QC_FAILED`, `READY_FOR_ZOHO`. Of these, only ONE (`READY_FOR_ZOHO`,
+the intended/expected source status for a Zoho-driven sale) has actually
+been exercised by a real import to date — the other six are permitted by
+the transition table but have not yet been observed occurring in
+practice. This is not a defect: `SOLD_REACHABLE_STATUSES` is scoped to
+"the transition edge is structurally valid," not "this edge occurs often
+in practice" — the table exists to reject genuinely locked/terminal
+statuses (`SOLD` itself, `REJECTED`, the five OPR/temp-export consignment
+statuses), not to predict frequency.
+
+**Scheduled review, after the first real import**: run this exact query
+against `device_events`/`received_devices` to determine which of the six
+unobserved edges actually occurred and how often:
+
+```sql
+SELECT de.from_status, COUNT(*) AS n
+FROM device_events de
+JOIN received_devices rd ON rd.id = de.device_id
+WHERE de.to_status = 'SOLD'
+  AND de.event_type = 'ZOHO_SALE_IMPORT'
+GROUP BY de.from_status
+ORDER BY n DESC;
+```
+
+This answers, per real import: which of the seven `SOLD_REACHABLE_STATUSES`
+values actually produced a sale, and in what proportion — the six
+currently-unobserved-but-permitted edges (`RECEIVED`, `SORTING`,
+`ACTIVE_INVENTORY`, `IN_HOUSE_REPAIR`, `READY_FOR_EXPORT`, `QC_FAILED`)
+either confirm as real, expected paths (e.g. a device sold straight from
+`RECEIVED` without ever routing through the full pipeline) or reveal as
+never-actually-occurring in real data, at which point narrowing the
+permitted set becomes a live discussion — not decided here, not done
+this pass; scheduled for the post-first-import review as instructed.
+
+### (iii) Path-scoped-diff lesson
+
+Already the subject of a full standing addendum — **Addendum A16**
+(above, "standing lesson: path-scoped diffs must never answer a
+blast-radius question"), recorded 2026-09-10, third time a re-check had
+overturned a premise built on a scoped diff in this thread. Restated
+here per instruction rather than re-authored: a path-scoped diff (e.g.
+`git diff <base> <head> -- src/routes/ src/index.tsx`) can only ever
+answer "what changed within this path" — a narrower, different question
+than "what would change" (the blast-radius question). The unscoped diff
+(`git diff --stat <base> <head>`, no path filter) is mandatory whenever a
+diff is used as the basis for a rollback/revert/safety decision; a scoped
+diff may supplement it afterward for drill-down, never substitute for it.
+This rule was already exercised correctly in this window at C2 and C3
+(both pre-checks cited in A22/A23 explicitly ran the unscoped diff first).
+

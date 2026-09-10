@@ -172,32 +172,62 @@ export function parseZohoCsv(raw: string): ZohoCsvParseResult {
     rows.push(row as ZohoCsvRow)
   }
 
-  // FILE-SHAPE GATE (2026-09-10 incident response): reject a wholly-Inwards
-  // export mistakenly submitted to this OUTWARDS/sale importer. Such a file
-  // has out_entity_date AND out_contact_id blank on EVERY row — every row
-  // then classifies skipped_available/matched_unclassified with no error,
-  // reducing to a near-total skipped_available read that looks like a
-  // clean no-op rather than the wrong file. Checked ONCE here, across the
-  // whole file, at parse time — deliberately independent of and before
-  // classifyRow()/classifyZohoCsvRows(), so it can never alter a per-row
-  // outcome. A file where at least one row carries out-side data (a normal
-  // outwards file, or a mixed file where only SOME rows lack out_contact_id)
-  // is NOT rejected here — only the wholly-blank shape is.
-  if (rows.length > 0) {
-    const hasAnyOutSideSignal = rows.some(
-      r => r.out_entity_date.trim() !== '' || r.out_contact_id.trim() !== ''
-    )
-    if (!hasAnyOutSideSignal) {
-      return {
-        ok: false,
-        error: 'Every row is missing both out_entity_date and out_contact_id — ' +
-          'this looks like an Inwards export submitted to the Outwards/sale ' +
-          'importer, not an outwards or mixed file. Rejected before classification.',
-      }
-    }
-  }
-
   return { ok: true, rows, fileLineCount: dataLines.filter(l => l.trim() !== '').length }
+}
+
+// ───────── Outwards-submission shape gate ─────────
+//
+// FILE-SHAPE GATE (2026-09-10 incident response, revised after the :405
+// collision). This is a SUBMISSION POLICY — "is this the right file for
+// this importer" — not a parsing concern, and deliberately lives OUTSIDE
+// parseZohoCsv() so unit tests may still call the parser directly with
+// small, deliberately-minimal fixtures (including a single genuinely-idle
+// row with no out-side data at all) without tripping an import-submission
+// rule. It is called once, by applyZohoSaleImport(), after a successful
+// parse and before classifyZohoCsvRows() — it never alters a per-row
+// outcome, only whether the whole file is accepted for classification.
+//
+// The first version of this gate rejected on ABSENCE alone (no row has
+// out_entity_date or out_contact_id populated). That collided with a
+// legitimate minimal fixture: a single row of genuinely idle stock has
+// no out-side data either, by definition, and is indistinguishable from
+// a wholly-mistaken-Inwards file under an absence-only rule. Absence of a
+// signal is not evidence of the WRONG file; it is also the shape of a
+// small slice of the RIGHT file. Revised to require a POSITIVE
+// counter-signal instead: reject only when the file has zero out-side
+// signal AND at least one row carries a positive Inwards signature
+// (in_entity_date populated with item_status = 'available') — i.e. there
+// is actual evidence this is an Inwards-shaped export, not merely an
+// absence of outwards evidence. A file with neither signal (no out-side
+// data, no Inwards signature either) is not diagnosable as the wrong
+// file and must pass through unchanged, exactly as before this gate
+// existed.
+export type OutwardsShapeCheckResult =
+  | { ok: true }
+  | { ok: false; error: string }
+
+export function assertOutwardsShape(rows: ZohoCsvRow[]): OutwardsShapeCheckResult {
+  if (rows.length === 0) return { ok: true }
+
+  const hasAnyOutSideSignal = rows.some(
+    r => r.out_entity_date.trim() !== '' || r.out_contact_id.trim() !== ''
+  )
+  if (hasAnyOutSideSignal) return { ok: true }
+
+  const inwardsSignatureCount = rows.filter(
+    r => r.in_entity_date.trim() !== '' && r.item_status.trim().toLowerCase() === 'available'
+  ).length
+
+  if (inwardsSignatureCount === 0) return { ok: true }
+
+  return {
+    ok: false,
+    error: `Every one of ${rows.length} row(s) is missing both out_entity_date ` +
+      `and out_contact_id, and ${inwardsSignatureCount} row(s) carry a positive ` +
+      `Inwards signature (in_entity_date populated with item_status=available) — ` +
+      `this looks like an Inwards export submitted to the Outwards/sale importer, ` +
+      `not an outwards or mixed file. Rejected before classification.`,
+  }
 }
 
 // ───────── Serial shape classification ─────────
@@ -669,6 +699,12 @@ export async function applyZohoSaleImport(
 
   const parsed = parseZohoCsv(csvText)
   if (!parsed.ok) return { ...empty, errors: [parsed.error] }
+
+  // Submission-shape gate (2026-09-10 incident response) — checked here,
+  // at the import-submission boundary, not inside parseZohoCsv() itself.
+  // See assertOutwardsShape()'s own header comment for the full rationale.
+  const shapeCheck = assertOutwardsShape(parsed.rows)
+  if (!shapeCheck.ok) return { ...empty, errors: [shapeCheck.error] }
 
   // Build the known-IMEI set from received_devices for this organisation —
   // classifyRow()'s INNER JOIN CONTRACT needs this to decide match/no-match.
