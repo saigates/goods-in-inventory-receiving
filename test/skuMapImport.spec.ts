@@ -12,10 +12,12 @@
 // correctly on deliberately-constructed cases, including the negative
 // ones the real file (being clean) never exercises.
 import { env } from 'cloudflare:workers'
+import { Hono } from 'hono'
 import { describe, expect, it, beforeEach } from 'vitest'
 import app from '../src/index'
-import { signAuthToken } from '../src/lib/auth'
-import type { AuthUser } from '../src/types'
+import { authMiddleware, signAuthToken } from '../src/lib/auth'
+import skuMapRoute from '../src/routes/skuMap'
+import type { AuthUser, Bindings } from '../src/types'
 import {
   parseSkuMapCsv,
   validateSkuMapCsv,
@@ -35,9 +37,23 @@ const OPERATOR_USER: AuthUser = {
   id: 802, email: 'operator-skumap@example.com', name: 'SkuMap Operator', role: 'operator', organisation_id: 1,
 }
 
+// Test-local harness: production retired /api/sku-map from the deployed
+// app (2026-09-10 incident response — see .deploy-checks/ addenda A22/A23)
+// while this route's own logic remains fully implemented, tested and
+// intentionally unmounted pending the item-5/6 sign-off. Mounting the SAME
+// router (skuMapRoute, unmodified) under a test-local Hono instance with
+// the SAME auth middleware wiring as src/index.tsx lets these HTTP-level
+// tests keep proving the route's actual request/response contract without
+// depending on whether the production app currently exposes it. Re-mounting
+// in src/index.tsx later requires no change here — this harness already
+// drives the real router with the real middleware, unchanged.
+const localApp = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
+localApp.use('/api/*', async (c, next) => authMiddleware(c, next))
+localApp.route('/api/sku-map', skuMapRoute)
+
 async function apiAs(user: AuthUser, path: string, init: RequestInit = {}) {
   const token = await signAuthToken(JWT_SECRET, user)
-  return app.request(path, {
+  return localApp.request(path, {
     ...init,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...(init.headers || {}) },
   }, testEnv)
@@ -371,5 +387,21 @@ describe('applySkuMapImport — invalid file never writes anything (hard-fail on
     const rowB = await db().prepare('SELECT * FROM sku_map WHERE goods_in_sku = ?').bind('BAD-B').first()
     expect(rowA).toBeNull()
     expect(rowB).toBeNull()
+  })
+})
+
+describe('GUARD: /api/sku-map stays unmounted from the deployed production app (2026-09-10 incident response)', () => {
+  it('the IMPORTED production app (src/index.tsx) returns 404 for /api/sku-map — deliberate, not incidental', async () => {
+    // Authenticate properly first so a 401 (missing/bad token) can never be
+    // mistaken for the 404 this test is actually proving. If someone
+    // re-mounts app.route('/api/sku-map', skuMapRoute) in src/index.tsx,
+    // this assertion flips to see a real response and fails loudly — that
+    // failure is the intended trigger to also flip this guard (delete or
+    // invert it) as part of the same re-mount change, one line each side.
+    const token = await signAuthToken(JWT_SECRET, MANAGER_USER)
+    const res = await app.request('/api/sku-map', {
+      headers: { Authorization: `Bearer ${token}` },
+    }, testEnv)
+    expect(res.status).toBe(404)
   })
 })

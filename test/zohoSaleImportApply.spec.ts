@@ -34,10 +34,12 @@
 //   - GUARD TEST: every status in SOLD_REACHABLE_STATUSES genuinely has a
 //     SOLD edge in the real ALLOWED_TRANSITIONS table (deviceLifecycle.ts)
 import { env } from 'cloudflare:workers'
+import { Hono } from 'hono'
 import { describe, expect, it, beforeEach } from 'vitest'
 import app from '../src/index'
-import { signAuthToken } from '../src/lib/auth'
-import type { AuthUser, DeviceStatus } from '../src/types'
+import { authMiddleware, signAuthToken } from '../src/lib/auth'
+import zohoSaleImportRoute from '../src/routes/zohoSaleImport'
+import type { AuthUser, Bindings, DeviceStatus } from '../src/types'
 import { ALLOWED_TRANSITIONS } from '../src/lib/deviceLifecycle'
 import {
   applyZohoSaleImport,
@@ -54,9 +56,24 @@ const MANAGER_USER: AuthUser = {
   id: 901, email: 'manager-zohoapply@example.com', name: 'Zoho Apply Manager', role: 'manager', organisation_id: 1,
 }
 
+// Test-local harness: production retired /api/zoho-sale-import from the
+// deployed app (2026-09-10 incident response — see .deploy-checks/ addenda
+// A22/A23) while this route's own logic remains fully implemented, tested
+// and intentionally unmounted pending the item-5/6 sign-off. Mounting the
+// SAME router (zohoSaleImportRoute, unmodified) under a test-local Hono
+// instance with the SAME auth middleware wiring as src/index.tsx lets the
+// one HTTP-level test below keep proving the route's actual
+// request/response contract without depending on whether the production
+// app currently exposes it. Re-mounting in src/index.tsx later requires no
+// change here — this harness already drives the real router with the real
+// middleware, unchanged.
+const localApp = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
+localApp.use('/api/*', async (c, next) => authMiddleware(c, next))
+localApp.route('/api/zoho-sale-import', zohoSaleImportRoute)
+
 async function apiAs(user: AuthUser, path: string, init: RequestInit = {}) {
   const token = await signAuthToken(JWT_SECRET, user)
-  return app.request(path, {
+  return localApp.request(path, {
     ...init,
     headers: { Authorization: `Bearer ${token}`, ...(init.headers || {}) },
   }, testEnv)
@@ -530,5 +547,22 @@ describe('SOLD_REACHABLE_STATUSES guard test (item 5)', () => {
       const edges = ALLOWED_TRANSITIONS[status] || []
       expect(edges, `expected ALLOWED_TRANSITIONS.${status} to include 'SOLD'`).toContain('SOLD')
     }
+  })
+})
+
+describe('GUARD: /api/zoho-sale-import stays unmounted from the deployed production app (2026-09-10 incident response)', () => {
+  it('the IMPORTED production app (src/index.tsx) returns 404 for /api/zoho-sale-import — deliberate, not incidental', async () => {
+    // Authenticate properly first so a 401 (missing/bad token) can never be
+    // mistaken for the 404 this test is actually proving. If someone
+    // re-mounts app.route('/api/zoho-sale-import', zohoSaleImportRoute) in
+    // src/index.tsx, this assertion flips to see a real response and fails
+    // loudly — that failure is the intended trigger to also flip this guard
+    // (delete or invert it) as part of the same re-mount change, one line
+    // each side.
+    const token = await signAuthToken(JWT_SECRET, MANAGER_USER)
+    const res = await app.request('/api/zoho-sale-import', {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/csv' }, body: 'x',
+    }, testEnv)
+    expect(res.status).toBe(404)
   })
 })
