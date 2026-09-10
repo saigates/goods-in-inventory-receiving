@@ -1431,3 +1431,197 @@ guarantee. No git state was at risk here — a failed push leaves both the
 local commit and the remote's prior state intact, it does not silently
 diverge — but the reporting language must not overclaim durability.
 
+---
+
+## Addendum A19 — Item A: confirmed-clean sequential re-run, gate GREEN, csvExport was contention not regression
+
+**Diagnosis accepted and confirmed correct.** A17's 612/8/1 result was
+produced while a serial run had been started prematurely (before main
+finished) and then killed mid-overlap on discovery — both suites share the
+same `workerd` process pool, so the main run recorded there was contaminated
+by that overlap. This addendum supersedes A17's numbers as the operative
+gate reading (A17 is not deleted — its STOP was the correct call at the
+time, on the evidence then available).
+
+**Step 1 — confirmed nothing running, before AND immediately before the
+retry that succeeded:**
+```
+ps aux | grep -iE "vitest|workerd" | grep -v grep   → zero matches (exit 1)
+pm2 list                                             → only 'webapp'
+                                                        (wrangler pages dev,
+                                                        unrelated dev-preview,
+                                                        0% CPU, PID 709299,
+                                                        uptime 30h, untouched)
+```
+Checked once before the main run and once again immediately before starting
+the serial run (i.e. after main's process had exited).
+
+**Interim anomaly, resolved (not the original run_5 anomaly — a new,
+unrelated one hit first this pass):** the first re-attempt this pass used
+`/usr/bin/time -v npm test > /tmp/main_test_run_6.log 2>&1`; `/usr/bin/time`
+does not exist in this sandbox, so the whole command failed to exec at all
+(`MAIN_EXIT=127`, 1-line log: `/bin/bash: line 1: /usr/bin/time: No such
+file or directory`) before `npm test` ever ran. This is a distinct, fully
+explained cause and is NOT a resolution of run_5's original empty-log/
+exit-0 anomaly — that anomaly's root cause (why a `tee ... | tail -0`
+pipeline returned exit 0 with a 0-line log in 17223ms) remains formally
+UNEXPLAINED. It is set aside rather than resolved: the corrected command
+(plain `>` redirect, no intermediate pipe) produced a normal, fully-populated
+log both times it was tried (`main_test_run_6` for the exec failure,
+`main_test_run_7` for the real run), so the anomaly is avoided rather than
+diagnosed. If it recurs, it needs its own investigation.
+
+**Step 2 — main, run to completion, nothing concurrent** —
+`/tmp/main_test_run_7.log`, command `npm test > /tmp/main_test_run_7.log
+2>&1`, wall-clock `date +%s` before/after: `1789053055` → `1789053354` (299s
+elapsed, consistent with runs 3/4's ~280-286s and NOT the suspicious 17s of
+the run_5 anomaly). Result, verbatim from the runner's own summary lines:
+```
+ Test Files  32 passed (32)
+      Tests  613 passed | 8 skipped (621)
+   Start at  15:11:13
+   Duration  280.92s (transform 10.34s, setup 27.46s, import 107.89s, tests 35.80s, environment 3ms)
+```
+`grep -n "csvExport" /tmp/main_test_run_7.log` → line 216:
+`✓ test/csvExport.spec.ts (35 tests) 1232ms` — passed clean, no timeout.
+A full-log fail/✗/× grep found no genuine failures; the only "fail" string
+matches are from `test/oprAutomation.spec.ts`'s intentionally-exercised
+"webhook receiver being DOWN never fails the finalise (delivery errors are
+swallowed)" scenario, which itself passed (line 197: `✓ ... 979ms`) — DNS
+failures and "delivery failed" lines there are the test's own fixture
+behaviour (an unreachable `opr4-test.example.com`), not suite failures.
+
+**Step 3 — serial, run to completion strictly after main, never
+overlapping** — confirmed main's process had exited (step-1 check repeated,
+zero matches) before starting. `/tmp/serial_test_run_2.log`, command
+`npm run test:serial > /tmp/serial_test_run_2.log 2>&1`, wall-clock
+`1789053373` → `1789053443` (70s elapsed; note serial's start timestamp
+`1789053373` is 19s after main's end timestamp `1789053354` — sequential,
+no overlap). Result, verbatim:
+```
+ Test Files  1 passed (1)
+      Tests  65 passed (65)
+   Start at  15:16:28
+   Duration  54.33s (transform 5.53s, setup 785ms, import 12.06s, tests 37.42s, environment 0ms)
+```
+
+**Step 4 — report, verbatim, separated:**
+
+| Suite  | Passed | Failed | Skipped | Files | Total |
+|--------|-------:|-------:|--------:|------:|------:|
+| Main   | 613    | 0      | 8       | 32    | 621   |
+| Serial | 65     | 0      | 0       | 1     | 65    |
+| **Combined** | **678** | **0** | **8** | **33** | **686** |
+
+**This is exactly Candidate B's predicted gate: 613/8/0 main (32 files),
+65/0/0 serial, 678/8/0 combined.** The gate is GREEN. A12's DEGRADED
+baseline (603/8/10 main, 668/8/10 combined) is left in place unchanged, as
+instructed — this addendum points at it as superseded-in-practice, not
+replaced or deleted. A17's 612/8/1 reading is likewise left in place,
+annotated by this addendum as contamination-explained rather than a
+genuine second discrepancy.
+
+**Per instruction: numbers taken verbatim from runner output, not adjusted
+to reach the prediction. They already matched.** No further diagnosis of
+csvExport is undertaken past what this addendum records, per "report before
+diagnosing, do not spend the turn on it unasked" — there is nothing left to
+diagnose since the confirmed-clean run did not reproduce the failure.
+
+---
+
+## Addendum A20 — Item B: arithmetic reconciliation across A17 and A19, Candidate B confirmed a second time; csvExport duration trend
+
+**Population reconciliation (user's own read, verified correct):**
+
+| Run | Passed | Failed | Skipped | Total | Executed (passed+failed) |
+|---|---:|---:|---:|---:|---:|
+| Pre-0032 (`main_test_run_3.log`) | 603 | 10 | 8 | 621 | 613 |
+| Post-0032, contaminated (`main_test_run_4.log`, A17) | 612 | 1 | 8 | 621 | 613 |
+| Post-0032, confirmed-clean (`main_test_run_7.log`, A19) | 613 | 0 | 8 | 621 | 613 |
+
+All three runs: **621 total, 613 executed** — the main-suite test population
+is identical across all three. Nothing was added or lost between them.
+Run 3 → Run 4: the 10 originally-failing `skuMapImport.spec.ts` tests moved
+into the passing column (+10), and 1 new failure appeared in
+`csvExport.spec.ts` (-1) — fully accounted, as the user's diagnosis stated.
+Run 4 → Run 7 (this pass, confirmed-clean): the same `csvExport.spec.ts`
+test that failed under contention in Run 4 passed cleanly in Run 7 (+1),
+with no other change — also fully accounted, and it is the direct evidence
+that Run 4's single failure was contention-caused, not a regression.
+
+**Candidate B is therefore confirmed independently a second time**: once by
+Run 4's population arithmetic alone (A17/this addendum), and now a third
+data point by Run 7's clean 613/8/0 matching the original prediction
+exactly with zero deviation.
+
+**csvExport.spec.ts duration trend (three data points, requested by
+instruction — not just pass/fail):**
+
+| Run | Migrations applied | File total | Specific streaming test | Result |
+|---|---:|---:|---:|---|
+| Run 3 (`main_test_run_3.log`), pre-0032 | 32 | 2496ms | 1350ms | pass |
+| Isolated diagnostic (`csvexport_isolated.log`), post-0032, alone | 33 | 2125ms | not itemised in that log | pass |
+| Run 7 (`main_test_run_7.log`), post-0032, full suite, confirmed-clean | 33 | **1232ms** | not itemised (no per-test line printed since it did not approach a slow-test threshold) | pass |
+
+**Reading the trend**: the file's duration went 2496ms (pre-0032, in full
+main suite) → 2125ms (post-0032, isolated) → 1232ms (post-0032, in full
+main suite, confirmed-clean). This is a DECREASE at every step, not an
+increase. The 0032-setup-cost hypothesis (one more migration file per
+test-file schema build raising overhead) predicts the OPPOSITE direction —
+if it held, post-0032 numbers should trend higher than pre-0032, not lower.
+They trend lower. **The setup-cost hypothesis is therefore not supported by
+this data and is not pursued further.** The only run in which the file
+failed at all was Run 4, the one confirmed to have been run under
+concurrent serial contention — the contention hypothesis is the one
+consistent with all three data points (fast when alone or uncontended,
+slow/timing-out only when something else was competing for the same
+`workerd` pool), and needs no further diagnosis since a confirmed-clean run
+reproduced the fast/passing behaviour directly.
+
+**No timeout value was raised.** Per instruction, that would only have been
+an acceptable diagnosed fix if the confirmed-clean run had still shown the
+failure and the setup-cost hypothesis had been the one supported by the
+data — neither condition held, so nothing was touched.
+
+---
+
+## Addendum A21 — standing gate: credential proof is per-turn, formalized (Item C, distinct from A18's incident narrative)
+
+**This is a rule entry, not an incident report** — A18 documents what
+happened (a stale-credential push failure this thread actually hit, and the
+self-correction of the "confirmed to persist" claim). This addendum
+codifies the resulting rule in the same form as A16, for direct reference
+without re-reading A18's narrative.
+
+**Standing rule**: proof that GitHub push credentials work is **per-turn**
+state. It is never carried forward from a previous turn, and it is never
+inferred from static inspection (`cat ~/.git-credentials`, `git config
+--list`, checking that `setup_github_environment` was called at some
+earlier point in the conversation). The only valid proof is an actual push
+attempted in the CURRENT turn.
+
+**Rule of practice, every turn that ends with local commits ahead of a
+remote:**
+1. Attempt the push (`git push origin <branch>`, `git push genspark
+   <branch>`) directly — do not pre-emptively call
+   `setup_github_environment` "just in case" before trying; the failure
+   mode is specific and only worth fixing if it actually occurs.
+2. If the push fails with an authentication error (the known signature:
+   `remote: Invalid username or token. Password authentication is not
+   supported for Git operations. fatal: Authentication failed`), call
+   `setup_github_environment` to repair, then retry the push.
+3. State the resulting HEAD SHA on BOTH remotes explicitly, this turn,
+   regardless of whether repair was needed. "Both remotes confirmed
+   matching HEAD `<sha>`" must be a claim about a check performed in the
+   current turn, never a restatement of a prior turn's confirmation.
+4. If a turn makes no commits, this gate does not apply (nothing to push);
+   it is not satisfied vacuously by pushing nothing and reporting a stale
+   HEAD as if it were freshly checked.
+
+**Why this is not overkill**: the actual sequence observed in this thread
+was proof (Turn 1, real push, `4b26f4d` succeeded) → identical failure
+recurring on the very next commit's push (Turn 2, `b3f8f2f`'s first
+attempt) → repaired and reproved. A one-time proof told nothing about the
+next turn's state. Treat every turn's push as a first attempt with no prior
+credit.
+
