@@ -612,3 +612,98 @@ duplicate-sweep design decision this item's stop condition was gated on,
 then re-checking `migrations-held/README.md`'s numbering-collision rule
 before choosing 0032's restored filename (0033/0034 have since shipped
 ahead of it).
+
+---
+
+## Addendum A11 — post-deploy incident review, 2026-09-10 (RECONSTRUCTED)
+
+**Status of this addendum: written retrospectively, after-the-fact, in response
+to a developer instruction demanding evidence the operation itself did not
+capture live. Marked RECONSTRUCTED throughout per that instruction. Not a
+substitute for capturing evidence live in future passes.**
+
+### A11.1 — Live exposure review (the gate was migrations-only; a worker bundle shipped)
+
+The 0033/0034 apply mechanism used (`gsk hosted deploy`, per Addendum A10 step
+8) bundles+publishes the full Worker on every invocation — confirmed via
+`gsk hosted deploy --help`: no flag skips the worker bundle. **A genuine
+migrations-only path did exist and was not used**: `gsk hosted d1_execute
+--sql "ALTER TABLE ..."` auto-routes DDL through the same user-approval
+handshake WITHOUT touching the worker bundle. The bundle shipment in Addendum
+A10 was therefore a consequence of following the `migrations-held/README.md`
+deploy-based hold/apply precedent (established for 0030), not a hard
+limitation of the platform. Self-critical finding, not previously stated.
+
+**Route diff, `aae5b1f` → `d91b661`** (full diff of every file `git diff
+--name-status` reported changed, not just the two routes already known):
+```
+src/index.tsx                |   4 +   (2 imports + 2 app.route() lines)
+src/routes/devices.ts        |  comment-only, no code change
+src/routes/inventory.ts      |  comment-only, no code change
+src/routes/reports.ts        |  comment-only, no code change
+src/routes/skuMap.ts         |  NEW FILE, mounted /api/sku-map
+src/routes/zohoSaleImport.ts |  NEW FILE, mounted /api/zoho-sale-import
+```
+Exactly two new routes exposed. Nothing else.
+
+**Reachability, `/api/zoho-sale-import`**: confirmed mounted via source-diff
+(the reliable proof) — a live `401` on unauthenticated GET was also observed
+but is NOT diagnostic on its own (a control probe against a deliberately
+nonexistent `/api/*` path returns the identical 401, since the global auth
+middleware fires before route dispatch). No POST was sent to this route at
+any point, dry_run or otherwise.
+
+**Current identifiers** (NOT `aae5b1f` — that commit is 27+ positions back in
+`git log`, predates this entire Zoho-sale-import workstream, and citing it as
+a rollback target would revert far more than this session's changes):
+- git SHA: `d91b66175c7856e34fd033267ee0a1bbd60a3c9d`
+- Cloudflare Version ID: `880f13e6-bde6-47bb-a0f7-dc11f31dd2c8`
+
+**Stale-`aae5b1f`-reference sweep**: grepped this file and the whole repo for
+`aae5b1f`. Zero hits in this file. All other hits (`.deploy-checks/
+csv-export-deploy-2026-09-08.md`, `README.md`) correctly describe `aae5b1f`
+as the 2026-09-08 CSV-export deploy's build commit — a true historical fact,
+never cited as a rollback target. No correction needed.
+
+**Damage sweep since `2026-09-10 10:22:30`** (re-run fresh):
+- `received_devices` any SOLD/money-column/disposition write: **0**
+- `device_events` any `to_status='SOLD'`: **0**
+- `received_devices.updated_at` since deploy: **0**
+- `device_events` since deploy: 81 total = 41 RECEIVE(→RECEIVED) + 41 SCAN —
+  ordinary goods-in workflow, unrelated to sale-import, zero SOLD involvement.
+
+**Mitigation recommended, NOT implemented, HOLD**: an early 503 guard on
+`POST /api/zoho-sale-import` only (narrowest change; leaves the schema-safe
+comment-only diffs and the separately-tracked `/api/sku-map` 500 untouched).
+Awaiting named user authorization before any change to production.
+
+### A11.2 — Migration-id arithmetic flag (RESOLVED, no gap, no extra row)
+
+Full `d1_migrations` dump (34 rows) shows ids 23-32 cover **10 files**, not
+9: `0023` was physically split into three files (`0023a`/`0023b`/`0023c`,
+ids 23/24/25) — three rows for one logically-named migration — and `0030`
+is absent from the applied range (held in `migrations-held/`, never
+applied). `22 + 10 = 32` → `0033`→id33, `0034`→id34. Matches production
+exactly. `sqlite_sequence.seq=34` = `COUNT(*)=34` = `MAX(id)=34`: no
+autoincrement gap.
+
+### A11.3 — Pre-apply D1 export (none taken; post-hoc taken now)
+
+`gsk hosted d1_snapshots` returns zero entries for this project (platform
+auto-snapshot only fires on `--rebuild_db`, not used here). **No export was
+taken before the 0033/0034 apply.** A post-hoc export was taken this turn:
+`https://www.genspark.ai/api/files/s/fePxG2Cy` (34 tables, 12,230 records,
+non-empty) — this captures POST-apply state only, NOT a pre-apply
+restore point. If a schema revert of 0033/0034 is ever needed, this export
+is not sufficient for that; manually-written reverse-DDL would be required.
+
+### A11.4 — Post-apply FK reconciliation (0 violations, manual substitution)
+
+`PRAGMA foreign_key_check` is blocked by the query tool's SQL safety filter
+(`"blocked statement: PRAGMA"`) — not retried, per no-retry-on-blocked-op
+policy. Substituted manual anti-join checks on every FK column 0033
+introduced (0034 adds no new FK columns):
+- `received_devices.sold_shipment_id → shipments.id`: 0 orphans
+- `received_devices.organisation_id → organisations.id` (general sanity): 0 orphans
+
+Result: 0 FK violations found.
