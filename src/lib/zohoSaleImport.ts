@@ -359,11 +359,36 @@ export function classifyRow(
     return null
   }
 
-  // Matched an IMEI we hold. If this row hasn't been sold yet (status
-  // available / no out_contact_id), there's nothing to attribute this run.
+  // Matched an IMEI we hold. A blank out_contact_id is skipped_available
+  // ONLY if there is also no out-side transaction data at all (2026-09-09
+  // narrowing, DEVELOPER INSTRUCTION): status='available' AND blank
+  // out_entity_type AND blank sold_price. NOTE: this row's `status` column
+  // (values 'available'/'sold') is the availability discriminator — NOT
+  // `item_status`, which reads 'active' for both the blank-out_contact_id
+  // AND non-blank populations alike in the 2026-09-09 sample (confirmed:
+  // 525/525 blanks and 2691/2691 non-blanks both read item_status='active'
+  // — item_status carries zero discriminating signal here and must not be
+  // used as this guard's condition). The 2026-09-09 sample's 525
+  // blank-out_contact_id rows are all Inwards/status=available/no-sold_price,
+  // so this guard changes nothing on that sample — but the sample's blanks
+  // are all Inwards BY CONSTRUCTION and cannot prove an Outwards row with
+  // a blank out_contact_id is safe to treat the same way. An OUTWARDS row
+  // with real out-side data (a genuine movement out) but a blank
+  // out_contact_id is a real classifier gap, not idle stock — filing it
+  // as skipped_available would make it vanish silently, the exact failure
+  // mode UNCLASSIFIED exists to prevent. So: blank id WITH any out-side
+  // data falls through to classifyDisposition() below, which already
+  // returns UNCLASSIFIED for a blank id — no new outcome variant, no
+  // special branch, just a narrower guard on the existing early return.
   const outContactId = row.out_contact_id.trim()
   if (!outContactId) {
-    return { outcome: 'skipped_available', serialCode, imei: matchedImei }
+    const status = row.status.trim().toLowerCase()
+    const hasOutSideData = status !== 'available'
+      || row.out_entity_type.trim() !== ''
+      || row.sold_price.trim() !== ''
+    if (!hasOutSideData) {
+      return { outcome: 'skipped_available', serialCode, imei: matchedImei }
+    }
   }
 
   const disposition = classifyDisposition(outContactId)
@@ -527,6 +552,34 @@ export type ZohoImportConflict = {
   currentStatus: string | null
 }
 
+// A matched_sale row whose device is already SOLD but whose stored
+// zoho_out_entity_number matches THIS row's invoice number: re-running the
+// same Zoho export file re-derives the same outcome, not a new conflict
+// (item 3, DEVELOPER INSTRUCTION 2026-09-09). Never counted in `conflicts`.
+export type ZohoAlreadyImported = { serialCode: string; imei: string; invoiceNo: string }
+
+// A matched_sale row whose device is currently QC_FAILED. `dryRun` lists
+// every such row here unconditionally (informational preview) regardless
+// of opts.acknowledgeQcFailed. (QC_FAILED acknowledgment gate, DEVELOPER
+// INSTRUCTION 2026-09-09 -- folded into item 2's classifier work.)
+export type ZohoQcFailedRow = {
+  serialCode: string; imei: string; invoiceNo: string
+  soldPricePence: number; currentStatus: string
+}
+
+// A matched_sale row that targeted a QC_FAILED device but was excluded
+// from the write batch because opts.acknowledgeQcFailed was not true.
+// Every OTHER row in the batch still proceeds -- one flagged device must
+// not fail a whole import. The verbatim `message` is QC_FAILED_WARNING_MESSAGE.
+export type ZohoWarningUnacknowledged = ZohoQcFailedRow & { message: string }
+
+// Verbatim, greppable copy for the QC_FAILED acknowledgment gate. The rule
+// attaches to the QC_FAILED -> SOLD edge itself, not to this importer --
+// reuse this exact string on any future single-device sale path that can
+// also reach SOLD from QC_FAILED.
+export const QC_FAILED_WARNING_MESSAGE =
+  'Device failed QC (QC_FAILED). Selling as a standard sale — revenue will be reported with all other sales. Confirm to proceed.'
+
 export type ZohoImportApplyResult = {
   ok: boolean
   errors: string[]
@@ -540,6 +593,19 @@ export type ZohoImportApplyResult = {
   soldCount: number // subset of matchedSaleCount actually written (dryRun: what WOULD write)
   conflicts: ZohoImportConflict[]
   unclassified: Array<{ serialCode: string; imei: string; outContactId: string; outContactName: string }>
+  // Same invoice number already recorded on this device from an earlier
+  // run of this same file -- idempotent no-op, NOT a conflict (item 3).
+  alreadyImportedCount: number
+  alreadyImported: ZohoAlreadyImported[]
+  // dryRun-only informational preview of every QC_FAILED-source matched_sale
+  // row, regardless of opts.acknowledgeQcFailed. Empty on a real (non-dryRun) run.
+  qcFailedPreview: ZohoQcFailedRow[]
+  // Rows excluded from the write batch because they targeted a QC_FAILED
+  // device without opts.acknowledgeQcFailed === true. Populated identically
+  // on dryRun and real runs (same rule, truthful preview). Empty when every
+  // QC_FAILED-source row was acknowledged or there were none.
+  warningUnacknowledgedCount: number
+  warningUnacknowledged: ZohoWarningUnacknowledged[]
 }
 
 // Statuses a device may be in when a matched_sale outcome targets it.
@@ -564,13 +630,16 @@ export async function applyZohoSaleImport(
   db: D1Database,
   organisationId: number,
   csvText: string,
-  opts: { dryRun: boolean; actorUserId: number; user: AuthUser },
+  opts: { dryRun: boolean; actorUserId: number; user: AuthUser; acknowledgeQcFailed?: boolean },
 ): Promise<ZohoImportApplyResult> {
   const empty = {
     ok: false, errors: [] as string[], dryRun: opts.dryRun, importBatchId: null,
     totalRows: 0, matchedSaleCount: 0, matchedNonRevenueCount: 0,
     matchedUnclassifiedCount: 0, skippedAvailableCount: 0, soldCount: 0,
     conflicts: [] as ZohoImportConflict[], unclassified: [] as ZohoImportApplyResult['unclassified'],
+    alreadyImportedCount: 0, alreadyImported: [] as ZohoAlreadyImported[],
+    qcFailedPreview: [] as ZohoQcFailedRow[],
+    warningUnacknowledgedCount: 0, warningUnacknowledged: [] as ZohoWarningUnacknowledged[],
   }
 
   const parsed = parseZohoCsv(csvText)
@@ -578,9 +647,12 @@ export async function applyZohoSaleImport(
 
   // Build the known-IMEI set from received_devices for this organisation —
   // classifyRow()'s INNER JOIN CONTRACT needs this to decide match/no-match.
+  // zoho_out_entity_number is fetched here too — item 3's re-import
+  // idempotency check needs the device's STORED invoice number to compare
+  // against the CSV row's invoice number.
   const { results: deviceRows } = await db.prepare(
-    'SELECT id, imei, status FROM received_devices WHERE organisation_id = ?'
-  ).bind(organisationId).all<{ id: number; imei: string; status: string }>()
+    'SELECT id, imei, status, zoho_out_entity_number FROM received_devices WHERE organisation_id = ?'
+  ).bind(organisationId).all<{ id: number; imei: string; status: string; zoho_out_entity_number: string | null }>()
   const byImeiUpper = new Map(deviceRows.map(d => [d.imei.trim().toUpperCase(), d]))
   const knownImeisUpper = new Set(byImeiUpper.keys())
 
@@ -597,19 +669,65 @@ export async function applyZohoSaleImport(
 
   // Conflict detection — same rule for dry-run preview and real write, so
   // the preview is a truthful predictor of what a real run will do.
+  //
+  // Three device-side checks, in order, for every matched_sale outcome:
+  //   1. device_not_found — should not happen (o.imei came from
+  //      knownImeisUpper), but keep the contract explicit rather than assume.
+  //   2. already-SOLD split on zoho_out_entity_number (item 3, DEVELOPER
+  //      INSTRUCTION 2026-09-09): SAME invoice number as already stored on
+  //      the device -> this is a re-run of a file we've already applied ->
+  //      `alreadyImported`, NOT a conflict. DIFFERENT (or no stored) invoice
+  //      number -> genuine double-sale / mis-keyed-serial conflict, reported
+  //      loudly as `already_sold`. Runs BEFORE the general
+  //      SOLD_REACHABLE_STATUSES check because SOLD is itself excluded from
+  //      that set — must intercept SOLD explicitly first.
+  //   3. QC_FAILED acknowledgment gate (folded into item 2's classifier
+  //      work, DEVELOPER INSTRUCTION 2026-09-09): a device currently
+  //      QC_FAILED is a reachable-to-SOLD source (SOLD_REACHABLE_STATUSES
+  //      already includes it — the transition edge itself is fine), but a
+  //      human must consciously confirm selling a device that failed QC.
+  //      Every QC_FAILED-source row is recorded in qcFailedPreview
+  //      unconditionally (informational, both dryRun and real run). If
+  //      opts.acknowledgeQcFailed is not true, the row is ALSO excluded from
+  //      the write batch and recorded in warningUnacknowledged — every OTHER
+  //      row in the batch still proceeds; one flagged device must not fail
+  //      a whole import.
   const conflicts: ZohoImportConflict[] = []
-  const writableSales: Array<{ outcome: Extract<ZohoImportOutcome, { outcome: 'matched_sale' }>; device: { id: number; imei: string; status: string } }> = []
+  const alreadyImported: ZohoAlreadyImported[] = []
+  const qcFailedPreview: ZohoQcFailedRow[] = []
+  const warningUnacknowledged: ZohoWarningUnacknowledged[] = []
+  const writableSales: Array<{ outcome: Extract<ZohoImportOutcome, { outcome: 'matched_sale' }>; device: { id: number; imei: string; status: string; zoho_out_entity_number: string | null } }> = []
   for (const o of saleOutcomes) {
     const device = byImeiUpper.get(o.imei)
     if (!device) {
-      // Should not happen (o.imei came from knownImeisUpper), but keep the
-      // contract explicit rather than assume.
       conflicts.push({ serialCode: o.serialCode, imei: o.imei, reason: 'device_not_found', currentStatus: null })
+      continue
+    }
+    if (device.status === 'SOLD') {
+      if (device.zoho_out_entity_number && device.zoho_out_entity_number === o.invoiceNo) {
+        alreadyImported.push({ serialCode: o.serialCode, imei: o.imei, invoiceNo: o.invoiceNo })
+      } else {
+        conflicts.push({ serialCode: o.serialCode, imei: o.imei, reason: 'already_sold', currentStatus: device.status })
+      }
       continue
     }
     if (!SOLD_REACHABLE_STATUSES.has(device.status)) {
       conflicts.push({ serialCode: o.serialCode, imei: o.imei, reason: conflictReasonFor(device.status), currentStatus: device.status })
       continue
+    }
+    if (device.status === 'QC_FAILED') {
+      qcFailedPreview.push({
+        serialCode: o.serialCode, imei: o.imei, invoiceNo: o.invoiceNo,
+        soldPricePence: o.soldPricePence, currentStatus: device.status,
+      })
+      if (!opts.acknowledgeQcFailed) {
+        warningUnacknowledged.push({
+          serialCode: o.serialCode, imei: o.imei, invoiceNo: o.invoiceNo,
+          soldPricePence: o.soldPricePence, currentStatus: device.status,
+          message: QC_FAILED_WARNING_MESSAGE,
+        })
+        continue
+      }
     }
     writableSales.push({ outcome: o, device })
   }
@@ -625,6 +743,11 @@ export async function applyZohoSaleImport(
       soldCount: writableSales.length,
       conflicts,
       unclassified,
+      alreadyImportedCount: alreadyImported.length,
+      alreadyImported,
+      qcFailedPreview,
+      warningUnacknowledgedCount: warningUnacknowledged.length,
+      warningUnacknowledged,
     }
   }
 
@@ -699,5 +822,15 @@ export async function applyZohoSaleImport(
     soldCount,
     conflicts,
     unclassified,
+    alreadyImportedCount: alreadyImported.length,
+    alreadyImported,
+    // qcFailedPreview is a dryRun-only informational concept (the user's
+    // "dry_run lists every QC_FAILED-source row" instruction) -- a real
+    // run's outcome for those rows is fully described by soldCount (if
+    // acknowledged) or warningUnacknowledged (if not), so this stays empty
+    // here rather than duplicating warningUnacknowledged's content.
+    qcFailedPreview: [],
+    warningUnacknowledgedCount: warningUnacknowledged.length,
+    warningUnacknowledged,
   }
 }

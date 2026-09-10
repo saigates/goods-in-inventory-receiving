@@ -1,8 +1,12 @@
 // Zoho Inwards/Outwards sale-attribution importer — pure classification
-// logic (src/lib/zohoSaleImport.ts). No D1, no HTTP: applyZohoSaleImport
-// (the D1-backed write function) does not exist yet and must NOT be
-// written until this file exists and passes (STILL OPEN #3,
-// DEVELOPER INSTRUCTION scope ruling 2026-09-09).
+// logic (src/lib/zohoSaleImport.ts). No D1, no HTTP.
+//
+// UPDATE (2026-09-09): applyZohoSaleImport (the D1-backed write function)
+// now exists in src/lib/zohoSaleImport.ts and IS tested — see
+// test/zohoSaleImportApply.spec.ts, the D1-backed HTTP-level companion
+// file (IMEI prefix 8604570, claimed in test/browser/README.md in the
+// same commit). This file stays pure-function-only by design; it is not
+// being extended to cover the write path.
 //
 // IMEI-registry note: every fixture "serial code" in this file is a
 // PLAIN STRING passed straight into classifyRow()'s knownImeisUpper Set —
@@ -10,15 +14,8 @@
 // anywhere in this file), so the collision this file's fixtures could
 // cause is with EACH OTHER within a single test, never with the shared
 // received_devices UNIQUE(imei) constraint or any other suite's rows.
-// The test/browser/README.md IMEI-prefix registry (7-digit prefixes,
-// next free 8604570 as of 2026-09-08) and every vitest spec's own
-// nextImei/imeiSeq base literal exist specifically to avoid THAT
-// UNIQUE-constraint collision — a concern this file cannot trigger, since
-// it never inserts a row. No registry entry is claimed here as a result.
-// If a future edit to this file adds a D1-backed test (e.g. once
-// applyZohoSaleImport exists and is tested against a live
-// received_devices table), that edit MUST claim a fresh prefix from the
-// registry in the SAME commit, per the standing instruction.
+// This file therefore claims no registry prefix — see
+// test/zohoSaleImportApply.spec.ts for the file that does.
 import { describe, expect, it } from 'vitest'
 import {
   classifySerialShape,
@@ -275,16 +272,48 @@ describe('classifyRow — INNER JOIN CONTRACT (2026-09-09 scope ruling)', () => 
   })
 
   it('matches case-insensitively against the known-IMEI set', () => {
-    const row = makeRow({ serial_number_code: 'rfat12vx6ey', out_contact_id: '' })
+    const row = makeRow({
+      serial_number_code: 'rfat12vx6ey', out_contact_id: '',
+      status: 'available', out_entity_type: '', out_entity_number: '', out_entity_date: '', sold_price: '',
+    })
     const result = classifyRow(row, new Set(['RFAT12VX6EY']))
     expect(result).not.toBeNull()
     expect(result?.outcome).toBe('skipped_available')
   })
 
-  it('a matched device with a blank out_contact_id (not yet sold) is skipped_available', () => {
-    const row = makeRow({ out_contact_id: '' })
+  it('a matched device with a blank out_contact_id AND no out-side data at all (status=available, blank out_entity_type, blank sold_price) is skipped_available', () => {
+    const row = makeRow({
+      out_contact_id: '',
+      status: 'available', out_entity_type: '', out_entity_number: '', out_entity_date: '', sold_price: '',
+    })
     const result = classifyRow(row, new Set([row.serial_number_code]))
     expect(result).toEqual({ outcome: 'skipped_available', serialCode: row.serial_number_code, imei: row.serial_number_code })
+  })
+
+  it('DEVELOPER INSTRUCTION 2026-09-09 (item 2 narrowing): a blank out_contact_id WITH real out-side data (an Outwards row that moved out but has no classifier) is matched_unclassified, NOT skipped_available -- this row shape does not occur in the 2026-09-09 sample (its 525 blanks are all Inwards/available/no-sold_price by construction) and must be constructed deliberately here so the 1 Aug real file cannot silently vanish a genuine outbound movement into the available bucket', () => {
+    const row = makeRow({
+      out_contact_id: '', out_contact_name: '',
+      status: 'sold', out_entity_type: 'invoice', out_entity_number: 'INV-0555', out_entity_date: '2026-08-12',
+      sold_price: '199.00',
+    })
+    const result = classifyRow(row, new Set([row.serial_number_code]))
+    expect(result).toEqual({
+      outcome: 'matched_unclassified',
+      serialCode: row.serial_number_code,
+      imei: row.serial_number_code,
+      outContactId: '',
+      outContactName: '',
+    })
+  })
+
+  it('DEVELOPER INSTRUCTION 2026-09-09: a blank out_contact_id with sold_price populated alone (even if status/out_entity_type still read available/blank) is matched_unclassified -- any ONE of the three out-side signals is enough to disqualify skipped_available', () => {
+    const row = makeRow({
+      out_contact_id: '', out_contact_name: '',
+      status: 'available', out_entity_type: '', out_entity_number: '', out_entity_date: '',
+      sold_price: '50.00',
+    })
+    const result = classifyRow(row, new Set([row.serial_number_code]))
+    expect(result?.outcome).toBe('matched_unclassified')
   })
 
   it('a matched SALE_EXTERNAL row classifies as matched_sale with pence-parsed sold price', () => {
@@ -370,7 +399,10 @@ describe('classifyZohoCsvRows — batch classification, no unmatched counter any
       makeRow({ serial_number_code: 'MATCH-SALE', out_contact_id: SALE_EXTERNAL_CONTACT_ID }),
       makeRow({ serial_number_code: 'MATCH-FBA', out_contact_id: FBA_TRANSFER_CONTACT_ID }),
       makeRow({ serial_number_code: 'MATCH-UNCLASSIFIED', out_contact_id: '251444000999999999', out_contact_name: 'UNKNOWN' }),
-      makeRow({ serial_number_code: 'MATCH-AVAILABLE', out_contact_id: '' }),
+      makeRow({
+        serial_number_code: 'MATCH-AVAILABLE', out_contact_id: '',
+        status: 'available', out_entity_type: '', out_entity_number: '', out_entity_date: '', sold_price: '',
+      }),
       makeRow({ serial_number_code: 'NO-MATCH-1' }),
       makeRow({ serial_number_code: 'NO-MATCH-2' }),
     ]
