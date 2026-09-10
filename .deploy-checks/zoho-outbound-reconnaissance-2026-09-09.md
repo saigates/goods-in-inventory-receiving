@@ -707,3 +707,46 @@ introduced (0034 adds no new FK columns):
 - `received_devices.organisation_id → organisations.id` (general sanity): 0 orphans
 
 Result: 0 FK violations found.
+
+### A11.5 — Item 4 (vitest gate) re-run: STOP CONDITION MET, gate result was stale at deploy time
+
+Fresh backgrounded run, this turn:
+
+| Suite | Files | Passed | Skipped | Failed |
+|---|---|---|---|---|
+| main (`npm test`) | 32 | 603 | 8 | **10** |
+| serial (`npm run test:serial`) | 1 | 65 | 0 | 0 |
+| combined | 33 | 668 | 8 | **10** |
+
+Neither Candidate A (676 combined) nor Candidate B (678 combined) — `failed=10`
+triggers the stop condition on its own regardless. Per-file:
+`test/skuMapImport.spec.ts` = 22 tests, 12 passed / **10 failed**, 0 skipped,
+all 10 failures `SQLITE_ERROR: no such table: sku_map`.
+
+**Root cause**: `vitest.config.ts` builds the local test D1 from every file
+physically present in `migrations/`. Commit `c7737ee` (`git mv
+migrations/0032_zoho_sku_mapping.sql migrations-held/...`) removed
+`sku_map`/`zoho_items`/etc. from the LOCAL test schema at the same time it
+removed them from the production apply set — the same directory governs
+both. `test/skuMapImport.spec.ts` (commit `39539e9`, predates the hold)
+depends on those tables.
+
+**Consequence**: the "613/8/32 main, 678/8/0 combined" gate result recorded
+in Addendum A10 step 4 was captured BEFORE step 5's `git mv` — i.e. against
+a local D1 that still had 0032 applied. The migration set that actually
+shipped to production (0033+0034 only, 0032 held) was never itself
+vitest-verified in that configuration. The gate report in A10 was accurate
+for what it measured, but what it measured was not what got deployed —
+a real pre-apply/post-hold gate-sequencing gap.
+
+**Not a new production risk**: this is a local-only test failure (no such
+table in local Miniflare D1). It corroborates, rather than newly discovers,
+the already-flagged-and-held `/api/sku-map` 500 (production is missing the
+same tables for the same reason). No production action follows from this by
+itself.
+
+**Standing correction**: `migrations-held/README.md`'s hold mechanism holds
+a migration out of BOTH the production-apply path and the local test-build
+path simultaneously — anyone holding a migration must expect (and, ideally,
+skip or update) any test file that depends on its tables, not just check
+production deploy safety.
