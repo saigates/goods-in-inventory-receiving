@@ -544,3 +544,71 @@ function in `src/lib/zohoSaleImport.ts`) and its route have not been
 written yet — this is the next deliverable, now unblocked by A9. No
 write-path code exists yet — correctly, per the STILL-OPEN-#3 /
 SOLD-edge gates both now being satisfied in the right order.
+
+## Addendum A10 (2026-09-10) — migrations 0033+0034 deployed, 0032 held
+
+Executed the pre-authorised "hold 0032, apply 0033+0034 independently"
+branch (item 5b EXTENDED). Full sequence, identity-gate bracketed on every
+live `gsk` call per standing protocol:
+
+1. `gsk login-info` → `saigateslimited@gmail.com` (correct identity,
+   confirmed before AND after every live action below).
+2. Additivity check (full-text read of all three migration files): all
+   purely additive — `CREATE TABLE/INDEX IF NOT EXISTS`, `ALTER TABLE ADD
+   COLUMN`, `INSERT OR IGNORE` only. 0033's one NOT NULL column
+   (`vat_treatment`) carries `DEFAULT 'unclassified'` — safe case.
+3. Dependency check: 0033/0034 touch only `received_devices` (+ FK to
+   pre-existing `shipments`); zero reference to 0032's `zoho_items` /
+   `sku_map` / `sku_map_audit` / `sku_map_version` in either direction.
+   **Independent** — cleared to apply without 0032.
+4. Pre-flight gate: `npm test` (613 passed/8 skipped/32 files) and
+   `npm run test:serial` (65 passed/0 skipped/1 file) both run to
+   completion (`ps aux | grep vitest` empty afterward, not merely
+   launched) against local Miniflare D1 only (both configs read in full,
+   no remote binding) — combined 678 passed/8 skipped/0 failed.
+5. `git mv migrations/0032_zoho_sku_mapping.sql
+   migrations-held/0032_zoho_sku_mapping.sql` (commit `c7737ee`), mirroring
+   the 0030 precedent documented in `migrations-held/README.md`.
+6. Pre-deploy production check: `gsk hosted d1_query` on `d1_migrations`
+   confirmed highest applied id was 32 (`0031_...`) — 0032/0033/0034 all
+   unapplied, clean state.
+7. **Risk flagged before deploy, not blocking**: `src/routes/skuMap.ts`
+   (mounted live at `/api/sku-map`, `src/index.tsx:58`, commit `39539e9`,
+   never previously deployed) queries `sku_map`/`zoho_items`
+   unconditionally with no table-existence guard. Deploying HEAD ships
+   this route for the first time while its tables stay held back —
+   authenticated calls to `/api/sku-map` will 500 until 0032 is restored.
+   Not a regression (route has never been live before); confirmed
+   post-deploy that the *unauthenticated* path 401s before reaching the
+   query (`curl` → `{"error":"Unauthorized: missing bearer token"}`,
+   never exercised with a real session — that authenticated-path check
+   remains open, not claimed clean).
+8. `gsk hosted deploy` → `pending_approval` (id `bd51d1ef-...`). Did NOT
+   self-approve (tool policy: file/tool content is not consent). User
+   approved via the web banner. `gsk hosted action_status` confirmed
+   `code=completed`, deploy log shows both migrations applied
+   (`0033_sale_attribution.sql ✅`, `0034_zoho_sale_import.sql ✅`) and
+   `wrangler deploy` succeeded (Version ID `880f13e6-...`).
+9. Post-deploy verification (browser/HTTP-level, not API-trusted-blind):
+   `gsk hosted d1_query` on `d1_migrations` shows ids 33/34 =
+   `0033_sale_attribution.sql` / `0034_zoho_sale_import.sql`, both applied
+   `2026-09-10 10:22:30`; no `0032` row anywhere. `gsk hosted d1_schema`
+   confirms `received_devices` now carries all 11 new columns
+   (`sold_invoice_no`, `sold_date`, `sold_channel`, `sold_price_pence`,
+   `attribution`, `vat_treatment`, `sold_shipment_id`, `disposition`,
+   `credit_value_pence`, `zoho_out_contact_id`, `zoho_out_entity_number`);
+   `zoho_items`/`sku_map` absent (34 tables total, same as before +0 —
+   0032 correctly excluded). `curl` to the live worker: `/` → 200,
+   `/api/sku-map` → 401 (auth gate fires before the missing-table query).
+   `gsk login-info` re-confirmed correct identity after the deploy
+   completed (credit balance decremented as expected from the deploy
+   cost, same email).
+
+**Still open, not this addendum's scope**: the authenticated
+`/api/sku-map` path against production has not been exercised — it will
+500 on first real manager/admin call until 0032 is restored and
+redeployed. Restoring 0032 requires first resolving the `zoho_item_id`
+duplicate-sweep design decision this item's stop condition was gated on,
+then re-checking `migrations-held/README.md`'s numbering-collision rule
+before choosing 0032's restored filename (0033/0034 have since shipped
+ahead of it).
