@@ -1401,3 +1401,33 @@ baseline stays in place, unchanged, pending resolution of this new,
 single-test discrepancy — this addendum points at it rather than replacing
 it, per instruction.
 
+
+---
+
+## Addendum A18 — GitHub credential-repair persistence: DID NOT hold, corrected
+
+**Prior turn's claim, now shown wrong**: "GitHub credential repair confirmed
+to persist — proven by an actual push succeeding cleanly to `origin`." That
+was true AT THE TIME (proven by a real push, not just config inspection, as
+claimed) but did not survive to this turn. This turn's first `git push
+origin main` failed with the identical error as the original incident:
+`remote: Invalid username or token. Password authentication is not
+supported for Git operations. fatal: Authentication failed`. Re-running
+`setup_github_environment` fixed it immediately; the retried push succeeded
+(`4b26f4d..b3f8f2f main -> main`). Both remotes confirmed matching local
+HEAD (`b3f8f2f36184001ba57ab8e49201e282f8acb6ef`) after the fix.
+
+**Standing correction**: credential persistence must be treated as
+per-turn/per-sandbox-session state, not a durable fact once proven true.
+"Confirmed to persist" in a prior addendum described that turn's session
+only. `setup_github_environment` must be called (or the push attempted and
+the failure caught) at the point of use in EVERY turn that pushes to
+`origin`, not assumed from a previous turn's success — this is the same
+class of fault flagged by the standing gate ("a stale-credential push
+failure that silently succeeds locally is the same class of fault as the
+678 test-count miscount"): the risk is not that the push fails loudly (it
+did, and was caught), it is treating a past-tense proof as a present-tense
+guarantee. No git state was at risk here — a failed push leaves both the
+local commit and the remote's prior state intact, it does not silently
+diverge — but the reporting language must not overclaim durability.
+
