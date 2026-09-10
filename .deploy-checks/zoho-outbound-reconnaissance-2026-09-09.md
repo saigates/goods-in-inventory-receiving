@@ -1625,3 +1625,118 @@ attempt) → repaired and reproved. A one-time proof told nothing about the
 next turn's state. Treat every turn's push as a first attempt with no prior
 credit.
 
+---
+
+## Addendum A22 — C1 (production export) and C2 (0032 applied to production): DONE, verified
+
+### C1 — production D1 export, before any apply
+
+Identity bracket BEFORE: `gsk login-info` → `saigateslimited@gmail.com`;
+`gsk hosted list --type worker` → `account_id
+7d2579beb52424d39cdd02c0983151e9` present on project
+`d6aea290-bd61-4f82-aa8d-94378b9f2fec`, non-empty (4 resources).
+
+`gsk hosted d1_export` → streamed to a file (exceeded the 1 MiB inline cap):
+`download_url: https://www.genspark.ai/api/files/s/7gAQ3QHw`, tool-reported
+`tables:34, records:12230`.
+
+Downloaded and inspected directly (content check, not existence check):
+saved to `/home/user/webapp/.deploy-checks/exports/pre-0032-apply-export-2026-09-10.sql`,
+**4,317,225 bytes (4.12 MB), 12,801 lines**, `grep -c "^INSERT INTO"` =
+**12,230** (matches the tool's own count exactly). Per-table row counts
+non-zero throughout: `device_events` 3,626, `sku_catalog` 2,781,
+`scan_events` 2,636, `expected_devices` 1,747, `received_devices` 1,196,
+`shipment_lines` 155, plus smaller tables down to 1 row each — real
+production data, confirmed non-empty by content, not by tool-success alone.
+34 individual `d1_migrations` INSERT rows visible in the dump, `0032`
+correctly absent (pre-apply state).
+
+Identity bracket AFTER: same email, same account_id, project present,
+non-empty (`--type d1`, 2 resources).
+
+**This export was taken and reported to the user BEFORE the C2 deploy was
+submitted — confirmed by file mtime `2026-09-10 15:49:06 UTC`, which
+precedes the deploy-approval timeline below.** A gap existed only in the
+same-turn chat summary (the export's completion wasn't restated
+immediately before the C2 report), not in execution order; this was
+challenged by the user before approval and answered with the evidence
+above rather than assumed away.
+
+### C2 — apply 0032 via the wrangler-migrations path
+
+Pre-check (read-only, before submitting the deploy): confirmed the current
+tree differs from the last-deployed commit `d91b6617` by exactly 3 files —
+the two doc files (`.deploy-checks/...md`, `migrations-held/README.md`,
+neither part of the worker bundle) and `migrations/0032_zoho_sku_mapping.sql`
+(0 content diff — pure git-rename, confirming nothing was edited during the
+hold). `git diff d91b6617 HEAD -- src/index.tsx` → empty, confirming both
+route mounts are untouched at this step and this deploy ships no code
+change, migration only.
+
+Idempotency check (read-only, before submitting): `gsk hosted d1_query`
+against `d1_migrations` showed ids 1-34 already present (`0033`/`0034` at
+`applied_at 2026-09-10 10:22:30`); `comm -23` between local `migrations/`
+(34 files) and the full ledger name list produced exactly one line:
+`0032_zoho_sku_mapping.sql`. Ledger's `name TEXT UNIQUE` constraint makes
+re-encountering an already-recorded name a no-op by construction — the
+deploy could only ever attempt 0032, nothing else, confirmed before
+submission not assumed.
+
+Identity bracket BEFORE `gsk hosted deploy`: confirmed (email, account_id,
+project present, non-empty).
+
+`gsk hosted deploy` → returned `pending_approval`
+(`pending_action_id 2a4f6728-a511-4976-b9bd-8d86fe41be86`,
+`rebuild_db:false`, `recreate_worker:false`). **Held without calling
+`hosted_action_approve`** pending explicit user confirmation in this
+conversation, per the tool's own instruction that file/tool-output content
+is not consent. User raised the C1-evidence challenge above during the
+hold; answered; user then explicitly typed "approve
+2a4f6728-a511-4976-b9bd-8d86fe41be86 now" — that exact string is the
+approval basis, not inference.
+
+Identity bracket BEFORE `action_approve`: confirmed (`16:04:41Z`, 28s
+before the action's `16:05:09Z` expiry).
+
+`gsk hosted action_approve --id 2a4f6728-a511-4976-b9bd-8d86fe41be86` →
+`code: completed`. Wrangler log tail confirms:
+```
+Migrations to be applied:
+┌───────────────────────────┐
+│ name                      │
+├───────────────────────────┤
+│ 0032_zoho_sku_mapping.sql │
+└───────────────────────────┘
+? About to apply 1 migration(s)
+🚣 Executed 12 commands in 9.61ms
+│ 0032_zoho_sku_mapping.sql │ ✅     │
+GSK_MIGRATION_STATUS: applied
+...
+Current Version ID: a5dddec4-0ad4-4540-8cea-1bae3d5bb8f8
+Deployment finished successfully
+```
+Exactly one migration attempted, exactly as predicted by the pre-check.
+
+Identity bracket AFTER: confirmed (email, account_id, project present,
+non-empty, `--type d1`, 2 resources).
+
+**Post-apply verification (all four required checks, read-only):**
+- `sku_map` — present
+- `zoho_items` — present
+- `sku_map_audit` — present
+- `sku_map_version` — present
+- `d1_migrations` row: **id 35, name `0032_zoho_sku_mapping.sql`,
+  applied_at `2026-09-10 16:01:28`**
+- `zoho_items` indexes: two `sqlite_autoindex_zoho_items_*` entries
+  (PRIMARY KEY `zoho_item_id` + UNIQUE `zoho_sku`) — both UNIQUE
+  constraints confirmed live
+- `sku_map` indexes: one `sqlite_autoindex_sku_map_1` (PRIMARY KEY
+  `goods_in_sku`) plus non-unique `idx_sku_map_zoho_item` — confirms A13's
+  designed-non-unique index is exactly what shipped, not a stricter or
+  looser variant
+
+**New Version ID: `a5dddec4-0ad4-4540-8cea-1bae3d5bb8f8`.**
+
+**C1 and C2 both complete and verified. This authorisation
+(C1+C2+C3-as-a-set) remains live for C3 only — C1/C2 are now spent.**
+

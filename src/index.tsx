@@ -55,8 +55,6 @@ app.route('/api/webhooks', webhooksRoute)
 app.route('/api/opr', oprRoute)
 app.route('/api/bills', billsRoute)
 app.route('/api/reports', reportsRoute)
-app.route('/api/sku-map', skuMapRoute)
-app.route('/api/zoho-sale-import', zohoSaleImportRoute)
 
 // SPA shell — all UI rendered client-side from /static/app.js
 app.get('/', (c) => {
