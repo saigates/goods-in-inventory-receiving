@@ -172,6 +172,31 @@ export function parseZohoCsv(raw: string): ZohoCsvParseResult {
     rows.push(row as ZohoCsvRow)
   }
 
+  // FILE-SHAPE GATE (2026-09-10 incident response): reject a wholly-Inwards
+  // export mistakenly submitted to this OUTWARDS/sale importer. Such a file
+  // has out_entity_date AND out_contact_id blank on EVERY row — every row
+  // then classifies skipped_available/matched_unclassified with no error,
+  // reducing to a near-total skipped_available read that looks like a
+  // clean no-op rather than the wrong file. Checked ONCE here, across the
+  // whole file, at parse time — deliberately independent of and before
+  // classifyRow()/classifyZohoCsvRows(), so it can never alter a per-row
+  // outcome. A file where at least one row carries out-side data (a normal
+  // outwards file, or a mixed file where only SOME rows lack out_contact_id)
+  // is NOT rejected here — only the wholly-blank shape is.
+  if (rows.length > 0) {
+    const hasAnyOutSideSignal = rows.some(
+      r => r.out_entity_date.trim() !== '' || r.out_contact_id.trim() !== ''
+    )
+    if (!hasAnyOutSideSignal) {
+      return {
+        ok: false,
+        error: 'Every row is missing both out_entity_date and out_contact_id — ' +
+          'this looks like an Inwards export submitted to the Outwards/sale ' +
+          'importer, not an outwards or mixed file. Rejected before classification.',
+      }
+    }
+  }
+
   return { ok: true, rows, fileLineCount: dataLines.filter(l => l.trim() !== '').length }
 }
 

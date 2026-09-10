@@ -1926,3 +1926,108 @@ output, not adjusted.
 write/deploy/approve call, D1 stayed untouched beyond the read-only checks
 already recorded in A22/A23/A24.
 
+## Addendum A26 (2026-09-10) — Confirmations 4b/4c/warning-independence (items 5a/5b/5c), revenue-definition ruling
+
+Read-only. `src/lib/zohoSaleImport.ts` only. No code, test, or production
+change in this addendum.
+
+### 5a — knownImeisUpper organisationId scoping (delivered inline, recorded here for the permanent record)
+
+`applyZohoSaleImport(db, organisationId, csvText, opts)` (line 629) —
+`organisationId` is the function's own second parameter. Line 653-655:
+
+```ts
+const { results: deviceRows } = await db.prepare(
+  'SELECT id, imei, status, zoho_out_entity_number FROM received_devices WHERE organisation_id = ?'
+).bind(organisationId).all(...)
+```
+
+`byImeiUpper`/`knownImeisUpper` (line 656-657) are built exclusively from
+`deviceRows`, which is exclusively this query's result. **Confirmed scoped
+by organisationId, line 654, bound at line 655. No blocker.**
+
+### 5b — sale-column write vs transitionDevice(): transaction or accepted partial write
+
+Lines 780-813, the `matched_sale` write loop:
+
+```ts
+for (const { outcome: o, device } of writableSales) {
+  await db.prepare(`UPDATE received_devices SET
+       sold_invoice_no = ?, sold_date = ?, sold_channel = 'zoho_import',
+       sold_price_pence = ?, attribution = 'zoho_import',
+       disposition = ?, zoho_out_contact_id = ?, zoho_out_entity_number = ?,
+       updated_at = ? WHERE id = ? AND organisation_id = ?`
+  ).bind(...).run()               // <- runs unconditionally, own statement
+
+  try {
+    await transitionDevice(db, device.id, 'SOLD', { ... })   // <- separate try/catch
+    soldCount++
+  } catch (err) {
+    // "...the sale columns just written stand as a record of the
+    // attempt; they are not rolled back (matches the 'no partial
+    // rollback across independent devices' precedent in bulk-transition)."
+    conflicts.push({ ... })
+  }
+}
+```
+
+**Answer: NOT wrapped in a transaction. This is an accepted, intentional
+partial write** — the code's own comment (line 802-806) states outright
+that the sale columns are not rolled back if `transitionDevice()` throws.
+Each device is a separate `UPDATE` followed by a separate `try/catch`
+around `transitionDevice()`; there is no `db.batch()` or `BEGIN/COMMIT`
+spanning the pair. Confirmed against no other wrapping in the surrounding
+80 lines (only `db.batch()` use in this function is the unrelated
+`nonRevenueStatements` batch at line 770-772).
+
+**Consequence, stated plainly**: a device can end up with `sold_invoice_no`,
+`sold_date`, `sold_price_pence`, `disposition = SALE_EXTERNAL` etc. all
+populated while `status` is NOT `SOLD` (still whatever it was pre-import,
+e.g. `RECEIVED`), if `transitionDevice()` throws (race: device changed
+status between the earlier conflict check and this write) — recorded as a
+`conflicts` entry, `soldCount` NOT incremented for that device.
+
+**RULING (recorded regardless of the answer above, per instruction):**
+
+> **Revenue = `status = 'SOLD' AND disposition = 'SALE_EXTERNAL'`.**
+> **`sold_price_pence` alone is NEVER sufficient on its own, in any report
+> or query.**
+
+This ruling is what reclassifies the partial-write behaviour above from a
+revenue-integrity fault into a cleanup item: a device left with
+`sold_price_pence`/`disposition` populated but `status != 'SOLD'` is
+correctly EXCLUDED from every revenue query that applies the compound
+condition. The only residual risk is a report/query written against
+`sold_price_pence` or `disposition` alone without the `status = 'SOLD'`
+half of the condition — that risk is now named explicitly so future
+report-writing (R1-R10, not yet started) cannot reintroduce it silently.
+**Cleanup item, not fixed this pass** (no code change authorised for this
+item): a stray populated-but-unsold row is orphaned bookkeeping, not a
+revenue leak, given the ruling above. No corrective backfill/rollback
+attempted or proposed here — out of this turn's scope (local-only,
+item-6-is-the-only-code-change instruction).
+
+### 5c — warning_unacknowledged: own counter/variant, does NOT increment conflicts
+
+Lines 718-733:
+
+```ts
+if (device.status === 'QC_FAILED') {
+  qcFailedPreview.push({ ... })                    // always, informational
+  if (!opts.acknowledgeQcFailed) {
+    warningUnacknowledged.push({ ...  message: QC_FAILED_WARNING_MESSAGE })
+    continue                                        // <- skips writableSales.push
+  }
+}
+writableSales.push({ outcome: o, device })
+```
+
+`warningUnacknowledged: ZohoWarningUnacknowledged[]` (type at line 574,
+field at line 608) and `warningUnacknowledgedCount = warningUnacknowledged.length`
+(lines 749, 833) are their own array/counter, populated ONLY at line 724
+inside the `!opts.acknowledgeQcFailed` branch. The `continue` at line 729
+means this row never reaches the `conflicts.push(...)` call sites (lines
+703, 710, 715, 807) — **confirmed: `warning_unacknowledged` has its own
+counter and outcome variant, and does NOT increment the conflict count.**
+No blocker.
+

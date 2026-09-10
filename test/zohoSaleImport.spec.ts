@@ -227,6 +227,63 @@ describe('parseZohoCsv — header-name parsing, never column position (2026-09-0
   })
 })
 
+describe('parseZohoCsv — FILE-SHAPE GATE (2026-09-10 incident response): reject a wholly-Inwards export', () => {
+  function rowWith(overrides: Partial<Record<string, string>>): string {
+    const values = ZOHO_CSV_HEADERS.map(h => (h in overrides ? (overrides as any)[h] : 'x'))
+    return values.join(',')
+  }
+
+  it('rejects a wholly-inwards file (out_entity_date AND out_contact_id blank on EVERY row) with a clear reason, not a silent empty-ish ok:true', () => {
+    const csv = [
+      ZOHO_CSV_HEADERS.join(','),
+      rowWith({ out_entity_date: '', out_contact_id: '' }),
+      rowWith({ out_entity_date: '', out_contact_id: '' }),
+      rowWith({ out_entity_date: '', out_contact_id: '' }),
+    ].join('\n')
+
+    const result = parseZohoCsv(csv)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toContain('out_entity_date')
+    expect(result.error).toContain('out_contact_id')
+  })
+
+  it('a normal outwards file (every row has both out_entity_date and out_contact_id populated) is unaffected', () => {
+    const csv = [
+      ZOHO_CSV_HEADERS.join(','),
+      rowWith({ out_entity_date: '2026-08-10', out_contact_id: '251444000000060479' }),
+      rowWith({ out_entity_date: '2026-08-11', out_contact_id: '251444000000060479' }),
+    ].join('\n')
+
+    const result = parseZohoCsv(csv)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.rows).toHaveLength(2)
+  })
+
+  it('a mixed file — some rows lack out_contact_id but at least one row carries real out-side data — is NOT rejected, and per-row classification (skipped_available/UNCLASSIFIED) is unaffected by this gate', () => {
+    const csv = [
+      ZOHO_CSV_HEADERS.join(','),
+      // Genuinely idle stock: no out-side data at all on this row.
+      rowWith({ status: 'available', out_entity_date: '', out_contact_id: '', out_entity_type: '', sold_price: '' }),
+      // A real outwards row with a populated out_entity_date, proving the
+      // file as a whole is NOT wholly-inwards.
+      rowWith({ out_entity_date: '2026-08-12', out_contact_id: '251444000000060479' }),
+    ].join('\n')
+
+    const result = parseZohoCsv(csv)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.rows).toHaveLength(2)
+    // The gate must not have touched per-row content — the first row's
+    // fields remain exactly as submitted, still eligible for
+    // classifyRow()'s existing skipped_available narrowing downstream.
+    expect(result.rows[0].out_contact_id).toBe('')
+    expect(result.rows[0].out_entity_date).toBe('')
+    expect(result.rows[1].out_entity_date).toBe('2026-08-12')
+  })
+})
+
 describe('resolveZohoRowForCode — grade-change-reuse guard (reconnaissance note Section 2)', () => {
   it('returns the single row unchanged when only one row exists for a code', () => {
     const row = makeRow()
