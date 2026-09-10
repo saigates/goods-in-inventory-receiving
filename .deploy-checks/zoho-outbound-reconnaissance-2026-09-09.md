@@ -718,8 +718,19 @@ Fresh backgrounded run, this turn:
 | serial (`npm run test:serial`) | 1 | 65 | 0 | 0 |
 | combined | 33 | 668 | 8 | **10** |
 
-Neither Candidate A (676 combined) nor Candidate B (678 combined) — `failed=10`
-triggers the stop condition on its own regardless. Per-file:
+**CORRECTED 2026-09-10 (user's own re-read of these numbers, superseding the
+paragraph below as originally written): this IS Candidate B, confirmed.**
+603 passed + 10 failed = 613 main tests, exactly Candidate B's prediction.
+613 + 65 serial = 678 total collected, also exactly Candidate B's prediction.
+The 39→41 test-count gap referenced in Addendum A10 was genuinely two new
+tests, not an ambiguity between two candidate baselines. The only real
+discrepancy is a REGRESSION (10 failures) whose cause was already correctly
+identified below — not an unresolved choice between candidates. See Addendum
+A12 for the corrected DEGRADED baseline this produces.
+
+~~Neither Candidate A (676 combined) nor Candidate B (678 combined) —
+`failed=10` triggers the stop condition on its own regardless.~~ *(struck
+through: wrong framing, corrected above)*. Per-file:
 `test/skuMapImport.spec.ts` = 22 tests, 12 passed / **10 failed**, 0 skipped,
 all 10 failures `SQLITE_ERROR: no such table: sku_map`.
 
@@ -750,3 +761,540 @@ a migration out of BOTH the production-apply path and the local test-build
 path simultaneously — anyone holding a migration must expect (and, ideally,
 skip or update) any test file that depends on its tables, not just check
 production deploy safety.
+
+---
+
+## Addendum A12 — Item A: baseline recorded as DEGRADED, Candidate B confirmed, 2026-09-10
+
+**Corrected framing, per user instruction, superseding Addendum A11.5's
+"neither candidate" conclusion**: 603 passed + 10 failed = 613 main tests,
+exactly Candidate B's predicted 613. Combined 613 + 65 serial = 678 total,
+exactly Candidate B's predicted 678. **Candidate B is CONFIRMED.** The 39→41
+test-count delta was genuinely two new tests; the only real discrepancy is a
+10-test regression whose root cause is already identified (0032 hold breaking
+the shared `migrations/`-driven local test schema — see A11.5).
+
+**Working baseline, effective now, labelled DEGRADED**:
+
+| Suite | Passed | Skipped | Failed | Total |
+|---|---|---|---|---|
+| main (`npm test`) | 603 | 8 | 10 | 621 |
+| serial (`npm run test:serial`) | 65 | 0 | 0 | 65 |
+| **combined** | **668** | **8** | **10** | **686*** |
+
+*Row total corrected: 621 + 65 = 686 collected; of those, 668 passed + 8
+skipped + 10 failed = 686. (668/8/10 as instructed; the "678" figure elsewhere
+in this doc referred to PASSED+FAILED only, 613+65=678, not the full
+collected-test denominator including skips. Both figures are internally
+consistent: 613 main pass/fail + 65 serial = 678 non-skipped; +8 skipped = 686
+total collected.)
+
+**Status: DEGRADED. Not a green suite. Do not replace with a manufactured
+green run.** This baseline stands until Item C's un-hold decision changes it.
+
+**The 10 failing tests, named individually** (all in
+`test/skuMapImport.spec.ts`, all `SQLITE_ERROR: no such table: sku_map`):
+
+1. line 213 — "non-manager (operator) gets 403, nothing written"
+2. line 220 — "dry_run=1 computes the diff but writes nothing"
+3. line 230 — "real import (dry_run absent) writes sku_map + zoho_items and bumps mapping_version exactly once"
+4. line 250 — "a manually-entered note survives a re-import..."
+5. line 274 — "a row missing from a re-import is marked orphaned, never deleted"
+6. line 290 — "an import overwriting an existing zoho_item_id writes a pre-image audit row"
+7. line 309 — "a stale row_version is rejected with 409, not silently applied"
+8. line 333 — "reassigning to a zoho_item_id writes a ui_edit audit row with a reason"
+9. line 354 — "a zoho_item_id referenced by two live goods_in_sku rows appears once in the shared view with both SKUs"
+10. line 370 — "a bijection-breaking file is refused with zero DB writes"
+
+Source: `/tmp/main_test_run_3.log`, `/tmp/serial_test_run_3.log` (fresh runs,
+2026-09-10), numbers verbatim from runner output, not retyped.
+
+---
+
+## Addendum A13 — Item C: 0032 DDL read-only report (HOLD — no un-hold action taken)
+
+**Status: READ-ONLY investigation only. No migration applied, no file moved.
+The un-hold decision belongs to the user.**
+
+### Full verbatim DDL, `migrations-held/0032_zoho_sku_mapping.sql`
+
+```sql
+-- Migration 0032 — zoho_items / sku_map / sku_map_audit
+--
+-- Deliberately its OWN migration, separate from the sale-attribution /
+-- freight-bill / vat_treatment migration (still unwritten, still informally
+-- called "0032" in migrations-held/README.md's numbering-claimant notes —
+-- see that file for why this filename is not a guarantee that THIS is the
+-- content the other note meant; whichever of the queued items is written
+-- first takes the true next-free number, checked fresh against this
+-- `migrations/` listing at write time. As of this write, 0031 is the
+-- highest applied migration and this file claims 0032; the sale-attribution
+-- work will need to re-check and take 0033 or later).
+--
+-- Explicit instruction this migration follows (2026-09-08 brief): mapping
+-- tables + audit table go in their own migration because 0032-the-label was
+-- already spoken for by sale columns/freight bills/allocation runs, and
+-- there's no reason to block UI-adjacent schema on that unrelated work.
+--
+-- Shape: two tables, not one flat map.
+--   zoho_items — keyed on zoho_item_id (Zoho's own primary key), UNIQUE on
+--   zoho_sku (Zoho SKU <-> Zoho Item ID is a strict bijection, confirmed
+--   empirically against Z-G-MAPPING.csv: 0 bijection breaks in either
+--   direction across all 747 rows).
+--
+--   sku_map — keyed on goods_in_sku (this business's own SKU, already the
+--   join key used throughout received_devices.sku), FK to zoho_items,
+--   carrying brand/model/capacity/colour/grade taken from the goods-in
+--   side ONLY. Never parse these from any SKU or item-name string — the
+--   source CSV documents real, accepted drift between Zoho's naming and
+--   the goods-in attributes (Graphite/Space-Gray, Rose-Gold/Pink-Gold,
+--   spelling variants, delimiter anomalies) that must never leak into
+--   reports/placards, which read sku_map's own columns, not zoho_items.
+--
+-- Cardinality: one goods-in SKU -> exactly one Zoho item (sku_map.zoho_item_id
+-- NOT NULL). A Zoho item MAY be referenced by more than one goods-in SKU —
+-- exactly three are, intentionally (physical-SIM / eSIM pairs with no
+-- separate physical-SIM Zoho catalogue entry). This is why the FK lives on
+-- sku_map -> zoho_items and NOT the other way around, and why sku_map has
+-- no UNIQUE(zoho_item_id) constraint — that would forbid the exact sharing
+-- this schema needs to allow.
+--
+-- Load-time constraints belong here, not only in the loader, because the
+-- planned UI edit screen is a second write path that can't be trusted to
+-- re-implement loader logic (explicit instruction): UNIQUE(goods_in_sku) on
+-- sku_map, UNIQUE(zoho_item_id) and UNIQUE(zoho_sku) on zoho_items. The
+-- "zoho_item_id referenced by >1 goods_in_sku is fine, zoho_sku duplicated
+-- under two different IDs is not" asymmetry is expressed correctly: zoho_sku
+-- is UNIQUE (one row per Zoho SKU in zoho_items), sku_map.zoho_item_id is a
+-- plain FK column, not unique.
+
+CREATE TABLE IF NOT EXISTS zoho_items (
+  zoho_item_id TEXT PRIMARY KEY,
+  zoho_sku TEXT NOT NULL UNIQUE,
+  zoho_item_name TEXT NOT NULL,
+  organisation_id INTEGER NOT NULL REFERENCES organisations(id) DEFAULT 1,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_zoho_items_org ON zoho_items(organisation_id);
+
+CREATE TABLE IF NOT EXISTS sku_map (
+  goods_in_sku TEXT PRIMARY KEY,
+  organisation_id INTEGER NOT NULL REFERENCES organisations(id) DEFAULT 1,
+  zoho_item_id TEXT NOT NULL REFERENCES zoho_items(zoho_item_id),
+  brand TEXT NOT NULL,
+  model TEXT NOT NULL,
+  capacity TEXT,
+  color TEXT,
+  grade TEXT,
+  -- Free-text note field. The CSV has no note column, so an import must
+  -- never overwrite this — "CSV wins" is column-scoped, not row-scoped.
+  -- Primary use case: the three intentional shared-ID pairs' explanatory
+  -- note, entered once via the shared-ID UI screen and expected to survive
+  -- every future re-import untouched.
+  note TEXT,
+  -- Set when a DB row has no corresponding line in the most recent import
+  -- (goods_in_sku present in DB, absent from file). Absence from the CSV
+  -- is NOT a delete — orphaned rows are marked and reported, never removed,
+  -- because deleting would strip the join from sales already attributed
+  -- through this mapping, unrecoverable from the file.
+  orphaned_at DATETIME,
+  -- Optimistic locking: the UI is a second write path (manual edits) that
+  -- must not silently clobber a concurrent editor or a concurrent import.
+  -- Every UPDATE must check-and-increment this, not just bump updated_at
+  -- (a plain timestamp has second-level resolution and this table can see
+  -- rapid successive writes from an import batch).
+  row_version INTEGER NOT NULL DEFAULT 1,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_sku_map_org ON sku_map(organisation_id);
+CREATE INDEX IF NOT EXISTS idx_sku_map_zoho_item ON sku_map(zoho_item_id);
+CREATE INDEX IF NOT EXISTS idx_sku_map_orphaned ON sku_map(orphaned_at);
+
+-- Audit trail: every overwrite of sku_map.zoho_item_id (whether via UI edit
+-- or import) is recorded with its pre-image, per explicit instruction. The
+-- import routine additionally uses this table to build its "which UI-edited
+-- rows did this import revert" summary (source = 'import' rows whose
+-- old_zoho_item_id differs from what a prior source = 'ui_edit' row had set
+-- immediately before it).
+CREATE TABLE IF NOT EXISTS sku_map_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  organisation_id INTEGER NOT NULL REFERENCES organisations(id),
+  goods_in_sku TEXT NOT NULL,
+  old_zoho_item_id TEXT,
+  new_zoho_item_id TEXT NOT NULL,
+  -- 'ui_edit' | 'import'
+  source TEXT NOT NULL,
+  -- Only set when source = 'import' — groups all audit rows from a single
+  -- importer run so the "reverted these rows" summary can be built by
+  -- filtering on one batch id.
+  import_batch_id TEXT,
+  actor_user_id INTEGER REFERENCES users(id),
+  reason TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_sku_map_audit_sku ON sku_map_audit(goods_in_sku);
+CREATE INDEX IF NOT EXISTS idx_sku_map_audit_batch ON sku_map_audit(import_batch_id);
+
+-- mapping_version — single-row counter, incremented on every sku_map write
+-- (UI edit or import), recorded on every valuation/attribution run so that
+-- editing a mapping today doesn't retroactively change a frozen historical
+-- run's numbers. Same freeze-the-basis-at-run-time principle already used
+-- for freight allocation (freight_invoices.apportioned_at / the planned
+-- freight_allocation_runs pointer column in the separate sale-attribution
+-- migration). A single-row table (not a bare column on some other table)
+-- because there is exactly one global counter per organisation, not one
+-- per sku_map row.
+CREATE TABLE IF NOT EXISTS sku_map_version (
+  organisation_id INTEGER PRIMARY KEY REFERENCES organisations(id),
+  mapping_version INTEGER NOT NULL DEFAULT 0,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+INSERT OR IGNORE INTO sku_map_version (organisation_id, mapping_version) VALUES (1, 0);
+```
+
+(133 lines, quoted verbatim from `migrations-held/0032_zoho_sku_mapping.sql`
+as it currently sits on disk. Not re-typed from memory.)
+
+### (i) Does every statement CREATE a new table, or does any ALTER/index an existing populated table?
+
+**Every DDL statement in this file is `CREATE TABLE IF NOT EXISTS` or
+`CREATE INDEX IF NOT EXISTS` against four tables that do not exist anywhere
+else in the applied migration set** (`zoho_items`, `sku_map`, `sku_map_audit`,
+`sku_map_version` — confirmed absent from every other `migrations/*.sql` file
+by name; these four table names appear nowhere else in the repo's migration
+history). There is no `ALTER TABLE` anywhere in this file. There is no
+existing-table modification of any kind. Confirmed by grep of this file
+(`grep -E '^(CREATE|ALTER|DROP)' migrations-held/0032_zoho_sku_mapping.sql`
+returns only `CREATE TABLE`/`CREATE INDEX` lines) and by grep of the rest of
+`migrations/` for the four table names (zero hits outside this file).
+
+**Answer: every statement CREATEs a new table/index. None ALTERs or indexes
+an existing populated table.**
+
+### (ii) Is the `zoho_item_id` index UNIQUE or not?
+
+Two different things are both named `zoho_item_id` in this file and must be
+distinguished:
+
+- `zoho_items.zoho_item_id` — the column is `TEXT PRIMARY KEY` (line 51).
+  A `PRIMARY KEY` in SQLite carries an implicit UNIQUE constraint. So on
+  `zoho_items`, `zoho_item_id` **is unique** (via PRIMARY KEY, not a separate
+  `CREATE UNIQUE INDEX`).
+- `sku_map.zoho_item_id` — the column is a plain `TEXT NOT NULL REFERENCES
+  zoho_items(zoho_item_id)` (line 63), with a **non-unique** index
+  (`CREATE INDEX IF NOT EXISTS idx_sku_map_zoho_item ON sku_map(zoho_item_id)`,
+  line 91 — no `UNIQUE` keyword). This is deliberate, per the file's own
+  header comment (lines 33-39, 44-48): a `zoho_item_id` may legitimately be
+  referenced by more than one `goods_in_sku` row (the 3 shared eSIM/physical
+  pairs), so `sku_map.zoho_item_id` is explicitly NOT unique. The truly
+  UNIQUE column on the Zoho side is `zoho_items.zoho_sku` (line 52,
+  `TEXT NOT NULL UNIQUE`) — one row per Zoho SKU string.
+
+**Answer: `zoho_items.zoho_item_id` is unique (PRIMARY KEY). The
+`sku_map.zoho_item_id` index is explicitly NOT unique — by design, to permit
+the 3 shared-item pairs.**
+
+### (iii) If UNIQUE, would loading Z-G-MAPPING.csv's 749 rows violate it given the 3 duplicates — i.e., is this an importer problem, not a migration problem?
+
+First, the precise shape of "the 3 duplicates," re-derived fresh this turn
+directly against the two UNIQUE constraints this schema actually has
+(`zoho_items.zoho_item_id` PRIMARY KEY, `zoho_items.zoho_sku` UNIQUE):
+
+```
+zoho_item_id -> multiple zoho_sku (would break BOTH unique constraints): 0 found
+zoho_sku -> multiple zoho_item_id (would break the zoho_sku UNIQUE constraint): 0 found
+zoho_item_id shared across >1 goods_in_sku, same single zoho_sku each time (the
+DESIGNED/allowed case sku_map.zoho_item_id is deliberately non-unique for): 3 found
+  251444000431996049 -> ['APL-I14PL-128-RED-B', 'APL-I14PL-128-RED-ESIM-B']    (1 zoho_sku: I14P-128-E-SIM-RED-B)
+  251444000336178047 -> ['APL-I14P-1TB-SBK-A', 'APL-I14P-1TB-SBK-ESIM-A']      (1 zoho_sku: I14PRO-1TB-E-SIM-BLK-A)
+  251444000367388740 -> ['APL-I14PM-1TB-SBK-A', 'APL-I14PM-1TB-SBK-ESIM-A']    (1 zoho_sku: I14PROMX-1TB-E-SIM-BLK-A)
+```
+
+**This is a materially sharper finding than my prior "3 Zoho-Item-ID
+duplicates" framing implied.** The 3 duplicate pairs are not a collision
+against either of `zoho_items`' UNIQUE constraints at all — each of the 3
+`zoho_item_id`s maps to exactly ONE `zoho_sku`, satisfying `zoho_items`
+insertion trivially (`INSERT ... ON CONFLICT(zoho_item_id) DO UPDATE`, per
+`src/lib/skuMapImport.ts` line 394-401 — a second row for the same
+`zoho_item_id` is an idempotent upsert, not a constraint violation). Nor do
+they violate `sku_map.zoho_item_id`'s non-unique index — that index has no
+UNIQUE constraint to violate in the first place, precisely because the
+schema was written anticipating this exact case (header comment lines
+33-39). The application-level validator (`validateSkuMapCsv`,
+`src/lib/skuMapImport.ts` lines 146-165) also does not reject this shape —
+it explicitly classifies "one `zoho_item_id` -> one `zoho_sku`, referenced by
+multiple `goods_in_sku`" as `sharedZohoItems`, informational only (lines
+178-190), and only HARD-FAILS the load on a genuine bijection break (one
+`zoho_item_id` mapping to >1 different `zoho_sku` strings, or vice versa —
+lines 146-165, exercised by the test at line 370, "a bijection-breaking file
+is refused with zero DB writes", using synthetic `BROKEN_ID` data, not the
+real CSV's 3 pairs).
+
+**Answer: no violation of any kind, at either the schema (UNIQUE) or importer
+(validator) layer. The real CSV's 3 duplicate `zoho_item_id` pairs are the
+schema's OWN designed-for case, not a defect. There is no "importer problem"
+here to describe — my prior "3 duplicates" framing was accurate as a raw
+count but wrong in implying it was any kind of hazard; it is the intentional
+eSIM/physical-pair sharing the schema and code were built to allow.**
+
+The two named orphan Zoho IDs (`251444000458737369`, `251444000458252564`)
+are separately confirmed absent from this CSV's 747 rows entirely (checked
+fresh, zero matches either as a `Zoho Item ID` or anywhere else in the file)
+— **RETIRED per user's instruction: the tables that would hold them don't
+exist in production, and the CSV itself never mentions them, so nothing
+could ever have gated on them.**
+
+### (iv) Do the 10 failing skuMapImport tests pass unchanged if 0032 is present?
+
+**Tested empirically, not inferred.** Procedure: copied (not moved/committed)
+`migrations-held/0032_zoho_sku_mapping.sql` into `migrations/` temporarily,
+deleted the local Miniflare D1 state (`.wrangler/state/v3/d1`) to force a
+schema rebuild from the now-33-file `migrations/` set, ran
+`npx vitest run test/skuMapImport.spec.ts` in isolation, then immediately
+removed the copied file from `migrations/` and deleted the local D1 state
+again to restore the working tree to its held state. `git status --short`
+before and after: clean both times (the copy was never staged or committed).
+
+Result: `Test Files 1 passed (1)`, `Tests 22 passed (22)`, 0 failed, 0
+skipped. **All 10 previously-failing tests pass unchanged with 0032
+present**, alongside the 12 that were already passing. Log:
+`/tmp/c_item_probe.log`.
+
+**Answer: yes — all 10 pass unchanged with 0032 present. This confirms
+A11.5's root-cause diagnosis (the hold removes `sku_map`/`zoho_items` from
+the local-test schema, causing `SQLITE_ERROR: no such table: sku_map`) and
+demonstrates the fix is exactly restoring 0032 to the applied set — no test
+code change is implicated.**
+
+### Report and HOLD
+
+Per instruction, no un-hold action taken. Reported (i)-(iv) above; the
+un-hold decision belongs to the user. Working tree confirmed clean
+(`git status --short` empty) — this investigation left no trace on disk.
+
+---
+
+## Addendum A14 — Items E & F: standing rules, written now
+
+### E. `d1_execute` / `d1_migrations` ledger caveat (standing note)
+
+`d1_execute` (direct DDL) bypasses wrangler's migration bookkeeping table
+(`d1_migrations`) entirely: it applies the SQL directly to the D1 database
+but writes NO row to `d1_migrations` recording that the migration file was
+applied. Wrangler's own apply mechanism (`wrangler d1 migrations apply`, and
+by extension `gsk hosted deploy`'s auto-apply-on-deploy step) determines
+which migration files still need applying by checking which filenames are
+ALREADY recorded in `d1_migrations` — a file's absence from that table means
+wrangler will try to apply it again on the next deploy.
+
+**Concretely**: if a migration file is applied via `gsk hosted d1_execute`
+instead of the normal migration-apply path, the schema change takes effect
+immediately, but `d1_migrations` has no row for it. On the next
+`gsk hosted deploy` (or any `wrangler d1 migrations apply` run), wrangler will
+see that migration file as still pending and attempt to re-run it — which can
+fail outright (e.g. `CREATE TABLE` without `IF NOT EXISTS` on a table that
+already exists) or, worse, silently double-apply data-mutating statements
+that lack their own idempotency guard.
+
+**Standing rule, recorded now**: if `d1_execute` is EVER used to apply a
+migration (as opposed to a one-off ad-hoc DML fix), the SAME operation must
+also `INSERT` the corresponding row into `d1_migrations` (matching
+wrangler's own bookkeeping format: filename + applied timestamp, in the same
+insertion-order convention already observed in the 34-row dump reconciled in
+Addendum A11.2). The execution log for that action must explicitly record
+that the `d1_migrations` row was written MANUALLY, not by wrangler, so a
+future reader is never misled into thinking wrangler's own apply path was
+used.
+
+### F. No-pre-apply-export — standing rule (stated once)
+
+The 0033/0034 deploy (Addendum A10/A11.3) proceeded with NO D1 export taken
+beforehand; a post-hoc export was taken after the fact
+(`https://www.genspark.ai/api/files/s/fePxG2Cy`) and accepted as the best
+available given the risk window was already closed and the migrations were
+purely additive. That acceptance is retrospective and does not set a
+precedent going forward.
+
+**Standing rule, recorded now, effective for all future production applies
+of any kind (migration, `d1_execute`, `d1_import`, `d1_rebuild`, or any other
+mutating operation against the live D1 database)**:
+
+No production apply proceeds until:
+1. A D1 export (`gsk hosted d1_export`) has been taken IMMEDIATELY before the
+   apply — not at some earlier point in the session, not "close enough,"
+   immediately before.
+2. That export has been CONFIRMED non-empty — i.e., its returned
+   table/record counts have been read and checked to be > 0, not merely
+   assumed to have succeeded because the tool call returned `ok`.
+3. If the export tool call fails, returns empty, or its non-emptiness cannot
+   be confirmed for any reason, **the apply does not happen.** No fallback,
+   no "proceed anyway and export after." Stop and report instead.
+
+This rule applies regardless of how low-risk the apply is believed to be
+(additive-only, single-column, etc.) — the entire point of a standing rule is
+that it does not get re-litigated case-by-case under time pressure.
+
+
+---
+
+## Addendum A15 — Item B: rollback to `aae5b1f` — BEFORE evidence gathered, EXECUTION HELD (two findings block proceeding)
+
+**Status: NOT EXECUTED. Authorization for this action remains open but unspent
+— nothing has been deployed, no git state changed.** Two findings discovered
+while assembling the mandated BEFORE evidence directly bear on the
+authorization's own rationale and its mechanical feasibility, and neither had
+been surfaced before this addendum. Per the authorization's own stop
+condition ("If rollback cannot be done without reverting migrations, STOP and
+report. Touch nothing.") applied in spirit — the literal condition named is
+migrations, which are unaffected either way, but the underlying premise the
+authorization was built on has changed — this addendum reports both findings
+and holds execution for explicit confirmation before any git/deploy action.
+
+### BEFORE evidence (mandated, gathered fresh this turn)
+
+**Identity bracket**: `gsk login-info` → `saigateslimited@gmail.com`,
+Saigates Limited, unchanged across the bracket (checked again after all
+read-only investigation below — same email, same credit balance,
+131804.4 — no drift, no retry needed).
+
+**`gsk hosted list`**: 6 resources returned. Explicit match on
+`project_id: d6aea290-bd61-4f82-aa8d-94378b9f2fec` with
+`metadata.account_id: 7d2579beb52424d39cdd02c0983151e9` on the `worker`
+resource — identity assertion PASSED.
+
+**SHA / Version ID, stated as three DISTINCT things, per the explicit
+instruction not to conflate them**:
+- **What is in local git HEAD right now**: `14ff48e677bef441adedc3c78964a9313fdbfffa`
+- **What was submitted for the 0033/0034 deploy**: `d91b66175c7856e34fd033267ee0a1bbd60a3c9d`
+- **What is ACTUALLY IN THE BUNDLE currently serving production** (the only
+  one of these three that describes the live worker): Cloudflare Version ID
+  `880f13e6-bde6-47bb-a0f7-dc11f31dd2c8` — re-extracted fresh this turn via
+  regex (`Current Version ID: (\S+)`) against the deploy action's own
+  `result.action.result.log_tail` array (confirmed this is the correct
+  field path this turn — `result.log` at the top level does not carry it;
+  `result.action.result.log_tail` does), from action id
+  `bd51d1ef-9a53-40b2-8db8-0c17802ed3c9`. Re-confirmed via
+  `gsk hosted worker_get`: `worker_name: d6aea290-bd61-4f82-aa8d-94378b9f2fec`,
+  `account_id: 7d2579beb52424d39cdd02c0983151e9`,
+  `row_ctime: 2026-09-10T10:22:37.474440`.
+
+The rollback target `aae5b1f` is none of these three — it is 27+ commits
+behind local HEAD, predates the entire Zoho-sale-import workstream.
+
+### Finding 1 — the rollback's blast radius is NOT "exactly two routes"
+
+My prior report characterized the `aae5b1f..HEAD` diff as proving the
+rollback's effect is narrow — "the route diff proves the effective blast
+radius is exactly the two routes" was the rationale the authorization was
+explicitly built on. That characterization was accurate ONLY for a
+path-scoped diff. Re-run fresh this turn, both scopes:
+
+**Scoped** (`git diff --stat aae5b1f HEAD -- src/routes/ src/index.tsx`) —
+matches prior report exactly:
+```
+ src/index.tsx                |   4 +
+ src/routes/devices.ts        |  10 +--
+ src/routes/inventory.ts      |  15 ++--
+ src/routes/reports.ts        |  13 ++--
+ src/routes/skuMap.ts         | 179 +++++++++++++++++++++++++++++++++++++++++++
+ src/routes/zohoSaleImport.ts |  49 ++++++++++++
+ 6 files changed, 252 insertions(+), 18 deletions(-)
+```
+
+**Unscoped** (`git diff --stat aae5b1f HEAD`, no path filter) — run fresh
+this turn, NOT previously reported:
+```
+34 files changed, 5350 insertions(+), 57 deletions(-)
+```
+Full file list includes, beyond the 6 above: `migrations-held/0032_zoho_sku_mapping.sql`
+(133 lines), `migrations-held/README.md` (260 lines), `migrations/0033_sale_attribution.sql`
+(172 lines), `migrations/0034_zoho_sale_import.sql` (47 lines), `src/lib/customsApportionment.ts`
+(new, 162 lines), `src/lib/deviceLifecycle.ts` (66 lines changed — see below),
+`src/lib/skuMapImport.ts` (new, 457 lines), `src/lib/zohoSaleImport.ts` (new,
+836 lines), plus ~1900 lines of new/changed test files
+(`test/costEntry.spec.ts`, `test/customsApportionment.spec.ts`,
+`test/skuMapImport.spec.ts`, `test/zohoSaleImport.spec.ts`,
+`test/zohoSaleImportApply.spec.ts`, `test/browser/README.md`), and cosmetic
+`package.json`/`tsconfig.json`/`vitest.config.ts` changes.
+
+A **literal worker-bundle rollback to `aae5b1f`** — i.e. checking out or
+resetting the working tree to `aae5b1f` and deploying that — reverts all of
+this, not just the two routes. Confirmed materially, not just by line count:
+`src/lib/deviceLifecycle.ts`'s 66-line diff (read in full this turn) adds
+new `SOLD` transition edges to `ALLOWED_TRANSITIONS` from 7 device statuses
+(`RECEIVED`, `SORTING`, `ACTIVE_INVENTORY`, `IN_HOUSE_REPAIR`,
+`READY_FOR_EXPORT`, `QC_FAILED`, `READY_FOR_ZOHO`), added 2026-09-09 as part
+of this same workstream, deliberately excluding the 5 OPR/consignment
+statuses and `REJECTED`. A rollback to `aae5b1f` removes these edges from the
+served bundle. This is currently inert (zero SOLD transitions exist in
+production data, per the repeated damage sweep) but it is still part of the
+true rollback effect, and it was not part of what was reported when the
+authorization was requested.
+
+**This means the authorization's stated rationale — "rollback removes both
+the untested importer path AND the /api/sku-map 500 in one action" — remains
+true as far as it goes, but the premise that this is achieved narrowly, with
+nothing else disturbed, does not hold for a literal full-tree rollback.** The
+two routes ARE removed by it, but so is unrelated, working code from the same
+workstream (the lib files, the SOLD edges, the test suite additions).
+
+### Finding 2 — no `gsk hosted` command performs "deploy this specific SHA"
+
+Enumerated the full `gsk hosted` command surface directly from the tool
+(`gsk hosted --help`, `gsk hosted deploy --help`), not from memory, this
+turn. 24 subcommands confirmed:
+`list, worker_get, worker_stats, d1_schema, d1_export, d1_snapshots, d1_query,
+r2_list, r2_get, d1_execute, r2_put, r2_delete_object, secret_list,
+secret_put, secret_delete, deploy, worker_delete, r2_bucket_delete,
+d1_rebuild, d1_import, custom_domain_add, custom_domain_status,
+custom_domain_remove, action_wait, action_status, action_approve,
+action_reject`. `deploy`'s own help text states plainly: **"Deploy the
+current project to Cloudflare Workers for Platform"** — its only parameters
+are `--rebuild_db` and `--recreate_worker`, neither of which selects a
+historical commit. There is no parameter, flag, or separate subcommand for
+"deploy commit X" or "deploy version Y."
+
+**Consequence**: executing "rollback the worker bundle to `aae5b1f`"
+mechanically requires FIRST changing the actual sandbox working tree to
+match `aae5b1f` (via `git checkout aae5b1f -- <paths>`, a targeted revert of
+specific commits, or a full `git reset --hard aae5b1f` followed by a
+force-push) and only THEN calling `gsk hosted deploy` — there is no atomic
+"rollback to X" primitive. Which method to use has real, different
+consequences:
+- A full hard-reset-and-deploy of the whole tree to `aae5b1f` accepts the
+  full 34-file blast radius from Finding 1 (including files that have
+  nothing to do with the two routes).
+- A narrower, targeted revert (e.g. `git revert` of just the commits that
+  introduced the two routes, or a manual checkout of just
+  `src/index.tsx`/`src/routes/` from `aae5b1f`) would achieve the two-route
+  removal without touching the unrelated lib/test files — closer to the
+  authorization's original "narrow" framing — but this is a different,
+  more surgical operation than "rollback to `aae5b1f`" as literally stated,
+  and has not been authorized in those terms.
+
+### What has NOT been done
+
+No git state change of any kind. No `gsk hosted deploy` call. No smoke
+checks (they depend on the deploy having happened). Working tree confirmed
+unchanged at `14ff48e677bef441adedc3c78964a9313fdbfffa`, `git status --short`
+clean.
+
+### Holding for explicit confirmation on two points before proceeding
+
+1. Given Finding 1, does the authorization still stand as "rollback to
+   `aae5b1f`" (accepting the full 34-file blast radius), or should the scope
+   be narrowed to a targeted revert of just the routes-layer changes (the
+   original "exactly two routes" framing, achieved without disturbing
+   `deviceLifecycle.ts`, the new lib files, or the test suite)?
+2. Given Finding 2, which mechanism should be used to change the working
+   tree before calling `gsk hosted deploy` — full `git reset --hard aae5b1f`
+   (matches the literal instruction, carries the full blast radius), or a
+   scoped revert/checkout of specific files/commits (matches the original
+   narrow rationale, is a different operation than literally stated)?
+
+No further action on Item B until this is resolved. Proceeding to Item C
+(already complete, read-only, reported in Addendum A13) per the G-order,
+since it does not depend on Item B's resolution.
+
