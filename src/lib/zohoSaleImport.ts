@@ -196,12 +196,28 @@ export function parseZohoCsv(raw: string): ZohoCsvParseResult {
 // small slice of the RIGHT file. Revised to require a POSITIVE
 // counter-signal instead: reject only when the file has zero out-side
 // signal AND at least one row carries a positive Inwards signature
-// (in_entity_date populated with item_status = 'available') — i.e. there
+// (in_entity_date populated with status = 'available') — i.e. there
 // is actual evidence this is an Inwards-shaped export, not merely an
 // absence of outwards evidence. A file with neither signal (no out-side
 // data, no Inwards signature either) is not diagnosable as the wrong
 // file and must pass through unchanged, exactly as before this gate
 // existed.
+//
+// CORRECTION (2026-09-10, same day): the second version, as originally
+// specified, keyed the Inwards signature on item_status = 'available'.
+// That was a column error — item_status reads 'active' in 100% of rows
+// in the reconnaissance sample (both files; see the design-basis comment
+// on classifyRow() below, and the reconnaissance note Section 1: "
+// item_status='active': 100% of rows in both files"), so that condition
+// could never fire against real data, leaving the gate permanently
+// inert — it would test green while silently letting a wholly-Inwards
+// file straight through, exactly the failure it exists to prevent. The
+// field that actually carries 'available'/'sold' is `status`
+// (reconnaissance note Section 1: "status='sold' <=> out_entity
+// populated: 0 mismatches across all 3216 combined rows"; the 525
+// blank-out_contact_id rows are explicitly status='available' in the
+// classification table). Corrected below to key on `status`, not
+// `item_status`.
 export type OutwardsShapeCheckResult =
   | { ok: true }
   | { ok: false; error: string }
@@ -215,7 +231,7 @@ export function assertOutwardsShape(rows: ZohoCsvRow[]): OutwardsShapeCheckResul
   if (hasAnyOutSideSignal) return { ok: true }
 
   const inwardsSignatureCount = rows.filter(
-    r => r.in_entity_date.trim() !== '' && r.item_status.trim().toLowerCase() === 'available'
+    r => r.in_entity_date.trim() !== '' && r.status.trim().toLowerCase() === 'available'
   ).length
 
   if (inwardsSignatureCount === 0) return { ok: true }
@@ -224,7 +240,7 @@ export function assertOutwardsShape(rows: ZohoCsvRow[]): OutwardsShapeCheckResul
     ok: false,
     error: `Every one of ${rows.length} row(s) is missing both out_entity_date ` +
       `and out_contact_id, and ${inwardsSignatureCount} row(s) carry a positive ` +
-      `Inwards signature (in_entity_date populated with item_status=available) — ` +
+      `Inwards signature (in_entity_date populated with status=available) — ` +
       `this looks like an Inwards export submitted to the Outwards/sale importer, ` +
       `not an outwards or mixed file. Rejected before classification.`,
   }
