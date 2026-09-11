@@ -1609,7 +1609,7 @@ app.post('/shipments/:id/export-proof', async (c) => {
   const body = await c.req.json<Record<string, unknown>>().catch(() => null)
   if (!body) return c.json({ error: 'Invalid JSON body' }, 400)
 
-  const fields: Record<string, string> = {}
+  const fields: Record<string, string | number> = {}
   for (const [key, label] of [['export_mrn', 'export_mrn'], ['ducr', 'ducr'], ['ead_mrn', 'ead_mrn'], ['mucr', 'mucr']] as const) {
     if (body[key] !== undefined) {
       const parsed = cleanProofRef(body[key], label)
@@ -1617,7 +1617,46 @@ app.post('/shipments/:id/export-proof', async (c) => {
       if (parsed.value) fields[key] = parsed.value
     }
   }
-  if (!Object.keys(fields).length) return c.json({ error: 'Provide at least one of export_mrn, ducr, ead_mrn, mucr' }, 422)
+
+  // Task G (migration 0036, LOCAL ONLY): carrier evidence — the AWB,
+  // the pre-alert date, and whether the OPR regime is actually EVIDENCED
+  // on the declaration (vs merely recorded/asserted at creation) — often
+  // only arrives from third parties (carriers, customs) AFTER finalise,
+  // on THEIR timetable. Wired to export-proof, the FINALISED-gated route,
+  // not to the DRAFT-gated PATCH — same dynamic-sets/partial-body pattern
+  // as the four existing proof fields above: omitting a key leaves the
+  // stored value untouched, never silently cleared.
+  if (body.tracking_reference !== undefined) {
+    // Deliberately free text, no format check — carriers' AWB formats
+    // differ too much to validate against a shared pattern (see the
+    // migration's own comment). Only cleaned/length-capped, same as
+    // carrier/consignee_name elsewhere in this file.
+    const v = cleanString(body.tracking_reference, 100)
+    if (v) fields.tracking_reference = v
+  }
+  if (body.prealert_date !== undefined && body.prealert_date !== null && body.prealert_date !== '') {
+    if (!isValidIsoDate(body.prealert_date)) {
+      return c.json({ error: 'prealert_date must be an ISO date (YYYY-MM-DD)' }, 422)
+    }
+    const today = new Date().toISOString().slice(0, 10)
+    if (body.prealert_date > today) return c.json({ error: 'prealert_date cannot be in the future' }, 422)
+    fields.prealert_date = body.prealert_date
+  }
+  if (body.regime_confirmed !== undefined) {
+    // Strict equality, deliberately NOT Number(...) coercion — Number(null)
+    // is 0 and Number(true) is 1, which would silently accept both as
+    // valid instead of rejecting them. Only the literal numbers 0 or 1
+    // are accepted; everything else (including booleans, strings, null)
+    // is rejected.
+    if (body.regime_confirmed !== 0 && body.regime_confirmed !== 1) {
+      return c.json({ error: 'regime_confirmed must be 0 or 1' }, 422)
+    }
+    fields.regime_confirmed = body.regime_confirmed
+  }
+
+  if (!Object.keys(fields).length) {
+    return c.json({ error: 'Provide at least one of export_mrn, ducr, ead_mrn, mucr, tracking_reference, prealert_date, regime_confirmed' }, 422)
+  }
 
   const sets = Object.keys(fields).map(k => `${k} = ?`).join(', ')
   await c.env.DB.prepare(

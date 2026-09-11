@@ -678,6 +678,139 @@ describe('finalisation', () => {
     const row = await env.DB.prepare('SELECT status FROM shipments WHERE id = ?').bind(shipment.id).first<{ status: string }>()
     expect(row!.status).toBe('DRAFT')
   })
+
+  // Task G (migration 0036, LOCAL ONLY) — tracking_reference/prealert_date/
+  // regime_confirmed wired to export-proof (FINALISED-gated), NOT the
+  // DRAFT-gated PATCH. Reuses the same finalise-then-export-proof shape as
+  // the happy-path test above rather than a parallel fixture.
+  async function finalisedShipment(): Promise<{ id: number; reference: string }> {
+    const shipment = await makeShipment()
+    const device = await makeDevice()
+    await api(`/api/opr/shipments/${shipment.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: device.imei }) })
+    const res = await api(`/api/opr/shipments/${shipment.id}/finalise`, { method: 'POST', body: '{}' })
+    expect(res.status).toBe(200)
+    return shipment
+  }
+
+  it('export-proof: tracking_reference set independently, other fields untouched', async () => {
+    const shipment = await finalisedShipment()
+    const res = await api(`/api/opr/shipments/${shipment.id}/export-proof`, {
+      method: 'POST', body: JSON.stringify({ tracking_reference: 'FDX-AWB-998877665544' }),
+    })
+    expect(res.status).toBe(200)
+    const data = await res.json() as { shipment: Record<string, unknown> }
+    expect(data.shipment.tracking_reference).toBe('FDX-AWB-998877665544')
+    expect(data.shipment.export_mrn).toBeNull()
+    expect(data.shipment.prealert_date).toBeNull()
+    expect(data.shipment.regime_confirmed).toBe(0)
+  })
+
+  it('export-proof: prealert_date set independently, other fields untouched', async () => {
+    const shipment = await finalisedShipment()
+    const res = await api(`/api/opr/shipments/${shipment.id}/export-proof`, {
+      method: 'POST', body: JSON.stringify({ prealert_date: '2026-08-27' }),
+    })
+    expect(res.status).toBe(200)
+    const data = await res.json() as { shipment: Record<string, unknown> }
+    expect(data.shipment.prealert_date).toBe('2026-08-27')
+    expect(data.shipment.tracking_reference).toBeNull()
+    expect(data.shipment.regime_confirmed).toBe(0)
+  })
+
+  it('export-proof: regime_confirmed set independently, other fields untouched', async () => {
+    const shipment = await finalisedShipment()
+    const res = await api(`/api/opr/shipments/${shipment.id}/export-proof`, {
+      method: 'POST', body: JSON.stringify({ regime_confirmed: 1 }),
+    })
+    expect(res.status).toBe(200)
+    const data = await res.json() as { shipment: Record<string, unknown> }
+    expect(data.shipment.regime_confirmed).toBe(1)
+    expect(data.shipment.tracking_reference).toBeNull()
+    expect(data.shipment.prealert_date).toBeNull()
+  })
+
+  it('export-proof: a partial body touching only one new field leaves a PREVIOUSLY-SET one untouched', async () => {
+    const shipment = await finalisedShipment()
+    const first = await api(`/api/opr/shipments/${shipment.id}/export-proof`, {
+      method: 'POST', body: JSON.stringify({ tracking_reference: 'FDX-AWB-111', regime_confirmed: 1 }),
+    })
+    expect(first.status).toBe(200)
+    // Second call only mentions prealert_date — tracking_reference and
+    // regime_confirmed, set above, must survive untouched (same COALESCE-
+    // free "omitted key = untouched", exactly as export_mrn/ducr behave).
+    const second = await api(`/api/opr/shipments/${shipment.id}/export-proof`, {
+      method: 'POST', body: JSON.stringify({ prealert_date: '2026-08-27' }),
+    })
+    expect(second.status).toBe(200)
+    const data = await second.json() as { shipment: Record<string, unknown> }
+    expect(data.shipment.prealert_date).toBe('2026-08-27')
+    expect(data.shipment.tracking_reference).toBe('FDX-AWB-111') // untouched
+    expect(data.shipment.regime_confirmed).toBe(1) // untouched
+  })
+
+  it('export-proof: DRAFT shipment still 409s for the three new fields', async () => {
+    const draft = await makeShipment()
+    const res = await api(`/api/opr/shipments/${draft.id}/export-proof`, {
+      method: 'POST', body: JSON.stringify({ tracking_reference: 'FDX-AWB-000', prealert_date: '2026-08-27', regime_confirmed: 1 }),
+    })
+    expect(res.status).toBe(409)
+    const row = await env.DB.prepare('SELECT tracking_reference, prealert_date, regime_confirmed FROM shipments WHERE id = ?')
+      .bind(draft.id).first<{ tracking_reference: string | null; prealert_date: string | null; regime_confirmed: number }>()
+    expect(row!.tracking_reference).toBeNull()
+    expect(row!.prealert_date).toBeNull()
+    expect(row!.regime_confirmed).toBe(0)
+  })
+
+  it('export-proof: prealert_date in the future is rejected 422, nothing written', async () => {
+    const shipment = await finalisedShipment()
+    const future = new Date(Date.now() + 86400000).toISOString().slice(0, 10)
+    const res = await api(`/api/opr/shipments/${shipment.id}/export-proof`, {
+      method: 'POST', body: JSON.stringify({ prealert_date: future }),
+    })
+    expect(res.status).toBe(422)
+    const row = await env.DB.prepare('SELECT prealert_date FROM shipments WHERE id = ?').bind(shipment.id).first<{ prealert_date: string | null }>()
+    expect(row!.prealert_date).toBeNull()
+  })
+
+  it('export-proof: regime_confirmed rejects any value other than 0 or 1, nothing written', async () => {
+    const shipment = await finalisedShipment()
+    for (const bad of [2, -1, 'yes', true, null]) {
+      const res = await api(`/api/opr/shipments/${shipment.id}/export-proof`, {
+        method: 'POST', body: JSON.stringify({ regime_confirmed: bad }),
+      })
+      // Strict === 0 / === 1 check (not Number(...) coercion) — every one
+      // of these, including true/null, fails the literal check and 422s.
+      // All leave the row untouched, which is what this test asserts.
+      expect(res.status).toBe(422)
+    }
+    const row = await env.DB.prepare('SELECT regime_confirmed FROM shipments WHERE id = ?').bind(shipment.id).first<{ regime_confirmed: number }>()
+    expect(row!.regime_confirmed).toBe(0)
+  })
+
+  it('export-proof: regime_confirmed defaults to 0 on a shipment that has never been touched by export-proof at all', async () => {
+    const shipment = await finalisedShipment()
+    const row = await env.DB.prepare('SELECT regime_confirmed FROM shipments WHERE id = ?').bind(shipment.id).first<{ regime_confirmed: number }>()
+    expect(row!.regime_confirmed).toBe(0)
+  })
+
+  it('export-proof: no money column is ever written and status never changes from any export-proof call touching the new fields', async () => {
+    const shipment = await finalisedShipment()
+    const before = await env.DB.prepare(
+      'SELECT status, reconciled_value_gbp, repair_cost, customs_exchange_rate, duty_rate_pct FROM shipments WHERE id = ?'
+    ).bind(shipment.id).first<Record<string, unknown>>()
+    const res = await api(`/api/opr/shipments/${shipment.id}/export-proof`, {
+      method: 'POST', body: JSON.stringify({ tracking_reference: 'FDX-AWB-222', prealert_date: '2026-08-27', regime_confirmed: 1 }),
+    })
+    expect(res.status).toBe(200)
+    const after = await env.DB.prepare(
+      'SELECT status, reconciled_value_gbp, repair_cost, customs_exchange_rate, duty_rate_pct FROM shipments WHERE id = ?'
+    ).bind(shipment.id).first<Record<string, unknown>>()
+    expect(after!.status).toBe(before!.status) // FINALISED, unchanged
+    expect(after!.reconciled_value_gbp).toBe(before!.reconciled_value_gbp)
+    expect(after!.repair_cost).toBe(before!.repair_cost)
+    expect(after!.customs_exchange_rate).toBe(before!.customs_exchange_rate)
+    expect(after!.duty_rate_pct).toBe(before!.duty_rate_pct)
+  })
 })
 
 afterAll(async () => {

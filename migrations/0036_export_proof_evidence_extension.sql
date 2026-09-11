@@ -1,0 +1,63 @@
+-- Migration 0036 — Task G: extend export-proof's evidence columns with
+-- tracking_reference, prealert_date, and regime_confirmed on `shipments`.
+--
+-- Numbering: `ls migrations/ | sort -V | tail` immediately before writing
+-- this file confirms 0035 (shipment_return_date_and_reconstructed) is the
+-- highest applied migration; this is the next number.
+--
+-- Context (per DEVELOPER INSTRUCTION 2026-09-11, Task G ruling): carrier
+-- and notes are DRAFT-gated (opr.ts PATCH /shipments/:id, status !==
+-- 'DRAFT' -> 409) and export-proof (the ONLY mutation a FINALISED
+-- shipment accepts) never touches them. That is a design accident, not a
+-- deliberate constraint — carrier/tracking evidence routinely arrives
+-- from third parties (freight forwarders, carriers) on THEIR timetable,
+-- which is very often AFTER a shipment has already been finalised. The
+-- schema must stop assuming that evidence is known at dispatch time.
+--
+-- All three columns are wired to export-proof (FINALISED-gated), NOT to
+-- the DRAFT-gated PATCH route — this migration only adds the columns;
+-- the route wiring is a separate, non-schema change in src/routes/opr.ts.
+--
+-- tracking_reference TEXT — the AWB/tracking number. Deliberately free
+-- text with NO format validation: carriers differ (FedEx AWB format is
+-- not DHL's, is not a domestic courier's), and guessing a shared format
+-- would either reject valid real-world values or accept garbage that
+-- merely happens to match a regex. Same "accept as typed, validate only
+-- charset-safety-for-declarations where that already applies" precedent
+-- as consignee_name/carrier elsewhere in this table.
+--
+-- prealert_date DATE — nullable. A structured date, unlike the existing
+-- pre-alert TIMING which only lives as a sent_emails row's created_at
+-- (see Addendum A33) — this is the field an operator fills in directly
+-- when the pre-alert genuinely happened on a different day than it was
+-- logged, or when there was no system-sent pre-alert at all (manual
+-- dispatch) and the operator wants the date recorded anyway.
+--
+-- regime_confirmed INTEGER NOT NULL DEFAULT 0 — SQLite has no native
+-- BOOLEAN; follows the same 0/1 flag convention as `reconstructed`
+-- (migration 0035) and `duty_override_claimed` (0024-family). Semantics,
+-- recorded here so they never drift from what the column name implies:
+--   0 = RECORDED AS OPR, UNVERIFIED — the operator picked OPR_REPAIR at
+--       creation, but nothing customs-side has yet confirmed the
+--       declaration actually carried that regime.
+--   1 = DECLARED OPR, EVIDENCED — an export declaration reference
+--       (export_mrn/ducr/ead_mrn/mucr) has been recorded AND actually
+--       confirms OPR relief was correctly claimed on it.
+-- Defaults to 0 so every existing row (including OPR20260826003, id=1,
+-- and every historical FINALISED shipment) is HONESTLY marked unverified
+-- rather than silently, retroactively asserted as evidenced. This
+-- migration performs NO backfill to 1 anywhere, for any row, under any
+-- condition — verification is a per-shipment human/customs-side act,
+-- never a migration-time bulk assumption.
+--
+-- Simple ALTER TABLE ADD COLUMN x3 (no CHECK, no rename, no drop) —
+-- follows 0035's own precedent for this shape of change.
+--
+-- (No explicit transaction wrapper: remote D1 rejects BEGIN/COMMIT
+-- [CF 7500]; wrangler applies this file as a single batch. Not that it
+-- matters here — LOCAL ONLY, no authorisation exists to apply this to
+-- production. Must be named alongside 0035 in the next deploy handshake.)
+
+ALTER TABLE shipments ADD COLUMN tracking_reference TEXT;
+ALTER TABLE shipments ADD COLUMN prealert_date DATE;
+ALTER TABLE shipments ADD COLUMN regime_confirmed INTEGER NOT NULL DEFAULT 0;

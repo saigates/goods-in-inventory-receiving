@@ -2404,10 +2404,15 @@
     );
   }
   function OprExportProofCard(s) {
-    const f = { export_mrn: '', ducr: '', ead_mrn: '', mucr: '' };
+    const f = { export_mrn: '', ducr: '', ead_mrn: '', mucr: '', tracking_reference: '', prealert_date: '' };
+    // regime_confirmed is a checkbox, not a text field — it always carries
+    // an explicit 0/1 (the server's own default is 0 = unverified), so it
+    // is NOT subject to the same "only send if non-blank" filter as the
+    // text fields below; the operator's checkbox state IS the value.
+    let regimeConfirmed = Number(s.regime_confirmed) === 1;
     const save = async () => {
       const body = Object.fromEntries(Object.entries(f).filter(([, v]) => v.trim()));
-      if (!Object.keys(body).length) { toast('Enter at least one reference to record', 'warn'); return; }
+      body.regime_confirmed = regimeConfirmed ? 1 : 0;
       try {
         await api.post(`/opr/shipments/${s.id}/export-proof`, body);
         toast('Export proof recorded', 'ok');
@@ -2416,21 +2421,31 @@
         toast(err.response?.data?.error || err.message, 'err', 5000);
       }
     };
-    const Field = (label, key, current, placeholder) => h('div', {},
+    const Field = (label, key, current, placeholder, type) => h('div', {},
       h('label', { class: 'text-[10px] uppercase text-slate-500 mb-1 block' }, label,
         current ? h('span', { class: 'ml-2 mono text-cyan-300 normal-case' }, current) : null),
-      h('input', { id: `opr-proof-${key}`, class: 'input mono text-xs', placeholder: current ? 'replace…' : placeholder,
+      h('input', { id: `opr-proof-${key}`, class: 'input mono text-xs', type: type || 'text', placeholder: current ? 'replace…' : placeholder,
         oninput: (e) => { f[key] = e.target.value; } }));
     return h('div', { class: 'card p-4', id: 'opr-proof-card' },
       h('div', { class: 'flex items-center gap-2 mb-3' },
         h('h3', { class: 'font-semibold text-sm' }, h('i', { class: 'fas fa-stamp mr-2 text-cyan-400' }), 'Export proof references'),
-        h('span', { class: 'text-[11px] text-slate-500' }, 'Record declaration references as they land — MRN, DUCR, EAD, MUCR. Existing values shown beside each label.')
+        h('span', { class: 'text-[11px] text-slate-500' }, 'Record declaration references as they land — MRN, DUCR, EAD, MUCR, tracking, pre-alert date. Existing values shown beside each label.')
       ),
       h('div', { class: 'grid grid-cols-2 md:grid-cols-4 gap-3' },
         Field('Export MRN', 'export_mrn', s.export_mrn, '26GB34F7Y1AB8CDE12'),
         Field('DUCR', 'ducr', s.ducr, '6GB369979995000-EXP…'),
         Field('EAD MRN', 'ead_mrn', s.ead_mrn, '(optional)'),
-        Field('MUCR', 'mucr', s.mucr, 'GB/SGAT-12345678')
+        Field('MUCR', 'mucr', s.mucr, 'GB/SGAT-12345678'),
+        Field('Tracking / AWB', 'tracking_reference', s.tracking_reference, 'FDX-AWB-998877665544'),
+        Field('Pre-alert date', 'prealert_date', s.prealert_date, '', 'date')
+      ),
+      h('div', { class: 'flex items-center gap-2 mt-3' },
+        h('input', { id: 'opr-proof-regime-confirmed', type: 'checkbox', checked: regimeConfirmed || null,
+          onchange: (e) => { regimeConfirmed = e.target.checked; } }),
+        h('label', { for: 'opr-proof-regime-confirmed', class: 'text-xs text-slate-300' },
+          'OPR regime EVIDENCED on the declaration',
+          h('span', { class: 'block text-[10px] text-slate-500' },
+            'Unchecked (default) means recorded as OPR but not yet customs-confirmed — NOT "not OPR".'))
       ),
       h('div', { class: 'flex justify-end mt-3' },
         h('button', { id: 'opr-proof-save', class: 'btn btn-primary text-xs', onclick: save },
