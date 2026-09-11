@@ -31,6 +31,15 @@ function requireManager(c: any): boolean {
 // INSTRUCTION 2026-09-09) — any future single-device sale route reaching
 // that same edge must apply the identical acknowledgment gate and reuse
 // QC_FAILED_WARNING_MESSAGE verbatim, not invent its own copy.
+// ?acknowledge_low_yield=1 (same query-param convention): required to
+// actually write on a real run whose classified outcome is LOW-YIELD
+// (see LOW_YIELD_MIN_ROWS/lowYield in zohoSaleImport.ts) — zero
+// matched_sale outcomes, or skipped_available at/above 25% of total
+// rows, on a file of at least 50 rows. Without it, a real run writes
+// NOTHING and returns the full outcomeHistogram plus the reason so the
+// operator can see why before resubmitting. Ignored (harmless) on a
+// dryRun request, which never writes regardless — dryRun's response
+// always carries the histogram too.
 app.post('/', async (c) => {
   const user = currentUser(c)
   if (!requireManager(c)) return c.json({ error: 'Manager or admin role required' }, 403)
@@ -38,9 +47,10 @@ app.post('/', async (c) => {
   if (!csvText || !csvText.trim()) return c.json({ error: 'Empty CSV body' }, 400)
   const dryRun = c.req.query('dry_run') === '1'
   const acknowledgeQcFailed = c.req.query('acknowledge_qc_failed') === '1'
+  const acknowledgeLowYield = c.req.query('acknowledge_low_yield') === '1'
 
   const result = await applyZohoSaleImport(c.env.DB, user.organisation_id, csvText, {
-    dryRun, actorUserId: user.id, user, acknowledgeQcFailed,
+    dryRun, actorUserId: user.id, user, acknowledgeQcFailed, acknowledgeLowYield,
   })
   if (!result.ok) return c.json(result, 422)
   return c.json(result, dryRun ? 200 : 201)

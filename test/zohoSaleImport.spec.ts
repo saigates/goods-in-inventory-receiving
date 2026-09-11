@@ -26,7 +26,6 @@ import {
   classifyRow,
   classifyZohoCsvRows,
   parseZohoCsv,
-  assertOutwardsShape,
   resolveZohoRowForCode,
   ZOHO_CSV_HEADERS,
   type ZohoCsvRow,
@@ -225,62 +224,6 @@ describe('parseZohoCsv — header-name parsing, never column position (2026-09-0
     if (!result.ok) return
     expect(result.rows).toHaveLength(1)
     expect(result.fileLineCount).toBe(1)
-  })
-})
-
-describe('assertOutwardsShape — submission-boundary FILE-SHAPE GATE (2026-09-10 incident response, revised after the :405 collision)', () => {
-  it('rejects a wholly-inwards file: EVERY row lacks out_entity_date/out_contact_id AND at least one row carries a positive Inwards signature (in_entity_date populated, item_status=available)', () => {
-    const rows = [
-      makeRow({ out_entity_date: '', out_contact_id: '', item_status: 'available' }),
-      makeRow({ out_entity_date: '', out_contact_id: '', item_status: 'available' }),
-      makeRow({ out_entity_date: '', out_contact_id: '', item_status: 'available' }),
-    ]
-    const result = assertOutwardsShape(rows)
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error).toContain('out_entity_date')
-    expect(result.error).toContain('out_contact_id')
-    expect(result.error).toContain('Inwards signature')
-    expect(result.error).toContain('3 row(s)') // total row count named
-  })
-
-  it('a normal outwards file (every row has both out_entity_date and out_contact_id populated) is unaffected', () => {
-    const rows = [
-      makeRow({ out_entity_date: '2026-08-10', out_contact_id: '251444000000060479' }),
-      makeRow({ out_entity_date: '2026-08-11', out_contact_id: '251444000000060479' }),
-    ]
-    const result = assertOutwardsShape(rows)
-    expect(result.ok).toBe(true)
-  })
-
-  it('a mixed file — some rows lack out_contact_id but at least one row carries real out-side data — is NOT rejected, and per-row content is untouched (skipped_available/UNCLASSIFIED narrowing downstream is unaffected by this gate)', () => {
-    const idleRow = makeRow({
-      status: 'available', out_entity_date: '', out_contact_id: '', out_contact_name: '',
-      out_entity_type: '', sold_price: '', item_status: 'available',
-    })
-    const saleRow = makeRow({ out_entity_date: '2026-08-12', out_contact_id: '251444000000060479' })
-    const rows = [idleRow, saleRow]
-
-    const result = assertOutwardsShape(rows)
-    expect(result.ok).toBe(true)
-    // The gate must not mutate its input — confirms it is a read-only check.
-    expect(rows[0].out_contact_id).toBe('')
-    expect(rows[0].out_entity_date).toBe('')
-    expect(rows[1].out_entity_date).toBe('2026-08-12')
-  })
-
-  it('a file with NO out-side signal and NO positive Inwards signature (the :405 shape — a single genuinely-idle row, no evidence either way) is NOT diagnosable as the wrong file and passes through unchanged', () => {
-    // item_status defaults to 'active' in makeRow(), matching the real
-    // dataset's confirmed finding (reconnaissance note: item_status reads
-    // 'active' for 100% of rows, blank-out_contact_id or not) — so this
-    // row carries no positive Inwards signature by the gate's definition,
-    // even though it also carries no out-side signal.
-    const rows = [
-      makeRow({ status: 'available', out_entity_date: '', out_contact_id: '', out_contact_name: '', out_entity_type: '', sold_price: '' }),
-    ]
-    expect(rows[0].item_status).toBe('active')
-    const result = assertOutwardsShape(rows)
-    expect(result.ok).toBe(true)
   })
 })
 

@@ -175,77 +175,6 @@ export function parseZohoCsv(raw: string): ZohoCsvParseResult {
   return { ok: true, rows, fileLineCount: dataLines.filter(l => l.trim() !== '').length }
 }
 
-// ───────── Outwards-submission shape gate ─────────
-//
-// FILE-SHAPE GATE (2026-09-10 incident response, revised after the :405
-// collision). This is a SUBMISSION POLICY — "is this the right file for
-// this importer" — not a parsing concern, and deliberately lives OUTSIDE
-// parseZohoCsv() so unit tests may still call the parser directly with
-// small, deliberately-minimal fixtures (including a single genuinely-idle
-// row with no out-side data at all) without tripping an import-submission
-// rule. It is called once, by applyZohoSaleImport(), after a successful
-// parse and before classifyZohoCsvRows() — it never alters a per-row
-// outcome, only whether the whole file is accepted for classification.
-//
-// The first version of this gate rejected on ABSENCE alone (no row has
-// out_entity_date or out_contact_id populated). That collided with a
-// legitimate minimal fixture: a single row of genuinely idle stock has
-// no out-side data either, by definition, and is indistinguishable from
-// a wholly-mistaken-Inwards file under an absence-only rule. Absence of a
-// signal is not evidence of the WRONG file; it is also the shape of a
-// small slice of the RIGHT file. Revised to require a POSITIVE
-// counter-signal instead: reject only when the file has zero out-side
-// signal AND at least one row carries a positive Inwards signature
-// (in_entity_date populated with status = 'available') — i.e. there
-// is actual evidence this is an Inwards-shaped export, not merely an
-// absence of outwards evidence. A file with neither signal (no out-side
-// data, no Inwards signature either) is not diagnosable as the wrong
-// file and must pass through unchanged, exactly as before this gate
-// existed.
-//
-// CORRECTION (2026-09-10, same day): the second version, as originally
-// specified, keyed the Inwards signature on item_status = 'available'.
-// That was a column error — item_status reads 'active' in 100% of rows
-// in the reconnaissance sample (both files; see the design-basis comment
-// on classifyRow() below, and the reconnaissance note Section 1: "
-// item_status='active': 100% of rows in both files"), so that condition
-// could never fire against real data, leaving the gate permanently
-// inert — it would test green while silently letting a wholly-Inwards
-// file straight through, exactly the failure it exists to prevent. The
-// field that actually carries 'available'/'sold' is `status`
-// (reconnaissance note Section 1: "status='sold' <=> out_entity
-// populated: 0 mismatches across all 3216 combined rows"; the 525
-// blank-out_contact_id rows are explicitly status='available' in the
-// classification table). Corrected below to key on `status`, not
-// `item_status`.
-export type OutwardsShapeCheckResult =
-  | { ok: true }
-  | { ok: false; error: string }
-
-export function assertOutwardsShape(rows: ZohoCsvRow[]): OutwardsShapeCheckResult {
-  if (rows.length === 0) return { ok: true }
-
-  const hasAnyOutSideSignal = rows.some(
-    r => r.out_entity_date.trim() !== '' || r.out_contact_id.trim() !== ''
-  )
-  if (hasAnyOutSideSignal) return { ok: true }
-
-  const inwardsSignatureCount = rows.filter(
-    r => r.in_entity_date.trim() !== '' && r.status.trim().toLowerCase() === 'available'
-  ).length
-
-  if (inwardsSignatureCount === 0) return { ok: true }
-
-  return {
-    ok: false,
-    error: `Every one of ${rows.length} row(s) is missing both out_entity_date ` +
-      `and out_contact_id, and ${inwardsSignatureCount} row(s) carry a positive ` +
-      `Inwards signature (in_entity_date populated with status=available) — ` +
-      `this looks like an Inwards export submitted to the Outwards/sale importer, ` +
-      `not an outwards or mixed file. Rejected before classification.`,
-  }
-}
-
 // ───────── Serial shape classification ─────────
 //
 // Deliberately NOT validateImei() (src/lib/validate.ts). That function
@@ -651,6 +580,60 @@ export type ZohoWarningUnacknowledged = ZohoQcFailedRow & { message: string }
 export const QC_FAILED_WARNING_MESSAGE =
   'Device failed QC (QC_FAILED). Selling as a standard sale — revenue will be reported with all other sales. Confirm to proceed.'
 
+// ───────── LOW-YIELD import acknowledgment gate (2026-09-10, replaces the
+// retracted assertOutwardsShape()) ─────────
+//
+// HISTORY: this importer previously tried to infer a submitted file's
+// PROVENANCE (Inwards vs Outwards) from row-level data, in three
+// increasingly-corrected attempts, all specified by the operator and all
+// retracted on review — see .deploy-checks/zoho-outbound-reconnaissance-
+// 2026-09-09.md Addendum A27/A29 for the full three-layer history. The
+// reconnaissance note itself already states the reason none of them could
+// have worked: "'Inwards' vs 'Outwards' is a report DATE-FILTER
+// distinction... not a schema difference." A row-level signal cannot
+// diagnose a report-level filter choice — and confirming this, the third
+// attempt's own logic would have been INERT against the real 1635-row
+// Inwards file itself (its sold rows carry `out_entity` populated, so
+// hasAnyOutSideSignal is true for the very file the gate was meant to
+// catch).
+//
+// REPLACEMENT: check the OUTCOME, not the provenance. The real failure
+// mode was never "wrong file" — it was a large, silent no-op import that
+// reads as a successful run. That is measurable AFTER classification,
+// with no inference about where the file came from, using the exact same
+// acknowledgment-gate shape/convention already built and tested for
+// QC_FAILED above: never a hard reject, always visible in the returned
+// histogram, requires ?acknowledge_low_yield=1 to write on a real run,
+// every other outcome in the same import is unaffected.
+//
+// Row-floor + threshold are tunable constants, named here with their
+// real-data basis (reconnaissance note): the real Outwards-shaped export
+// has ~0% of rows lacking out-side data (matched_sale/non_revenue
+// dominate); the real Inwards-shaped export has 525/1635 = 32.1%
+// skipped_available. 25% sits between those two real figures. Files
+// under LOW_YIELD_MIN_ROWS are never judged — too small a sample to
+// diagnose either way (this is what makes a small unit-test fixture
+// SAFE BY CONSTRUCTION, not merely accidentally safe as with either
+// retracted provenance check).
+export const LOW_YIELD_MIN_ROWS = 50
+export const LOW_YIELD_SKIPPED_AVAILABLE_RATIO = 0.25
+
+export type ZohoLowYieldReason = 'zero_sales' | 'high_skipped_available_ratio'
+
+// Full outcome histogram, ALWAYS returned (both dryRun and real runs) so a
+// no-op is visible in the response, never inferred from its absence.
+export type ZohoOutcomeHistogram = {
+  totalRows: number
+  matchedSaleCount: number
+  matchedNonRevenueCount: number
+  matchedUnclassifiedCount: number
+  skippedAvailableCount: number
+  soldCount: number
+  conflictsCount: number
+  alreadyImportedCount: number
+  warningUnacknowledgedCount: number
+}
+
 export type ZohoImportApplyResult = {
   ok: boolean
   errors: string[]
@@ -677,6 +660,17 @@ export type ZohoImportApplyResult = {
   // QC_FAILED-source row was acknowledged or there were none.
   warningUnacknowledgedCount: number
   warningUnacknowledged: ZohoWarningUnacknowledged[]
+  // Always populated (both dryRun and real runs) — the complete outcome
+  // histogram, so a large silent no-op is visible in the response itself.
+  outcomeHistogram: ZohoOutcomeHistogram
+  // Populated only when totalRows >= LOW_YIELD_MIN_ROWS AND (zero
+  // matched_sale outcomes OR skippedAvailableCount / totalRows >=
+  // LOW_YIELD_SKIPPED_AVAILABLE_RATIO). null otherwise (including every
+  // file under the row floor — never judged). On a REAL run (not dryRun),
+  // when this is non-null and opts.acknowledgeLowYield is not true, NOTHING
+  // is written (ok:false, no batch, no transitionDevice calls) — the
+  // histogram above is still returned so the operator can see why.
+  lowYield: { reason: ZohoLowYieldReason; skippedAvailableRatio: number } | null
 }
 
 // Statuses a device may be in when a matched_sale outcome targets it.
@@ -701,8 +695,13 @@ export async function applyZohoSaleImport(
   db: D1Database,
   organisationId: number,
   csvText: string,
-  opts: { dryRun: boolean; actorUserId: number; user: AuthUser; acknowledgeQcFailed?: boolean },
+  opts: { dryRun: boolean; actorUserId: number; user: AuthUser; acknowledgeQcFailed?: boolean; acknowledgeLowYield?: boolean },
 ): Promise<ZohoImportApplyResult> {
+  const emptyHistogram: ZohoOutcomeHistogram = {
+    totalRows: 0, matchedSaleCount: 0, matchedNonRevenueCount: 0,
+    matchedUnclassifiedCount: 0, skippedAvailableCount: 0, soldCount: 0,
+    conflictsCount: 0, alreadyImportedCount: 0, warningUnacknowledgedCount: 0,
+  }
   const empty = {
     ok: false, errors: [] as string[], dryRun: opts.dryRun, importBatchId: null,
     totalRows: 0, matchedSaleCount: 0, matchedNonRevenueCount: 0,
@@ -711,16 +710,11 @@ export async function applyZohoSaleImport(
     alreadyImportedCount: 0, alreadyImported: [] as ZohoAlreadyImported[],
     qcFailedPreview: [] as ZohoQcFailedRow[],
     warningUnacknowledgedCount: 0, warningUnacknowledged: [] as ZohoWarningUnacknowledged[],
+    outcomeHistogram: emptyHistogram, lowYield: null as ZohoImportApplyResult['lowYield'],
   }
 
   const parsed = parseZohoCsv(csvText)
   if (!parsed.ok) return { ...empty, errors: [parsed.error] }
-
-  // Submission-shape gate (2026-09-10 incident response) — checked here,
-  // at the import-submission boundary, not inside parseZohoCsv() itself.
-  // See assertOutwardsShape()'s own header comment for the full rationale.
-  const shapeCheck = assertOutwardsShape(parsed.rows)
-  if (!shapeCheck.ok) return { ...empty, errors: [shapeCheck.error] }
 
   // Build the known-IMEI set from received_devices for this organisation —
   // classifyRow()'s INNER JOIN CONTRACT needs this to decide match/no-match.
@@ -809,6 +803,33 @@ export async function applyZohoSaleImport(
     writableSales.push({ outcome: o, device })
   }
 
+  // LOW-YIELD acknowledgment gate (2026-09-10, replaces the retracted
+  // assertOutwardsShape() — see this file's header comment above
+  // LOW_YIELD_MIN_ROWS for the full rationale). Checked on the OUTCOME,
+  // after classification, never on row-level provenance. Files under
+  // LOW_YIELD_MIN_ROWS are never judged.
+  const skippedAvailableRatio = summary.totalRows > 0 ? summary.skippedAvailableCount / summary.totalRows : 0
+  let lowYield: ZohoImportApplyResult['lowYield'] = null
+  if (summary.totalRows >= LOW_YIELD_MIN_ROWS) {
+    if (summary.matchedSaleCount === 0) {
+      lowYield = { reason: 'zero_sales', skippedAvailableRatio }
+    } else if (skippedAvailableRatio >= LOW_YIELD_SKIPPED_AVAILABLE_RATIO) {
+      lowYield = { reason: 'high_skipped_available_ratio', skippedAvailableRatio }
+    }
+  }
+
+  const outcomeHistogram: ZohoOutcomeHistogram = {
+    totalRows: summary.totalRows,
+    matchedSaleCount: summary.matchedSaleCount,
+    matchedNonRevenueCount: summary.matchedNonRevenueCount,
+    matchedUnclassifiedCount: summary.matchedUnclassifiedCount,
+    skippedAvailableCount: summary.skippedAvailableCount,
+    soldCount: writableSales.length,
+    conflictsCount: conflicts.length,
+    alreadyImportedCount: alreadyImported.length,
+    warningUnacknowledgedCount: warningUnacknowledged.length,
+  }
+
   if (opts.dryRun) {
     return {
       ok: true, errors: [], dryRun: true, importBatchId: null,
@@ -825,6 +846,37 @@ export async function applyZohoSaleImport(
       qcFailedPreview,
       warningUnacknowledgedCount: warningUnacknowledged.length,
       warningUnacknowledged,
+      outcomeHistogram,
+      lowYield,
+    }
+  }
+
+  // A real run with an unacknowledged low-yield result writes NOTHING —
+  // no non-revenue batch, no sale-column writes, no transitionDevice()
+  // calls — and returns ok:false with the histogram + reason so the
+  // caller can see exactly why, then resubmit with
+  // ?acknowledge_low_yield=1 to proceed normally. This is deliberately
+  // NOT a hard block: a legitimate quiet week can genuinely produce zero
+  // sales, so the operator must be able to proceed once they have seen
+  // the histogram — silent pass and silent block are both failures.
+  if (lowYield && !opts.acknowledgeLowYield) {
+    return {
+      ok: false, errors: [], dryRun: false, importBatchId: null,
+      totalRows: summary.totalRows,
+      matchedSaleCount: summary.matchedSaleCount,
+      matchedNonRevenueCount: summary.matchedNonRevenueCount,
+      matchedUnclassifiedCount: summary.matchedUnclassifiedCount,
+      skippedAvailableCount: summary.skippedAvailableCount,
+      soldCount: 0,
+      conflicts,
+      unclassified,
+      alreadyImportedCount: alreadyImported.length,
+      alreadyImported,
+      qcFailedPreview,
+      warningUnacknowledgedCount: warningUnacknowledged.length,
+      warningUnacknowledged,
+      outcomeHistogram,
+      lowYield,
     }
   }
 
@@ -909,5 +961,14 @@ export async function applyZohoSaleImport(
     qcFailedPreview: [],
     warningUnacknowledgedCount: warningUnacknowledged.length,
     warningUnacknowledged,
+    // outcomeHistogram was computed BEFORE the write loop from the same
+    // summary/conflicts/writableSales figures — soldCount there reflects
+    // writableSales.length (what WOULD write), while the local `soldCount`
+    // variable above reflects what actually wrote after transitionDevice()
+    // races; both are correct for their own purpose (histogram = classification
+    // snapshot, soldCount field = actual write outcome) and are allowed to
+    // differ only if a race conflict occurred during the write loop.
+    outcomeHistogram,
+    lowYield,
   }
 }
