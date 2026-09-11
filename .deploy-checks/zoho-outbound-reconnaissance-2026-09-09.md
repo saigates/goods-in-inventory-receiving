@@ -2575,3 +2575,138 @@ TEMP_EXPORT_STANDARD stops being a theoretical shipment_type and starts
 being used for live shipments) AND a genuinely mixed single consignment
 is requested. Until then, 2A gap (b) is CLOSED as deferred, not fixed.
 2A is therefore closed at items 1-3; gap (b) tracked here, not built.
+
+
+## Addendum A33 (2026-09-11) — export evidence gap, scoped to what is genuinely absent
+
+Live investigation this pass (OPR20260826003, shipment id 1, 155 lines,
+DRAFT, ship_date 2026-08-27) surfaced what evidence the export/return
+declaration lifecycle can and cannot hold. Recording the full picture so
+the absent piece is not confused with what already exists.
+
+**Already present, correctly, no gap:**
+- `carrier`, `carrier_account` (both TEXT columns on `shipments`) —
+  writable via `PATCH /shipments/:id` (opr.ts:614-616 in the earlier
+  pass's citation), DRAFT-gated (`opr.ts:562-570`: `status !== 'DRAFT'`
+  → 409 on the whole PATCH route).
+- `export_mrn`, `ducr`, `ead_mrn`, `mucr` — settable at finalise
+  (`opr.ts:1552-1554`) and, importantly, CORRECTABLE AFTER finalise via
+  `POST /shipments/:id/export-proof` (`opr.ts:1593-1624`), gated
+  `status !== 'FINALISED'` → 409 (`opr.ts:1605-1607`), with a live UI
+  form (`OprExportProofCard`, `app.js:2406-2424`). Nothing about these
+  four is foreclosed by finalising early — this was the Step 1 finding
+  of the prior pass, and it stands.
+- Pre-alert TIMING as an event — `sent_emails` (kind='prealert') rows
+  carry their own `created_at`; the operator can already see when a
+  pre-alert was logged/sent, just not as a structured field on the
+  shipment itself.
+
+**Genuinely absent — the whole proposal, DO NOT IMPLEMENT this pass:**
+1. **Tracking / AWB reference column.** No column on `shipments` or
+   `shipment_lines` holds a carrier tracking/airway-bill number as a
+   named, structured field — only the free-text `carrier`/
+   `carrier_account` exist, which name WHO is carrying it, not the
+   specific consignment's tracking reference. Minimal proposal: a single
+   nullable `TEXT` column, e.g. `tracking_reference`, DRAFT-gated
+   identically to `carrier` (same PATCH route, same guard) — no new
+   guard logic needed, it slots into the existing `fields.X = ...`
+   pattern at `opr.ts:614-616` verbatim.
+2. **Pre-alert date on the shipment itself.** The only recorded pre-alert
+   timing lives on a `sent_emails` row, not on `shipments` — there is no
+   `prealert_sent_at` (or similar) column to read back directly off the
+   shipment without a join. Minimal proposal: a nullable `DATETIME`
+   column, set (not necessarily exclusively) by
+   `POST /shipments/:id/prealert/mark-sent`, mirroring how
+   `finalised_at` is set by finalise.
+3. **A regime-confirmed flag** distinguishing "declared OPR, evidenced"
+   (an authorisation and a customs MRN both actually exist and match)
+   from "recorded as OPR, unverified" (the operator picked `OPR_REPAIR`
+   at creation but nothing customs-side has yet confirmed it). Confirmed
+   absent by grep (`regime|confirmed|verified|evidenced|asserted` across
+   `opr.ts`/`types.ts` — only unrelated hits: `repair_cost_confirmed_at`,
+   `misdeclaration_ack_at`). Minimal proposal: a nullable boolean/flag,
+   set only when `export_mrn` (or the wider MRN family) is actually
+   populated — i.e. derived from existing data, not a new manual toggle
+   an operator could set incorrectly.
+
+**The addendum's most useful content — the sequencing fact this gap
+forces:** because `carrier`/`carrier_account`/`notes` are all DRAFT-gated
+(`opr.ts:562-570`) and there is NO post-FINALISED write path for `notes`
+anywhere in the route table (confirmed: absent from `export-proof`,
+`import-proof`, and `checklist`'s field lists), any operator who wants to
+record an AWB number, pre-alert date, or delivery-confirmed date as free
+text on THIS shipment (until the structured columns above exist) MUST do
+so via `PATCH /shipments/1` **before** finalising — that window closes
+permanently the moment `status` flips to `FINALISED`. This is why the
+finalise handshake for OPR20260826003 sequences a PATCH before the
+finalise POST, not after: it is the only chance `notes` will ever get.
+
+RULING: DEFER all three structural additions above — real gaps,
+correctly scoped now that the export-evidence four-column family (MRN/
+DUCR/EAD/MUCR) turned out NOT to be part of the gap. Nothing implemented
+this pass.
+
+
+## Addendum A34 (2026-09-11) — the finalised_at fallback trap
+
+`oprImport.ts:948-950` (IMP_DISCHARGE_WINDOW check) and
+`oprImport.ts:1063-1066` (`computeDischargeRow`, the /discharge tracker's
+own deadline computation) both compute the export date as:
+```
+const exportDate = exportShipment.ship_date
+  || (exportShipment.finalised_at ? String(exportShipment.finalised_at).slice(0, 10) : null)
+```
+`ship_date` wins whenever it is truthy; `finalised_at` is consulted ONLY
+as a fallback when `ship_date` is null/empty. For OPR20260826003 this is
+moot — `ship_date='2026-08-27'` is set, so `finalised_at` is never
+reached for this shipment's own discharge deadline.
+
+The trap is general, not specific to this shipment: **`ship_date` is
+merely offered at creation, not required.** Checked directly —
+`app.js:2110`'s date `<input>` carries no `required` attribute, the
+create handler at `app.js:2026` only sends `ship_date` in the POST body
+`if (f.ship_date)` (falsy-guarded, silently omits it otherwise), and
+server-side (`opr.ts:498-500`, from an earlier pass's citation) the field
+is validated only `if (body.ship_date != null && body.ship_date !== '')`
+— there is no rejection anywhere for a shipment created without one.
+
+Consequence: any shipment created without a `ship_date` will, at
+finalise time, silently date its OWN discharge/relief window from
+`finalised_at` — i.e. from whenever the Finalise button happened to be
+clicked, not from when the goods actually left. Since the finalise modal
+(`app.js:2500-2564`, confirmed in the prior pass to have no date input
+at all) offers no way to supply or correct `finalised_at` through the
+UI, an operator who forgot to set `ship_date` at creation has no UI
+recourse — the relief clock is set by whatever moment the button was
+pressed, silently, with no warning surfaced anywhere in the modal or the
+validation checks that this happened.
+
+RULING: propose nothing beyond the instruction's own framing — either
+make `ship_date` required at creation, or expose `finalised_at` as an
+editable field in the finalise modal (mirroring how it is already
+backdatable via the API). DO NOT IMPLEMENT either fix this pass. Filed
+for a future pass/ruling.
+
+
+## 2B design note — RELIEF_AT_RISK, second cause (2026-09-11)
+
+Carried forward per instruction. `RELIEF_AT_RISK` (the Step 2B customs-
+relief-integrity concern, still PARKED on the customs agent, nothing
+built) has a SECOND, distinct cause beyond the previously-noted
+line-level case (a device scrapped/lost abroad after export, before
+return — a per-DEVICE failure):
+
+**Consignment-level cause**: an entire export declaration may never have
+correctly carried the OPR relief regime in the first place — e.g. the
+wrong procedure code was used, the authorisation reference didn't
+actually attach to the customs entry, or (per Addendum A33 above) the
+export was finalised with no evidence yet on file and the MRN later
+recorded via `export-proof` reveals a declaration that was NOT filed
+under OPR terms at all. This is a failure of the WHOLE consignment's
+customs treatment, not any one device's physical fate — every device on
+that shipment is affected identically, and no per-line state (grade,
+status, custody) would ever surface it, because the state machine has no
+concept of "this consignment's declared regime turned out to be wrong."
+
+2B remains PARKED — this is a note for whoever eventually builds the
+customs-relief-integrity agent, not a build item now.
