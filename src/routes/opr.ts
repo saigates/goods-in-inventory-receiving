@@ -98,6 +98,7 @@ import {
   type MisdeclarationVarianceType,
 } from '../lib/oprImport'
 import { computeFollowUpStatus, computeOutstandingChecklist, type SentEmailLite, type ShipmentReplyLite } from '../lib/oprComms'
+import { parseBulkSerialInput, classifyBulkSerials, type BulkSerialDeviceLookup } from '../lib/bulkSerialImport'
 import { gmailConfigFromEnv, sendGmail, type EmailAttachment } from '../lib/email'
 import { dispatchShipmentWebhooks, type ShipmentEventPayload } from '../lib/webhook'
 import {
@@ -2194,6 +2195,112 @@ app.post('/shipments/:id/scan-bulk', async (c) => {
 
   const added = results.filter(r => r.ok).length
   return c.json({ ok: true, requested: results.length, added, failed: results.length - added, results })
+})
+
+// ───────── Step 2A gap (a): bulk serial list with per-serial outcome ─────────
+//
+// POST /shipments/:id/bulk-serials — replaces the one-at-a-time /scan for
+// manifest-driven consignment building. Body:
+//   { text: string, serial_column?: string }
+// `text` is EITHER a bare paste (one serial per line, the common case) OR
+// an uploaded CSV with a header row, in which case `serial_column` names
+// the column to extract (supplier layouts vary — this is the "small
+// column-mapping step"). Every serial in the submission gets an explicit
+// outcome in the response — matched / unknown / already_sold /
+// already_out / already_on_this_shipment / duplicate_in_submission —
+// never a silent default (see bulkSerialImport.ts's classifyBulkSerials
+// for the full vocabulary and its rationale).
+//
+// Re-submitting the identical list is idempotent: a serial that landed
+// as a line on THIS shipment on a prior call reports
+// already_on_this_shipment (informational, ok:true, no second insert
+// attempted) rather than erroring or silently re-adding.
+//
+// The actual write reuses addDeviceToShipment / addDeviceToReturnShipment
+// VERBATIM — same buy_price/grade/value-snapshot gate, same
+// IN_EXPORT_CONSIGNMENT transition, same duplicate-draft return guard —
+// so this endpoint can never diverge from single /scan's guarantees:
+// no money column written, cost basis untouched, grade captured per
+// line exactly as /scan already does it.
+const BULK_SERIAL_CAP = 500
+
+app.post('/shipments/:id/bulk-serials', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+
+  const gate = await loadDraftShipment(c, user, id)
+  if (!gate.ok) return gate.response
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => null)
+  if (!body || typeof body.text !== 'string') {
+    return c.json({ error: 'Body must be { text: string, serial_column?: string }' }, 422)
+  }
+  const serialColumn = typeof body.serial_column === 'string' && body.serial_column.trim() ? body.serial_column.trim() : undefined
+
+  const parsed = parseBulkSerialInput(body.text, serialColumn)
+  if (!parsed.ok) return c.json({ error: parsed.error }, 422)
+  if (parsed.serials.length > BULK_SERIAL_CAP) {
+    return c.json({ error: `Maximum ${BULK_SERIAL_CAP} serials per submission` }, 422)
+  }
+
+  // expectedStatus mirrors the SAME divergence addDeviceToShipment (export:
+  // READY_FOR_EXPORT) / addDeviceToReturnShipment (import: EXPORTED_UNDER_OPR
+  // or TEMP_EXPORTED_STANDARD, keyed off shipment_type) already enforce —
+  // computed here ONLY to classify outcomes up front; the actual gate is
+  // still re-checked inside the add-function itself, so a race between
+  // classification and write can never silently bypass it.
+  const expectedStatus = gate.shipment.direction === 'import'
+    ? (gate.shipment.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'TEMP_EXPORTED_STANDARD' : 'EXPORTED_UNDER_OPR')
+    : 'READY_FOR_EXPORT'
+
+  // Single batched read for every distinct normalised serial in the
+  // submission — never one query per serial.
+  const normalisedSerials = [...new Set(parsed.serials.map(s => s.trim().toUpperCase()).filter(Boolean))]
+  const devicesByImeiUpper = new Map<string, BulkSerialDeviceLookup & { row: Record<string, unknown> }>()
+  if (normalisedSerials.length > 0) {
+    const placeholders = normalisedSerials.map(() => '?').join(',')
+    const { results: rows } = await c.env.DB.prepare(
+      `SELECT * FROM received_devices WHERE organisation_id = ? AND UPPER(imei) IN (${placeholders})`
+    ).bind(user.organisation_id, ...normalisedSerials).all<Record<string, unknown>>()
+    for (const row of rows || []) {
+      devicesByImeiUpper.set(String(row.imei).toUpperCase(), { id: Number(row.id), status: String(row.status), row })
+    }
+  }
+
+  const existingLines = await c.env.DB.prepare(
+    'SELECT received_device_id FROM shipment_lines WHERE shipment_id = ?'
+  ).bind(id).all<{ received_device_id: number }>()
+  const deviceIdsOnThisShipment = new Set((existingLines.results || []).map(r => r.received_device_id))
+
+  const outcomes = classifyBulkSerials(parsed.serials, devicesByImeiUpper, expectedStatus, deviceIdsOnThisShipment)
+
+  // Only 'matched' outcomes attempt a write — every other outcome is
+  // already fully explained by classification and needs no D1 call.
+  const results: Array<Record<string, unknown>> = []
+  for (const outcome of outcomes) {
+    if (outcome.outcome !== 'matched') {
+      results.push({ ...outcome, ok: outcome.outcome === 'already_on_this_shipment' })
+      continue
+    }
+    const device = devicesByImeiUpper.get(outcome.normalised)!
+    const res = gate.shipment.direction === 'import'
+      ? await addDeviceToReturnShipment(c, user, gate.shipment, device.row)
+      : await addDeviceToShipment(c, user, gate.shipment, device.row)
+    const data = await res.json() as { error?: string; line?: { id: number } }
+    results.push(res.status === 201
+      ? { ...outcome, ok: true, line_id: data.line?.id }
+      : { ...outcome, outcome: 'already_out', ok: false, error: data.error })
+  }
+
+  const added = results.filter(r => r.ok).length
+  return c.json({
+    ok: true,
+    requested: results.length,
+    added,
+    failed: results.length - added,
+    results,
+  })
 })
 
 export default app

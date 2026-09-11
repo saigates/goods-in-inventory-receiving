@@ -546,7 +546,12 @@ file — claimed here per the standing per-suite-prefix convention by
 `test/zohoSaleImportApply.spec.ts`, 2026-09-09, the first D1-backed vitest
 spec for the Zoho outbound sale importer; the earlier pure-function
 `test/zohoSaleImport.spec.ts` never writes to `received_devices` and
-claims no prefix, per its own header comment), `9900*` (G5 item 2 catalog
+claims no prefix, per its own header comment), `8604571` (NOT a
+`.browser.mjs` file — claimed here per the standing per-suite-prefix
+convention by `test/bulkSerials.spec.ts`, 2026-09-11, the D1-backed
+vitest spec for Step 2A gap (a), POST /shipments/:id/bulk-serials; the
+pure-function `test/bulkSerialImport.spec.ts` never writes to
+`received_devices` and claims no prefix), `9900*` (G5 item 2 catalog
 auto-generation verification, 2026-08-21, disposable `browser_check.mjs`
 script — not checked into this repo, deleted after the citation was
 captured; see the citation record below).

@@ -2497,3 +2497,30 @@ paired with a freshly-seeded device). A real-data fixture is only as
 good as its ability to actually reach classification, not merely its
 fidelity to the source file's field values.
 
+
+## Addendum A31 (2026-09-11) — /discharge INNER JOIN excludes TEMP_EXPORT_STANDARD, DEFERRED
+
+`GET /discharge` (src/routes/opr.ts:1183) does `JOIN opr_authorisations a ON
+a.id = s.authorisation_id` — an INNER JOIN. TEMP_EXPORT_STANDARD shipments
+are created with `authorisation_id: null` (opr.ts:471), so they produce NO
+row in `s.authorisation_id` and are silently excluded from `/discharge`
+entirely: no row, no deadline, no ageing, no outstanding-count contribution.
+
+Live D1 check (2026-09-11, this pass): the operator's only real shipments
+row is `shipment_type='OPR_REPAIR', direction='export', status='DRAFT'`
+with 155 lines already added (IN_EXPORT_CONSIGNMENT). Zero
+TEMP_EXPORT_STANDARD rows exist in production. The operator's own
+statement: OPR is the only export route available to them; standard
+temporary export is not available to them today.
+
+RULING (per DEVELOPER INSTRUCTION 2026-09-11): since the operator's live
+flow is OPR_REPAIR -> EXPORTED_UNDER_OPR, which IS covered by the INNER
+JOIN (every OPR_REPAIR shipment has a non-null authorisation_id), ageing
+already works correctly for the flow actually in use. The
+TEMP_EXPORT_STANDARD exclusion is a real gap but affects only a path the
+operator cannot currently use. DEFERRED — not fixed in Step 2A. If/when
+TEMP_EXPORT_STANDARD becomes a live route, the fix is a LEFT JOIN (so a
+null-authorisation shipment still produces a row) plus a null-authorisation
+ageing basis of days-out-only (no discharge_period_months to compute a
+deadline against), consistent with 2A gap (c)'s expected_return_date
+fallback design.

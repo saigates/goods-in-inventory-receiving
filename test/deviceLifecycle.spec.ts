@@ -421,6 +421,44 @@ describe('transitionDevice — reject/un-reject gate is enforced INSIDE transiti
   })
 })
 
+describe('GUARD (2026-09-11, Step 2A item 1): no edge to SOLD from any out-of-custody or return-in-transit state', () => {
+  // The five states a device is either physically NOT on hand, or has
+  // just been received back but not yet restocked to ACTIVE_INVENTORY --
+  // none of these may ever reach SOLD directly. A sale during any of
+  // these must surface as a named conflict (see zohoSaleImport.ts's
+  // SOLD_REACHABLE_STATUSES precedent), never a silent status overwrite.
+  const OUT_OF_CUSTODY_OR_RETURN_IN_TRANSIT: DeviceStatus[] = [
+    'IN_EXPORT_CONSIGNMENT',
+    'EXPORTED_UNDER_OPR',
+    'TEMP_EXPORTED_STANDARD',
+    'RETURNED_UNDER_OPR',
+    'RETURNED_UNDER_STANDARD',
+  ]
+
+  it('static: ALLOWED_TRANSITIONS has no SOLD entry for any of these five states', () => {
+    for (const status of OUT_OF_CUSTODY_OR_RETURN_IN_TRANSIT) {
+      expect(ALLOWED_TRANSITIONS[status]).not.toContain('SOLD')
+    }
+  })
+
+  for (const from of OUT_OF_CUSTODY_OR_RETURN_IN_TRANSIT) {
+    it(`runtime: transitionDevice() rejects ${from} → SOLD with InvalidTransitionError, writes nothing`, async () => {
+      const deviceId = await seedDevice(from)
+
+      await expect(
+        transitionDevice(db(), deviceId, 'SOLD', { user: ADMIN_USER })
+      ).rejects.toBeInstanceOf(InvalidTransitionError)
+
+      const device = await db()
+        .prepare('SELECT status FROM received_devices WHERE id = ?')
+        .bind(deviceId)
+        .first<{ status: string }>()
+      expect(device?.status).toBe(from)
+      expect(await eventsFor(deviceId)).toHaveLength(0)
+    })
+  }
+})
+
 describe('DEVICE_STATUSES / ALLOWED_TRANSITIONS sanity', () => {
   it('every key and value in ALLOWED_TRANSITIONS is a real DeviceStatus', () => {
     for (const [from, tos] of Object.entries(ALLOWED_TRANSITIONS)) {

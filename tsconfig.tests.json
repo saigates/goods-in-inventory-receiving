@@ -1,0 +1,9 @@
+{
+  "//": "NAMED, non-default config — NOT referenced by the build (vite.config.ts / wrangler use tsconfig.json only), NOT part of the standing `tsc --noEmit` gate run after every write. Exists solely to typecheck test/**/*.ts, which the main tsconfig.json explicitly excludes (see its own \"exclude\" list). Run manually: npx tsc --noEmit -p tsconfig.tests.json. Carry-forward from the Item B/INTERNAL_REPAIR_OUT pass (2026-09-11): deferred while no test files were being written that pass; due this pass since Step 2A adds test/bulkSerialImport.spec.ts, test/bulkSerials.spec.ts and edits test/deviceLifecycle.spec.ts.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["vite/client", "@cloudflare/workers-types", "vitest/globals"]
+  },
+  "include": ["test/**/*.ts", "src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -1,0 +1,50 @@
+-- Migration 0035 — Step 2A gaps (c) and (d): expected_return_date and
+-- reconstructed flag on shipments.
+--
+-- Numbering: `ls migrations/ | sort -V | tail` immediately before writing
+-- this file confirms 0034 (zoho_sale_import) is the highest applied
+-- migration; this is the next number.
+--
+-- Both columns are CONSIGNMENT-level (on `shipments`), not per-line, per
+-- the pass instruction: "expected_return_date REQUIRED for new
+-- consignments" and "RECONSTRUCTED flag on the consignment" — a whole
+-- export consignment either has a known expected date or is a historical
+-- reconstruction, never a mix within one shipment.
+--
+-- Application-level enforcement (NOT a DB CHECK, mirroring the
+-- disposition/attribution precedent elsewhere in this schema): a NEW
+-- consignment (reconstructed=0) REQUIRES a non-null expected_return_date
+-- at creation time; a RECONSTRUCTED consignment (reconstructed=1) may
+-- leave it NULL. This is deliberately NOT a SQL CHECK constraint because
+-- the requirement is conditional on the value of `reconstructed` on the
+-- SAME row — SQLite CHECK constraints on two columns of the same row
+-- are technically possible but the codebase's own precedent (qc_result/
+-- qc_fail_reason in 0022) already established "enforced in application
+-- code, not a CHECK" for exactly this shape of conditional requirement.
+--
+-- Why NULLABLE, not a fixed default: the confirmed `rep` RECONSTRUCTED
+-- candidate set (10 rows: 7 Outwards + 3 Inwards, serials in
+-- .deploy-checks/zoho-outbound-reconnaissance-2026-09-09.md) all share
+-- ONE bulk Zoho close-out date, 2026-08-06 — a required field here would
+-- force the operator to invent per-device dates that were never real.
+-- Ageing (computeDischargeRow / the ageing view) falls back to
+-- days-out-only against the configurable threshold constant when this
+-- date is absent — no code change to that fallback is needed as part of
+-- this migration; it is a consumer-side decision made when gap (c)'s
+-- read path is built.
+--
+-- Simple ALTER TABLE ADD COLUMN (no CHECK, no rename, no drop) — follows
+-- migration 0034's precedent of a plain ALTER for this shape of change,
+-- not the full recreate-table dance 0023a needed for a CHECK widening.
+--
+-- reconstructed: INTEGER 0/1 (SQLite has no native BOOLEAN), following
+-- the qc_result-adjacent boolean-flag convention already used elsewhere
+-- in this schema (e.g. shipment_value_deltas). Defaults to 0 (a normal,
+-- forward-dated consignment) so every existing row is unambiguously
+-- "not reconstructed" without a backfill statement.
+--
+-- (No explicit transaction wrapper: remote D1 rejects BEGIN/COMMIT
+-- [CF 7500]; wrangler applies this file as a single batch.)
+
+ALTER TABLE shipments ADD COLUMN expected_return_date DATE;
+ALTER TABLE shipments ADD COLUMN reconstructed INTEGER NOT NULL DEFAULT 0;
