@@ -628,7 +628,17 @@ export type ZohoOutcomeHistogram = {
   matchedNonRevenueCount: number
   matchedUnclassifiedCount: number
   skippedAvailableCount: number
-  soldCount: number
+  // Pre-gate classification-time "would write" count (writableSales.length
+  // at the moment the histogram is built) -- NOT the same quantity as the
+  // top-level ZohoImportApplyResult.soldCount field, which is the actual
+  // post-write count and can be 0 here (e.g. the whole import blocked by
+  // the low-yield gate) while this is >0. Named distinctly from that field
+  // on purpose (DEVELOPER INSTRUCTION 2026-09-10 Correction B) -- the two
+  // sharing one name already produced one silently-wrong read of this
+  // exact histogram, the same shape as the revenue-inflation class of bug
+  // ruled against elsewhere in this project. Read this as "how many rows
+  // classified as a sale", never as "how many rows were actually sold".
+  classifiedSaleCount: number
   conflictsCount: number
   alreadyImportedCount: number
   warningUnacknowledgedCount: number
@@ -699,7 +709,7 @@ export async function applyZohoSaleImport(
 ): Promise<ZohoImportApplyResult> {
   const emptyHistogram: ZohoOutcomeHistogram = {
     totalRows: 0, matchedSaleCount: 0, matchedNonRevenueCount: 0,
-    matchedUnclassifiedCount: 0, skippedAvailableCount: 0, soldCount: 0,
+    matchedUnclassifiedCount: 0, skippedAvailableCount: 0, classifiedSaleCount: 0,
     conflictsCount: 0, alreadyImportedCount: 0, warningUnacknowledgedCount: 0,
   }
   const empty = {
@@ -824,7 +834,7 @@ export async function applyZohoSaleImport(
     matchedNonRevenueCount: summary.matchedNonRevenueCount,
     matchedUnclassifiedCount: summary.matchedUnclassifiedCount,
     skippedAvailableCount: summary.skippedAvailableCount,
-    soldCount: writableSales.length,
+    classifiedSaleCount: writableSales.length,
     conflictsCount: conflicts.length,
     alreadyImportedCount: alreadyImported.length,
     warningUnacknowledgedCount: warningUnacknowledged.length,
@@ -962,12 +972,16 @@ export async function applyZohoSaleImport(
     warningUnacknowledgedCount: warningUnacknowledged.length,
     warningUnacknowledged,
     // outcomeHistogram was computed BEFORE the write loop from the same
-    // summary/conflicts/writableSales figures — soldCount there reflects
-    // writableSales.length (what WOULD write), while the local `soldCount`
-    // variable above reflects what actually wrote after transitionDevice()
-    // races; both are correct for their own purpose (histogram = classification
-    // snapshot, soldCount field = actual write outcome) and are allowed to
-    // differ only if a race conflict occurred during the write loop.
+    // summary/conflicts/writableSales figures — its classifiedSaleCount
+    // reflects writableSales.length (what WOULD write), while the local
+    // `soldCount` variable above (returned as the top-level soldCount
+    // field) reflects what actually wrote after transitionDevice() races;
+    // both are correct for their own purpose (histogram.classifiedSaleCount
+    // = classification snapshot, top-level soldCount = actual write
+    // outcome) and are allowed to differ only if a race conflict occurred
+    // during the write loop. The two fields are deliberately named
+    // differently (DEVELOPER INSTRUCTION 2026-09-10 Correction B) so this
+    // distinction is visible from the field name alone, not just a comment.
     outcomeHistogram,
     lowYield,
   }

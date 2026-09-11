@@ -642,7 +642,7 @@ describe('applyZohoSaleImport — LOW-YIELD acknowledgment gate (2026-09-10, rep
     expect(result.soldCount).toBe(0)
     expect(result.lowYield).toMatchObject({ reason: 'zero_sales' })
     expect(result.outcomeHistogram).toMatchObject({
-      totalRows: 50, matchedSaleCount: 0, skippedAvailableCount: 50, soldCount: 0,
+      totalRows: 50, matchedSaleCount: 0, skippedAvailableCount: 50, classifiedSaleCount: 0,
     })
 
     // Confirm nothing at all was written -- every seeded device is still RECEIVED.
@@ -669,14 +669,16 @@ describe('applyZohoSaleImport — LOW-YIELD acknowledgment gate (2026-09-10, rep
     expect(result.ok).toBe(false)
     expect(result.soldCount).toBe(0) // nothing ACTUALLY written -- the whole import is blocked
     expect(result.lowYield).toMatchObject({ reason: 'high_skipped_available_ratio', skippedAvailableRatio: 0.8 })
-    // outcomeHistogram.soldCount is the classification-time "would write"
-    // count (writableSales.length, computed BEFORE the low-yield gate),
-    // not the actual post-block write count -- correctly 10 here (the 10
-    // genuine sales were classified as writable before the gate blocked
-    // the run). This differs from the top-level soldCount field by design
-    // (see zohoSaleImport.ts's comment on the final return statement).
+    // outcomeHistogram.classifiedSaleCount is the classification-time
+    // "would write" count (writableSales.length, computed BEFORE the
+    // low-yield gate), not the actual post-block write count -- correctly
+    // 10 here (the 10 genuine sales were classified as writable before the
+    // gate blocked the run). This is a DIFFERENT field from the top-level
+    // soldCount (asserted 0 above) by design -- the two are deliberately
+    // named differently, not just documented differently (see
+    // zohoSaleImport.ts's comment on the final return statement).
     expect(result.outcomeHistogram).toMatchObject({
-      totalRows: 50, matchedSaleCount: 10, skippedAvailableCount: 40, soldCount: 10,
+      totalRows: 50, matchedSaleCount: 10, skippedAvailableCount: 40, classifiedSaleCount: 10,
     })
 
     // Confirm the write was fully suppressed -- even the 10 genuine sales
@@ -721,7 +723,7 @@ describe('applyZohoSaleImport — LOW-YIELD acknowledgment gate (2026-09-10, rep
     const dryResult = await applyZohoSaleImport(db(), 1, csv, { dryRun: true, actorUserId: MANAGER_USER.id, user: MANAGER_USER })
     expect(dryResult.outcomeHistogram).toMatchObject({
       totalRows: 1, matchedSaleCount: 1, matchedNonRevenueCount: 0,
-      matchedUnclassifiedCount: 0, skippedAvailableCount: 0, soldCount: 1,
+      matchedUnclassifiedCount: 0, skippedAvailableCount: 0, classifiedSaleCount: 1,
       conflictsCount: 0, alreadyImportedCount: 0, warningUnacknowledgedCount: 0,
     })
     expect(dryResult.lowYield).toBeNull() // 1 row, far under the floor
@@ -731,7 +733,7 @@ describe('applyZohoSaleImport — LOW-YIELD acknowledgment gate (2026-09-10, rep
     const realResult = await applyZohoSaleImport(db(), 1, csv2, { dryRun: false, actorUserId: MANAGER_USER.id, user: MANAGER_USER })
     expect(realResult.outcomeHistogram).toMatchObject({
       totalRows: 1, matchedSaleCount: 1, matchedNonRevenueCount: 0,
-      matchedUnclassifiedCount: 0, skippedAvailableCount: 0, soldCount: 1,
+      matchedUnclassifiedCount: 0, skippedAvailableCount: 0, classifiedSaleCount: 1,
       conflictsCount: 0, alreadyImportedCount: 0, warningUnacknowledgedCount: 0,
     })
     expect(realResult.lowYield).toBeNull()
