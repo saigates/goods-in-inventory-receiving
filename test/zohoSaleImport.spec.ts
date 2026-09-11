@@ -37,6 +37,7 @@ const SALE_EXTERNAL_CONTACT_ID = '251444000000060479' // Amazon UK - Customer
 const FBA_TRANSFER_CONTACT_ID = '251444000345383017' // Amazon FBA
 const GRADE_CHANGE_OUT_CONTACT_ID = '251444000065690570' // GR CHANGE AUTO OUT
 const RETURN_TO_SUPPLIER_CONTACT_ID = '251444000347365746' // SW001
+const INTERNAL_REPAIR_OUT_CONTACT_ID = '251444000244894695' // rep
 
 function makeRow(overrides: Partial<ZohoCsvRow> = {}): ZohoCsvRow {
   const base: ZohoCsvRow = {
@@ -105,6 +106,12 @@ describe('classifyDisposition — the out_contact_id -> Disposition map', () => 
     expect(classifyDisposition(FBA_TRANSFER_CONTACT_ID)).toBe('FBA_TRANSFER')
     expect(classifyDisposition(GRADE_CHANGE_OUT_CONTACT_ID)).toBe('GRADE_CHANGE_OUT')
     expect(classifyDisposition(RETURN_TO_SUPPLIER_CONTACT_ID)).toBe('RETURN_TO_SUPPLIER')
+    expect(classifyDisposition(INTERNAL_REPAIR_OUT_CONTACT_ID)).toBe('INTERNAL_REPAIR_OUT')
+  })
+
+  it('rep (251444000244894695) classifies as INTERNAL_REPAIR_OUT, NOT RETURN_TO_SUPPLIER (2026-09-11 Correction C: rep is internal repair-out per the operator, not a genuine supplier return — mapping it to RETURN_TO_SUPPLIER would post vendor credits that never existed)', () => {
+    expect(classifyDisposition(INTERNAL_REPAIR_OUT_CONTACT_ID)).not.toBe('RETURN_TO_SUPPLIER')
+    expect(classifyDisposition(INTERNAL_REPAIR_OUT_CONTACT_ID)).toBe('INTERNAL_REPAIR_OUT')
   })
 
   it('an out_contact_id NOT in the mapping table classifies as UNCLASSIFIED, never defaults to SALE_EXTERNAL', () => {
@@ -357,6 +364,15 @@ describe('classifyRow — INNER JOIN CONTRACT (2026-09-09 scope ruling)', () => 
     if (result?.outcome !== 'matched_non_revenue') return
     expect(result.disposition).toBe('RETURN_TO_SUPPLIER')
     expect(result.creditValuePence).toBe(26000)
+  })
+
+  it('INTERNAL_REPAIR_OUT classifies as matched_non_revenue with creditValuePence null (internal repair-out move, not a credit — 2026-09-11 Correction C guard)', () => {
+    const row = makeRow({ out_contact_id: INTERNAL_REPAIR_OUT_CONTACT_ID, sold_price: '' })
+    const result = classifyRow(row, new Set([row.serial_number_code]))
+    expect(result?.outcome).toBe('matched_non_revenue')
+    if (result?.outcome !== 'matched_non_revenue') return
+    expect(result.disposition).toBe('INTERNAL_REPAIR_OUT')
+    expect(result.creditValuePence).toBeNull()
   })
 
   it('an out_contact_id absent from the mapping table classifies as matched_unclassified, never as matched_sale', () => {

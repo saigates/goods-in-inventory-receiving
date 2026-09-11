@@ -118,6 +118,7 @@ async function deviceEventCount(deviceId: number): Promise<number> {
 const SALE_EXTERNAL_CONTACT_ID = '251444000000060479' // Amazon UK - Customer
 const FBA_TRANSFER_CONTACT_ID = '251444000345383017' // Amazon FBA
 const GRADE_CHANGE_OUT_CONTACT_ID = '251444000065690570' // GR CHANGE AUTO OUT
+const INTERNAL_REPAIR_OUT_CONTACT_ID = '251444000244894695' // rep
 
 function makeRow(imei: string, overrides: Partial<ZohoCsvRow> = {}): ZohoCsvRow {
   const base: ZohoCsvRow = {
@@ -309,6 +310,42 @@ describe('applyZohoSaleImport — matched_non_revenue writes', () => {
     expect(after.credit_value_pence).toBeNull()
     expect(after.status).toBe('RECEIVED')
     expect(await deviceEventCount(device.id)).toBe(0)
+  })
+
+  it('GUARD (2026-09-11, Correction C): INTERNAL_REPAIR_OUT writes NO money column at all — no credit_value_pence, no sold_price_pence, no status change, no SOLD transition', async () => {
+    const device = await seedDevice('RECEIVED')
+    const csv = csvOf([makeRow(device.imei, {
+      out_contact_id: INTERNAL_REPAIR_OUT_CONTACT_ID, out_contact_name: 'rep',
+      sold_price: '265.00', out_entity_number: 'REP-0001',
+    })])
+
+    const result = await applyZohoSaleImport(db(), 1, csv, { dryRun: false, actorUserId: MANAGER_USER.id, user: MANAGER_USER })
+
+    expect(result.matchedNonRevenueCount).toBe(1)
+    expect(result.soldCount).toBe(0)
+    const after = await deviceRow(device.id)
+    expect(after.disposition).toBe('INTERNAL_REPAIR_OUT')
+    expect(after.credit_value_pence).toBeNull()
+    expect(after.sold_price_pence).toBeNull()
+    expect(after.status).toBe('RECEIVED') // never transitioned
+    expect(await deviceEventCount(device.id)).toBe(0)
+  })
+
+  it('the rep contact id (251444000244894695) classifies as INTERNAL_REPAIR_OUT end-to-end through the D1 write path, NOT RETURN_TO_SUPPLIER — the exact remap this correction makes (2026-09-11 Correction C)', async () => {
+    const device = await seedDevice('RECEIVED')
+    const csv = csvOf([makeRow(device.imei, {
+      out_contact_id: INTERNAL_REPAIR_OUT_CONTACT_ID, out_contact_name: 'rep',
+      sold_price: '265.00', out_entity_number: 'REP-0002',
+    })])
+
+    await applyZohoSaleImport(db(), 1, csv, { dryRun: false, actorUserId: MANAGER_USER.id, user: MANAGER_USER })
+
+    const after = await deviceRow(device.id)
+    expect(after.disposition).not.toBe('RETURN_TO_SUPPLIER')
+    expect(after.disposition).toBe('INTERNAL_REPAIR_OUT')
+    // The critical financial fact this whole correction protects: no
+    // vendor credit is posted for an internal repair-out.
+    expect(after.credit_value_pence).toBeNull()
   })
 })
 

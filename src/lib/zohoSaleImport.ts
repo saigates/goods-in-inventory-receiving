@@ -220,14 +220,17 @@ export type Disposition =
   | 'FBA_TRANSFER'
   | 'GRADE_CHANGE_OUT'
   | 'RETURN_TO_SUPPLIER'
+  | 'INTERNAL_REPAIR_OUT'
   | 'UNCLASSIFIED'
 
 // Dispositions that must NEVER set status=SOLD or populate
 // sold_price_pence (RETURN_TO_SUPPLIER is excluded from revenue by
-// definition; UNCLASSIFIED is excluded because we don't yet know what it
-// is — treating an unknown as a sale is the exact silent-default failure
-// mode the brief forbids).
-export const NON_SALE_DISPOSITIONS: readonly Disposition[] = ['FBA_TRANSFER', 'GRADE_CHANGE_OUT', 'RETURN_TO_SUPPLIER', 'UNCLASSIFIED']
+// definition; INTERNAL_REPAIR_OUT is excluded because it is an internal
+// repair-out movement, not a transaction of any kind — see the
+// 2026-09-11 correction below; UNCLASSIFIED is excluded because we don't
+// yet know what it is — treating an unknown as a sale is the exact
+// silent-default failure mode the brief forbids).
+export const NON_SALE_DISPOSITIONS: readonly Disposition[] = ['FBA_TRANSFER', 'GRADE_CHANGE_OUT', 'RETURN_TO_SUPPLIER', 'INTERNAL_REPAIR_OUT', 'UNCLASSIFIED']
 
 export const ZOHO_CONTACT_DISPOSITION_MAP: Record<string, Disposition> = {
   '251444000000060479': 'SALE_EXTERNAL',     // Amazon UK - Customer
@@ -246,7 +249,15 @@ export const ZOHO_CONTACT_DISPOSITION_MAP: Record<string, Disposition> = {
   '251444000345383017': 'FBA_TRANSFER',      // Amazon FBA (flat GBP450 custody move)
   '251444000065690570': 'GRADE_CHANGE_OUT',  // GR CHANGE AUTO OUT (internal re-grade)
   '251444000347365746': 'RETURN_TO_SUPPLIER', // SW001
-  '251444000244894695': 'RETURN_TO_SUPPLIER', // rep
+  // rep: RECLASSIFIED 2026-09-11 (Correction C) — confirmed by the operator
+  // as INTERNAL REPAIR-OUT, not a supplier return. Mapping it to
+  // RETURN_TO_SUPPLIER (as it was before this fix) would post vendor
+  // credits that never existed — £4,007 across the 7 Outwards / 3 Inwards
+  // sample rows (.deploy-checks/zoho-outbound-reconnaissance-2026-09-09.md,
+  // Section 3/7) — understating cost basis and overstating margin. GATE:
+  // this remap must land before the first production import of any
+  // outwards file (1 August import precondition).
+  '251444000244894695': 'INTERNAL_REPAIR_OUT', // rep (internal repair-out)
   '251444000000147532': 'RETURN_TO_SUPPLIER', // ADJ
   '251444000000365314': 'RETURN_TO_SUPPLIER', // MT001
   '251444000457721449': 'RETURN_TO_SUPPLIER', // TWG001
@@ -293,7 +304,7 @@ export type ZohoImportOutcome =
       outcome: 'matched_non_revenue'
       serialCode: string
       imei: string
-      disposition: 'FBA_TRANSFER' | 'GRADE_CHANGE_OUT' | 'RETURN_TO_SUPPLIER'
+      disposition: 'FBA_TRANSFER' | 'GRADE_CHANGE_OUT' | 'RETURN_TO_SUPPLIER' | 'INTERNAL_REPAIR_OUT'
       creditValuePence: number | null
       entityNumber: string
       entityDate: string
@@ -417,11 +428,13 @@ export function classifyRow(
     }
   }
 
-  // FBA_TRANSFER / GRADE_CHANGE_OUT / RETURN_TO_SUPPLIER — all non-revenue.
-  // Only RETURN_TO_SUPPLIER carries a meaningful credit value; the other
-  // two still record cost_price-adjacent bookkeeping via entityNumber/date
-  // but never populate sold_price_pence or credit_value_pence for
-  // themselves (FBA/grade-change are custody/internal moves, not credits).
+  // FBA_TRANSFER / GRADE_CHANGE_OUT / RETURN_TO_SUPPLIER / INTERNAL_REPAIR_OUT
+  // — all non-revenue. Only RETURN_TO_SUPPLIER carries a meaningful credit
+  // value; the other three still record entityNumber/date bookkeeping but
+  // never populate sold_price_pence or credit_value_pence for themselves
+  // (FBA/grade-change/internal-repair-out are custody/internal moves, not
+  // credits — INTERNAL_REPAIR_OUT added 2026-09-11, Correction C: writes
+  // NO money column at all, by falling through this same guard).
   const creditValuePence = disposition === 'RETURN_TO_SUPPLIER'
     ? gbpStringToPence(row.sold_price)
     : null
