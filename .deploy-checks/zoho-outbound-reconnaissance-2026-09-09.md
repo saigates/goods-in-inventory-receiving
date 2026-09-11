@@ -2524,3 +2524,54 @@ null-authorisation shipment still produces a row) plus a null-authorisation
 ageing basis of days-out-only (no discharge_period_months to compute a
 deadline against), consistent with 2A gap (c)'s expected_return_date
 fallback design.
+
+
+## Addendum A32 (2026-09-11) — Step 2A gap (b), per-line customs regime, DEFERRED with workaround on file
+
+Gap (b): a single `shipments` row (and therefore every `shipment_lines` row
+snapshotted onto it) carries exactly one `shipment_type`
+(`'OPR_REPAIR' | 'TEMP_EXPORT_STANDARD'`), keyed uniformly at
+`opr.ts:735` (`addDeviceToShipment` reads `shipment.shipment_type` once
+per shipment, not per line), and again at the finalise-time transition
+(`opr.ts:1563` — `exportTarget` computed once from
+`shipment.shipment_type`), and again at receipt (`opr.ts:1437` — expected
+import status computed once from `shipment.shipment_type`), and again in
+the new bulk-serials route added this pass (`opr.ts` — `expectedStatus`
+computed once from `gate.shipment.shipment_type`, not per serial). A
+consignment that is genuinely MIXED — some lines under OPR full-repair
+relief, others under plain temporary-export relief, physically shipped
+together — cannot be represented today: there is no per-line
+`customs_regime` column, only the shipment-level `shipment_type`.
+
+RULING (per DEVELOPER INSTRUCTION 2026-09-11): DEFER. Do not add a
+per-line `customs_regime` column. Two reasons hold simultaneously:
+  1. The operator has only ONE export regime available to them today
+     (OPR_REPAIR — confirmed live in Addendum A31 above: zero
+     TEMP_EXPORT_STANDARD rows exist in production, and the operator's
+     own statement is that standard temporary export is not available to
+     them). A column solving a mixing problem neither regime they can
+     currently use will ever hit is speculative schema, not a fix for an
+     observed need.
+  2. `shipment_type` already encodes the regime at the correct
+     granularity for every real shipment that has ever existed in this
+     system (one regime per physical consignment, by construction of how
+     the operator books outbound freight).
+
+WORKAROUND, documented so the reason for deferral survives: if the
+operator ever needs to ship a genuinely mixed consignment (some devices
+under OPR relief, others under plain temporary-export relief) in one
+physical movement, this is recorded as TWO separate `shipments` rows —
+one `shipment_type='OPR_REPAIR'`, one `shipment_type='TEMP_EXPORT_STANDARD'`
+— each carrying only the lines under its own regime. Nothing in the
+schema or the add/finalise/receipt code paths prevents two shipments
+sharing the same physical freight movement/ship_date; they are already
+independent rows with independent lifecycles. The two-shipments
+workaround costs the operator nothing structurally — it is the SAME
+data model already in use, applied twice instead of introducing a new
+per-line dimension no current regime requires.
+
+REVISIT ONLY IF: the operator gains a second real export route (i.e.
+TEMP_EXPORT_STANDARD stops being a theoretical shipment_type and starts
+being used for live shipments) AND a genuinely mixed single consignment
+is requested. Until then, 2A gap (b) is CLOSED as deferred, not fixed.
+2A is therefore closed at items 1-3; gap (b) tracked here, not built.
