@@ -2214,3 +2214,286 @@ diff may supplement it afterward for drill-down, never substitute for it.
 This rule was already exercised correctly in this window at C2 and C3
 (both pre-checks cited in A22/A23 explicitly ran the unscoped diff first).
 
+## Addendum A29 (2026-09-11) — standing gap: `tsc --noEmit` has NEVER type-checked `test/`, recorded not fixed (DEVELOPER INSTRUCTION 2026-09-10, Correction C)
+
+Read-only finding, surfaced as a side-effect of this session's own work on
+Item 6's low-yield gate (below, A30) — not sought out deliberately, found
+while explaining why "tsc clean" had been cited for weeks as a gate that
+should have caught this pass's two real bugs (the unseeded-IMEI fixture
+bug and the `soldCount` dual-meaning naming defect, both A30) and had not.
+
+### What `tsc --noEmit` actually covers today
+
+`tsconfig.json` (repo root):
+
+```json
+"exclude": ["test", "vitest.config.ts", "vitest.serial.config.ts", "node_modules", "dist"]
+```
+
+This means every `npx tsc --noEmit` run this project has ever cited as a
+gate — including every "`tsc clean`" line in A19, A20, A22, A25, A27's
+second attempt, and this session's own main-suite passes — has type-checked
+`src/` only. **No file under `test/`, and neither `vitest.config.ts` nor
+`vitest.serial.config.ts`, has ever been type-checked.** Confirmed by
+direct inspection of the exclude array, not inferred.
+
+### Cheap one-off estimate (this pass): 78 errors, output discarded, no config change committed
+
+Per instruction, no widening of the real `tsconfig.json` was attempted or
+committed. A throwaway ad-hoc config was created, run once, and deleted
+immediately afterward:
+
+```json
+// tsconfig.test-check.tmp.json (repo root, deleted immediately after the run)
+{
+  "extends": "./tsconfig.json",
+  "exclude": ["node_modules", "dist"]
+}
+```
+
+```
+npx tsc --noEmit --project ./tsconfig.test-check.tmp.json
+```
+
+**Result: exit code 2, 78 `error TS*` lines.** File confirmed deleted
+(`git status --short` clean, no untracked file) immediately after the run
+completed and the count was captured — this file was never committed.
+
+By TS error code:
+
+| code | count | meaning |
+|---|---|---|
+| TS2339 | 68 | Property does not exist on type (dominant category) |
+| TS7006 | 4 | Parameter implicitly has an 'any' type |
+| TS2307 | 3 | Cannot find module or its type declarations |
+| TS2304 | 2 | Cannot find name |
+| TS2322 | 1 | Type is not assignable |
+
+By file:
+
+| file | errors |
+|---|---|
+| test/oprAutomation.spec.ts | 20 |
+| test/oprImport.spec.ts | 16 |
+| test/oprFoundation.spec.ts | 12 |
+| test/oprExport.spec.ts | 10 |
+| test/oprComms.spec.ts | 10 |
+| test/bills.spec.ts | 4 |
+| vitest.serial.config.ts | 2 |
+| vitest.config.ts | 2 |
+| test/manifestConditionDerivation.spec.ts | 1 |
+| test/apply-migrations.ts | 1 |
+
+**Root cause of the dominant category (68 of 78, TS2339 "Property does
+not exist on type 'Env'")**: every one of the sampled instances reads
+`Property 'DB' does not exist on type 'Env'` (or the `Env & {
+JWT_SECRET: string }` variant) — the test-side `Env` type used across the
+`opr*.spec.ts` files and `bills.spec.ts` does not carry the same shape as
+the `Bindings` type `src/types.ts` declares for the app, so any test
+reading `env.DB` off that narrower type trips this error. This looks like
+one systemic type-shape gap (test harness `Env` vs. production
+`Bindings`), not 68 independent defects — consistent with "a handful of
+underlying causes," even though the raw line count is not itself a
+handful.
+
+The remaining categories are smaller and self-explanatory: `vitest.config.ts`
+/`vitest.serial.config.ts`'s 4 errors are Node-global/module-resolution
+errors (`node:path`, `__dirname`) that only appear because the ad-hoc
+config, unlike a proper Node-targeted tsconfig, does not carry
+`@types/node`/`"types": ["node"]` — an artifact of the throwaway config's
+minimalism, not a defect in the files themselves. `test/apply-migrations.ts`'s
+1 error (`Cannot find module 'cloudflare:test'`) is the same class of
+environment-declaration gap.
+
+### Assessment: neither "a handful" nor "hundreds" — one systemic cause, worth fixing soon but not silently
+
+68 of 78 errors trace to one shape mismatch (test `Env` vs. production
+`Bindings`) concentrated in five `opr*.spec.ts` files plus `bills.spec.ts`.
+This is closer to "a handful of underlying causes producing a inflated
+line count" than either extreme named in the instruction. Recommendation
+(not actioned this pass, per Correction C's explicit "do not widen the
+tsconfig this pass"): once test's `Env`/`Bindings` shape is reconciled,
+re-run this same one-off check to see how much of the 78 collapses, then
+decide whether including `test/` in the real `tsconfig.json` is cheap
+enough to do for real. Until then, `tsc --noEmit` continues to run
+`src/`-only in this project's normal workflow.
+
+### Standing correction to prior language
+
+Every earlier addendum in this file (and every prior turn's status report)
+that said "tsc clean" as if it covered the change set is corrected
+retroactively by this note: it covered `src/` only, at every citation.
+Going forward, cite it as "`tsc --noEmit` (src/ only) clean" rather than
+an unqualified "tsc clean."
+
+## Addendum A30 (2026-09-11) — Item 6, full retraction and replacement: FOUR layers, all four specified by the supervisor, plus a fourth standing lesson (DEVELOPER INSTRUCTION 2026-09-10)
+
+Every one of the four layers below, including the retraction itself and
+the outcome-based replacement design, was specified by the supervisor —
+none originated as this agent's own initiative. Recorded here in full,
+superseding the incomplete framing in A27 (which covered only layers 1-2
+and did not yet know a third and fourth layer were coming).
+
+### Layer 1 — as-specified with `item_status` (commit `5a36ede`, A27 above)
+
+The gate's second version (the first having already been retracted for
+the `:405` absence-vs-presence collision, per A27) was specified keyed on
+`item_status = 'available'` as the Inwards positive-signature clause.
+Implemented literally as specified — A27 flagged, at the time, that this
+field choice looked wrong against the reconnaissance note's own Section 1
+finding (`item_status='active'`: 100% of rows in both files) but was NOT
+deviated from without instruction: "Implemented literally per
+instruction; flagged here rather than quietly changed to `status`... not
+done in this pass (no such instruction given)." This is layer 1: flagged,
+not corrected, pending the supervisor's own review.
+
+### Layer 2 — column corrected to `status`; the `:405`-shape collision this time found by ANALYSIS BEFORE running, not by running and observing failure (commit `b253172`)
+
+Supervisor instruction corrected the field: the Inwards signature clause
+must key on `status`, not `item_status` — `status='sold' ⟺ out_entity
+populated: 0 mismatches across all 3216 combined rows` (reconnaissance
+Section 1, line 32) is the field that actually discriminates
+`available`/`sold`; `item_status` reads `'active'` in 100% of rows in
+both files (line 34) and could never have fired. Implemented verbatim in
+`src/lib/zohoSaleImport.ts` (`assertOutwardsShape()`, the
+`inwardsSignatureCount` filter and the error-message string both
+switched from `r.item_status` to `r.status`).
+
+**The key discipline point**: this correction, and the reasoning behind
+it, was reached and recorded (see the `CORRECTION (2026-09-10, same day)`
+comment block added directly above the function) BEFORE any test was run
+against the corrected field — by re-reading the reconnaissance note's own
+already-recorded findings (lines 32/34), not by running the gate and
+observing a failure. Analysis-before-running, not trial-and-error.
+
+### Layer 3 — the WHOLE `assertOutwardsShape()` design retracted (commit `8c812f0`), on two independent grounds, both supervisor-specified
+
+Both grounds below were given by the supervisor, not discovered
+independently and then rationalized:
+
+**(a) Unsound in principle — provenance is not inferable from row-level
+data when the Inwards/Outwards distinction is a report-filter artefact
+with no row-level schema footprint.** The reconnaissance note's own
+Section 2 finding (line ~87, referenced in the retained header comment)
+already states: "'Inwards' vs 'Outwards' is a report DATE-FILTER
+distinction... not a schema difference." No column, however chosen, can
+diagnose which report-filter window produced a given export, because the
+same row shape (a settled sale, an unsold available item) can appear in
+either report depending purely on which date window was selected when
+the export was pulled from Zoho — the distinction lives in the query
+that generated the file, not in anything the file itself carries.
+
+**(b) Separately, and empirically: the gate was INERT against the real
+Inwards file in every single version.** The real
+`Serial Number Details_Inwards.csv` (1635 rows) is not "wholly without
+out-side data" — its `sold` rows carry `out_entity` populated (line 32's
+same 0-mismatch finding: `status='sold' ⟺ out_entity populated`), which
+means `hasAnyOutSideSignal` evaluates `true` for this file under EVERY
+version of the gate (layers 1 and 2 alike), short-circuiting the whole
+function to `{ ok: true }` before the Inwards-signature check is ever
+reached. The gate that was built specifically to catch an
+accidentally-submitted Inwards file would have silently passed the real
+Inwards file straight through, in every one of its three implementations,
+had it ever been run against that exact file. This was found by direct
+inspection of the real file's own confirmed structural finding (line 32),
+not by constructing a fixture and watching it fail — the retained header
+comment in `src/lib/zohoSaleImport.ts` records this exact finding
+verbatim: "the third attempt's own logic would have been INERT against
+the real 1635-row Inwards file itself."
+
+Removal (commit `8c812f0`): `assertOutwardsShape()`, its exported
+`OutwardsShapeCheckResult` type, and its call site inside
+`applyZohoSaleImport()` deleted in full. The 4 tests written against it
+directly in `test/zohoSaleImport.spec.ts` (A27's second attempt) removed
+in the same session (confirmed by `git diff --stat abca616..HEAD`:
+`test/zohoSaleImport.spec.ts | 57 ---------`, and by grep, with only
+comment-history references to the retired name remaining in this file).
+
+### Layer 4 — replaced by the outcome-based LOW-YIELD acknowledgment gate (commit `8c812f0`, tested green this session)
+
+Supervisor's full replacement specification, implemented verbatim: check
+the OUTCOME of classification, never the provenance of the file. The real
+failure mode this whole gate family exists to prevent was never "wrong
+file" — it was a large, silent no-op import that reads as a successful
+run. That is measurable after classification with zero inference about
+where the file came from.
+
+Implementation (`src/lib/zohoSaleImport.ts`): `LOW_YIELD_MIN_ROWS = 50`,
+`LOW_YIELD_SKIPPED_AVAILABLE_RATIO = 0.25` (thresholds placed between the
+real Outwards-shaped export's ~0% skipped_available and the real
+Inwards-shaped export's 525/1635 = 32.1% skipped_available — files under
+the row floor are never judged), `ZohoLowYieldReason =
+'zero_sales' | 'high_skipped_available_ratio'`, full `ZohoOutcomeHistogram`
+always returned on both dryRun and real runs, `lowYield` field, reused
+the exact QC_FAILED acknowledgment-gate shape/convention: never a hard
+reject, always visible in the histogram, `?acknowledge_low_yield=1`
+required to write on a real run, every other outcome in the same import
+unaffected.
+
+6 new tests added this session in `test/zohoSaleImportApply.spec.ts`
+(20→26): zero_sales trips and blocks; high_skipped_available_ratio trips
+and blocks (sales > 0, isolating this branch from zero_sales); the
+acknowledgment flag permits a normal write; a file under the row floor is
+never judged; the histogram is returned complete on both dryRun and real
+runs for an ordinary file; and a REAL-DATA fixture (59 rows sampled
+verbatim from the actual reconnaissance source CSV — 40 available + 19
+sold) trips the high_skipped_available_ratio branch — the exact case both
+retracted provenance-inference designs (layers 1-3) would have silently
+failed against, now correctly caught.
+
+Two genuine bugs were found and fixed while authoring this real-data
+fixture test (both diagnosed this session, both fully described in the
+commit history at `0d9006d`/`4bb0b6b` and this document's A29 above is
+unrelated to them):
+
+1. `makeSkippedAvailableRows()` initially generated synthetic IMEIs with
+   no corresponding `received_devices` row. The INNER JOIN CONTRACT
+   silently dropped every such row (zero outcomes produced, not
+   `skipped_available`), so every low-yield test saw
+   `skippedAvailableCount: 0` instead of the intended count. Fixed by
+   making the helper `async` and seeding a real `RECEIVED` device per
+   generated IMEI via `seedDevice('RECEIVED')`.
+2. Test (ii)'s own assertion was wrong, not the implementation:
+   `outcomeHistogram.soldCount` (now `classifiedSaleCount`, see the
+   separate rename record below) is a pre-gate classification-time
+   "would write" count (`writableSales.length`), correctly 10 for that
+   fixture's 10 genuine sales, while the top-level `result.soldCount`
+   (actual writes) is correctly 0 since the whole import was blocked by
+   the low-yield gate. Diagnosed as a test-expectation bug, not the
+   implementation — the assertion was fixed, the implementation was not
+   bent to match a wrong expectation.
+
+Confirmed-clean main suite run this session (`/tmp/main_test_run_15.log`,
+later re-confirmed unchanged after the `classifiedSaleCount` rename in
+`/tmp/main_test_run_16.log`): 621 passed / 0 failed / 8 skipped (629),
+32/32 files. `zohoSaleImportApply.spec.ts`: 26/26 passed both times.
+
+### The four standing lessons (three carried forward, one new this pass)
+
+**(a) Carried forward from A27/this addendum's layer 3** — do not infer a
+file's provenance from row-level data when the Inwards/Outwards
+distinction is a report-filter artefact with no row-level schema
+footprint; check the OUTCOME instead, not the provenance.
+
+**(b) Carried forward** — a rule keyed on real data values requires at
+least one fixture sampled verbatim from real data, of realistic size
+(the 59-row `REAL_INWARDS_SAMPLE_ROWS` fixture in
+`test/zohoSaleImportApply.spec.ts`, test (vi), satisfies this).
+
+**(c) Carried forward** — prefer an acknowledged pass over a hard reject
+where a legitimate case can produce the same signature (the low-yield
+gate's `?acknowledge_low_yield=1` design, never a hard block, directly
+embodies this).
+
+**(d) NEW this pass** — a real-data fixture must also satisfy the
+system's own join contracts. Sampling real rows verbatim is necessary but
+not sufficient: if the sampled rows' serial numbers do not correspond to
+seeded `received_devices` rows in the test database, the importer's INNER
+JOIN CONTRACT drops them before they can be classified at all — the
+fixture runs, produces a result, and looks like it tested something, but
+in fact tested nothing (bug 1 above is the concrete instance: 40 sampled
+"available" rows produced `skippedAvailableCount: 0` until each was
+paired with a freshly-seeded device). A real-data fixture is only as
+good as its ability to actually reach classification, not merely its
+fidelity to the source file's field values.
+
