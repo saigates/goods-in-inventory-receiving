@@ -55,6 +55,13 @@ app.route('/api/webhooks', webhooksRoute)
 app.route('/api/opr', oprRoute)
 app.route('/api/bills', billsRoute)
 app.route('/api/reports', reportsRoute)
+// Re-mounted 2026-09-11 (Quick Item B) — precondition satisfied: the
+// low-yield-acknowledgment gate work (item 6) is complete and tested
+// green (test/zohoSaleImportApply.spec.ts, test/skuMapImport.spec.ts).
+// /api/zoho-sale-import stays UNMOUNTED below — its own validation is
+// not yet rebuilt; do not re-add that import/mount without a separate
+// authorisation.
+app.route('/api/sku-map', skuMapRoute)
 
 // SPA shell — all UI rendered client-side from /static/app.js
 app.get('/', (c) => {

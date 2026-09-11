@@ -390,17 +390,32 @@ describe('applySkuMapImport — invalid file never writes anything (hard-fail on
   })
 })
 
-describe('GUARD: /api/sku-map stays unmounted from the deployed production app (2026-09-10 incident response)', () => {
-  it('the IMPORTED production app (src/index.tsx) returns 404 for /api/sku-map — deliberate, not incidental', async () => {
-    // Authenticate properly first so a 401 (missing/bad token) can never be
-    // mistaken for the 404 this test is actually proving. If someone
-    // re-mounts app.route('/api/sku-map', skuMapRoute) in src/index.tsx,
-    // this assertion flips to see a real response and fails loudly — that
-    // failure is the intended trigger to also flip this guard (delete or
-    // invert it) as part of the same re-mount change, one line each side.
+describe('GUARD: /api/sku-map re-mounted on the deployed production app (2026-09-11, Quick Item B)', () => {
+  // Flipped from the prior "stays unmounted" guard (2026-09-10 incident
+  // response) per its own documented trigger: Quick Item B's precondition
+  // (item 6's low-yield acknowledgment gate) is complete and tested green,
+  // so app.route('/api/sku-map', skuMapRoute) was re-added in src/index.tsx.
+  // This guard now proves the OPPOSITE fact — that the route IS live on
+  // the real production app, not just the test-local `localApp` harness
+  // above (which was always decoupled and provable either way) — so a
+  // future accidental removal of the mount line is caught here, the same
+  // way its removal was caught by the retired 404 assertion.
+  it('the IMPORTED production app (src/index.tsx) returns a real response (200), not 404, for /api/sku-map', async () => {
     const token = await signAuthToken(JWT_SECRET, MANAGER_USER)
     const res = await app.request('/api/sku-map', {
       headers: { Authorization: `Bearer ${token}` },
+    }, testEnv)
+    expect(res.status).toBe(200)
+    const body = await res.json() as { sku_map?: unknown[] }
+    expect(Array.isArray(body.sku_map)).toBe(true)
+  })
+
+  it('/api/zoho-sale-import remains unmounted on the same production app (unaffected by the sku-map re-mount)', async () => {
+    const token = await signAuthToken(JWT_SECRET, MANAGER_USER)
+    const res = await app.request('/api/zoho-sale-import', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: 'irrelevant',
     }, testEnv)
     expect(res.status).toBe(404)
   })
