@@ -521,6 +521,58 @@ describe('Task L — owner-only DRAFT editing (PATCH /shipments/:id)', () => {
   })
 })
 
+// Task Q — dedicated owner-gate assertions for the real external reference
+// format (hyphenated, e.g. "OPR-20260902-003-155"). The two tests above
+// ('403 for a non-owner' and 'display_label accepts hyphens') each prove
+// one half of this in isolation with a plain-word label; neither combines
+// both, so a regression that broke the owner gate specifically for
+// hyphenated values (e.g. a route that checks role only on the plain-word
+// branch) would still pass everything above. These two close that gap —
+// mirrors the manual curl verification done against the local dev server
+// during the Task Q build, now made permanent.
+describe('Task Q — owner-only PATCH of a hyphenated display_label', () => {
+  let shipmentId = 0
+  let operatorToken = ''
+
+  beforeAll(async () => {
+    const res = await api('/api/opr/shipments', {
+      method: 'POST',
+      body: JSON.stringify({ reference: 'TASKQ HYPHEN GATE 1', direction: 'export', authorisation_id: authId, procedure_code: '2100' }),
+    })
+    expect(res.status).toBe(201)
+    shipmentId = ((await res.json()) as { shipment: { id: number } }).shipment.id
+
+    // Mirrors production's ops@saigates.com exactly: role 'operator', same org.
+    operatorToken = await signAuthToken(JWT_SECRET, {
+      id: 998, email: 'ops-fixture@example.com', name: 'Ops Fixture', role: 'operator', organisation_id: 1,
+    })
+  })
+
+  it('owner (admin-role) PATCH of a hyphenated display_label — 200, value round-trips exactly', async () => {
+    const res = await api(`/api/opr/shipments/${shipmentId}`, {
+      method: 'PATCH', body: JSON.stringify({ display_label: 'OPR-20260902-003-155' }),
+    })
+    expect(res.status).toBe(200)
+    const data = await res.json() as { shipment: { display_label: string } }
+    expect(data.shipment.display_label).toBe('OPR-20260902-003-155')
+  })
+
+  it('non-owner (operator-role) PATCH of the same hyphenated display_label — 403, zero side-effects', async () => {
+    const res = await app.request(`/api/opr/shipments/${shipmentId}`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${operatorToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ display_label: 'OPR-20260902-004-999' }),
+    }, testEnv)
+    expect(res.status).toBe(403)
+    const body = await res.json() as { error: string }
+    expect(body.error).toMatch(/admin/i)
+    // Zero side-effects: the prior owner-set value must survive untouched.
+    const check = await api(`/api/opr/shipments/${shipmentId}`)
+    const data = await check.json() as { shipment: { display_label: string } }
+    expect(data.shipment.display_label).toBe('OPR-20260902-003-155')
+  })
+})
+
 describe('tenancy', () => {
   it("another org's token cannot see or use org 1's authorisation", async () => {
     await env.DB.prepare("INSERT OR IGNORE INTO organisations (id, name, slug) VALUES (2, 'Other Org', 'other')").run()

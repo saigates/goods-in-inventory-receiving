@@ -2240,7 +2240,20 @@
       h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
         h('div', { class: 'flex items-center gap-3' },
           backBtn,
-          h('h2', { class: 'text-xl font-bold mono text-cyan-300', id: 'opr-detail-ref' }, s.reference),
+          // Task Q fix — the operator's actual complaint was that this
+          // screen showed the system reference (e.g. OPR20260826003) while
+          // the correct external/carrier reference sat in display_label,
+          // a field this header never rendered. Prefer display_label when
+          // set; fall back to the immutable system reference when it is
+          // not (covers every shipment created before Task O/Q). The
+          // system reference is never hidden — shown alongside, muted,
+          // whenever it differs from what's on display, so the audit trail
+          // (which is keyed on `reference`, never on display_label) stays
+          // visible from this screen without opening the edit card.
+          h('h2', { class: 'text-xl font-bold mono text-cyan-300', id: 'opr-detail-ref' }, s.display_label || s.reference),
+          (s.display_label && s.display_label !== s.reference)
+            ? h('span', { class: 'text-xs text-slate-500 mono', id: 'opr-detail-system-ref', title: 'Immutable system reference (audit key)' }, `sys: ${s.reference}`)
+            : null,
           oprDirBadge(s.direction), oprStatusBadge(s.status)
         ),
         h('div', { class: 'flex items-center gap-2 flex-wrap' },
