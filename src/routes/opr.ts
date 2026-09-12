@@ -558,11 +558,36 @@ app.post('/shipments', async (c) => {
   }
 })
 
+// Task L — owner-only DRAFT editing (2026-09-12 DEVELOPER INSTRUCTION).
+// "Owner" is not a role value in this schema: `users.role` is CHECK'd to
+// ('operator', 'manager', 'admin') — no 'owner' exists. The two named
+// accounts resolve to role 'admin' (owner@saigates.com) and 'operator'
+// (ops@saigates.com); the gate below is therefore role === 'admin', which
+// is the schema's actual owner-tier value. This also admits any OTHER
+// admin-role account (e.g. admin@goodsin.local, also role 'admin' in
+// production) — there is no narrower distinguishing field than role
+// itself, so a literal "only owner@saigates.com" check would be a
+// hardcoded-email special case, not a role gate; role is what this
+// pass was asked to build.
+//
+// Same duplicated-not-shared convention as requireManager in
+// src/routes/devices.ts:378 / src/routes/reports.ts:15 — if a THIRD
+// route needs this, move it to a shared lib module instead of copying
+// again.
+function requireAdmin(c: Context, user: AuthUser): Response | null {
+  if (user.role !== 'admin') {
+    return c.json({ error: `Only an admin-role user may edit a DRAFT shipment header — current role is '${user.role}'` }, 403)
+  }
+  return null
+}
+
 // Update header fields while DRAFT only.
 app.patch('/shipments/:id', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const adminGate = requireAdmin(c, user)
+  if (adminGate) return adminGate
   const shipment = await c.env.DB.prepare(
     'SELECT * FROM shipments WHERE id = ? AND organisation_id = ?'
   ).bind(id, user.organisation_id).first<Record<string, unknown>>()
@@ -613,6 +638,18 @@ app.patch('/shipments/:id', async (c) => {
   }
   if (body.notes !== undefined) fields.notes = cleanString(body.notes, 2000)
 
+  // Task L (migration 0037) — consignee_code: free text, no format
+  // validation, no FK (no vendors table with a stable key exists today
+  // — see A35/A38 addenda). display_label: free text, independent of
+  // the immutable system `reference`; null means "fall back to
+  // reference" at read time, enforced by callers, not by this column.
+  if (body.consignee_code !== undefined) fields.consignee_code = cleanString(body.consignee_code, 60)
+  if (body.display_label !== undefined) {
+    const v = cleanString(body.display_label, 60)
+    if (v && !isDeclarationSafeText(v)) return c.json({ error: 'display_label may contain letters, numbers and spaces only' }, 422)
+    fields.display_label = v
+  }
+
   // C&E1154 inputs (OPR 3) — import shipments only.
   const repair = parseRepairFields(body, String(shipment.direction))
   if (!repair.ok) return c.json({ error: repair.error }, 422)
@@ -630,7 +667,24 @@ app.patch('/shipments/:id', async (c) => {
     throw e
   }
   const updated = await c.env.DB.prepare('SELECT * FROM shipments WHERE id = ?').bind(id).first()
-  return c.json({ ok: true, shipment: updated })
+
+  // Task L — re-run the validation engine on every save and surface it
+  // inline, so a header edit's effect on finalisability is visible
+  // immediately rather than only discovered later on GET /validation or
+  // at /finalise time. Same direction-aware dispatch as GET
+  // /shipments/:id/validation (line ~1041) — this intentionally
+  // duplicates that dispatch rather than importing it, because the GET
+  // route returns its OWN response shape and re-fetches via
+  // loadShipmentBundle; wiring PATCH through the GET handler would mean
+  // a second, redundant shipment fetch for no benefit.
+  const bundle = await loadShipmentBundle(c, user, id)
+  const validation = bundle.ok
+    ? (bundle.shipment.direction === 'import'
+        ? runImportValidation(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, await loadSiblingLegs(c, user, bundle.shipment), await loadMisdeclarationAcks(c, user, bundle.shipment.id))
+        : runExportValidation(bundle.shipment, bundle.authorisation, bundle.lines, undefined, await loadExportProcedurePolicy(c, user, bundle.shipment)))
+    : null
+
+  return c.json({ ok: true, shipment: updated, validation })
 })
 
 // ═════════ Shipment lines (device snapshots) ═════════

@@ -1,0 +1,50 @@
+-- Migration 0037 — Task L: consignee_code and display_label on `shipments`.
+--
+-- Numbering: `ls migrations/ | sort -V | tail` immediately before writing
+-- this file confirms 0036 (export_proof_evidence_extension) is the
+-- highest applied migration; this is the next number.
+--
+-- Context (per DEVELOPER INSTRUCTION 2026-09-12, Task L / A35 follow-up):
+-- shipment 1's `consignee_name` held the literal string 'SW001' — a
+-- vendor/counterparty code, not a name — until this pass corrected it to
+-- 'Syncere Wireless FZE'. That correction was made with NO column to put
+-- the code in: `shipments` has no vendor/counterparty-code column, and
+-- the `suppliers` table (organisation_id, name, created_at — no code
+-- column either) is empty (0 rows) in production. SW001 is preserved as
+-- free text inside `notes` ("Vendor code: SW001.") pending this proper
+-- column. Also referenced, as the bare string 'SW001', by 4 `manifests`
+-- rows (supplier) and 1 `bills` row (vendor_name) — none of those are
+-- foreign keys, so this migration creates no join dependency and fixes
+-- nothing on those other tables; it only gives `shipments` a real home
+-- for the concept going forward.
+--
+-- consignee_code TEXT — deliberately free text, no format validation
+-- and no FK to a vendors table (none exists with a stable key today —
+-- see A35/A38 addenda). Same "accept as typed" precedent as
+-- tracking_reference (0036) and carrier/consignee_name elsewhere in this
+-- table. NOT backfilled from notes by this migration — the SW001 token
+-- living in shipment 1's notes stays there; a human decides when/whether
+-- to lift it into this column, since automatically parsing free text
+-- into a new column is exactly the kind of silent inference this whole
+-- thread has been correcting for (GBNCL001, SW001 both started as
+-- exactly that kind of unexamined value landing in the wrong field).
+--
+-- display_label TEXT — nullable free-text label for UI display,
+-- independent of `reference` (the internal, system-generated, immutable
+-- identifier — see A34-follow-up: shipment 1's `reference` =
+-- 'OPR20260826003' must never change, per explicit operator ruling).
+-- When NULL, callers fall back to `reference` for display purposes; this
+-- migration does not backfill display_label for any existing row
+-- (including shipment 1), so every current shipment's effective label
+-- is unchanged until an operator explicitly sets one.
+--
+-- Simple ALTER TABLE ADD COLUMN x2 (no CHECK, no rename, no drop) —
+-- follows 0035/0036's own precedent for this shape of change.
+--
+-- (No explicit transaction wrapper: remote D1 rejects BEGIN/COMMIT
+-- [CF 7500]; wrangler applies this file as a single batch. LOCAL ONLY —
+-- no authorisation exists yet to apply this to production. Must be named
+-- explicitly in the deploy handshake before it can go live.)
+
+ALTER TABLE shipments ADD COLUMN consignee_code TEXT;
+ALTER TABLE shipments ADD COLUMN display_label TEXT;

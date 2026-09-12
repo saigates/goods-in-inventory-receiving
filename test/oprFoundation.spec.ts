@@ -421,6 +421,97 @@ describe('shipment lines — frozen snapshots', () => {
   })
 })
 
+describe('Task L — owner-only DRAFT editing (PATCH /shipments/:id)', () => {
+  let shipmentId = 0
+  let operatorToken = ''
+
+  beforeAll(async () => {
+    const res = await api('/api/opr/shipments', {
+      method: 'POST',
+      body: JSON.stringify({ reference: 'OWNERGATE SHIP 1', direction: 'export', authorisation_id: authId, procedure_code: '2100' }),
+    })
+    expect(res.status).toBe(201)
+    shipmentId = ((await res.json()) as { shipment: { id: number } }).shipment.id
+
+    // Mirrors production's ops@saigates.com: role 'operator', same org.
+    operatorToken = await signAuthToken(JWT_SECRET, {
+      id: 998, email: 'ops-fixture@example.com', name: 'Ops Fixture', role: 'operator', organisation_id: 1,
+    })
+  })
+
+  it('403 for a non-owner (operator role) — no admin-tier user, no edit', async () => {
+    const res = await app.request(`/api/opr/shipments/${shipmentId}`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${operatorToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ carrier: 'DHL' }),
+    }, testEnv)
+    expect(res.status).toBe(403)
+    const body = await res.json() as { error: string }
+    expect(body.error).toMatch(/admin/i)
+    // Zero side-effects: carrier must still be unset.
+    const check = await api(`/api/opr/shipments/${shipmentId}`)
+    const data = await check.json() as { shipment: { carrier: string | null } }
+    expect(data.shipment.carrier).toBeNull()
+  })
+
+  it('200 for an admin-role user (the owner-tier value) — edit succeeds', async () => {
+    const res = await api(`/api/opr/shipments/${shipmentId}`, {
+      method: 'PATCH', body: JSON.stringify({ carrier: 'FedEx' }),
+    })
+    expect(res.status).toBe(200)
+    const data = await res.json() as { shipment: { carrier: string } }
+    expect(data.shipment.carrier).toBe('FedEx')
+  })
+
+  it('DRAFT-only gate still applies for an admin — FINALISED shipment rejects PATCH with 409, not bypassed by role', async () => {
+    await env.DB.prepare("UPDATE shipments SET status = 'FINALISED' WHERE id = ?").bind(shipmentId).run()
+    const res = await api(`/api/opr/shipments/${shipmentId}`, {
+      method: 'PATCH', body: JSON.stringify({ carrier: 'UPS' }),
+    })
+    expect(res.status).toBe(409)
+    await env.DB.prepare("UPDATE shipments SET status = 'DRAFT' WHERE id = ?").bind(shipmentId).run()
+  })
+
+  it('accepts consignee_code and display_label (migration 0037 fields)', async () => {
+    const res = await api(`/api/opr/shipments/${shipmentId}`, {
+      method: 'PATCH', body: JSON.stringify({ consignee_code: 'SW001', display_label: 'Syncere repair run 1' }),
+    })
+    expect(res.status).toBe(200)
+    const data = await res.json() as { shipment: { consignee_code: string; display_label: string } }
+    expect(data.shipment.consignee_code).toBe('SW001')
+    expect(data.shipment.display_label).toBe('Syncere repair run 1')
+  })
+
+  it('display_label rejects declaration-unsafe characters, same charset rule as consignee_name', async () => {
+    const res = await api(`/api/opr/shipments/${shipmentId}`, {
+      method: 'PATCH', body: JSON.stringify({ display_label: 'Bad/label!' }),
+    })
+    expect(res.status).toBe(422)
+  })
+
+  it('PATCH response surfaces validation inline — red on a bad procedure code, without a separate GET /validation call', async () => {
+    const res = await api(`/api/opr/shipments/${shipmentId}`, {
+      method: 'PATCH', body: JSON.stringify({ procedure_code: '2100', additional_procedure_code: 'B02' }),
+    })
+    // PROCEDURE_CODE itself is fine for 2100+B02 (only 2100+B51 is
+    // hard-blocked) — this asserts the validation OBJECT is present and
+    // shaped correctly, not any specific verdict for this combination.
+    expect(res.status).toBe(200)
+    const data = await res.json() as { validation: { result: string; checks: Array<{ code: string; level: string }>; red_count: number; amber_count: number } }
+    expect(data.validation).toBeTruthy()
+    expect(Array.isArray(data.validation.checks)).toBe(true)
+    // This fixture shipment has no lines, so the three line-dependent
+    // checks (IMEIS_VALID_UNIQUE, UNIT_VALUES_PRESENT, TOTALS_CONSISTENT)
+    // are correctly omitted (oprValidation.ts's `else if (lines.length)`
+    // guards, no else branch) — 9, not the full 12, is the right count
+    // here. SHIP_HAS_LINES itself must be red for an empty consignment.
+    const shipHasLines = data.validation.checks.find(x => x.code === 'SHIP_HAS_LINES')
+    expect(shipHasLines?.level).toBe('red')
+    expect(data.validation.result).toBe('red')
+    expect(data.validation.red_count).toBeGreaterThan(0)
+  })
+})
+
 describe('tenancy', () => {
   it("another org's token cannot see or use org 1's authorisation", async () => {
     await env.DB.prepare("INSERT OR IGNORE INTO organisations (id, name, slug) VALUES (2, 'Other Org', 'other')").run()
