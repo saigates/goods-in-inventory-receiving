@@ -2710,3 +2710,401 @@ concept of "this consignment's declared regime turned out to be wrong."
 
 2B remains PARKED — this is a note for whoever eventually builds the
 customs-relief-integrity agent, not a build item now.
+
+## Addendum A34 follow-up (2026-09-12) — two-reference mapping for shipment 1, reference correction 004→003
+
+**Distinguish from Addendum A34 above** (the `finalised_at` fallback trap) —
+same label number, different topic, filed same session as the rest of
+A35-A41 below. Numbered as a follow-up rather than reusing/renumbering A34
+to avoid breaking existing cross-references to it in this file.
+
+Shipment 1 carries **two references, by design, serving different
+purposes**:
+
+| Field | Value | Nature |
+|---|---|---|
+| `shipments.reference` | `OPR20260826003` | Internal, system-generated at creation (2026-08-26, sequence 003). Load-bearing for lookups, uniqueness and document rendering. **Not to be changed** — explicit operator ruling, this session. |
+| `shipments.notes` (free text) | `OPR-20260902-003-155` | External/operator-declared reference, carried as a token inside the notes free-text field. Corrected this session from `OPR-20260902-004-155` (written in error during Action 1, a prior pass). |
+
+**Why the correction is more than a typo fix**: the corrected external
+reference's sequence segment (`003`) now agrees with the internal
+reference's own sequence number (`OPR20260826003`, sequence 003). Before
+the correction, the two references disagreed on sequence (external said
+004, internal said 003) with no stated reason for the divergence. After
+the correction, the only remaining difference between the two is the
+date segment — `20260826` (internal, creation date) vs. `20260902`
+(external, actual physical departure date) — which is expected and
+already explained by Action 1's own `notes` text ("corrected from
+2026-08-27 on operator confirmation"). The `-155` suffix on the external
+reference is the piece count, present on the external reference only.
+
+**Open, unresolved fork — flagged, not closed this pass**: whether the
+FedEx pre-alert email as actually sent said "003" or "004" cannot be
+verified from this sandbox (no tool here can read real sent-mail or
+FedEx's own systems). The database now carries "003" per explicit
+operator instruction, on the reasoning above. If the sent email in fact
+says "004", the filed customs declaration reference conflicts with what
+the database now asserts is correct — a question for the operator's own
+customs agent, not resolvable by any further database write. Recorded
+here so a future reader does not mistake the corrected `notes` value for
+independent proof of what was actually transmitted to the carrier.
+
+**Verification of the write** (production D1, `shipments` id=1, re-read
+after the correcting `UPDATE`):
+```json
+{
+  "id": 1, "status": "DRAFT", "procedure_code": "2100",
+  "additional_procedure_code": "000",
+  "notes": "AWB 876629113082. Operator reference OPR-20260902-003-155. Physical departure 2026-09-02, corrected from 2026-08-27 on operator confirmation. Delivered per FedEx tracking, delivery date TBC. Pre-alert email sent, date TBC. OPR regime asserted, export declaration not yet held.",
+  "updated_at": "2026-09-12 08:56:52"
+}
+```
+Only the reference token changed; AWB, both dates, delivery-TBC and
+pre-alert-TBC clauses are byte-identical to the pre-correction text.
+`procedure_code` and `additional_procedure_code` unaffected by this
+specific write.
+
+
+## Addendum A35 (2026-09-12) — EXP_SUPERVISING_OFFICE red resolved in favour of GBLIV002; no write made
+
+Cross-checked against the operator's FedEx pre-alert evidence this
+session. Resolution: the pre-alert correctly names **GBLIV002** as the
+supervising office. The value **GBNCL001** currently on
+`opr_authorisations.supervising_office_code` (id=1, org-wide) is the
+erroneous artifact — described by the operator as a misfiled
+correspondence address, not a genuine supervising-office code — and has
+sat unreconciled in that row for 16 days (since the authorisation's
+`valid_from` window opened 2026-03-01; specifically discovered this
+session, not previously flagged in any prior addendum).
+
+**No compliance verdict is asserted against shipment 1 or any other
+shipment.** This addendum resolves the underlying FACT question (which
+code is correct) so that a future pass can act on it; it does NOT
+constitute a decision that shipment 1 (or any other shipment referencing
+authorisation_id=1) is or is not correctly declared. That determination
+depends on what was actually filed with customs, which this database
+does not evidence either way.
+
+**No write was made to `opr_authorisations` this pass.** Per the
+operator's explicit Option 1 choice (this session): the office-code fix
+is deferred to its own explicit, `opr_authorisations`-scoped handshake in
+a future pass, precisely because that table is org-wide and a write there
+has blast radius beyond shipment 1 (see A36's count below). This
+addendum records the resolved VALUE only.
+
+**Read-only counts, this pass (Step 3a)** — shipments referencing
+`authorisation_id = 1`, by status:
+
+| status | count |
+|---|---|
+| DRAFT | 1 |
+
+Only shipment 1 itself currently references this authorisation. The
+blast radius of a future `opr_authorisations` write, AS OF THIS QUERY,
+is exactly one shipment — though the authorisation row is still org-wide
+and any new shipment created before that fix would inherit the same
+wrong code via `loadShipmentBundle` (`opr.ts:924-930`, joins
+`opr_authorisations` by `shipment.authorisation_id` fresh on every
+request — see A36 below for the live-vs-snapshot finding this bears on).
+
+**Severity classification of `EXP_SUPERVISING_OFFICE` (Step 3c)** — confirmed
+HARD BLOCK, not a warning:
+- `oprValidation.ts:158-159`: the failure branch calls
+  `add('EXP_SUPERVISING_OFFICE', 'red', ...)`.
+- `oprValidation.ts:251`: `red_count = checks.filter(x => x.level === 'red').length`.
+- `oprValidation.ts:254`: `result: red_count ? 'red' : amber_count ? 'amber' : 'green'`.
+- `opr.ts:1529-1530` (`POST /shipments/:id/finalise`, export branch):
+  `if (validation.result === 'red') { ... }` — blocks finalisation outright.
+
+So a red `EXP_SUPERVISING_OFFICE` is not advisory; it is one of the
+checks that, on its own, is sufficient to make `validation.result` red
+and therefore block `/finalise`. This is exactly the check shipment 1
+is currently red on (alongside `EXP_PROCEDURE_CODE`, now fixed — see
+the dry-run delta note below), and it CANNOT be fixed by any
+shipment-level write, because the comparison
+(`oprValidation.ts:156`: `authorisation.supervising_office_code ===
+procedurePolicy.supervising_office_code`) reads only the authorisation
+row, never anything on `shipments`.
+
+
+## Addendum A36 (2026-09-12) — live-vs-snapshot rendering of supervising office (Step 3b, decisive question, answered)
+
+Read `oprDocs.ts` and `oprImport.ts` in full surrounding context (not
+just the grep line hits from a prior pass) plus every call site in
+`opr.ts`. Answer: **live, every request. No persisted snapshot exists.**
+
+Evidence:
+- `opr.ts:924-930` (`loadShipmentBundle`, the single loader behind every
+  document/validation endpoint) queries `opr_authorisations` fresh, by
+  `shipment.authorisation_id`, on every call — no caching, no snapshot
+  column on `shipments` or `shipment_lines` holding a copied office name
+  or code.
+- `oprDocs.ts:112` (`buildCommercialInvoiceHtml`) and `oprDocs.ts:163`
+  (`buildPreAlertDraft`) both take the freshly-loaded `authorisation`
+  object as a plain function parameter and read
+  `authorisation.supervising_office_name` /
+  `_code` directly off it — no intermediate storage.
+- `oprImport.ts:370` (`computeCe1154`) likewise takes `authorisation` as
+  a parameter (called from `opr.ts:1107,1130,1332,1367,1865,1951` — every
+  call re-fetches the authorisation via `loadShipmentBundle` or an
+  equivalent direct query immediately beforehand) and reads
+  `authorisation.supervising_office_name` at
+  `oprImport.ts:293`/`621` into the `Ce1154.supervising_office_name`
+  field of a freshly-constructed object, on every call — never read back
+  out of storage.
+- No `INSERT`/`UPDATE` anywhere in `opr.ts`, `oprDocs.ts`, or
+  `oprImport.ts` writes a supervising-office value onto `shipments`,
+  `shipment_lines`, or any other table. The office concept has exactly
+  one home: `opr_authorisations.supervising_office_name` /
+  `_code`.
+
+**Practical consequence**: every previously-generated commercial
+invoice, pre-alert draft, and C&E1154 worksheet for shipment 1 —
+including any already sent to FedEx or filed with customs before this
+session — would have rendered whatever `opr_authorisations.supervising_office_code`
+held AT THE TIME OF THAT REQUEST. There is no way to retroactively
+determine from THIS database what a given historical document actually
+said, because regenerating the same endpoint today reads today's
+(currently still GBNCL001) value, not whatever was current when a given
+document was originally produced. This is the same class of problem
+`regime_confirmed` (A41 below) is designed to catch on the pre-alert
+side specifically — the pre-alert-vs-filed-declaration gap.
+
+This also means: once the office-code write to `opr_authorisations` is
+eventually made (deferred, not this pass), every document generated
+AFTER that write will immediately and correctly render GBLIV002, with no
+migration or backfill needed — but nothing in this system can prove or
+disprove what any document generated BEFORE that point actually said.
+
+
+## Addendum A37 (2026-09-12) — consignment reference data, no other home for it
+
+Recorded here as reference data with no natural table/column home found
+during this session's reads, filed so it is not lost:
+
+- EORI: `GB369979995000`
+- Consignee: Syncere Wireless FZE, SAIF Zone, Sharjah
+- HS code: `8517.13.00.00.00`
+- Country of origin: China
+- Declaration basis: PI967 Section II
+- Declared customs value: £36,031.71 (see A39/Task J below — matches
+  the 155-line sum exactly, to the penny)
+- CDS number: `GBOPO36997999500020260226105539`
+- OP authorisation number: `OP/0922/601/31`
+- Re-import procedure code: `6121` (chargeable-repair return path — see
+  A40's customs rule set)
+
+All of the above independently cross-checked against
+`opr_authorisations` id=1 this session and confirmed to match exactly
+(CDS number, OP authorisation number, EORI). No discrepancy found on any
+of these fields — the ONLY confirmed-wrong field on the authorisation
+row is `supervising_office_code` (A35 above).
+
+
+## Addendum A38 (2026-09-12) — Syncere Wireless FZE's dual role
+
+Syncere Wireless FZE appears in two distinct roles that must not be
+conflated:
+1. **OPR consignee** — the overseas repairer receiving devices under
+   this shipment's outward-processing declaration.
+2. **Third-party counterparty** — potentially also a trading
+   counterparty in unrelated buy/sell flows elsewhere in the business
+   (not evidenced in this session's reads, but flagged as a live risk
+   given the same legal entity name).
+
+**Why this matters for Task E (the return-bridge design, deferred)**:
+any future logic that tries to auto-match returning devices to their
+original export leg must classify strictly on DEVICE HISTORY (i.e. "was
+this specific IMEI on export shipment X's `shipment_lines`") and never on
+COUNTERPARTY NAME. If Task E ever used "returned from Syncere Wireless
+FZE" as a matching signal, it would silently conflate the OPR-repair
+return path with any unrelated commercial shipment from the same legal
+entity, causing wrong-shipment attribution. Filed as a design constraint
+for whoever eventually builds Task E, not a defect in current code (no
+such matching-by-counterparty logic exists today, confirmed by the read
+of `opr.ts:741-747`'s return-bridge check, which matches on
+`shipment_lines` device linkage only).
+
+
+## Addendum A39 (2026-09-12) — Task J, value reconciliation (Step 4)
+
+Production query, this session:
+```sql
+SELECT COUNT(*) as line_count,
+       SUM(CAST(ROUND(unit_value*100) AS INTEGER)) as total_pence
+FROM shipment_lines WHERE shipment_id = 1
+```
+Result: `line_count = 155`, `total_pence = 3603171` → **£36,031.71
+exactly**.
+
+Declared customs value (A37 above, from the authorisation/consignment
+reference data): **£36,031.71**.
+
+**Difference: £0.00.** The 155-line pence-sum matches the declared
+value exactly, to the penny.
+
+**What `TOTALS_CONSISTENT` actually checks — stated explicitly, per
+`oprValidation.ts:229-238`**: this check does NOT compare either total
+against the £36,031.71 declared-value figure at all. It computes the
+SAME 155 lines' total TWICE, via two different summation strategies —
+
+```js
+const invoiceTotal = sumLineValues(lines)                                   // pence-sum
+const scanOutTotal = Math.round(lines.reduce((s, l) => s + Number(l.unit_value), 0) * 100) / 100 // float-sum then round
+```
+
+— and passes only if those two internal computations agree with each
+other. It is a check that the invoice document and the scan-out document
+(A34-era code, `buildCommercialInvoiceHtml` and `buildScanOutList`) would
+render the same total as each other, guarding against floating-point
+summation drift between the two rendering paths — NOT a check that
+either total matches any externally-declared value field. There is no
+check anywhere in `runExportValidation`'s 12 checks that compares the
+computed line total against an external "declared value" field, because
+no such field exists on `shipments` — the £36,031.71 figure lives only
+in `opr_authorisations`/consignment reference data (A37), read-only
+context, never joined into `TOTALS_CONSISTENT`'s comparison.
+
+This session's £0.00 match is therefore a genuinely reassuring
+CONFIRMATION (the underlying figures are consistent across every source
+checked this session) but is not something `TOTALS_CONSISTENT` itself
+was ever designed to verify — that check would pass identically even if
+every unit_value were doubled, so long as both internal summations moved
+together.
+
+
+## Addendum A40 (2026-09-12) — customs rule set (design reference only, no build authorized this pass)
+
+Recorded verbatim as settled by the operator this session, for whoever
+eventually builds Task K/Task E:
+
+- **Chargeable repair** → export procedure `2100` + `000`, return
+  procedure `6121`, no `B02` (B02 void if chargeable).
+- **Guarantee repair** → export procedure `2200` + `B51`, return
+  procedure `6121` + `B02` (alternate primaries seen in the wild:
+  `6122`/`0121`/`5121`/`4221` — not all necessarily applicable to this
+  organisation's own declarations, recorded as context).
+- **Free-of-charge status binds irreversibly at export departure** — see
+  RELIEF_AT_RISK third cause (A41) for why this makes a later
+  chargeable-cost discovery a problem with the EXPORT declaration, not
+  just the relief claim.
+- **B02 is void** if the repair is chargeable, or if an extended
+  guarantee was separately purchased (post-original-warranty coverage
+  does not carry the same relief entitlement as the manufacturer's
+  original guarantee).
+
+### Task K (deferred design note)
+
+A required `repair_basis` header field
+(`CHARGEABLE`/`UNDER_GUARANTEE`, no default value permitted) that would
+validate the procedure-code PAIRS above at shipment-creation time.
+Motivation: today, nothing in `validateProcedureCodes` (`opr.ts:65-96`)
+enforces the 2100↔000 / 2200↔B51 pairing — that function only
+hard-blocks the single combination `2100`+`B51`; `2100`+`B02` and
+`2100`+`000` both currently pass as individually "valid" even though
+only one matches the operator's own stated policy for a given repair
+basis. Not built, not migrated, this pass.
+
+### Task E-SES (deferred, flagged real conflict)
+
+The return-bridge check (`opr.ts:741-747`) requires the returning device
+to already exist on the linked export's `shipment_lines` — i.e. it must
+be the SAME physical unit that went out. A Standard Exchange System
+(SES) repair, where the repairer ships back a DIFFERENT replacement
+handset rather than the original unit, fails this check by definition;
+it is not a bug in the current check, it is a scenario the current
+design does not model at all.
+
+Sketch for a future fix (not built, not migrated, this pass): add a
+`replacement_for_export_line_id` field on the return line, pointing at
+the original export's `shipment_lines` row it is standing in for,
+letting the return-bridge logic accept a non-identical IMEI when that
+field is populated and the original export line is confirmed SES-eligible.
+
+### RELIEF_AT_RISK, third cause
+
+Because free-of-charge status binds at export (see above), a `2200`+
+`B51` line for work that later turns out to have been chargeable makes
+the EXPORT DECLARATION ITSELF wrong — not merely the relief claim filed
+against it. This is a THIRD distinct cause of `RELIEF_AT_RISK` (see
+`.deploy-checks/zoho-outbound-reconnaissance-2026-09-09.md`'s existing
+"2B design note" section, filed 2026-09-11, for the first two: a
+per-device scrapped/lost-abroad cause, and a consignment-level
+wrong-regime-at-filing cause). Detection signal for this third cause:
+`repair_jobs.cost` arriving non-zero against a shipment line whose
+export carried `B51`. Not built, this pass — recorded as a design
+input for the eventual customs-relief-integrity agent, same as the
+existing 2B note.
+
+### `regime_confirmed`'s stated purpose
+
+Per Task G's schema (migration 0036, `regime_confirmed INTEGER NOT NULL
+DEFAULT 0`, confirmed present on production `shipments` this session):
+distinguishes "asked for B51 in the pre-alert" from "B51 actually
+present on the filed customs declaration." The operator named this
+explicitly, this session, as the SAME failure mode as this entire
+thread's origin: the FedEx pre-alert said GBLIV002 correctly, but the
+database carried the wrong office code (GBNCL001) unreconciled for 16
+days regardless — the pre-alert being right did not make the underlying
+record right. `regime_confirmed` exists so that a correct ask (the
+pre-alert) is never mistaken for a correct outcome (what was actually
+filed) — the two must be independently confirmed, not inferred from
+each other.
+
+
+## Addendum A41 (2026-09-12) — Step 6 close summary for this pass
+
+**Scope executed this pass** ("Task I deploy, then shipment-scoped
+procedure-code fix, then office reads," Option 1 as chosen by the
+operator):
+1. Migrations 0035+0036 deployed to production (confirmed live via
+   `d1_migrations` count and direct column-presence queries; Worker
+   bundle independently confirmed live via served `app.js` content,
+   separate from the schema check).
+2. Shipment 1 `additional_procedure_code` corrected `B02` → `000`
+   (verified by re-read).
+3. Shipment 1 `notes` reference token corrected `OPR-20260902-004-155`
+   → `OPR-20260902-003-155` (verified by re-read, `updated_at` stamped
+   on this write after a self-flagged omission on the write before it).
+4. Three read-only office checks completed (A35/A36 above): office-code
+   fact resolved in favour of GBLIV002 (no write); blast radius counted
+   at 1 shipment; live-vs-snapshot rendering confirmed LIVE, no
+   persisted snapshot anywhere; `EXP_SUPERVISING_OFFICE` severity
+   confirmed HARD BLOCK.
+5. Task J value reconciliation completed (A39): £0.00 difference,
+   `TOTALS_CONSISTENT`'s actual scope stated explicitly.
+6. Addenda A34-follow-up through A41 filed (this and the six sections
+   above).
+
+**Explicitly NOT done this pass** (all deferred by explicit operator
+instruction or genuine external unresolvability, not omission):
+- No write to `opr_authorisations` — the GBNCL001→GBLIV002 correction is
+  deferred to its own future, explicitly `opr_authorisations`-scoped
+  handshake.
+- No `/finalise` call on shipment 1 — it remains `DRAFT`, still red on
+  `EXP_SUPERVISING_OFFICE` (unchanged by anything writable at the
+  shipment level).
+- No runbook written.
+- No `/export-proof` call.
+- No code changes anywhere in `src/` this pass — every file listed under
+  "Files and Code Sections" this session was read-only.
+- The 003-vs-004 pre-alert-email fork (A34 follow-up above) remains
+  genuinely open — unverifiable from this sandbox, referred to the
+  operator's own sent-mail/FedEx record.
+- Task K (`repair_basis` field), Task E-SES
+  (`replacement_for_export_line_id`), and the customs-relief-integrity
+  agent implied by RELIEF_AT_RISK's three causes are all design notes
+  only — none built, none migrated.
+
+**Verbatim closing figures, this session**:
+- Local HEAD: `a777cf4e6a94633fea93d2ff1b8e5ff8215380a0`
+- `origin/main`: `a777cf4e6a94633fea93d2ff1b8e5ff8215380a0` (confirmed
+  live via `git ls-remote`, this session)
+- `genspark/main`: `a777cf4e6a94633fea93d2ff1b8e5ff8215380a0` (confirmed
+  live via authenticated `git ls-remote`, this session)
+- Working tree: clean
+- Serial suite: 65 passed / 0 failed / 0 skipped (65 total) — not
+  re-run this pass (no code changed since prior pass's run)
+- Main suite (accepted baseline per standing ruling): 672 passed / 0
+  failed / 8 skipped (680 total) — not re-run this pass
+- Combined: 737 passed / 0 failed / 8 skipped (745 total)
