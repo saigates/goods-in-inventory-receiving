@@ -643,10 +643,21 @@ app.patch('/shipments/:id', async (c) => {
   // — see A35/A38 addenda). display_label: free text, independent of
   // the immutable system `reference`; null means "fall back to
   // reference" at read time, enforced by callers, not by this column.
+  //
+  // Charset note (Task O addendum): display_label is NOT read by
+  // DECLARATION_TEXT or any other check in oprValidation.ts today — grep
+  // confirmed zero references outside this route. Real-world external
+  // references (e.g. operator-format "OPR-20260902-003-155") use hyphens,
+  // so display_label gets its OWN, slightly looser charset guard
+  // (letters/numbers/spaces/hyphens) rather than reusing
+  // isDeclarationSafeText verbatim — reference and consignee_name keep the
+  // stricter declaration-only charset unchanged. If display_label is ever
+  // wired into declaration text, this guard must be revisited alongside
+  // that change, not before.
   if (body.consignee_code !== undefined) fields.consignee_code = cleanString(body.consignee_code, 60)
   if (body.display_label !== undefined) {
     const v = cleanString(body.display_label, 60)
-    if (v && !isDeclarationSafeText(v)) return c.json({ error: 'display_label may contain letters, numbers and spaces only' }, 422)
+    if (v && !/^[A-Za-z0-9 -]+$/.test(v)) return c.json({ error: 'display_label may contain letters, numbers, spaces and hyphens only' }, 422)
     fields.display_label = v
   }
 

@@ -482,11 +482,20 @@ describe('Task L — owner-only DRAFT editing (PATCH /shipments/:id)', () => {
     expect(data.shipment.display_label).toBe('Syncere repair run 1')
   })
 
-  it('display_label rejects declaration-unsafe characters, same charset rule as consignee_name', async () => {
+  it('display_label rejects declaration-unsafe characters (slash, exclamation) even under its looser hyphen-permitting charset', async () => {
     const res = await api(`/api/opr/shipments/${shipmentId}`, {
       method: 'PATCH', body: JSON.stringify({ display_label: 'Bad/label!' }),
     })
     expect(res.status).toBe(422)
+  })
+
+  it('display_label accepts hyphens (Task O addendum) — real external references like "OPR-20260902-003-155" are not stopped by the declaration-only charset', async () => {
+    const res = await api(`/api/opr/shipments/${shipmentId}`, {
+      method: 'PATCH', body: JSON.stringify({ display_label: 'OPR-20260902-003-155' }),
+    })
+    expect(res.status).toBe(200)
+    const data = await res.json() as { shipment: { display_label: string } }
+    expect(data.shipment.display_label).toBe('OPR-20260902-003-155')
   })
 
   it('PATCH response surfaces validation inline — red on a bad procedure code, without a separate GET /validation call', async () => {
