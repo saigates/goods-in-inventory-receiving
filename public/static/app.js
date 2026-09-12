@@ -204,6 +204,7 @@
     oprFinaliseOpen: false,      // finalise modal (export MRN capture)
     oprDraftDoc: null,           // { kind: 'prealert'|'clearance', data } text-draft panel
     oprBusy: false,              // in-flight guard for OPR mutations
+    oprEditOpen: false,          // Task Q — DRAFT header-edit card expanded/collapsed
     // ───── Devices tab (status-movement / repair queue / QC / removal flags) ─────
     devicesSubview: 'all',       // 'all' | 'repair' | 'qc-failed' | 'ready-zoho' | 'removal-flags'
     deviceStatuses: null,        // { statuses, transitions } from GET /api/devices/meta/statuses
@@ -780,6 +781,16 @@
   function isManagerOrAdmin() {
     const role = state.authUser && state.authUser.role;
     return role === 'manager' || role === 'admin';
+  }
+  // Task Q — mirrors the server's requireAdmin() gate on PATCH
+  // /opr/shipments/:id exactly (src/routes/opr.ts): role === 'admin',
+  // never a literal 'owner' check (no 'owner' role value exists in the
+  // schema — see the Task L addenda). This is UI decluttering ONLY: the
+  // route enforces the real 403, this just avoids showing a control that
+  // would fail for the current user.
+  function isAdmin() {
+    const role = state.authUser && state.authUser.role;
+    return role === 'admin';
   }
   function deviceStatusBadge(s) {
     const cls = {
@@ -2284,6 +2295,16 @@
         OprFact('Declared value', fmtMoney(b.total_value, s.currency), 'coins'),
       ),
 
+      // Task Q — DRAFT header-edit card. Gated on isDraft (mirrors the
+      // route's own 409 DRAFT-only gate) && isAdmin() (mirrors the route's
+      // own 403 owner-only gate) — hiding the affordance here is UI
+      // decluttering only; the route enforces both for real. Applies to
+      // BOTH export and import DRAFT shipments (the PATCH route itself is
+      // direction-agnostic for these fields), and to TEMP_EXPORT_STANDARD
+      // too — display_label/consignee_name/etc. are not customs-declaration
+      // fields, unlike the blocks above that hide for isStandardTemp.
+      isDraft && isAdmin() ? OprHeaderEditCard(s) : null,
+
       // Export proof card (FINALISED exports) — record/replace MRN / DUCR /
       // EAD / MUCR after the fact (e.g. when the carrier's declaration or
       // consolidation reference lands later). The only mutation a FINALISED
@@ -2458,6 +2479,134 @@
     return h('div', { class: 'card p-4' },
       h('div', { class: 'text-[10px] uppercase text-slate-500 mb-1' }, h('i', { class: `fas fa-${icon} mr-1` }), label),
       h('div', { class: 'text-sm font-semibold mono truncate', title: String(value) }, value)
+    );
+  }
+
+  // Task Q — DRAFT header-edit card. Wraps the PATCH /opr/shipments/:id
+  // route Task L built (owner-only, DRAFT-only, no route/validation changes
+  // in this pass). Fields are exactly the set the route already accepts and
+  // the operator asked for, in the order they asked for it: display_label,
+  // consignee_name, consignee_address, consignee_code, incoterm, ship_date,
+  // carrier, carrier_account, notes.
+  //
+  // `reference` is deliberately ABSENT — not shown, not greyed out. It is
+  // the immutable system key; display_label is the editable "name" the
+  // operator sees on screen everywhere else.
+  //
+  // ship_date carries extra weight: moving it can cross the effective-dated
+  // export_procedure_policy_defaults boundary (EXP_PROCEDURE_CODE /
+  // EXP_SUPERVISING_OFFICE) and silently invalidate a previously-green
+  // shipment. The route already re-runs the full validation engine and
+  // returns it inline on every save — this card surfaces that result as a
+  // traffic light + the failing check codes, not a bare "saved" toast, so a
+  // date edit that breaks the policy match is visible immediately, not
+  // discovered later at finalise.
+  //
+  // Visibility, mirroring OprExportProofCard/OprRepairInvoiceCard's own
+  // gating style: only rendered for isDraft && isAdmin(). The route's own
+  // 403 (non-admin) and 409 (non-DRAFT) are the real enforcement; hiding the
+  // affordance here is purely so a non-owner or a FINALISED shipment never
+  // sees a control that would fail — never the other way around.
+  function OprHeaderEditCard(s) {
+    const f = {
+      display_label: s.display_label || '',
+      consignee_name: s.consignee_name || '',
+      consignee_address: s.consignee_address || '',
+      consignee_code: s.consignee_code || '',
+      incoterm: s.incoterm || '',
+      ship_date: s.ship_date || '',
+      carrier: s.carrier || '',
+      carrier_account: s.carrier_account || '',
+      notes: s.notes || '',
+    };
+    let saveResult = null; // { ok: true/false, validation? , error? } — shown inline, replaces bare toast
+    const save = async () => {
+      const body = {
+        display_label: f.display_label.trim(),
+        consignee_name: f.consignee_name.trim(),
+        consignee_address: f.consignee_address.trim(),
+        consignee_code: f.consignee_code.trim(),
+        incoterm: f.incoterm.trim(),
+        ship_date: f.ship_date || null,
+        carrier: f.carrier.trim(),
+        carrier_account: f.carrier_account.trim(),
+        notes: f.notes.trim(),
+      };
+      try {
+        const r = await http.patch(`/opr/shipments/${s.id}`, body);
+        saveResult = { ok: true, validation: r.validation || null };
+        toast('Consignment details saved', 'ok');
+        await refreshOprDetail(); render();
+      } catch (err) {
+        saveResult = { ok: false, error: err.response?.data?.error || err.message };
+        toast(saveResult.error, 'err', 6000);
+        render();
+      }
+    };
+    const Text = (label, key, placeholder, maxlen) => h('div', {},
+      h('label', { class: 'text-xs text-slate-400 mb-1 block' }, label),
+      h('input', { class: 'input', placeholder, maxlength: maxlen || null, value: f[key],
+        oninput: (e) => { f[key] = e.target.value; } }));
+    // Inline validation result — shown ONLY after a save (saveResult set),
+    // never on first render. red_count > 0 is the same red/amber/green
+    // wording the top-of-page traffic-light card already uses, so a
+    // ship_date edit that breaks EXP_PROCEDURE_CODE / EXP_SUPERVISING_OFFICE
+    // (or any other check) is visible right where the edit happened, not
+    // just at the top of the page after a re-render.
+    const resultBanner = () => {
+      if (!saveResult) return null;
+      if (!saveResult.ok) {
+        return h('div', { class: 'text-xs text-red-400 mt-2', id: 'opr-edit-save-error' }, saveResult.error);
+      }
+      const v = saveResult.validation;
+      if (!v) return h('div', { class: 'text-xs text-slate-500 mt-2' }, 'Saved — no validation result returned for this shipment.');
+      const failing = v.checks.filter(c2 => c2.level !== 'green');
+      return h('div', { class: 'mt-2', id: 'opr-edit-save-validation' },
+        h('span', { class: 'badge ' + (v.result === 'green' ? 'badge-green' : v.result === 'amber' ? 'badge-amber' : 'badge-red') },
+          h('i', { class: 'fas fa-' + (v.result === 'green' ? 'check' : v.result === 'amber' ? 'triangle-exclamation' : 'ban') + ' mr-1' }),
+          v.result.toUpperCase(), ` after save (red_count=${v.red_count}, amber_count=${v.amber_count})`),
+        failing.length ? h('div', { class: 'text-xs text-slate-400 mt-1' },
+          failing.map(c2 => h('div', {}, h('span', { class: 'mono text-slate-500' }, c2.code + ': '), c2.message))) : null);
+    };
+    return h('div', { class: 'card p-4', id: 'opr-edit-card' },
+      h('div', { class: 'flex items-center justify-between mb-3' },
+        h('div', { class: 'flex items-center gap-2' },
+          h('i', { class: 'fas fa-pen-to-square text-cyan-400' }),
+          h('h3', { class: 'font-semibold text-sm' }, 'Edit consignment details'),
+          h('span', { class: 'text-[11px] text-slate-500' }, 'DRAFT only — the system reference stays fixed; this is everything else.')
+        ),
+        h('button', { class: 'btn btn-ghost text-xs', id: 'opr-edit-toggle',
+          onclick: () => { state.oprEditOpen = !state.oprEditOpen; saveResult = null; render(); } },
+          h('i', { class: 'fas fa-' + (state.oprEditOpen ? 'chevron-up' : 'chevron-down') }),
+          state.oprEditOpen ? 'Hide' : 'Edit')
+      ),
+      !state.oprEditOpen ? null : h('div', {},
+        h('div', { class: 'grid grid-cols-2 md:grid-cols-3 gap-3' },
+          Text('Display label', 'display_label', 'e.g. OPR-20260902-003-155 (shown in place of the system reference)', 60),
+          Text('Consignee (overseas repairer)', 'consignee_name', 'Syncere Wireless FZE', 200),
+          Text('Consignee code', 'consignee_code', 'e.g. vendor/counterparty code', 60),
+          Text('Incoterm', 'incoterm', 'DAP', 10),
+          h('div', {},
+            h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Ship date',
+              h('span', { class: 'block text-[10px] text-amber-400/80 font-normal' }, 'Can move this shipment across a policy boundary — check the result below after saving.')),
+            h('input', { class: 'input mono', type: 'date', value: f.ship_date, oninput: (e) => { f.ship_date = e.target.value; } })),
+          Text('Carrier', 'carrier', 'FedEx', 100),
+          Text('Carrier account', 'carrier_account', '', 100)
+        ),
+        h('div', { class: 'mt-3' },
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Consignee address'),
+          h('textarea', { class: 'input', rows: 2, oninput: (e) => { f.consignee_address = e.target.value; } }, f.consignee_address)
+        ),
+        h('div', { class: 'mt-3' },
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Notes'),
+          h('textarea', { class: 'input', rows: 3, oninput: (e) => { f.notes = e.target.value; } }, f.notes)
+        ),
+        resultBanner(),
+        h('div', { class: 'flex justify-end mt-3' },
+          h('button', { id: 'opr-edit-save', class: 'btn btn-primary text-xs', onclick: save },
+            h('i', { class: 'fas fa-floppy-disk' }), 'Save changes')
+        )
+      )
     );
   }
 
