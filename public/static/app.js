@@ -2520,7 +2520,7 @@
         Field('Export MRN', 'export_mrn', s.export_mrn, '26GB34F7Y1AB8CDE12'),
         Field('DUCR', 'ducr', s.ducr, '6GB369979995000-EXP…'),
         Field('EAD MRN', 'ead_mrn', s.ead_mrn, '(optional)'),
-        Field('MUCR', 'mucr', s.mucr, 'GB/SGAT-12345678'),
+        Field('MUCR', 'mucr', s.mucr, 'optional — leave blank unless consolidated'),
         Field('Tracking / AWB', 'tracking_reference', s.tracking_reference, 'FDX-AWB-998877665544'),
         Field('Pre-alert date', 'prealert_date', s.prealert_date, '', 'date')
       ),
@@ -2791,7 +2791,7 @@
             ? [Field('Export MRN', 'export_mrn', '26GB34F7Y1AB8CDE12'),
                Field('DUCR', 'ducr', '6GB369979995000-EXP2026001'),
                Field('EAD MRN', 'ead_mrn', '(optional)'),
-               Field('MUCR (master UCR)', 'mucr', 'GB/SGAT-12345678 (optional)')]
+               Field('MUCR (master UCR)', 'mucr', 'optional — leave blank unless consolidated')]
             : Field('Import MRN (6121 declaration)', 'import_mrn', '26GB89E4Q2CD7FGH34')
         ),
         h('div', { class: 'flex justify-end gap-2 mt-5' },
