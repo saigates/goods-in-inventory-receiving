@@ -1,10 +1,11 @@
-# Standing constraints — read this before touching bulk queries or auth probes
+# Standing constraints — read this before touching bulk queries, auth probes, or deploy
 
-Docs-only. No handshake, no deploy, no code change accompanies this file.
-Recorded 2026-09-14, after the Task Z read-only pass and the deploy-state
-reconciliation earlier the same day. These four facts carry the same
-weight as the credential wall (i.e.: forgetting one of them WILL produce
-a production incident or a wasted investigation, not just a style nit).
+Docs-only. No handshake, no deploy, no code change accompanies this file
+(this update included). Recorded 2026-09-14, after the Task Z read-only
+pass, the deploy-state reconciliation, and the Task U/W deploy itself.
+These five facts carry the same weight as the credential wall (i.e.:
+forgetting one of them WILL produce a production incident, a burned
+handshake, or a wasted investigation, not just a style nit).
 
 ## 1. D1 bound-parameter cap = 100 per query
 
@@ -87,9 +88,49 @@ checks.)
 `gsk hosted deploy` always returns `pending_approval` with a
 `pending_action_id` and an `expires_at` TTL. Only the operator's own
 banner click or explicit typed confirmation naming that ID constitutes
-approval. Two consecutive handshakes have already expired unapproved
-(`920b2f05...` for Task U, `6912107f...` for Task W) — both confirmed
-via direct `action_status` query, not assumed. Report the TTL
+approval. Two consecutive handshakes expired unapproved before this one
+landed (`920b2f05...` for Task U, `6912107f...` for Task W) — both
+confirmed via direct `action_status` query, not assumed. A failed
+action's approval does not carry forward to a resubmission — a new
+`pending_action_id` requires a fresh, explicit approval naming that new
+ID (see §5 below for why the resubmission was needed). Report the TTL
 prominently on every future submission so the operator can time their
 click; do not resubmit a second time without the operator's explicit
 go-ahead if a handshake expires again.
+
+## 5. Deploy packages the sandbox directory tree, not the git tree
+
+**`git status --porcelain` clean is necessary but NOT sufficient
+evidence that a deploy will succeed.** The Cloudflare Workers for
+Platform deploy pipeline packages the actual sandbox filesystem, not
+just git-tracked files — a git-ignored artifact left on disk (log file,
+core dump, cache, anything) still gets bundled into the source tree and
+counts against the platform's 500MB uncompressed size limit, even
+though it will never show up in `git diff` or a commit.
+
+**What happened (2026-09-14, first Task U/W deploy attempt):** a
+608MB `workerd` crash-dump file (`core`, git-ignored, never tracked)
+was sitting in `/home/user/webapp/` — left behind by stray duplicate
+`vitest`/`workerd` processes from an earlier attempt to get a clean
+test-suite summary line, which had to be killed. `git status` was
+clean; the deploy still failed: `Source tree exceeds the uncompressed
+size limit (500MB); largest so far: core (579MB)`. The approved action
+(`155d494f...`) executed and failed — terminal, not retryable — costing
+one handshake. Root cause found, file deleted, resubmitted as a new
+action (`1bcd49cb...`), fresh approval obtained, deploy succeeded.
+
+**Standing pre-submit step, from now on:** before calling
+`gsk hosted deploy`, run something equivalent to:
+```
+du -sh --exclude=node_modules --exclude=.git --exclude=dist .
+```
+and flag anything over ~50MB before submitting. **28MB is the
+known-good figure** for this project's actual source (everything
+excluding `node_modules`/`.git`/`dist`). This turns this whole class of
+failure into a pre-submit warning instead of a burned handshake.
+
+Also worth noting: `ulimit -c` in this sandbox is `unlimited`, so any
+future `workerd`/`node` crash can silently deposit another large core
+file. The size check above catches it either way, but it's the reason
+this class of stray artifact can recur without any code change on our
+part.
