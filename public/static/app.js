@@ -3739,26 +3739,34 @@ into each Condition, each VAT Type, and each Currency.`;
           ),
           h('div', { class: 'border border-slate-800 rounded-lg overflow-hidden' },
             h('table', { class: 'w-full text-xs' },
+              // Task W (2026-09-14 DEVELOPER INSTRUCTION) — display-only
+              // reorder to IMEI · OEM · Model No. · Storage · Colour · Grade,
+              // with Description moved to a 7th column at the far right
+              // (still parsed/stored, just deprioritised here — not dropped,
+              // pending the operator's confirmation on the mapping-smell
+              // question below). No parser/mapping/route change: r.* field
+              // names are untouched, only cell order + the "Colour" UI label
+              // (was "Color") changed.
               h('thead', { class: 'bg-slate-900/50 text-slate-400' },
                 h('tr', {},
-                  h('th', { class: 'text-left px-3 py-2' }, 'OEM'),
-                  h('th', { class: 'text-left px-3 py-2' }, 'Description'),
-                  h('th', { class: 'text-left px-3 py-2' }, 'Storage'),
-                  h('th', { class: 'text-left px-3 py-2' }, 'Color'),
-                  h('th', { class: 'text-left px-3 py-2' }, 'Grade'),
-                  h('th', { class: 'text-left px-3 py-2' }, 'Model No.'),
                   h('th', { class: 'text-left px-3 py-2' }, 'IMEI'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'OEM'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Model No.'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Storage'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Colour'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Grade'),
+                  h('th', { class: 'text-left px-3 py-2' }, 'Description'),
                 )
               ),
               h('tbody', { class: 'divide-y divide-slate-800' },
                 uploadCtx.rows.slice(0, 5).map(r => h('tr', {},
+                  h('td', { class: 'px-3 py-2 mono' }, r.imei),
                   h('td', { class: 'px-3 py-2' }, r.oem || '—'),
-                  h('td', { class: 'px-3 py-2' }, r.description || '—'),
+                  h('td', { class: 'px-3 py-2 mono' }, r.model_no || '—'),
                   h('td', { class: 'px-3 py-2' }, r.capacity || '—'),
                   h('td', { class: 'px-3 py-2' }, r.color || '—'),
                   h('td', { class: 'px-3 py-2' }, r.grade || '—'),
-                  h('td', { class: 'px-3 py-2 mono' }, r.model_no || '—'),
-                  h('td', { class: 'px-3 py-2 mono' }, r.imei),
+                  h('td', { class: 'px-3 py-2' }, r.description || '—'),
                 ))
               )
             )
