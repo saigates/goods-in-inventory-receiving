@@ -10,10 +10,11 @@ import { Hono } from 'hono'
 import { stream } from 'hono/streaming'
 import type { Bindings, AuthUser, DeviceStatus } from '../types'
 import { currentUser } from '../lib/auth'
-import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, TransitionGateError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES, REJECT_REASON_CODES, UNREJECT_REASON_CODES, checkRejectUnrejectGate } from '../lib/deviceLifecycle'
+import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, TransitionGateError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES, REJECT_REASON_CODES, UNREJECT_REASON_CODES, checkRejectUnrejectGate, logDeviceEvent } from '../lib/deviceLifecycle'
 import { dispatchDeviceStatusWebhooks } from '../lib/webhook'
 import { startRepair, scanBackRepair, recordQc, reopenRepair, closeToInventory, recordRepairCost, postRepairCostToLedger, RepairJobError } from '../lib/repairWorkflow'
 import { postPurchaseCostToLedger, CostEntryError } from '../lib/costEntry'
+import { cleanString } from '../lib/validate'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -114,6 +115,206 @@ app.get('/:id', async (c) => {
   ).bind(id, user.organisation_id).all()
 
   return c.json({ device, events })
+})
+
+// ───────── Task X — one-off device correction (2026-09-14) ─────────
+// PATCH /:id/correct — the owner-driven fix for a device that was scanned
+// in with the wrong SKU/colour/grade (e.g. IMEI 355178160488248, catalogued
+// as MIDNIGHT when the physical device is a different colour). This is
+// NOT the bulk /grade re-resolution path above (that fires on a grade
+// CHANGE and is available to any operator); this is a single-device,
+// owner-only, catalogue-driven correction of a scanning mistake, and
+// IMEI is always excluded from what it may touch.
+//
+// Owner gate: same "owner has no distinct role value, so owner === role
+// 'admin'" resolution as Task L (see opr.ts:587-608's requireAdmin
+// comment) — duplicated here as a local boolean helper rather than a
+// shared import, matching this file's own requireManager() convention
+// (line ~733) rather than opr.ts's Response-returning requireAdmin().
+function requireOwner(c: any): boolean {
+  return (c.var.user as AuthUser).role === 'admin'
+}
+
+// Pre-commitment gate: a device may be corrected only while it is NOT
+// externally committed. "Committed" is defined as the union of the two
+// existing named families the codebase already treats as
+// consignment/sale-locked — OPR_WORKFLOW_ONLY_STATUSES (in/under an
+// export or temp-export consignment, in either direction) — plus SOLD
+// (committed to a buyer, via Zoho or otherwise). Every other status,
+// INCLUDING REJECTED and the repair-workflow statuses, is pre-commitment
+// and therefore correctable: a rejected or mid-repair device can still
+// have its catalogue-line details fixed.
+const CORRECTION_LOCKED_STATUSES: readonly DeviceStatus[] = [
+  ...OPR_WORKFLOW_ONLY_STATUSES,
+  'SOLD',
+]
+
+app.patch('/:id/correct', async (c) => {
+  const user = currentUser(c)
+  const orgId = user.organisation_id
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+
+  if (!requireOwner(c)) {
+    return c.json({ error: `Only the owner (admin role) may correct a device — current role is '${user.role}'` }, 403)
+  }
+
+  const body = await c.req.json<{
+    sku?: string
+    reason?: string
+    also_correct_manifest_line?: boolean
+    imei?: unknown
+  }>().catch(() => ({} as any))
+
+  // IMEI is immutable on this route — its presence in the body at all is
+  // rejected, regardless of value, so a client can never even attempt to
+  // slip a changed IMEI through alongside a legitimate SKU correction.
+  if (Object.prototype.hasOwnProperty.call(body, 'imei')) {
+    return c.json({ error: 'imei is immutable and may not be included in a correction request' }, 422)
+  }
+
+  const reason = cleanString(body.reason, 500)
+  if (!reason) {
+    return c.json({ error: 'reason is required — a free-text explanation of what was wrong and why' }, 422)
+  }
+
+  const newSku = cleanString(body.sku, 64)
+  if (!newSku) {
+    return c.json({ error: 'sku is required — pick a SKU from the catalogue picker' }, 422)
+  }
+
+  const device = await c.env.DB.prepare(
+    'SELECT * FROM received_devices WHERE id = ? AND organisation_id = ?'
+  ).bind(id, orgId).first<Record<string, unknown>>()
+  if (!device) return c.json({ error: 'Not found' }, 404)
+
+  if (CORRECTION_LOCKED_STATUSES.includes(device.status as DeviceStatus)) {
+    return c.json({
+      error: `Device is ${device.status} — it is committed to a consignment or sale and can no longer be corrected via this route`,
+    }, 409)
+  }
+
+  // SKU must resolve to a real catalogue row for this organisation — no
+  // free-text SKU, ever (see catalog.ts's own "the catalog is the source
+  // of truth" header note). Colour and grade are DERIVED from the chosen
+  // row, never independently editable — this is what stops the correction
+  // from silently re-introducing the exact grade/SKU disagreement that
+  // motivated the existing SKU_CORRECTION event type in inventory.ts.
+  const catalogRow = await c.env.DB.prepare(
+    'SELECT sku, brand, model, capacity, color, grade FROM sku_catalog WHERE organisation_id = ? AND sku = ?'
+  ).bind(orgId, newSku).first<{ sku: string; brand: string; model: string; capacity: string | null; color: string | null; grade: string | null }>()
+  if (!catalogRow) {
+    return c.json({ error: `SKU '${newSku}' is not in the catalogue — pick one from the catalogue picker` }, 422)
+  }
+
+  const oldSku = String(device.sku ?? '')
+  const oldColor = device.color ?? null
+  const oldGrade = String(device.grade ?? '')
+  const newColor = catalogRow.color ?? null
+  const newGrade = catalogRow.grade ?? oldGrade
+
+  const stmts = [
+    c.env.DB.prepare(
+      `UPDATE received_devices
+         SET sku = ?, brand = ?, model = ?, capacity = ?, color = ?, grade = ?
+       WHERE id = ? AND organisation_id = ?`
+    ).bind(catalogRow.sku, catalogRow.brand, catalogRow.model, catalogRow.capacity, catalogRow.color, newGrade, id, orgId),
+  ]
+
+  // Print-job invalidation/re-queue — same pattern as inventory.ts:365-398
+  // (any queued, not-yet-printed label was rendered with the OLD sku/
+  // colour/grade baked into its payload; a 'sent' job is left alone,
+  // since the physical label is already printed and nothing here can
+  // un-print it).
+  const { results: queuedJobs } = await c.env.DB.prepare(
+    `SELECT id FROM print_jobs WHERE received_device_id = ? AND organisation_id = ? AND status = 'queued'`
+  ).bind(id, orgId).all<{ id: number }>()
+  for (const job of queuedJobs) {
+    stmts.push(c.env.DB.prepare("UPDATE print_jobs SET status = 'invalidated' WHERE id = ?").bind(job.id))
+  }
+  if (queuedJobs.length) {
+    const payload = {
+      uuid: device.uuid, sku: catalogRow.sku, imei: device.imei,
+      brand: catalogRow.brand, model: catalogRow.model, capacity: catalogRow.capacity, color: catalogRow.color, grade: newGrade,
+    }
+    stmts.push(
+      c.env.DB.prepare(
+        `INSERT INTO print_jobs (organisation_id, received_device_id, payload_json, created_by_user_id) VALUES (?, ?, ?, ?)`
+      ).bind(orgId, id, JSON.stringify(payload), user.id)
+    )
+  }
+
+  await c.env.DB.batch(stmts)
+
+  await logDeviceEvent(c.env.DB, {
+    organisationId: orgId, deviceId: id, eventType: 'SKU_CORRECTION', userId: user.id,
+    metadata: {
+      reason,
+      old_sku: oldSku, new_sku: catalogRow.sku,
+      old_color: oldColor, new_color: newColor,
+      old_grade: oldGrade, new_grade: newGrade,
+      print_jobs_invalidated: queuedJobs.map(j => j.id),
+      print_jobs_requeued: queuedJobs.length,
+    },
+  })
+
+  // Downstream bill-line flag: informational only (no `needs_review`/flag
+  // column exists on bill_lines or bill_line_serials today — confirmed
+  // against migrations/0028 — so this is reported to the caller, not
+  // written to the DB, until such a column is asked for).
+  const { results: billLineRows } = await c.env.DB.prepare(
+    `SELECT bl.id AS bill_line_id, bl.bill_id, bl.sku AS bill_line_sku
+       FROM bill_line_serials bls
+       JOIN bill_lines bl ON bl.id = bls.bill_line_id
+      WHERE bls.received_device_id = ? AND bls.organisation_id = ?`
+  ).bind(id, orgId).all<{ bill_line_id: number; bill_id: number; bill_line_sku: string | null }>()
+  const billLinesFlagged = billLineRows.filter(r => r.bill_line_sku && r.bill_line_sku !== catalogRow.sku)
+
+  // Prompt-not-cascade: correct received_devices directly (done above,
+  // unconditionally); the linked expected_devices row (the manifest line
+  // — evidence of what the supplier originally said) is only ever
+  // touched if the caller explicitly opts in via
+  // also_correct_manifest_line, on THIS same call. Otherwise the response
+  // signals the mismatch so the frontend can show a second confirmation
+  // prompt, and a caller who wants to apply it makes a second PATCH with
+  // also_correct_manifest_line: true.
+  let manifestLineAlsoWrong = false
+  let manifestLine: Record<string, unknown> | null = null
+  if (device.expected_device_id) {
+    const expectedRow = await c.env.DB.prepare(
+      'SELECT id, sku, model_no, description, oem, grade FROM expected_devices WHERE id = ? AND organisation_id = ?'
+    ).bind(device.expected_device_id, orgId).first<Record<string, unknown>>()
+    if (expectedRow && String(expectedRow.sku ?? '') === oldSku) {
+      manifestLineAlsoWrong = true
+      manifestLine = expectedRow
+      if (body.also_correct_manifest_line === true) {
+        await c.env.DB.prepare('UPDATE expected_devices SET sku = ? WHERE id = ? AND organisation_id = ?')
+          .bind(catalogRow.sku, expectedRow.id, orgId).run()
+        await logDeviceEvent(c.env.DB, {
+          organisationId: orgId, deviceId: id, eventType: 'SKU_CORRECTION', userId: user.id,
+          metadata: {
+            reason, target: 'expected_devices', expected_device_id: expectedRow.id,
+            old_sku: oldSku, new_sku: catalogRow.sku,
+          },
+        })
+        manifestLineAlsoWrong = false // resolved in this same call
+      }
+    }
+  }
+
+  const { results: freshEvents } = await c.env.DB.prepare(
+    'SELECT * FROM device_events WHERE device_id = ? AND organisation_id = ? ORDER BY id DESC LIMIT 5'
+  ).bind(id, orgId).all()
+
+  return c.json({
+    ok: true,
+    device: { id, sku: catalogRow.sku, brand: catalogRow.brand, model: catalogRow.model, capacity: catalogRow.capacity, color: catalogRow.color, grade: newGrade },
+    events: freshEvents,
+    print_jobs_invalidated: queuedJobs.length,
+    bill_lines_flagged: billLinesFlagged,
+    manifest_line_also_wrong: manifestLineAlsoWrong,
+    manifest_line: manifestLineAlsoWrong ? manifestLine : null,
+  })
 })
 
 // GET /api/devices/export/csv?status=&source=&ids=  — CSV export for a
