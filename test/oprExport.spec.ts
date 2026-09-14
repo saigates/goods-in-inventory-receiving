@@ -813,6 +813,186 @@ describe('finalisation', () => {
   })
 })
 
+// Task U (2026-09-14 DEVELOPER INSTRUCTION, post-incident) — finalise/resume.
+// Production case that motivated this: shipment 1 (OPR20260826003)
+// finalised with only 52/155 devices reaching EXPORTED_UNDER_OPR — the
+// caller's browser disconnected mid-loop, the shipment had already
+// flipped to FINALISED (that UPDATE runs before the transition loop), and
+// there was no existing route able to move the other 103 (finalise is
+// DRAFT-gated and refuses to re-run). These tests exercise the recovery
+// route and the batched original loop's own regression coverage.
+describe('finalise/resume — recovery for a stuck FINALISED shipment', () => {
+  it('403 for a non-admin (operator role) — resume rejected, same gate as PATCH', async () => {
+    const shipment = await makeShipment()
+    const operatorToken = await signAuthToken(JWT_SECRET, {
+      id: 900, email: 'ops-resume-fixture@example.com', name: 'Ops Fixture', role: 'operator', organisation_id: 1,
+    })
+    const res = await app.request(`/api/opr/shipments/${shipment.id}/finalise/resume`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${operatorToken}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    }, testEnv)
+    expect(res.status).toBe(403)
+    const body = await res.json() as { error: string }
+    expect(body.error).toMatch(/admin/i)
+  })
+
+  it('409 when shipment is DRAFT — resume only applies to a FINALISED shipment', async () => {
+    const shipment = await makeShipment()
+    const res = await api(`/api/opr/shipments/${shipment.id}/finalise/resume`, { method: 'POST', body: '{}' })
+    expect(res.status).toBe(409)
+    const body = await res.json() as { error: string }
+    expect(body.error).toMatch(/FINALISED/)
+  })
+
+  it('happy path: a FINALISED shipment with devices stranded IN_EXPORT_CONSIGNMENT — resume moves them, reports moved/remaining', async () => {
+    const shipment = await makeShipment()
+    const devices = [] as Array<{ id: number; imei: string }>
+    for (let i = 0; i < 5; i++) devices.push(await makeDevice())
+    for (const d of devices) {
+      const r = await api(`/api/opr/shipments/${shipment.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: d.imei }) })
+      expect(r.status).toBe(201)
+    }
+    const fin = await api(`/api/opr/shipments/${shipment.id}/finalise`, {
+      method: 'POST', body: JSON.stringify({ export_mrn: '26GB1111111111111' }),
+    })
+    expect(fin.status).toBe(200)
+    for (const d of devices) expect(await deviceStatus(d.id)).toBe('EXPORTED_UNDER_OPR')
+
+    // Simulate the production incident directly: 2 of the 5 devices get
+    // knocked back to IN_EXPORT_CONSIGNMENT out-of-band (as if their
+    // transitionDevice call never happened because the request died
+    // first) on an ALREADY-FINALISED shipment — the exact stuck state
+    // finalise itself can no longer reach (DRAFT-gated).
+    await env.DB.prepare("UPDATE received_devices SET status = 'IN_EXPORT_CONSIGNMENT' WHERE id IN (?, ?)")
+      .bind(devices[3].id, devices[4].id).run()
+
+    const resume = await api(`/api/opr/shipments/${shipment.id}/finalise/resume`, { method: 'POST', body: '{}' })
+    expect(resume.status).toBe(200)
+    const data = await resume.json() as { moved: number; remaining: number }
+    expect(data.moved).toBe(2)
+    expect(data.remaining).toBe(0)
+    for (const d of devices) expect(await deviceStatus(d.id)).toBe('EXPORTED_UNDER_OPR')
+
+    // Event-logged, tagged resumed:true — distinguishable from the
+    // original finalise's transitions by metadata, not by eventType (both
+    // are EXPORT_FINALISED — same customs-relevant event, different cause).
+    const ev = await latestEvent(devices[4].id)
+    expect(ev!.event_type).toBe('EXPORT_FINALISED')
+    const meta = JSON.parse(String(ev!.metadata))
+    expect(meta.resumed).toBe(true)
+    expect(meta.export_mrn).toBe('26GB1111111111111')
+  })
+
+  it('one batch per call: >25 stranded devices only moves the first 25, remaining stays accurate, second call clears the rest', async () => {
+    const shipment = await makeShipment()
+    const devices = [] as Array<{ id: number; imei: string }>
+    for (let i = 0; i < 30; i++) devices.push(await makeDevice())
+    for (const d of devices) {
+      const r = await api(`/api/opr/shipments/${shipment.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: d.imei }) })
+      expect(r.status).toBe(201)
+    }
+    const fin = await api(`/api/opr/shipments/${shipment.id}/finalise`, { method: 'POST', body: '{}' })
+    expect(fin.status).toBe(200)
+    // All 30 finalise in one call (well under the 25-batch's total D1
+    // budget concern — this asserts BATCHING the original loop doesn't
+    // break the normal single-call case, see 2b's regression test below
+    // for a value closer to the 155 production count).
+    for (const d of devices) expect(await deviceStatus(d.id)).toBe('EXPORTED_UNDER_OPR')
+
+    // Knock 27 back to simulate a bigger stuck backlog than one resume
+    // batch (25) can clear in a single call.
+    const stuckIds = devices.slice(0, 27).map(d => d.id)
+    await env.DB.prepare(`UPDATE received_devices SET status = 'IN_EXPORT_CONSIGNMENT' WHERE id IN (${stuckIds.map(() => '?').join(',')})`)
+      .bind(...stuckIds).run()
+
+    const first = await api(`/api/opr/shipments/${shipment.id}/finalise/resume`, { method: 'POST', body: '{}' })
+    const firstData = await first.json() as { moved: number; remaining: number }
+    expect(firstData.moved).toBe(25)
+    expect(firstData.remaining).toBe(2)
+
+    const second = await api(`/api/opr/shipments/${shipment.id}/finalise/resume`, { method: 'POST', body: '{}' })
+    const secondData = await second.json() as { moved: number; remaining: number }
+    expect(secondData.moved).toBe(2)
+    expect(secondData.remaining).toBe(0)
+    for (const d of devices) expect(await deviceStatus(d.id)).toBe('EXPORTED_UNDER_OPR')
+  }, 30000)
+
+  it('idempotent on re-call: nothing stranded — moved 0, remaining 0, no error', async () => {
+    const shipment = await makeShipment()
+    const device = await makeDevice()
+    await api(`/api/opr/shipments/${shipment.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: device.imei }) })
+    const fin = await api(`/api/opr/shipments/${shipment.id}/finalise`, { method: 'POST', body: '{}' })
+    expect(fin.status).toBe(200)
+    expect(await deviceStatus(device.id)).toBe('EXPORTED_UNDER_OPR')
+
+    const res = await api(`/api/opr/shipments/${shipment.id}/finalise/resume`, { method: 'POST', body: '{}' })
+    expect(res.status).toBe(200)
+    const data = await res.json() as { moved: number; remaining: number }
+    expect(data.moved).toBe(0)
+    expect(data.remaining).toBe(0)
+
+    // Calling it again changes nothing further — same result, no throw.
+    const again = await api(`/api/opr/shipments/${shipment.id}/finalise/resume`, { method: 'POST', body: '{}' })
+    const againData = await again.json() as { moved: number; remaining: number }
+    expect(againData.moved).toBe(0)
+    expect(againData.remaining).toBe(0)
+  })
+
+  it('GET /shipments/:id reports export_progress for a partially-stuck FINALISED shipment, null otherwise', async () => {
+    const shipment = await makeShipment()
+    const devices = [] as Array<{ id: number; imei: string }>
+    for (let i = 0; i < 4; i++) devices.push(await makeDevice())
+    for (const d of devices) {
+      const r = await api(`/api/opr/shipments/${shipment.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: d.imei }) })
+      expect(r.status).toBe(201)
+    }
+    // Before finalise: DRAFT, no export_progress.
+    const draftView = await (await api(`/api/opr/shipments/${shipment.id}`)).json() as { export_progress: unknown }
+    expect(draftView.export_progress).toBeNull()
+
+    const fin = await api(`/api/opr/shipments/${shipment.id}/finalise`, { method: 'POST', body: '{}' })
+    expect(fin.status).toBe(200)
+    const finData = await fin.json() as { devices_exported: number; devices_total: number }
+    expect(finData.devices_exported).toBe(4)
+    expect(finData.devices_total).toBe(4)
+
+    // Fully exported: export_progress reports exported === total.
+    const fullView = await (await api(`/api/opr/shipments/${shipment.id}`)).json() as { export_progress: { exported: number; total: number } }
+    expect(fullView.export_progress).toEqual({ exported: 4, total: 4 })
+
+    // Knock 1 back — reload should now show the gap.
+    await env.DB.prepare("UPDATE received_devices SET status = 'IN_EXPORT_CONSIGNMENT' WHERE id = ?").bind(devices[0].id).run()
+    const stuckView = await (await api(`/api/opr/shipments/${shipment.id}`)).json() as { export_progress: { exported: number; total: number } }
+    expect(stuckView.export_progress).toEqual({ exported: 3, total: 4 })
+  })
+
+  it('batched original finalise loop still exports every device in one call for a consignment larger than one batch (regression for 2b)', async () => {
+    const shipment = await makeShipment()
+    const devices = [] as Array<{ id: number; imei: string }>
+    // 3 batches' worth (25 + 25 + 3) in a single finalise call — proves
+    // batching the original loop into chunks of FINALISE_TRANSITION_BATCH_SIZE
+    // didn't silently drop or stop early on a consignment bigger than one
+    // batch, which is the whole point of the fix.
+    for (let i = 0; i < 53; i++) devices.push(await makeDevice())
+    for (const d of devices) {
+      const r = await api(`/api/opr/shipments/${shipment.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: d.imei }) })
+      expect(r.status).toBe(201)
+    }
+    const fin = await api(`/api/opr/shipments/${shipment.id}/finalise`, { method: 'POST', body: '{}' })
+    expect(fin.status).toBe(200)
+    const finData = await fin.json() as { devices_exported: number; devices_total: number }
+    expect(finData.devices_exported).toBe(53)
+    expect(finData.devices_total).toBe(53)
+    for (const d of devices) expect(await deviceStatus(d.id)).toBe('EXPORTED_UNDER_OPR')
+    // Nothing left to resume.
+    const resume = await api(`/api/opr/shipments/${shipment.id}/finalise/resume`, { method: 'POST', body: '{}' })
+    const resumeData = await resume.json() as { moved: number; remaining: number }
+    expect(resumeData.moved).toBe(0)
+    expect(resumeData.remaining).toBe(0)
+  }, 60000)
+})
+
 afterAll(async () => {
   // Test hygiene, consistent with the other suites.
   await env.DB.prepare('DELETE FROM shipment_lines').run()

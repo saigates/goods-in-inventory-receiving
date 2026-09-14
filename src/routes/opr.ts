@@ -312,7 +312,33 @@ app.get('/shipments/:id', async (c) => {
     'SELECT * FROM opr_authorisations WHERE id = ?'
   ).bind((shipment as Record<string, unknown>).authorisation_id).first()
   const totalValue = (lines as Array<Record<string, unknown>>).reduce((s, l) => s + Number(l.unit_value || 0), 0)
-  return c.json({ shipment, lines, authorisation, total_value: Math.round(totalValue * 100) / 100 })
+
+  // Post-incident (2026-09-14 DEVELOPER INSTRUCTION): a FINALISED export
+  // can have fewer devices actually EXPORTED_UNDER_OPR / TEMP_EXPORTED_STANDARD
+  // than lines.length — see the finalise route's own comment for the
+  // production case (shipment 1, 52/155). Report the real count here too,
+  // not just in finalise's own response, so a reload after a disconnected
+  // finalise request shows the true state instead of the UI's last-known
+  // toast (which, on that failure path, never arrived at all). Only
+  // computed for FINALISED exports — DRAFT/import/cancelled shipments have
+  // no such partial-progress concept.
+  const s = shipment as Record<string, unknown>
+  let exportProgress: { exported: number; total: number } | null = null
+  if (s.status === 'FINALISED' && s.direction === 'export' && (lines as Array<Record<string, unknown>>).length) {
+    const target = s.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'TEMP_EXPORTED_STANDARD' : 'EXPORTED_UNDER_OPR'
+    // Joined via shipment_lines.shipment_id, NOT an IN (...) list of line
+    // device ids bound individually — D1 caps bound parameters at 100 per
+    // query; a 155+ device consignment (e.g. shipment 1, the production
+    // incident) would exceed that if queried the other way.
+    const exported = await c.env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM shipment_lines sl
+         JOIN received_devices rd ON rd.id = sl.received_device_id
+        WHERE sl.shipment_id = ? AND rd.status = ?`
+    ).bind(id, target).first<{ n: number }>()
+    exportProgress = { exported: exported?.n ?? 0, total: (lines as Array<unknown>).length }
+  }
+
+  return c.json({ shipment, lines, authorisation, total_value: Math.round(totalValue * 100) / 100, export_progress: exportProgress })
 })
 
 type ShipmentBody = Record<string, unknown>
@@ -1626,14 +1652,31 @@ app.post('/shipments/:id/finalise', async (c) => {
   // Finalise-time transition diverges by shipment_type: OPR_REPAIR ->
   // EXPORTED_UNDER_OPR, TEMP_EXPORT_STANDARD -> TEMP_EXPORTED_STANDARD.
   // IN_EXPORT_CONSIGNMENT (checked above) was the shared precursor for both.
+  //
+  // Batched in chunks of FINALISE_TRANSITION_BATCH_SIZE (2026-09-14
+  // DEVELOPER INSTRUCTION, post-incident): a 155-device consignment run
+  // as one unbatched sequential loop (155 devices x ~5 D1 round-trips
+  // each inside transitionDevice, no batching, no try/catch) previously
+  // stopped cold at device 52/155 when the calling browser disconnected
+  // ~34s in (shipment 1, OPR20260826003, 2026-09-12 15:45) — the shipment
+  // had already flipped to FINALISED (that UPDATE runs before this loop)
+  // but 103 devices were left stranded IN_EXPORT_CONSIGNMENT with no
+  // existing route able to move them, since finalise itself is DRAFT-only.
+  // Chunking bounds the worst case (at most one batch's devices stranded,
+  // not the whole consignment) but does NOT make this loop atomic or
+  // resumable by itself — POST /shipments/:id/finalise/resume (below) is
+  // the designated recovery path for whatever a batch leaves stranded.
   const exportTarget = shipment.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'TEMP_EXPORTED_STANDARD' : 'EXPORTED_UNDER_OPR'
-  for (const deviceId of deviceIds) {
-    await transitionDevice(c.env.DB, deviceId, exportTarget, {
-      user,
-      reference: shipment.reference,
-      metadata: { shipment_id: id, export_mrn: mrn.value },
-      eventType: 'EXPORT_FINALISED',
-    })
+  for (let i = 0; i < deviceIds.length; i += FINALISE_TRANSITION_BATCH_SIZE) {
+    const batch = deviceIds.slice(i, i + FINALISE_TRANSITION_BATCH_SIZE)
+    for (const deviceId of batch) {
+      await transitionDevice(c.env.DB, deviceId, exportTarget, {
+        user,
+        reference: shipment.reference,
+        metadata: { shipment_id: id, export_mrn: mrn.value },
+        eventType: 'EXPORT_FINALISED',
+      })
+    }
   }
 
   const finalised = await c.env.DB.prepare('SELECT * FROM shipments WHERE id = ?').bind(id).first()
@@ -1649,7 +1692,117 @@ app.post('/shipments/:id/finalise', async (c) => {
     user_id: user.id,
     occurred_at: new Date().toISOString(),
   })
-  return c.json({ ok: true, shipment: finalised, devices_exported: deviceIds.length, validation })
+  // Report actual progress, not just intent: exported_count reflects how
+  // many of this shipment's devices are ACTUALLY EXPORTED_UNDER_OPR /
+  // TEMP_EXPORTED_STANDARD right now, re-queried post-loop rather than
+  // assumed equal to deviceIds.length — the incident above is exactly the
+  // case where the loop above completes (no throw) but a disconnect on
+  // the CALLER's side ends the request early, so the response the caller
+  // actually receives never reaches this point at all on that failure
+  // path. This field exists for the normal-completion response, and for
+  // GET /shipments/:id (below) to report the same truth if the caller
+  // reloads instead of trusting the toast from a request whose response
+  // never arrived.
+  //
+  // Joined via shipment_lines.shipment_id, NOT an IN (...) list of
+  // deviceIds bound as individual parameters — D1 caps bound parameters
+  // at 100 per query, and this exact query 500'd in testing on a
+  // 162-device consignment (163 params: 162 ids + 1 status) before this
+  // fix. The production incident's own shipment (155 devices, 156 params)
+  // was already over the cap too — this bug would have 500'd THIS query
+  // even after the incident's own devices were all correctly exported.
+  const exportedCount = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM shipment_lines sl
+       JOIN received_devices rd ON rd.id = sl.received_device_id
+      WHERE sl.shipment_id = ? AND rd.status = ?`
+  ).bind(id, exportTarget).first<{ n: number }>()
+  return c.json({
+    ok: true,
+    shipment: finalised,
+    devices_exported: exportedCount?.n ?? deviceIds.length,
+    devices_total: deviceIds.length,
+    validation,
+  })
+})
+
+// Sequential D1 round-trips per device inside the finalise/resume
+// transition loops. Kept small and named (not inlined as a literal) so
+// the post-incident comment above and the resume route below both read
+// the same number — see that comment for why this exists.
+const FINALISE_TRANSITION_BATCH_SIZE = 25
+
+// POST /shipments/:id/finalise/resume — owner-only recovery for a
+// FINALISED export/temp-export shipment that has devices stranded
+// IN_EXPORT_CONSIGNMENT (see the post-incident comment on the finalise
+// route above for the production case that motivated this). Gated on
+// status = 'FINALISED', NOT 'DRAFT' — finalise's own gate deliberately
+// refuses to re-run on a shipment that already flipped, which is exactly
+// why a stuck consignment previously had no route able to move it.
+//
+// No state-machine change: IN_EXPORT_CONSIGNMENT -> EXPORTED_UNDER_OPR /
+// TEMP_EXPORTED_STANDARD is already an ALLOWED_TRANSITIONS edge (it is
+// the same edge finalise itself uses) — this is a routing problem
+// (missing a way back into that edge post-FINALISED), not a lifecycle
+// problem.
+//
+// One batch of FINALISE_TRANSITION_BATCH_SIZE devices per call, then
+// returns — deliberately NOT looping internally over every remaining
+// batch, so each request stays small and bounded regardless of how many
+// devices are stranded. Idempotent on re-call: every call re-derives
+// "stranded" as this shipment's lines whose CURRENT device status is
+// still IN_EXPORT_CONSIGNMENT, so a device already moved by an earlier
+// call simply drops out of scope on the next — no separate resume-run
+// bookkeeping needed. Call repeatedly until `remaining` is 0.
+app.post('/shipments/:id/finalise/resume', async (c) => {
+  const user = currentUser(c)
+  const adminGate = requireAdmin(c, user)
+  if (adminGate) return adminGate
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+  const { shipment } = bundle
+
+  if (shipment.status !== 'FINALISED') {
+    return c.json({ error: `Shipment is ${shipment.status} — resume only applies to a FINALISED shipment with devices stranded IN_EXPORT_CONSIGNMENT` }, 409)
+  }
+  if (shipment.direction !== 'export') {
+    return c.json({ error: 'Resume applies to export shipments only — import/return receipt has no equivalent stuck state' }, 409)
+  }
+
+  const exportTarget = shipment.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'TEMP_EXPORTED_STANDARD' : 'EXPORTED_UNDER_OPR'
+
+  // Joined via shipment_lines.shipment_id (a single-parameter query), NOT
+  // an IN (...) list of `lines`' device ids bound as individual
+  // parameters — D1 caps bound parameters at 100 per query, and the
+  // production incident's own shipment (155 devices) would already
+  // exceed that if this route queried it that way. Re-deriving "stranded"
+  // fresh from the DB on every call (rather than trusting bundle.lines or
+  // anything cached) is what makes this idempotent. This join lives here,
+  // not in the shared loadShipmentBundle, so every OTHER caller of that
+  // loader keeps getting plain shipment_lines rows unchanged.
+  const { results: stranded } = await c.env.DB.prepare(
+    `SELECT sl.received_device_id AS id FROM shipment_lines sl
+       JOIN received_devices rd ON rd.id = sl.received_device_id
+      WHERE sl.shipment_id = ? AND rd.status = 'IN_EXPORT_CONSIGNMENT'
+      ORDER BY sl.id ASC`
+  ).bind(id).all<{ id: number }>()
+  const strandedIds = stranded.map(r => r.id)
+
+  const batch = strandedIds.slice(0, FINALISE_TRANSITION_BATCH_SIZE)
+  for (const deviceId of batch) {
+    await transitionDevice(c.env.DB, deviceId, exportTarget, {
+      user,
+      reference: shipment.reference,
+      // export_mrn may genuinely be null here (e.g. still awaiting the
+      // carrier's declaration, exactly the shipment-1 case) — metadata
+      // just carries whatever is on record, same as the original loop.
+      metadata: { shipment_id: id, export_mrn: shipment.export_mrn, resumed: true },
+      eventType: 'EXPORT_FINALISED',
+    })
+  }
+  return c.json({ ok: true, moved: batch.length, remaining: strandedIds.length - batch.length })
 })
 
 // POST /shipments/:id/export-proof — record/replace MRN / DUCR / EAD after

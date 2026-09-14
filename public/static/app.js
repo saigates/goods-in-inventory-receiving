@@ -2235,6 +2235,28 @@
         toast(err.response?.data?.error || err.message, 'err', 5000);
       }
     };
+    // Task U (2026-09-14 DEVELOPER INSTRUCTION, post-incident) — resumes a
+    // FINALISED export/temp-export shipment whose finalise call was cut off
+    // partway (browser/gateway disconnect mid-loop; see the backend route's
+    // own comment for the production case: shipment 1, 52/155). One batch
+    // per click, same as the backend's one-batch-per-call contract — click
+    // again if `remaining` is still > 0 after this call.
+    const doResume = async () => {
+      if (state.oprBusy) return;
+      state.oprBusy = true; render();
+      try {
+        const r = await api.post(`/opr/shipments/${s.id}/finalise/resume`, {});
+        toast(
+          `Resumed — ${r.moved} device${r.moved === 1 ? '' : 's'} moved` +
+          (r.remaining ? `, ${r.remaining} still remaining — click Resume again` : ', consignment now fully exported'),
+          r.remaining ? 'warn' : 'ok', 5000);
+      } catch (err) {
+        toast(err.response?.data?.error || err.message, 'err', 5000);
+      } finally {
+        state.oprBusy = false;
+        await refreshOprDetail(); render();
+      }
+    };
 
     return h('div', { class: 'space-y-5' },
       h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
@@ -2307,6 +2329,35 @@
           : OprFact(isExport ? 'Export MRN' : 'Import MRN', (isExport ? s.export_mrn : s.import_mrn) || '—', 'barcode'),
         OprFact('Declared value', fmtMoney(b.total_value, s.currency), 'coins'),
       ),
+
+      // Task U (2026-09-14 DEVELOPER INSTRUCTION, post-incident) — partial
+      // export progress banner. GET /shipments/:id now returns
+      // export_progress = { exported, total } for any FINALISED export/
+      // temp-export shipment (null otherwise: DRAFT/import/cancelled have
+      // no such concept). exported < total is exactly the shipment-1
+      // failure mode: the finalise request's browser disconnected mid-loop
+      // (Worker kept running, ~34s, stopped at 52/155) and the operator's
+      // seat only ever saw whatever toast preceded the disconnect — no
+      // visible signal that 103 devices never made it. This is that
+      // visible signal on every future/reloaded view of the shipment, not
+      // just live at the moment of the original click.
+      (b.export_progress && b.export_progress.exported < b.export_progress.total)
+        ? h('div', { class: 'card p-4 border-amber-500/40', id: 'opr-export-progress-banner' },
+            h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
+              h('div', { class: 'flex items-center gap-2' },
+                h('span', { class: 'badge badge-amber' }, h('i', { class: 'fas fa-triangle-exclamation mr-1' }), 'Partial export'),
+                h('span', { class: 'text-sm text-slate-300' },
+                  `${b.export_progress.exported} of ${b.export_progress.total} devices actually exported — the remaining ${b.export_progress.total - b.export_progress.exported} are still IN_EXPORT_CONSIGNMENT`)
+              ),
+              isAdmin() ? h('button', {
+                id: 'opr-resume-finalise-btn',
+                class: 'btn btn-amber text-xs' + (state.oprBusy ? ' opacity-60' : ''),
+                title: 'Move the next batch (up to 25) of stranded devices to their export target — repeatable, idempotent',
+                onclick: doResume,
+              }, h('i', { class: 'fas fa-rotate-right' }), 'Resume finalisation') : null
+            )
+          )
+        : null,
 
       // Task Q — DRAFT header-edit card. Gated on isDraft (mirrors the
       // route's own 409 DRAFT-only gate) && isAdmin() (mirrors the route's
@@ -2694,10 +2745,22 @@
         const r = await api.post(`/opr/shipments/${s.id}/finalise`, body);
         state.oprFinaliseOpen = false;
         const ambers = (r.validation?.checks || []).filter(c2 => c2.level === 'amber');
+        // Task U (2026-09-14 DEVELOPER INSTRUCTION, post-incident) — show
+        // "N of M exported" rather than a bare success toast, so a partial
+        // result (devices_exported < devices_total — possible if the loop
+        // itself throws partway without the REQUEST disconnecting first,
+        // e.g. a single device row mutated out-of-band mid-loop) is visible
+        // immediately rather than looking identical to a full success. The
+        // shipment-1 incident's actual failure mode (client disconnect) never
+        // reaches this .then() at all — see the export_progress banner
+        // above, which is what catches THAT case on the next load/reload.
+        const total = r.devices_total ?? r.devices_exported;
+        const partial = isExport && r.devices_exported < total;
         toast(
-          (isExport ? `Export finalised — ${r.devices_exported} devices ${exportTarget}` : `Return received — ${r.devices_returned ?? b.lines.length} devices ${returnTarget}`) +
+          (isExport ? `Export finalised — ${r.devices_exported} of ${total} devices ${exportTarget}` : `Return received — ${r.devices_returned ?? b.lines.length} devices ${returnTarget}`) +
+          (partial ? `<br><span class="text-xs">${total - r.devices_exported} device${total - r.devices_exported === 1 ? '' : 's'} did not transition — use Resume finalisation below</span>` : '') +
           (ambers.length ? `<br><span class="text-xs">${ambers.length} amber warning${ambers.length === 1 ? '' : 's'} noted</span>` : ''),
-          'ok', 4500);
+          partial ? 'warn' : 'ok', partial ? 6500 : 4500);
         await refreshOprDetail(); await refreshOprShipments(); render();
       } catch (err) {
         state.oprFinaliseOpen = false;
