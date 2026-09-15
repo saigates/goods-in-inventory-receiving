@@ -1,0 +1,48 @@
+# Pinned 3-way test split (2026-09-14, master-checklist minor note: group
+# composition must be pinned so future run figures are comparable file-by-
+# file, not just in aggregate). Regenerate ONLY when a spec file is added/
+# removed/renamed — re-run:
+#   ls test/*.spec.ts | grep -v oprImport | sort
+# and re-split alphabetically into 3 near-equal groups, updating this file
+# and its per-group counts below in the same commit as the spec change.
+# test/oprImport.spec.ts is EXCLUDED — it runs separately via
+# vitest.serial.config.ts (see that file's header for why).
+#
+# GROUP 1 (12 files)
+test/auth.spec.ts
+test/billBuilder.spec.ts
+test/bills.spec.ts
+test/bulkSerialImport.spec.ts
+test/bulkSerials.spec.ts
+test/catalog.spec.ts
+test/catalogAutoGenerate.spec.ts
+test/ce1154Golden.spec.ts
+test/condition.spec.ts
+test/costEntry.spec.ts
+test/csvExport.spec.ts
+test/customsApportionment.spec.ts
+# GROUP 2 (12 files)
+test/deviceCorrectRoute.spec.ts
+test/deviceLifecycle.spec.ts
+test/devicesRejectRoute.spec.ts
+test/docToken.spec.ts
+test/forceAddValuation.spec.ts
+test/freightApportionment.spec.ts
+test/inventoryGradeSkuResolution.spec.ts
+test/inventoryValuationReport.spec.ts
+test/manifestBillLink.spec.ts
+test/manifestBillReconciliation.spec.ts
+test/manifestCleanupPrompt.spec.ts
+test/manifestConditionDerivation.spec.ts
+# GROUP 3 (11 files)
+test/manifestValuation.spec.ts
+test/manualValuation.spec.ts
+test/oprAutomation.spec.ts
+test/oprComms.spec.ts
+test/oprExport.spec.ts
+test/oprFoundation.spec.ts
+test/repairWorkflow.spec.ts
+test/skuMapImport.spec.ts
+test/validate.spec.ts
+test/zohoSaleImport.spec.ts
+test/zohoSaleImportApply.spec.ts

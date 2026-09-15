@@ -176,3 +176,33 @@ read production D1 from this sandbox — NOT raw
 `wrangler.jsonc` `database_id` is a Workers-for-Platform placeholder,
 not a real Cloudflare D1 UUID). Use `gsk hosted d1_query` for every
 production read from now on.
+
+**Gap found and fixed before first deploy submission (same day,
+master-checklist review):** the original `CORRECTION_LOCKED_STATUSES`
+list could not see a device that had been pushed to Zoho, because "pushed
+to Zoho" is not a `received_devices.status` value at all —
+`READY_FOR_ZOHO` means "QC passed, awaiting the human's manual upload"
+(still correctable, deliberately), and the actual push confirmation is a
+human clicking "Close to inventory" in the UI, which calls
+`closeToInventory()` (`repairWorkflow.ts:299-345`) — that stamps
+`repair_jobs.closed_at` and moves the device to `ACTIVE_INVENTORY`, a
+status this route already treats as freely correctable. Confirmed (not
+assumed) that `repair_jobs.closed_at` on the device's most recent job is
+the ONLY signal anywhere in the codebase for this: grepped every
+`zoho_batches`/`zoho_batch_devices` reference in `src/` (only
+`inventory.ts:308`'s own comment — *"no application code writes to
+zoho_batches today"*) and confirmed live via `gsk hosted d1_query`
+(0 rows in both tables in production). Fixed by adding an explicit
+`repair_jobs.closed_at IS NOT NULL` check (most recent job, by id) right
+after the status-lock check, returning the same 409 family. Zero live
+devices were affected today (checked via `gsk hosted d1_query` before
+and after the fix), but the gap was structural, not hypothetical, and
+is now closed. Two new tests added (closed job → 409; open job →
+still correctable) — 12 tests total in `test/deviceCorrectRoute.spec.ts`,
+all green. Combined baseline after this fix: 765/8/773.
+
+**Test-split pinning (master-checklist minor note):** the file-to-group
+assignment now lives in `.deploy-checks/test-split-groups.txt` — regenerate
+it only when a spec file is added/removed/renamed, in the same commit as
+that change, so future run figures are comparable file-by-file across
+runs, not just in aggregate.

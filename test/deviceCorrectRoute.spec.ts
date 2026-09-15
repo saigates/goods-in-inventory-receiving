@@ -264,6 +264,56 @@ describe('PATCH /api/devices/:id/correct', () => {
     expect((await eventsFor(device.id)).length).toBe(0)
   })
 
+  // ── Zoho-push gate (added 2026-09-14, master-checklist review) ──
+  // "Pushed to Zoho" is not a received_devices.status value — it is
+  // repair_jobs.closed_at, stamped by closeToInventory() when a human
+  // confirms the manual Zoho upload. A device in that state has already
+  // moved on to ACTIVE_INVENTORY (correctable by status alone), so the
+  // route must check repair_jobs directly, not just device.status.
+  it('device with a CLOSED repair job (pushed to Zoho) -> 409, zero writes, even though its status (ACTIVE_INVENTORY) is not itself locked', async () => {
+    const suffix = uniqueSuffix()
+    await insertCatalogRow({ sku: `TEST-ZOHOPUSHED-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTP', capacity: '128GB', color: 'GREEN', grade: 'A' })
+    const device = await seedDevice({
+      sku: 'TEST-STALE-ZOHOPUSHED-SKU', brand: 'APPLE', model: 'IPHONE TESTP', capacity: '128GB', color: 'RED', grade: 'A',
+      status: 'ACTIVE_INVENTORY',
+    })
+    await db().prepare(
+      `INSERT INTO repair_jobs (organisation_id, device_id, imei, fault_code, status, qc_result, closed_at)
+       VALUES (1, ?, ?, 'screen', 'completed', 'PASSED', CURRENT_TIMESTAMP)`
+    ).bind(device.id, device.imei).run()
+
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-ZOHOPUSHED-${suffix}`, reason: 'attempted on a device already pushed to Zoho' }),
+    })
+    expect(res.status).toBe(409)
+    const body = await res.json() as any
+    expect(body.error).toMatch(/pushed to Zoho/i)
+
+    const row = await deviceRow(device.id)
+    expect(row?.sku).toBe('TEST-STALE-ZOHOPUSHED-SKU') // unchanged
+    expect((await eventsFor(device.id)).length).toBe(0)
+  })
+
+  it('device with an OPEN (not yet closed) repair job is still correctable — only a CLOSED job blocks', async () => {
+    const suffix = uniqueSuffix()
+    await insertCatalogRow({ sku: `TEST-ZOHOOPEN-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTO', capacity: '128GB', color: 'GREEN', grade: 'A' })
+    const device = await seedDevice({
+      sku: 'TEST-STALE-ZOHOOPEN-SKU', brand: 'APPLE', model: 'IPHONE TESTO', capacity: '128GB', color: 'RED', grade: 'A',
+      status: 'READY_FOR_ZOHO',
+    })
+    await db().prepare(
+      `INSERT INTO repair_jobs (organisation_id, device_id, imei, fault_code, status, qc_result)
+       VALUES (1, ?, ?, 'screen', 'completed', 'PASSED')`
+    ).bind(device.id, device.imei).run()
+
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-ZOHOOPEN-${suffix}`, reason: 'correcting before Zoho upload is confirmed' }),
+    })
+    expect(res.status).toBe(200)
+  })
+
   // ── Test 4 (named): off-catalogue SKU -> 422, zero writes ──
   it('SKU not present in the catalogue -> 422, zero writes', async () => {
     const suffix = uniqueSuffix()

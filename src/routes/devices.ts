@@ -194,6 +194,35 @@ app.patch('/:id/correct', async (c) => {
     }, 409)
   }
 
+  // Zoho-push lock (gap fixed 2026-09-14, master-checklist review): "pushed
+  // to Zoho" is NOT tracked as a received_devices.status value, so
+  // CORRECTION_LOCKED_STATUSES above cannot see it. READY_FOR_ZOHO only
+  // means "QC passed, awaiting the human's manual upload" — the device is
+  // still correctable at that point, deliberately (fixing a catalogue
+  // mistake before it ever reaches Zoho is exactly the good case). The
+  // upload itself is confirmed by a human clicking "Close to inventory"
+  // (repairWorkflow.ts's closeToInventory(), called from
+  // POST /:id/repair/close-to-inventory below), which stamps
+  // repair_jobs.closed_at and moves the device to ACTIVE_INVENTORY — a
+  // status this route already treats as freely correctable. Checked
+  // directly against zoho_batches/zoho_batch_devices too: confirmed via
+  // grep that no application code anywhere writes to either table (see
+  // inventory.ts:308's own comment, "no application code writes to
+  // zoho_batches today") and confirmed live in production (0 rows in
+  // both) — so repair_jobs.closed_at on the device's most recent job is
+  // the ONLY signal in this codebase that a push actually happened, and
+  // it lives on a different table than device.status. Checked here
+  // explicitly rather than folded into CORRECTION_LOCKED_STATUSES because
+  // it is not a status value at all.
+  const lastRepairJob = await c.env.DB.prepare(
+    `SELECT closed_at FROM repair_jobs WHERE device_id = ? AND organisation_id = ? ORDER BY id DESC LIMIT 1`
+  ).bind(id, orgId).first<{ closed_at: string | null }>()
+  if (lastRepairJob?.closed_at) {
+    return c.json({
+      error: `Device was pushed to Zoho on ${lastRepairJob.closed_at} (repair job closed) — it can no longer be corrected via this route`,
+    }, 409)
+  }
+
   // SKU must resolve to a real catalogue row for this organisation — no
   // free-text SKU, ever (see catalog.ts's own "the catalog is the source
   // of truth" header note). Colour and grade are DERIVED from the chosen
