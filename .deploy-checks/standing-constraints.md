@@ -134,3 +134,45 @@ future `workerd`/`node` crash can silently deposit another large core
 file. The size check above catches it either way, but it's the reason
 this class of stray artifact can recur without any code change on our
 part.
+
+## 6. Task X — device correction route (2026-09-14)
+
+`PATCH /api/devices/:id/correct` (src/routes/devices.ts, right after
+`GET /:id`) landed: owner-only (role==='admin', `requireOwner()`, a local
+boolean helper matching this file's own `requireManager()` idiom rather
+than opr.ts's Response-returning `requireAdmin()`), pre-commitment gate
+via `CORRECTION_LOCKED_STATUSES` (= `OPR_WORKFLOW_ONLY_STATUSES` ∪
+`SOLD`), catalogue-only SKU with colour/grade always derived from the
+chosen `sku_catalog` row, IMEI immutable (any `imei` key in the body at
+all is a 422, not just a changed value), mandatory `reason`, a
+`SKU_CORRECTION` event via `logDeviceEvent` (same event type/shape as
+`inventory.ts:427-437`), queued-print-job invalidation/re-queue (same
+pattern as `inventory.ts:365-398`), and a **prompt-not-cascade** flow for
+the linked `expected_devices` row: `received_devices` is corrected
+unconditionally on every call; the manifest line is only ever touched
+when the caller explicitly passes `also_correct_manifest_line: true` on
+the SAME call, and gets its own second `SKU_CORRECTION` event
+(`metadata.target: 'expected_devices'`) rather than a silent write.
+`bill_lines_flagged` is reported in the response, not written to a DB
+column — no `needs_review`/flag column exists on `bill_lines` or
+`bill_line_serials` (checked against migration 0028 before deciding
+this).
+
+10 tests in `test/deviceCorrectRoute.spec.ts` (5 named by the operator +
+5 supporting), all passing standalone and inside the full 3-group split.
+Verified live-production pre-image for the motivating device (IMEI
+355178160488248, id 1319) via `gsk hosted d1_query` before writing the
+route: `status='RECEIVED'` (pre-commitment, correctable),
+`sku='APL-I13-128-MDN-A'` (MIDNIGHT), `expected_device_id=2602` whose
+`expected_devices.sku` carries the SAME wrong value — so the real
+correction the operator will make live is exactly the
+prompt-not-cascade path this route is built to exercise, not a
+synthetic edge case.
+
+**Tool note:** `gsk hosted d1_query --sql "..."` is the correct way to
+read production D1 from this sandbox — NOT raw
+`wrangler d1 execute --remote` (that fails here with
+`Invalid property: databaseId => Invalid uuid`, since this project's
+`wrangler.jsonc` `database_id` is a Workers-for-Platform placeholder,
+not a real Cloudflare D1 UUID). Use `gsk hosted d1_query` for every
+production read from now on.
