@@ -214,12 +214,30 @@ app.patch('/:id/correct', async (c) => {
   // it lives on a different table than device.status. Checked here
   // explicitly rather than folded into CORRECTION_LOCKED_STATUSES because
   // it is not a status value at all.
-  const lastRepairJob = await c.env.DB.prepare(
-    `SELECT closed_at FROM repair_jobs WHERE device_id = ? AND organisation_id = ? ORDER BY id DESC LIMIT 1`
-  ).bind(id, orgId).first<{ closed_at: string | null }>()
-  if (lastRepairJob?.closed_at) {
+  //
+  // 2026-09-15 correction (2nd master-checklist review): this used to be
+  // `ORDER BY id DESC LIMIT 1` — the device's MOST RECENT job only. That is
+  // wrong: once a device has been pushed to Zoho, that fact is permanent
+  // regardless of what happens to the device afterwards. If job 1 closes
+  // (pushed) and the device is then re-repaired under a NEW job 2 that is
+  // still open, "most recent job" reports job 2's null closed_at and the
+  // route would let the correction through — leaving Zoho holding the old
+  // SKU with zero reconciliation path. Fixed to EXISTS-any-closed-job:
+  // ANY job ever closed on this device blocks the route, forever, not just
+  // the latest one. Production currently has 17 open jobs and 0 closed, so
+  // no live device could have reached the old bad branch — this was a
+  // structural gap, not an active incident.
+  // MIN(closed_at) — the EARLIEST closed job — is reported in the error
+  // message, since that is the date the device first became "pushed";
+  // any later closed/reopened jobs don't change that fact.
+  const pushedToZoho = await c.env.DB.prepare(
+    `SELECT
+       EXISTS(SELECT 1 FROM repair_jobs WHERE device_id = ? AND organisation_id = ? AND closed_at IS NOT NULL) AS was_pushed,
+       (SELECT MIN(closed_at) FROM repair_jobs WHERE device_id = ? AND organisation_id = ? AND closed_at IS NOT NULL) AS first_closed_at`
+  ).bind(id, orgId, id, orgId).first<{ was_pushed: number; first_closed_at: string | null }>()
+  if (pushedToZoho?.was_pushed) {
     return c.json({
-      error: `Device was pushed to Zoho on ${lastRepairJob.closed_at} (repair job closed) — it can no longer be corrected via this route`,
+      error: `Device was pushed to Zoho on ${pushedToZoho.first_closed_at} (repair job closed) — it can no longer be corrected via this route`,
     }, 409)
   }
 

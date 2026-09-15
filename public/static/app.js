@@ -315,6 +315,7 @@
   const api = {
     get: (p) => http.get(p).then(r => r.data),
     post: (p, d) => http.post(p, d).then(r => r.data),
+    patch: (p, d) => http.patch(p, d).then(r => r.data),
     del: (p) => http.delete(p).then(r => r.data),
   };
 
@@ -647,6 +648,7 @@
       state.pendingUnrec ? UnreconciledModal() : null,
       state.labelPreview ? LabelPreviewModal() : null,
       state.deleteDevice ? DeleteDeviceModal() : null,
+      state.correctDevice ? CorrectDeviceModal() : null,
       state.manualReceiveOpen ? ManualReceiveModal() : null,
       state.bulkScanOpen ? BulkScanModal() : null,
       state.oprNewOpen ? OprNewShipmentModal() : null,
@@ -973,6 +975,15 @@
                     h('td', { class: 'px-4 py-2' }, deviceStatusBadge(d.status)),
                     h('td', { class: 'px-4 py-2 text-right' },
                       h('div', { class: 'flex items-center justify-end gap-2' },
+                        // Owner-only visibility (isAdmin()) is UI decluttering,
+                        // matching the isAdmin() note at its definition above —
+                        // the server's own 403 on PATCH /:id/correct is the
+                        // real gate, this just avoids showing a control that
+                        // would fail for the current user.
+                        isAdmin() ? h('button', {
+                          class: 'btn btn-ghost text-xs', title: 'Fix a wrong SKU/colour/grade (audit-logged)',
+                          onclick: () => openCorrectDeviceModal(d),
+                        }, h('i', { class: 'fas fa-pen-to-square' }), 'Correct details') : null,
                         canStartRepair ? h('button', {
                           class: 'btn btn-ghost text-xs', title: 'Send to in-house repair',
                           onclick: () => doStartRepair(d),

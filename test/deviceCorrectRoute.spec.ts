@@ -314,6 +314,51 @@ describe('PATCH /api/devices/:id/correct', () => {
     expect(res.status).toBe(200)
   })
 
+  // ── Zoho-push gate: EXISTS-any-closed-job, not just the latest job
+  // (fixed 2026-09-15, 2nd master-checklist review) ──
+  // A device pushed to Zoho once (job 1 closed) and then re-repaired
+  // under a NEW, still-open job 2 must STILL be blocked — the earlier
+  // `ORDER BY id DESC LIMIT 1` form would see only job 2's null
+  // closed_at and wrongly allow the correction through, even though the
+  // device is already sitting in Zoho with the old SKU from job 1's
+  // push. This is the exact case the operator's second review caught.
+  it('device pushed to Zoho once (job 1 closed) then re-repaired (job 2 open) is STILL blocked — any closed job counts, not just the latest', async () => {
+    const suffix = uniqueSuffix()
+    await insertCatalogRow({ sku: `TEST-ZOHOREREPAIR-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTR', capacity: '128GB', color: 'GREEN', grade: 'A' })
+    const device = await seedDevice({
+      sku: 'TEST-STALE-ZOHOREREPAIR-SKU', brand: 'APPLE', model: 'IPHONE TESTR', capacity: '128GB', color: 'RED', grade: 'A',
+      status: 'SORTING', // device came back in for a second repair pass
+    })
+    // job 1: closed (this is the push-to-Zoho event) — inserted first so
+    // its id is lower, i.e. NOT the "most recent" job.
+    await db().prepare(
+      `INSERT INTO repair_jobs (organisation_id, device_id, imei, fault_code, status, qc_result, closed_at)
+       VALUES (1, ?, ?, 'screen', 'completed', 'PASSED', '2026-09-10 10:00:00')`
+    ).bind(device.id, device.imei).run()
+    // job 2: open (re-repair after the device came back) — higher id,
+    // so this IS "most recent" — its closed_at is NULL. status='open' and
+    // qc_result='PENDING' are the schema's real values (migration 0022:
+    // status CHECK is open/awaiting_qc/completed/cancelled, qc_result is
+    // NOT NULL DEFAULT 'PENDING' — 'in_progress' is not a valid status).
+    await db().prepare(
+      `INSERT INTO repair_jobs (organisation_id, device_id, imei, fault_code, status, qc_result)
+       VALUES (1, ?, ?, 'battery', 'open', 'PENDING')`
+    ).bind(device.id, device.imei).run()
+
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-ZOHOREREPAIR-${suffix}`, reason: 'attempted on a device pushed once, now mid re-repair' }),
+    })
+    expect(res.status).toBe(409)
+    const body = await res.json() as any
+    expect(body.error).toMatch(/pushed to Zoho/i)
+    expect(body.error).toMatch(/2026-09-10/) // reports the EARLIEST closed date, i.e. when it first became pushed
+
+    const row = await deviceRow(device.id)
+    expect(row?.sku).toBe('TEST-STALE-ZOHOREREPAIR-SKU') // unchanged
+    expect((await eventsFor(device.id)).length).toBe(0)
+  })
+
   // ── Test 4 (named): off-catalogue SKU -> 422, zero writes ──
   it('SKU not present in the catalogue -> 422, zero writes', async () => {
     const suffix = uniqueSuffix()
