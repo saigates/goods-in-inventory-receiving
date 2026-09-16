@@ -151,7 +151,12 @@ describe('PATCH /api/devices/:id/correct', () => {
     expect(body.device.grade).toBe('A')
     expect(body.manifest_line_also_wrong).toBe(true)
     expect(body.manifest_line).toMatchObject({ id: expectedId, sku: `TEST-CORRECT-WRONG-${suffix}` })
-    expect(body.manifest_line_cascade).toBeNull() // no cascade was requested on this call
+    // A genuine mismatch exists but no cascade was requested — the route
+    // must say so explicitly (2026-09-16 fourth-state addition), not a
+    // bare null indistinguishable from "no mismatch at all". This is the
+    // exact response shape the real device-1319 modal-race incident
+    // produced at the API layer before this fix.
+    expect(body.manifest_line_cascade).toBe('divergent_not_requested')
 
     const row = await deviceRow(device.id)
     expect(row?.sku).toBe(`TEST-CORRECT-RIGHT-${suffix}`)
@@ -242,6 +247,7 @@ describe('PATCH /api/devices/:id/correct', () => {
     expect(res1.status).toBe(200)
     const body1 = await res1.json() as any
     expect(body1.manifest_line_also_wrong).toBe(true) // correctly flagged — manifest still says WRONG
+    expect(body1.manifest_line_cascade).toBe('divergent_not_requested') // mismatch exists, no cascade asked for this call
 
     // Call 2: the buggy two-call flow the UI spec originally implied —
     // resubmit the SAME (already-applied) sku with the cascade flag on.
@@ -328,6 +334,78 @@ describe('PATCH /api/devices/:id/correct', () => {
     // though it would never have matched the old oldSku-based test.
     expect(body.manifest_line_also_wrong).toBe(true)
     expect(body.manifest_line).toMatchObject({ id: expectedId, sku: `TEST-THIRDVAL-MANIFESTONLY-${suffix}` })
+    expect(body.manifest_line_cascade).toBe('divergent_not_requested') // mismatch exists, no cascade asked for this call
+  })
+
+  // ── Real-incident regression (2026-09-16): device 1319 / IMEI
+  // 355178160488248's live acceptance run. The CorrectDeviceModal's
+  // GET /:id fetch (which populates ctx.manifestLine) is async; the "Save
+  // correction" button was gated only on ctx.busy, not ctx.loading, so an
+  // operator who picked a replacement SKU and clicked Save before that
+  // fetch resolved could submit with also_correct_manifest_line
+  // effectively false — indistinguishable, from the route's OLD response
+  // alone, from a deliberate decline or from there having been no
+  // mismatch at all. Fixed two ways: the modal now also gates Save on
+  // ctx.loading (this test proves the ROUTE side — that a false/absent
+  // flag on a genuine mismatch is reported as 'divergent_not_requested',
+  // never a bare null a caller could misread as "nothing to say"), and
+  // the modal fix itself is a UI-only change with no route-observable
+  // side effect to assert here.
+  //
+  // The critical distinction this test exists for: 'divergent_not_requested'
+  // must appear ONLY when a real mismatch exists — a device with NO
+  // mismatch and no cascade requested must still get a plain null (see
+  // test 2's second call further down, and the very first "no manifest
+  // line at all" shape below), so a future caller can tell "there was
+  // something to decide and it wasn't decided" apart from "there was
+  // nothing to decide" without inspecting manifest_line_also_wrong
+  // separately.
+  it('a genuine mismatch with also_correct_manifest_line absent (the modal-race shape) is reported as divergent_not_requested, never a bare null', async () => {
+    const suffix = uniqueSuffix()
+    await insertCatalogRow({ sku: `TEST-RACE-WRONG-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTRACE', capacity: '128GB', color: 'MIDNIGHT', grade: 'A' })
+    await insertCatalogRow({ sku: `TEST-RACE-RIGHT-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTRACE', capacity: '128GB', color: 'BLUE', grade: 'A' })
+
+    const manifestId = await seedManifest()
+    const device = await seedDevice({
+      sku: `TEST-RACE-WRONG-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTRACE', capacity: '128GB', color: 'MIDNIGHT', grade: 'A',
+    })
+    const expectedId = await seedExpectedDevice({ manifestId, imei: device.imei, sku: `TEST-RACE-WRONG-${suffix}` })
+    await db().prepare('UPDATE received_devices SET expected_device_id = ? WHERE id = ?').bind(expectedId, device.id).run()
+
+    // No also_correct_manifest_line key at all in the body — the exact
+    // shape a race-truncated submit produces (the modal never sends the
+    // key as `true` if the race window closed before ctx.manifestLine
+    // populated; manifestMismatch is false so it sends `false`, but a
+    // client that omitted the key entirely must be caught identically).
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-RACE-RIGHT-${suffix}`, reason: 'race-shaped submit: cascade flag never arrived despite a real mismatch' }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as any
+    expect(body.manifest_line_also_wrong).toBe(true)
+    expect(body.manifest_line_cascade).toBe('divergent_not_requested')
+
+    // Manifest line itself must remain untouched — this is a report-only
+    // signal, not an implicit cascade.
+    const expectedRowAfter = await db().prepare('SELECT sku FROM expected_devices WHERE id = ?').bind(expectedId).first<{ sku: string }>()
+    expect(expectedRowAfter?.sku).toBe(`TEST-RACE-WRONG-${suffix}`)
+
+    // Contrast case, same call shape, but genuinely nothing to report:
+    // no expected_devices link at all. Must stay a plain null, not
+    // 'divergent_not_requested' — the new state names a REAL divergence,
+    // not "cascade wasn't requested" in general.
+    const plainDevice = await seedDevice({
+      sku: `TEST-RACE-RIGHT-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTRACE', capacity: '128GB', color: 'BLUE', grade: 'A',
+    })
+    const resPlain = await apiAs(ADMIN_USER, `/api/devices/${plainDevice.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-RACE-WRONG-${suffix}`, reason: 'no manifest line linked at all — genuinely nothing to report' }),
+    })
+    expect(resPlain.status).toBe(200)
+    const bodyPlain = await resPlain.json() as any
+    expect(bodyPlain.manifest_line_also_wrong).toBe(false)
+    expect(bodyPlain.manifest_line_cascade).toBeNull()
   })
 
   // ── Test 2 (named): non-owner -> 403, zero writes ──

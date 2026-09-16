@@ -551,7 +551,8 @@ claims no prefix, per its own header comment), `8604571` (NOT a
 convention by `test/bulkSerials.spec.ts`, 2026-09-11, the D1-backed
 vitest spec for Step 2A gap (a), POST /shipments/:id/bulk-serials; the
 pure-function `test/bulkSerialImport.spec.ts` never writes to
-`received_devices` and claims no prefix), `9900*` (G5 item 2 catalog
+`received_devices` and claims no prefix), `8604572`
+(correct-device-race-ui, 2026-09-16, see below), `9900*` (G5 item 2 catalog
 auto-generation verification, 2026-08-21, disposable `browser_check.mjs`
 script — not checked into this repo, deleted after the citation was
 captured; see the citation record below).
@@ -835,6 +836,46 @@ Both were caught only because this script's assertions failed loudly
 wrong thing — worth remembering when a *new* role-gated download check's
 first run reports something that looks like an unrelated infra failure
 rather than a real assertion mismatch.
+
+### `correct-device-race-ui.browser.mjs` (real incident, 2026-09-16)
+
+Regression check for the CorrectDeviceModal async-fetch race that let the
+live device-1319 / IMEI 355178160488248 correction go out with
+`also_correct_manifest_line` effectively false despite a genuine manifest
+mismatch — no vitest test could have caught this since it's a claim about
+the "Save correction" button's real `disabled` state at a specific instant
+relative to an in-flight fetch, not about route logic or pure-function
+output. Uses Playwright's `context.route()` to artificially throttle (or
+fail) the live `GET /api/devices/:id` call the modal issues on open, so the
+race window is wide and deterministic rather than dependent on incidental
+network speed:
+
+- **Throttled fetch**: while the response is held, "Checking linked
+  manifest line…" is shown and "Save correction" is asserted **disabled**
+  — including after a SKU is picked while still loading, and that no
+  `PATCH .../correct` request escapes a `click()` on the disabled button.
+  Once the response is released, the button becomes enabled, the cascade
+  checkbox correctly appears (this fixture's manifest line genuinely
+  disagrees with the picked SKU), and submitting with it checked is
+  confirmed server-side to have cascaded the manifest line's SKU too — not
+  just closed the modal optimistically.
+- **Failed fetch**: the same call is aborted outright. Asserts the catch
+  path in `openCorrectDeviceModal()` clears `ctx.loading` (so the fix does
+  not trade a silent wrong-answer bug for a permanently frozen Save
+  button), surfaces a visible failure toast, offers no cascade checkbox
+  (the manifest line was never learned), and still lets the device-level
+  correction succeed — a degraded but functional path, never a dead end.
+- Fixtures are built through the real API end-to-end (`POST /manifests` ->
+  `POST /scan` -> `POST /scan/confirm`), not a raw D1 insert, so
+  `expected_device_id` is populated exactly the way a real receive
+  populates it.
+- Also asserts zero unexpected console errors across the whole run.
+- **Cleanup**: prints the FK-ordered `DELETE` for both seeded devices, the
+  manifests, and the two disposable catalogue rows, plus a re-query to
+  confirm afterwards (this script has no D1 binding, only `fetch()`, so it
+  cannot run the DELETE itself).
+
+IMEI prefix: `8604572`.
 
 ## Process note (2026-08-19): scope correction (0023-0029, not 0024-0029) + two owed browser assertions closed + local dev D1 reset side-effect
 

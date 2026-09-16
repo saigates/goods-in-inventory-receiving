@@ -371,13 +371,32 @@ app.patch('/:id/correct', async (c) => {
   //      call again with the flag on a device whose sku has already
   //      moved) is covered by the new test right below this route's
   //      existing cascade tests.
+  //
+  // 2026-09-16 addition, after the real device-1319/IMEI 355178160488248
+  // acceptance run: a client-side race (see CorrectDeviceModal in
+  // public/static/app.js, ctx.loading not gating Save) let the operator
+  // submit with also_correct_manifest_line effectively false even though a
+  // genuine mismatch existed and the operator never actually got the
+  // chance to decline it. That produced manifestLineCascade === null,
+  // indistinguishable from the ordinary "no mismatch, nothing to say"
+  // case — a `false`/absent flag on a genuine mismatch used to look
+  // identical to "nothing to report" from the response alone (the caller
+  // had to separately notice manifest_line_also_wrong to learn otherwise).
+  // The route now tells this apart explicitly, regardless of what any
+  // particular UI does or fails to do: null means there was truly nothing
+  // to say (no mismatch, or no manifest line at all, and no cascade was
+  // requested); 'divergent_not_requested' means a real mismatch exists but
+  // the caller did not ask to fix it (whether by a genuine decline or a
+  // bug like the one above) — a signal a future caller/UI can act on
+  // instead of one more silent null.
   let manifestLineAlsoWrong = false
   let manifestLine: Record<string, unknown> | null = null
-  // One of: null (cascade not requested — nothing to report), 'applied'
-  // (mismatch existed, cascade wrote the second event), or a distinct
-  // not-applicable reason when the caller asked for a cascade but there
-  // was genuinely nothing to cascade — never a bare `false`.
-  let manifestLineCascade: 'applied' | 'not_applicable_no_manifest_line' | 'not_applicable_already_matches' | null = null
+  let manifestLineCascade:
+    | 'applied'
+    | 'not_applicable_no_manifest_line'
+    | 'not_applicable_already_matches'
+    | 'divergent_not_requested'
+    | null = null
   const wantsCascade = body.also_correct_manifest_line === true
 
   if (device.expected_device_id) {
@@ -407,6 +426,12 @@ app.patch('/:id/correct', async (c) => {
         manifestLineCascade = 'applied'
         manifestLineAlsoWrong = false // resolved in this same call
       }
+    } else if (mismatch) {
+      // Flag absent/false, but a genuine mismatch exists — the caller was
+      // asked (or should have been) and did not opt in. Never leave this
+      // as a bare null; that is exactly what let the modal-race incident
+      // above go unreported at the API layer.
+      manifestLineCascade = 'divergent_not_requested'
     }
   } else if (wantsCascade) {
     manifestLineCascade = 'not_applicable_no_manifest_line'

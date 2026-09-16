@@ -5273,10 +5273,22 @@ into each Condition, each VAT Type, and each Currency.`;
 
         h('div', { class: 'mt-5 flex justify-end gap-2' },
           h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
+          // Gated on ctx.loading too, not just ctx.busy (2026-09-16 fix,
+          // real-incident-driven — device 1319/IMEI 355178160488248): the
+          // GET /:id fetch that populates ctx.manifestLine is async, and an
+          // operator who picks a SKU and clicks Save before it resolves
+          // would submit with ctx.manifestLine still null, so
+          // manifestMismatch's `!!ctx.manifestLine` guard evaluates false
+          // regardless of what the SKUs actually say — no prompt, no
+          // cascade, no error, single event, exactly what happened live.
+          // The catch path above (openCorrectDeviceModal) always clears
+          // ctx.loading, success or failure, so this can never freeze Save
+          // — the window is exactly the fetch's real round-trip, nothing
+          // more.
           h('button', {
-            class: 'btn btn-primary', disabled: ctx.busy ? 'disabled' : null,
+            class: 'btn btn-primary', disabled: (ctx.busy || ctx.loading) ? 'disabled' : null,
             onclick: submit,
-          }, ctx.busy ? h('i', { class: 'fas fa-spinner fa-spin' }) : h('i', { class: 'fas fa-check' }), 'Save correction')
+          }, (ctx.busy || ctx.loading) ? h('i', { class: 'fas fa-spinner fa-spin' }) : h('i', { class: 'fas fa-check' }), 'Save correction')
         )
       )
     );
