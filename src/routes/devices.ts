@@ -107,14 +107,34 @@ app.get('/:id', async (c) => {
 
   const device = await c.env.DB.prepare(
     'SELECT * FROM received_devices WHERE id = ? AND organisation_id = ?'
-  ).bind(id, user.organisation_id).first()
+  ).bind(id, user.organisation_id).first<Record<string, unknown>>()
   if (!device) return c.json({ error: 'Not found' }, 404)
 
   const { results: events } = await c.env.DB.prepare(
     'SELECT * FROM device_events WHERE device_id = ? AND organisation_id = ? ORDER BY id DESC LIMIT 200'
   ).bind(id, user.organisation_id).all()
 
-  return c.json({ device, events })
+  // 2026-09-15 addition (Task X UI bundle, 3rd master-checklist review):
+  // the correction modal needs to know, BEFORE the operator submits a
+  // correction, whether the linked manifest line's SKU matches this
+  // device's CURRENT sku — so it can decide whether to show the
+  // "the manifest line also reads X — correct it too?" prompt up front,
+  // and send `also_correct_manifest_line` on the SAME single PATCH call
+  // (see PATCH /:id/correct's own oldSku note: that route re-reads
+  // device.sku fresh on every call, so a second follow-up call after the
+  // first one already changed the sku can never see the original
+  // mismatch — the prompt-then-single-call shape below is the only one
+  // that works against that route's real semantics). Kept as a small,
+  // separate query rather than a JOIN on the main SELECT so the common
+  // case (no expected_device_id) costs nothing extra.
+  let manifestLine: { id: number; sku: string | null } | null = null
+  if (device.expected_device_id) {
+    manifestLine = await c.env.DB.prepare(
+      'SELECT id, sku FROM expected_devices WHERE id = ? AND organisation_id = ?'
+    ).bind(device.expected_device_id, user.organisation_id).first<{ id: number; sku: string | null }>()
+  }
+
+  return c.json({ device, events, manifest_line: manifestLine })
 })
 
 // ───────── Task X — one-off device correction (2026-09-14) ─────────
@@ -321,32 +341,75 @@ app.patch('/:id/correct', async (c) => {
   // unconditionally); the linked expected_devices row (the manifest line
   // — evidence of what the supplier originally said) is only ever
   // touched if the caller explicitly opts in via
-  // also_correct_manifest_line, on THIS same call. Otherwise the response
-  // signals the mismatch so the frontend can show a second confirmation
-  // prompt, and a caller who wants to apply it makes a second PATCH with
-  // also_correct_manifest_line: true.
+  // also_correct_manifest_line, on THIS same call — the UI is expected to
+  // decide whether to show the "also fix the manifest line?" prompt
+  // BEFORE submitting (via GET /:id's manifest_line field, added
+  // alongside this hardening), and send its answer as
+  // also_correct_manifest_line on this one call. There is deliberately
+  // no supported two-call flow: oldSku above is read fresh from
+  // received_devices on every request, so a follow-up call made AFTER
+  // this one has already changed the device's sku would compare the
+  // NEW sku against the manifest line and never match the original
+  // mismatch — see the 2026-09-15 UI-bundle review that caught this.
+  //
+  // 2026-09-15 hardening (3rd master-checklist review), three changes:
+  //   1. WIDENED CONDITION: was `expectedRow.sku === oldSku` (only
+  //      catches the manifest line being wrong in exactly the same way
+  //      the device was). Now `expectedRow.sku !== catalogRow.sku` — the
+  //      real question is "does the manifest line match the device's
+  //      CORRECTED sku", which also catches a manifest line that was
+  //      wrong in some OTHER, unrelated way (previously neither
+  //      corrected nor reported — a silent gap).
+  //   2. EXPLICIT NO-OP SIGNAL: also_correct_manifest_line: true used to
+  //      map a "nothing to cascade" case onto the same `false` as
+  //      "resolved in this same call" — indistinguishable from a
+  //      genuine cascade success. manifestLineCascade below is now a
+  //      tri-state describing exactly why nothing happened when the
+  //      caller asked for a cascade and didn't get one, instead of a
+  //      bare boolean a future caller could misread as "all good".
+  //   3. The two-call case this was written to catch (call once, then
+  //      call again with the flag on a device whose sku has already
+  //      moved) is covered by the new test right below this route's
+  //      existing cascade tests.
   let manifestLineAlsoWrong = false
   let manifestLine: Record<string, unknown> | null = null
+  // One of: null (cascade not requested — nothing to report), 'applied'
+  // (mismatch existed, cascade wrote the second event), or a distinct
+  // not-applicable reason when the caller asked for a cascade but there
+  // was genuinely nothing to cascade — never a bare `false`.
+  let manifestLineCascade: 'applied' | 'not_applicable_no_manifest_line' | 'not_applicable_already_matches' | null = null
+  const wantsCascade = body.also_correct_manifest_line === true
+
   if (device.expected_device_id) {
     const expectedRow = await c.env.DB.prepare(
       'SELECT id, sku, model_no, description, oem, grade FROM expected_devices WHERE id = ? AND organisation_id = ?'
     ).bind(device.expected_device_id, orgId).first<Record<string, unknown>>()
-    if (expectedRow && String(expectedRow.sku ?? '') === oldSku) {
+    const mismatch = !!expectedRow && String(expectedRow.sku ?? '') !== catalogRow.sku
+    if (mismatch) {
       manifestLineAlsoWrong = true
       manifestLine = expectedRow
-      if (body.also_correct_manifest_line === true) {
+    }
+    if (wantsCascade) {
+      if (!expectedRow) {
+        manifestLineCascade = 'not_applicable_no_manifest_line'
+      } else if (!mismatch) {
+        manifestLineCascade = 'not_applicable_already_matches'
+      } else {
         await c.env.DB.prepare('UPDATE expected_devices SET sku = ? WHERE id = ? AND organisation_id = ?')
           .bind(catalogRow.sku, expectedRow.id, orgId).run()
         await logDeviceEvent(c.env.DB, {
           organisationId: orgId, deviceId: id, eventType: 'SKU_CORRECTION', userId: user.id,
           metadata: {
             reason, target: 'expected_devices', expected_device_id: expectedRow.id,
-            old_sku: oldSku, new_sku: catalogRow.sku,
+            old_sku: String(expectedRow.sku ?? ''), new_sku: catalogRow.sku,
           },
         })
+        manifestLineCascade = 'applied'
         manifestLineAlsoWrong = false // resolved in this same call
       }
     }
+  } else if (wantsCascade) {
+    manifestLineCascade = 'not_applicable_no_manifest_line'
   }
 
   const { results: freshEvents } = await c.env.DB.prepare(
@@ -361,6 +424,7 @@ app.patch('/:id/correct', async (c) => {
     bill_lines_flagged: billLinesFlagged,
     manifest_line_also_wrong: manifestLineAlsoWrong,
     manifest_line: manifestLineAlsoWrong ? manifestLine : null,
+    manifest_line_cascade: manifestLineCascade,
   })
 })
 

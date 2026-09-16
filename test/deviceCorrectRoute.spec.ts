@@ -151,6 +151,7 @@ describe('PATCH /api/devices/:id/correct', () => {
     expect(body.device.grade).toBe('A')
     expect(body.manifest_line_also_wrong).toBe(true)
     expect(body.manifest_line).toMatchObject({ id: expectedId, sku: `TEST-CORRECT-WRONG-${suffix}` })
+    expect(body.manifest_line_cascade).toBeNull() // no cascade was requested on this call
 
     const row = await deviceRow(device.id)
     expect(row?.sku).toBe(`TEST-CORRECT-RIGHT-${suffix}`)
@@ -191,6 +192,7 @@ describe('PATCH /api/devices/:id/correct', () => {
     expect(res.status).toBe(200)
     const body = await res.json() as any
     expect(body.manifest_line_also_wrong).toBe(false) // resolved within this same call
+    expect(body.manifest_line_cascade).toBe('applied')
 
     const expectedRowAfter = await db().prepare('SELECT sku FROM expected_devices WHERE id = ?').bind(expectedId).first<{ sku: string }>()
     expect(expectedRowAfter?.sku).toBe(`TEST-CASCADE-RIGHT-${suffix}`)
@@ -203,6 +205,129 @@ describe('PATCH /api/devices/:id/correct', () => {
     const meta2 = JSON.parse(String(events[1].metadata))
     expect(meta1.target).toBeUndefined() // first event = the device-row correction
     expect(meta2).toMatchObject({ target: 'expected_devices', expected_device_id: expectedId, new_sku: `TEST-CASCADE-RIGHT-${suffix}` })
+  })
+
+  // ── Route hardening (3rd master-checklist review, 2026-09-15) ──
+  // The exact bug the UI-design review caught: call once (sku fixed, no
+  // cascade requested), then call AGAIN with also_correct_manifest_line:
+  // true. Because oldSku is re-read fresh from received_devices on every
+  // call, by the second call the device's sku is already the NEW one —
+  // so the old `expectedRow.sku === oldSku` condition can never see the
+  // original mismatch, silently returns manifest_line_also_wrong: false
+  // (indistinguishable from "already correct"), and the manifest line is
+  // never touched, with a 200 and no error anywhere. This is the exact
+  // shape of the IMEI 355178160488248 acceptance test if the UI were
+  // built as a two-call flow. The hardened route must return
+  // manifest_line_cascade: 'not_applicable_already_matches' — an
+  // EXPLICIT, distinct signal — not a bare false a caller could misread
+  // as success.
+  it('a SECOND, follow-up call with also_correct_manifest_line=true (after the sku already changed) gets an EXPLICIT not-applicable signal, not a silent false', async () => {
+    const suffix = uniqueSuffix()
+    await insertCatalogRow({ sku: `TEST-TWOCALL-WRONG-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTW', capacity: '128GB', color: 'MIDNIGHT', grade: 'A' })
+    await insertCatalogRow({ sku: `TEST-TWOCALL-RIGHT-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTW', capacity: '128GB', color: 'BLUE', grade: 'A' })
+
+    const manifestId = await seedManifest()
+    const device = await seedDevice({
+      sku: `TEST-TWOCALL-WRONG-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTW', capacity: '128GB', color: 'MIDNIGHT', grade: 'A',
+    })
+    const expectedId = await seedExpectedDevice({ manifestId, imei: device.imei, sku: `TEST-TWOCALL-WRONG-${suffix}` })
+    await db().prepare('UPDATE received_devices SET expected_device_id = ? WHERE id = ?').bind(expectedId, device.id).run()
+
+    // Call 1: fix the device sku, no cascade requested — same shape as
+    // test 1 above. Device sku is now TEST-TWOCALL-RIGHT-<suffix>.
+    const res1 = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-TWOCALL-RIGHT-${suffix}`, reason: 'first call: fix the device only' }),
+    })
+    expect(res1.status).toBe(200)
+    const body1 = await res1.json() as any
+    expect(body1.manifest_line_also_wrong).toBe(true) // correctly flagged — manifest still says WRONG
+
+    // Call 2: the buggy two-call flow the UI spec originally implied —
+    // resubmit the SAME (already-applied) sku with the cascade flag on.
+    // Manifest line is still wrong (still TEST-TWOCALL-WRONG-<suffix>),
+    // but device.sku now EQUALS the target sku, so this is NOT a genuine
+    // mismatch-and-cascade case any more — it's the stale-comparison
+    // trap. Must be reported explicitly, never a bare false.
+    const res2 = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-TWOCALL-RIGHT-${suffix}`, reason: 'second call: attempt cascade after the fact', also_correct_manifest_line: true }),
+    })
+    expect(res2.status).toBe(200)
+    const body2 = await res2.json() as any
+    // Because device.sku already equals catalogRow.sku on this second
+    // call, the widened `expectedRow.sku !== catalogRow.sku` condition
+    // in the route (hardening change #1) DOES still detect the
+    // manifest/device mismatch here (expectedRow.sku is still the OLD
+    // sku, catalogRow.sku is the corrected one) — so this specific
+    // two-call retry is actually rescued by the widened condition and
+    // DOES cascade correctly. The real trap this route hardening exists
+    // for is the case below, where the widened condition also runs out
+    // of things to fix because the manifest line has ALREADY been
+    // brought in line by an earlier explicit cascade.
+    expect(body2.manifest_line_cascade).toBe('applied')
+
+    // Call 3: repeat the same cascade request a THIRD time. The manifest
+    // line is now genuinely in sync with the device (both corrected) —
+    // this is the true "nothing left to cascade" case hardening change
+    // #2 exists for, and it must come back as an explicit reason, not a
+    // bare false indistinguishable from a fresh success.
+    const res3 = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-TWOCALL-RIGHT-${suffix}`, reason: 'third call: cascade requested again with nothing left to fix', also_correct_manifest_line: true }),
+    })
+    expect(res3.status).toBe(200)
+    const body3 = await res3.json() as any
+    expect(body3.manifest_line_also_wrong).toBe(false)
+    expect(body3.manifest_line_cascade).toBe('not_applicable_already_matches')
+
+    const expectedRowFinal = await db().prepare('SELECT sku FROM expected_devices WHERE id = ?').bind(expectedId).first<{ sku: string }>()
+    expect(expectedRowFinal?.sku).toBe(`TEST-TWOCALL-RIGHT-${suffix}`) // cascaded exactly once, by call 2
+  })
+
+  // ── Widened condition (hardening change #2): a manifest line wrong in
+  // a THIRD, unrelated way — i.e. it never matched the device's ORIGINAL
+  // sku either — used to be neither corrected nor reported under the old
+  // `expectedRow.sku === oldSku` test. The widened
+  // `expectedRow.sku !== catalogRow.sku` test catches this too, since the
+  // real question is "does the manifest line match what the device now
+  // is", not "did it match what the device used to be". ──
+  it('manifest line SKU that never matched the device at all (a third, unrelated value) is still flagged as a mismatch, not silently ignored', async () => {
+    const suffix = uniqueSuffix()
+    // NOTE: model 'IPHONE TESTTHIRD' (not 'IPHONE TESTQ') — TESTQ collides
+    // with the pre-existing REJECTED test below on the org-scoped unique
+    // index (brand, model, capacity, color, grade); this test originally
+    // reused TESTQ+128GB+BLUE+A, the exact same config+grade key as that
+    // test's TEST-REJECTED-OK row, and INSERT OR IGNORE silently dropped
+    // whichever ran second — caught by the full-file run, fixed here.
+    await insertCatalogRow({ sku: `TEST-THIRDVAL-DEVICE-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTTHIRD', capacity: '128GB', color: 'MIDNIGHT', grade: 'A' })
+    await insertCatalogRow({ sku: `TEST-THIRDVAL-CORRECTED-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTTHIRD', capacity: '128GB', color: 'BLUE', grade: 'A' })
+
+    const manifestId = await seedManifest()
+    const device = await seedDevice({
+      sku: `TEST-THIRDVAL-DEVICE-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTTHIRD', capacity: '128GB', color: 'MIDNIGHT', grade: 'A',
+    })
+    // Manifest line's sku is a THIRD value — neither the device's current
+    // sku nor the sku it's being corrected to. Under the old
+    // `expectedRow.sku === oldSku` test this would never match (oldSku is
+    // TEST-THIRDVAL-DEVICE-<suffix>, expectedRow.sku is
+    // TEST-THIRDVAL-MANIFESTONLY-<suffix>), so the mismatch would be
+    // silently dropped — no flag, no report, no way for the operator to
+    // ever learn the manifest line disagreed with anything.
+    const expectedId = await seedExpectedDevice({ manifestId, imei: device.imei, sku: `TEST-THIRDVAL-MANIFESTONLY-${suffix}` })
+    await db().prepare('UPDATE received_devices SET expected_device_id = ? WHERE id = ?').bind(expectedId, device.id).run()
+
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-THIRDVAL-CORRECTED-${suffix}`, reason: 'correcting device sku; manifest line disagrees with both old and new' }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as any
+    // Widened condition catches it: expectedRow.sku (MANIFESTONLY) !==
+    // catalogRow.sku (CORRECTED) -> true, so this IS flagged, even
+    // though it would never have matched the old oldSku-based test.
+    expect(body.manifest_line_also_wrong).toBe(true)
+    expect(body.manifest_line).toMatchObject({ id: expectedId, sku: `TEST-THIRDVAL-MANIFESTONLY-${suffix}` })
   })
 
   // ── Test 2 (named): non-owner -> 403, zero writes ──
@@ -450,5 +575,33 @@ describe('PATCH /api/devices/:id/correct', () => {
       body: JSON.stringify({ sku: `TEST-REJECTED-OK-${suffix}`, reason: 'correcting a rejected device catalogue line' }),
     })
     expect(res.status).toBe(200)
+  })
+})
+
+// ── GET /api/devices/:id — manifest_line field (2026-09-15, Task X UI
+// bundle) ── Added specifically so the correction modal can decide,
+// BEFORE submitting a PATCH, whether the linked manifest line's sku
+// already matches the device's current sku — the only way the
+// "also fix the manifest line?" prompt can be shown up front rather
+// than as a broken second call (see the two-call trap covered above).
+describe('GET /api/devices/:id — manifest_line field', () => {
+  it('returns manifest_line: null when the device has no linked expected_devices row', async () => {
+    const device = await seedDevice({ sku: 'TEST-GETID-NOLINK-SKU', brand: 'APPLE', model: 'IPHONE TESTG', capacity: '128GB', color: 'RED', grade: 'A' })
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}`)
+    expect(res.status).toBe(200)
+    const body = await res.json() as any
+    expect(body.manifest_line).toBeNull()
+  })
+
+  it('returns the linked manifest line { id, sku } when device.expected_device_id is set', async () => {
+    const manifestId = await seedManifest()
+    const device = await seedDevice({ sku: 'TEST-GETID-LINKED-SKU', brand: 'APPLE', model: 'IPHONE TESTG', capacity: '128GB', color: 'RED', grade: 'A' })
+    const expectedId = await seedExpectedDevice({ manifestId, imei: device.imei, sku: 'TEST-GETID-LINKED-SKU' })
+    await db().prepare('UPDATE received_devices SET expected_device_id = ? WHERE id = ?').bind(expectedId, device.id).run()
+
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}`)
+    expect(res.status).toBe(200)
+    const body = await res.json() as any
+    expect(body.manifest_line).toMatchObject({ id: expectedId, sku: 'TEST-GETID-LINKED-SKU' })
   })
 })

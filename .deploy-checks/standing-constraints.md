@@ -206,3 +206,106 @@ assignment now lives in `.deploy-checks/test-split-groups.txt` — regenerate
 it only when a spec file is added/removed/renamed, in the same commit as
 that change, so future run figures are comparable file-by-file across
 runs, not just in aggregate.
+
+**Deploy history for this route:** `f4550f7a-4769-42fe-80c8-090373e6f9c0`
+landed the route+gates+12-tests bundle above at production version
+`f62c877b` (commit `f96375a`) — approved by the operator, deployed clean
+(no migrations, no asset diff). The operator then caught that the deploy
+shipped **no UI**: `app.js` was untouched, so there was no way to reach
+the route from the browser, and the planned acceptance test (operator
+performs the IMEI `355178160488248` correction from the UI) could not be
+performed. Same class of regression as Task L. Task X was marked back
+down to 60% until a UI control actually exists — recorded here so this
+specific failure mode (route deployed, no way to reach it) has a named
+precedent to check against before any future "done" claim on a route
+that's meant to be operator-facing.
+
+**Second gap found while building the UI (same day, 3rd master-checklist
+review) — the two-call cascade trap:** the original UI spec described
+the manifest-line prompt as shown AFTER a successful correction, with
+`also_correct_manifest_line: true` sent on a SECOND, follow-up PATCH.
+Tracing this against the route's actual code (`oldSku` is read fresh
+from `received_devices.sku` on every call, before the WHERE-based
+UPDATE) showed that a second call could never see the original
+mismatch — by the time it runs, `received_devices.sku` already equals
+the corrected value, so the manifest line silently fails to cascade with
+a plain 200 and no error, exactly the shape of the operator's own
+`355178160488248` acceptance test (manifest line `id=2602`) failing
+silently with a green toast on screen. Ruled by the operator: option (b)
+— extend `GET /:id` to return the linked manifest line's `{id, sku}` so
+the modal can decide whether to show the prompt BEFORE the operator ever
+submits, and always send exactly one PATCH either way. Option (a) —
+always cascade silently and report afterwards — was explicitly rejected:
+"an always-on cascade that reports afterwards is a notification, not
+consent," since the manifest line is evidence of what the supplier
+originally said and overwriting it without asking destroys that
+evidence.
+
+**Route hardening riding the same bundle (three changes, all in
+`PATCH /:id/correct`):**
+  1. **Widened the cascade-eligibility condition** from
+     `expectedRow.sku === oldSku` to `expectedRow.sku !== catalogRow.sku`
+     — the real question is "does the manifest line match the device's
+     CORRECTED sku", not "did it match what the device used to be
+     wrong as". The narrower, pre-fix condition would let a manifest
+     line that was wrong in some unrelated THIRD way pass through
+     completely unflagged and unreported.
+  2. **Explicit no-op signal.** `also_correct_manifest_line: true` used
+     to collapse "genuine cascade applied" and "nothing to cascade" onto
+     the same `manifest_line_also_wrong: false` — indistinguishable from
+     each other. Added `manifest_line_cascade`, a tri-state
+     (`'applied' | 'not_applicable_no_manifest_line' |
+     'not_applicable_already_matches' | null`) that always states
+     plainly why nothing happened when the caller asked for a cascade
+     and didn't get a genuine one.
+  3. **Test coverage for the exact two-call trap** that motivated all of
+     this: call once (no cascade), then call again with the flag on a
+     device whose sku has already moved — asserts the response reports
+     `not_applicable_already_matches` explicitly rather than a bare
+     `false`.
+
+**UI built:** `Correct details` button next to `Move to…` in
+`AllDevicesSubview` (`app.js`), visible only under `isAdmin()` (the
+existing UI-decluttering convention — server's own 403 is the real
+gate). `CorrectDeviceModal` fetches `GET /:id` on open (now returning
+`manifest_line: {id, sku} | null`), lets the operator pick a SKU from
+`state.catalog` (no free text), shows the derived colour/grade read-only,
+shows IMEI read-only, requires a reason, and — only if the fetched
+manifest line's sku differs from the pick — shows the
+"the manifest line also reads X — correct it too?" checkbox BEFORE
+submit, sending exactly one PATCH with `also_correct_manifest_line` set
+from that checkbox's answer. Added `api.patch` to the `api` helper
+(previously only `get`/`post`/`del` existed, even though the underlying
+`http` axios instance already supported `.patch`). 409/422/403 responses
+are surfaced via the existing `toast(err.response?.data?.error, 'err')`
+pattern — the Zoho-push 409's date is shown verbatim, not swallowed.
+
+**Tests added this bundle:** two hardening tests in
+`deviceCorrectRoute.spec.ts` (the two-call trap, explicit
+`not_applicable_already_matches`; and the widened-condition "third
+value" case), plus two new tests for `GET /:id`'s `manifest_line` field
+(null when unlinked; `{id, sku}` when linked) — 17 tests total in
+`deviceCorrectRoute.spec.ts`. One test-authoring mistake caught and
+fixed during this bundle: the new "third value" test originally reused
+`model: 'IPHONE TESTQ'` + the exact same capacity/color/grade as the
+pre-existing REJECTED test further down the same file — an org-scoped
+catalogue collision on `ux_sku_catalog_org_config_grade`
+(`organisation_id, brand, model, capacity, color, grade`), silently
+absorbed by `INSERT OR IGNORE`, that caused whichever test ran second to
+fail with a 422 (SKU not in catalogue) that had nothing to do with the
+change under test. Fixed by using a distinct model name
+(`IPHONE TESTTHIRD`) for the new test. Caught by running the full spec
+file, not just the new tests in isolation — a reminder that
+`uniqueSuffix()` only guarantees a unique SKU STRING, not a unique
+catalogue config+grade key.
+
+**Full-suite baseline after this bundle** (measured fresh, each group run
+to completion this session): Group 1 165 passed/0 skipped/165 total
+(unchanged — no files in this group touched), Group 2 192 passed/1
+skipped/193 total (`deviceCorrectRoute.spec.ts` now carries 17 tests: 13
+from the prior deploy's EXISTS-fix state + 4 new this bundle — the
+two-call-trap test, the widened-condition "third value" test, and two
+new `GET /:id` `manifest_line` tests), Group 3 348 passed/7 skipped/355
+total (unchanged), Serial 65 passed/0 skipped/65 total (unchanged).
+**Combined: 770 passed / 8 skipped / 778 total.** `tsc --noEmit` clean.
+`npm run build` succeeds (307.38 kB).

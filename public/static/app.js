@@ -5094,6 +5094,194 @@ into each Condition, each VAT Type, and each Currency.`;
     );
   }
 
+  // ───────── Correct device details modal (Task X, 2026-09-14/15) ─────────
+  // PATCH /api/devices/:id/correct — owner-only fix for a device scanned
+  // in with the wrong SKU/colour/grade. SKU is ALWAYS picked from the
+  // catalogue (never free text — see the route's own "catalog is the
+  // source of truth" note); colour/grade are DERIVED from that pick and
+  // shown read-only so the operator sees what the SKU implies, never
+  // independently editable; IMEI is shown but never sent in the body at
+  // all (the route rejects the key's mere presence, regardless of value).
+  //
+  // Prompt-BEFORE-submit, single call (2026-09-15 design, 3rd
+  // master-checklist review): the route re-reads the device's CURRENT
+  // sku on every call, so a prompt shown AFTER a first successful PATCH
+  // and answered with a second PATCH can never see the original
+  // mismatch — the fix already changed what "current" means. So this
+  // modal fetches GET /:id up front (which now also returns
+  // manifest_line: {id, sku} | null) to learn the manifest line's sku
+  // BEFORE the operator ever picks a replacement, and always sends
+  // exactly one PATCH, with also_correct_manifest_line set from the
+  // operator's answer to the prompt shown while still on this screen.
+  function openCorrectDeviceModal(d) {
+    state.correctDevice = {
+      device: d,
+      manifestLine: null,     // filled in once GET /:id resolves
+      loading: true,
+      sku_pick: '',
+      reason: '',
+      cascadeConfirmed: false, // operator's answer to the manifest-line prompt, if shown
+      busy: false,
+    };
+    render();
+    api.get(`/devices/${d.id}`)
+      .then((r) => {
+        if (!state.correctDevice || state.correctDevice.device.id !== d.id) return; // modal closed/reopened meanwhile
+        state.correctDevice.manifestLine = r.manifest_line || null;
+        state.correctDevice.loading = false;
+        render();
+      })
+      .catch((err) => {
+        if (!state.correctDevice || state.correctDevice.device.id !== d.id) return;
+        state.correctDevice.loading = false;
+        render();
+        toast(err.response?.data?.error || 'Failed to load device details', 'err', 5000);
+      });
+  }
+
+  function CorrectDeviceModal() {
+    const ctx = state.correctDevice;
+    const d = ctx.device;
+    const close = () => { state.correctDevice = null; render(); };
+    const update = (k, v) => { ctx[k] = v; render(); };
+
+    const pickedRow = ctx.sku_pick ? state.catalog.find(c => c.sku === ctx.sku_pick) : null;
+
+    // The manifest-line prompt is only relevant once the operator has
+    // picked a replacement SKU AND that pick genuinely differs from
+    // what the manifest line already says. Mirrors the route's own
+    // widened condition (expectedRow.sku !== catalogRow.sku), computed
+    // here client-side against the SAME manifest_line fetched up front.
+    const manifestMismatch = !!ctx.manifestLine && !!ctx.sku_pick && ctx.manifestLine.sku !== ctx.sku_pick;
+
+    const submit = async () => {
+      const reason = ctx.reason.trim();
+      if (!reason) { toast('A reason is required — explain what was wrong and why', 'warn'); return; }
+      if (!ctx.sku_pick) { toast('Pick a SKU from the catalogue', 'warn'); return; }
+      if (ctx.busy) return;
+      ctx.busy = true; render();
+      try {
+        const r = await api.patch(`/devices/${d.id}/correct`, {
+          sku: ctx.sku_pick,
+          reason,
+          also_correct_manifest_line: manifestMismatch ? ctx.cascadeConfirmed === true : false,
+        });
+        toast(
+          `<span class="mono">${d.imei}</span> corrected → ${r.device.sku}` +
+          (r.manifest_line_cascade === 'applied' ? ' · manifest line updated too' : ''),
+          'ok'
+        );
+        state.correctDevice = null;
+        await refreshDevicesSubview();
+        render();
+      } catch (err) {
+        // 409 (locked status / pushed to Zoho) and 422 (bad sku / missing
+        // reason / imei present) both carry a specific, readable message
+        // from the route — the Zoho-push 409 in particular names the
+        // date, which the operator needs to see, not a bare toast.
+        toast(err.response?.data?.error || err.message || 'Failed to correct device', 'err', 7000);
+      } finally {
+        if (state.correctDevice) { ctx.busy = false; render(); }
+      }
+    };
+
+    // Lazy-load catalogue the first time this modal needs it (same
+    // pattern as ManualReceiveModal above).
+    if (state.catalog.length === 0) {
+      refreshCatalog().then(render);
+    }
+
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-xl' },
+        h('div', { class: 'flex items-center gap-3 mb-3' },
+          h('div', { class: 'w-10 h-10 rounded-xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center' },
+            h('i', { class: 'fas fa-pen-to-square' })),
+          h('div', {},
+            h('h2', { class: 'text-lg font-semibold' }, 'Correct device details'),
+            h('p', { class: 'text-xs text-slate-400' }, 'Fix a wrong SKU/colour/grade. IMEI cannot be changed here. This is audit-logged.')
+          )
+        ),
+
+        h('div', { class: 'card p-3 bg-slate-900/40 space-y-2 mb-4' },
+          h('div', { class: 'flex justify-between text-xs' },
+            h('span', { class: 'text-slate-500' }, 'IMEI (not editable)'),
+            h('span', { class: 'mono font-semibold' }, d.imei)),
+          h('div', { class: 'flex justify-between text-xs' },
+            h('span', { class: 'text-slate-500' }, 'Current SKU'),
+            h('span', { class: 'mono' }, d.sku)),
+          h('div', { class: 'flex justify-between text-xs' },
+            h('span', { class: 'text-slate-500' }, 'Current colour / grade'),
+            h('span', {}, `${d.color || '—'} / ${d.grade || '—'}`)),
+        ),
+
+        h('label', { class: 'block text-xs text-slate-400 mb-1' }, 'Corrected SKU (from catalogue)'),
+        h('select', {
+          class: 'input w-full mb-1',
+          value: ctx.sku_pick,
+          onchange: (e) => update('sku_pick', e.target.value),
+        },
+          h('option', { value: '' }, state.catalog.length === 0 ? 'Loading catalogue…' : 'Select a SKU…'),
+          state.catalog.map(c => h('option', { value: c.sku, selected: ctx.sku_pick === c.sku ? 'selected' : null }, c.sku))
+        ),
+
+        // Derived, read-only — never independently editable. Shown as
+        // soon as a SKU is picked so the operator sees exactly what
+        // that SKU implies before confirming.
+        pickedRow ? h('div', { class: 'card p-3 bg-slate-900/40 space-y-1 mb-4 border border-cyan-500/20' },
+          h('div', { class: 'text-[10px] uppercase text-slate-500 mb-1' }, 'Derived from catalogue (read-only)'),
+          h('div', { class: 'flex justify-between text-xs' },
+            h('span', { class: 'text-slate-500' }, 'Brand / Model'),
+            h('span', {}, `${pickedRow.brand} / ${pickedRow.model}`)),
+          h('div', { class: 'flex justify-between text-xs' },
+            h('span', { class: 'text-slate-500' }, 'Capacity'),
+            h('span', {}, pickedRow.capacity || '—')),
+          h('div', { class: 'flex justify-between text-xs' },
+            h('span', { class: 'text-slate-500' }, 'Colour'),
+            h('span', { class: 'font-semibold' }, pickedRow.color || '—')),
+          h('div', { class: 'flex justify-between text-xs' },
+            h('span', { class: 'text-slate-500' }, 'Grade'),
+            h('span', { class: 'font-semibold' }, pickedRow.grade || d.grade || '—')),
+        ) : h('div', { class: 'mb-4' }),
+
+        h('label', { class: 'block text-xs text-slate-400 mb-1' }, 'Reason (required)'),
+        h('textarea', {
+          class: 'input w-full mb-4', rows: 2,
+          placeholder: 'What was wrong, and why is this the correct value?',
+          value: ctx.reason,
+          oninput: (e) => update('reason', e.target.value),
+        }),
+
+        // Prompt-not-cascade: shown only once a mismatch is actually
+        // known (manifest line fetched AND differs from the pick) — the
+        // operator answers HERE, before submit, not after.
+        ctx.loading
+          ? h('div', { class: 'mb-4 p-3 rounded-lg bg-slate-800/40 border border-slate-700/40 text-xs text-slate-400' },
+              h('i', { class: 'fas fa-spinner fa-spin mr-2' }), 'Checking linked manifest line…')
+          : manifestMismatch
+            ? h('label', { class: 'flex items-start gap-2 mb-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-xs text-amber-200 cursor-pointer' },
+                h('input', {
+                  type: 'checkbox', class: 'mt-0.5',
+                  checked: ctx.cascadeConfirmed ? 'checked' : null,
+                  onchange: (e) => update('cascadeConfirmed', e.target.checked),
+                }),
+                h('span', {},
+                  `The manifest line for this IMEI also reads `,
+                  h('span', { class: 'mono font-semibold' }, ctx.manifestLine.sku),
+                  ` — correct it too? (Otherwise the manifest line is left as-is — it is evidence of what the supplier told you.)`)
+              )
+            : null,
+
+        h('div', { class: 'mt-5 flex justify-end gap-2' },
+          h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
+          h('button', {
+            class: 'btn btn-primary', disabled: ctx.busy ? 'disabled' : null,
+            onclick: submit,
+          }, ctx.busy ? h('i', { class: 'fas fa-spinner fa-spin' }) : h('i', { class: 'fas fa-check' }), 'Save correction')
+        )
+      )
+    );
+  }
+
   // ───────── Manual receive modal (no manifest required) ─────────
   // Lets the operator enter an IMEI + pick/define a SKU and book the device
   // straight into inventory with source='manual'. Used when there's no
