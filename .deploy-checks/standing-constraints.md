@@ -309,3 +309,59 @@ new `GET /:id` `manifest_line` tests), Group 3 348 passed/7 skipped/355
 total (unchanged), Serial 65 passed/0 skipped/65 total (unchanged).
 **Combined: 770 passed / 8 skipped / 778 total.** `tsc --noEmit` clean.
 `npm run build` succeeds (307.38 kB).
+
+## §7 — Task M closed: supervising office `GBLIV002` confirmed by HMRC (2026-09-16)
+
+**Ruling received, quoted in full:**
+
+> *"The GBLIV002 is the correct reference for the IP/OP Supervising
+> office."* — Neil Platts, Officer, Customs Liverpool Team, India
+> Buildings, Liverpool.
+
+This settles a genuine, previously-open disagreement, not a rubber
+stamp. Before this ruling, the case against `GBLIV002` was reasoned and
+well-sourced: HMRC's own published Appendix 17 list labels `GBLIV002`
+as *"India Buildings (Freeport Authorisations Team)"* and places IP/OP
+at `GBLIV001`, Graeme House — a different building, a different office
+code, on the same published list this project relied on to validate
+office codes elsewhere. The ruling above comes from an officer who
+sits in India Buildings, on the IP/OP team, and who owns this specific
+authorisation (`OP/0922/601/31`) — direct authority over the published
+list's own labelling, which is now known to be stale or imprecise for
+this code. **Recording this here specifically so nobody re-opens the
+Appendix 17 objection from the published list alone in the future** —
+the objection was reasonable at the time it was raised, and the
+resolution is this named officer's direct confirmation, not a
+correction to the published Appendix 17 text itself (which has not
+been amended and should not be treated as authoritative for this code
+going forward).
+
+**Verified live in production before writing this note** (not merely
+transcribed from the operator's message), via `gsk hosted d1_query`:
+
+```
+SELECT id, supervising_office_code, supervising_office_name, op_authorisation_number
+FROM opr_authorisations WHERE id = 1;
+```
+→ `supervising_office_code = 'GBLIV002'`,
+`supervising_office_name = 'HMRC S1756 IP-OP Customs Liverpool'`,
+`op_authorisation_number = 'OP/0922/601/31'`.
+
+This matches exactly what was already stored (corrected in an earlier
+session — see `.deploy-checks/runbook-shipment1-finalise-2026-09-12.md`
+line 61, "The supervising-office code (`GBLIV002`) was corrected on
+`opr_authorisations` this session"). **No database write was made or
+needed for this ruling** — the existing value is now HMRC-evidenced
+rather than operator-asserted. `EXP_SUPERVISING_OFFICE` green and
+`export_procedure_policy_defaults` (effective 2026-08-16) are confirmed
+correct as a consequence; neither needs revisiting on this point.
+
+**Also confirmed by HMRC, same correspondence:** Bills of Discharge are
+not required for Outward Processing authorisation — the discharge
+tracker in this codebase is internal record-keeping / audit trail, not
+a statutory HMRC submission. This does not change the 180-day /
+six-month re-import deadline (an authorisation condition, separate from
+discharge returns) — **2 March 2027** stands unaffected.
+
+Task M closes at 100%. No code, migration, or route change resulted
+from this ruling — docs-only entry.
