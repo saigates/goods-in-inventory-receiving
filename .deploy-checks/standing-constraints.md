@@ -365,3 +365,130 @@ discharge returns) — **2 March 2027** stands unaffected.
 
 Task M closes at 100%. No code, migration, or route change resulted
 from this ruling — docs-only entry.
+
+## §8 — Task X: the manifest-line-cascade modal race, its fix, the route's fourth state, and browser verification dropped a second time (2026-09-16)
+
+**The real incident this section is about.** The operator performed the
+Task X acceptance test on production device 1319 (IMEI
+355178160488248): picked the corrected SKU, entered a reason, and
+submitted. The device-row correction succeeded (one `SKU_CORRECTION`
+event), but the manifest line's own cascade never fired —
+`expected_devices` id=2602 was left at the old, wrong SKU
+(`APL-I13-128-MDN-A`) with no error shown anywhere. Confirmed live via
+`gsk hosted d1_query`: only one `SKU_CORRECTION` event exists for
+device 1319, not the expected two.
+
+**Root cause, confirmed by direct code read, not by recall or
+assumption.** `CorrectDeviceModal`'s pre-submit mismatch check
+(`public/static/app.js`) was:
+
+```javascript
+const manifestMismatch = !!ctx.manifestLine && !!ctx.sku_pick && ctx.manifestLine.sku !== ctx.sku_pick;
+```
+
+This is genuinely correct logic — it compares the manifest line's SKU
+against the operator's newly-**selected** SKU (`ctx.sku_pick`), not the
+device's stale current SKU, which is what the earlier route-side bug
+did before its own fix (`expectedRow.sku === oldSku`, widened to
+`!== catalogRow.sku` in the 2026-09-15 pass documented above §7). An
+initial hypothesis that the modal repeated that exact class of mistake
+was checked against the file and did **not** hold — worth recording
+explicitly so it is not re-asserted later without a fresh read.
+
+The actual defect was a **race**, not a logic error: `openCorrectDeviceModal()`
+sets `ctx.manifestLine = null` and `ctx.loading = true` synchronously,
+then asynchronously fetches `GET /devices/:id` (which populates
+`ctx.manifestLine` from the response's `manifest_line` field) before
+setting `ctx.loading = false`. The "Save correction" button's
+`disabled` attribute was wired only to `ctx.busy`, never to
+`ctx.loading`. An operator who picked the SKU and clicked Save before
+that fetch resolved could submit with `ctx.manifestLine` still `null`
+— `manifestMismatch`'s `!!ctx.manifestLine` guard then evaluates
+`false` regardless of what the SKUs actually say, no prompt is shown,
+`also_correct_manifest_line: false` is sent, and nothing on screen
+indicates anything went wrong. This reproduces every observed symptom
+on device 1319 exactly.
+
+**Fix, two parts, both landed in commit `b685c13` (auto-backup) /
+confirmed identical by this session's own edits — see the git note
+below:**
+
+1. **Modal** (`public/static/app.js`, `CorrectDeviceModal`): Save is
+   now gated on `(ctx.busy || ctx.loading)`, not `ctx.busy` alone.
+   Checked before landing this: `openCorrectDeviceModal`'s `.catch()`
+   path already unconditionally clears `ctx.loading` on fetch failure
+   (and shows an error toast), so this gate cannot freeze the button —
+   the window is exactly the fetch's real round-trip, nothing more.
+2. **Route** (`src/routes/devices.ts`, `PATCH /:id/correct`): the
+   `manifest_line_cascade` response field gained a fourth state,
+   `'divergent_not_requested'` — fires whenever a genuine
+   manifest/device mismatch exists but the cascade flag was absent or
+   false, for *any* reason (a genuine operator decline, this exact
+   race, or a future bug not yet imagined). Previously this case
+   collapsed to a bare `null`, indistinguishable from "no mismatch at
+   all, nothing to report" — the same class of silent-success-that-
+   wasn't the tri-state signal (§6, `70a2a9b`) was introduced to close,
+   now closed one layer deeper: the route tells the truth about a real
+   divergence regardless of what any particular UI does or fails to
+   do, not just regardless of what the caller explicitly asked for.
+
+**Tests**: 3 existing assertions in `test/deviceCorrectRoute.spec.ts`
+updated (they hit the same "mismatch present, no cascade requested"
+shape and were asserting the old bare-`null` behaviour), plus one new
+dedicated test reproducing the device-1319 shape exactly — a genuine
+mismatch with `also_correct_manifest_line` omitted from the body
+entirely gets `'divergent_not_requested'`, contrasted in the same test
+against a device with no manifest link at all, which correctly still
+gets a plain `null`. Full suite: Group 1 165/0/165, Group 2 193/1/194
+(+1 net test), Group 3 348/7/355, Serial 65/0/65 — **combined 771
+passed / 8 skipped / 779 total** (up from 770/8/778). `tsc --noEmit`
+clean. `npm run build` succeeds (307.41 kB).
+
+**Browser verification dropped a second time.** A
+`correct-device-race-ui.browser.mjs` script was written to prove the
+race through a real rendered DOM (throttling/failing the live
+`GET /devices/:id` call via Playwright's `context.route()`) — the kind
+of claim this project's own standing rule says needs a browser check,
+not a route test, to back a rendered-verdict statement. It cost three
+separate debug cycles, all in the SCRIPT, not the product: a wrong
+`POST /manifests` response field (`manifest.id` vs the route's actual
+`manifest_id`), an unscoped `page.locator('select')` matching four
+elements on the real page (subview filters and per-row "Move to"
+pickers, not just the modal's own picker), and a `const modal`
+temporal-dead-zone ordering bug. It never reached a clean pass. Ruled:
+dropped — this is the **second** time browser verification has been
+explicitly dropped on this project (the standing instruction earlier
+in this project's history was "stop browser verification, drop
+Playwright"; it came back for this one check and cost exactly what
+that ruling anticipated). The script and its README registration were
+deleted (commit `30b3e71`); the race is left proven by the direct code
+read above and the route-level regression test, which is sufficient —
+a one-line boolean-gate fix does not need DOM-level proof when the
+route-side signal now makes the failure mode impossible to mistake for
+"nothing to report" even under a different future race. **No further
+`*.browser.mjs` work should be started on this project without an
+explicit, separate operator instruction** — see
+`test/browser/README.md`'s matching process note for the fuller
+writeup and the fixture-cleanup confirmation (all `8604572`-prefixed
+rows existed only in local D1, never remote, and were deleted with a
+zero-count re-query before the harness was removed).
+
+**Git note**: a `genspark auto-backup` commit (`b685c13`) landed
+mid-session and already captured `devices.ts`, `app.js`, and
+`test/deviceCorrectRoute.spec.ts` exactly as verified above — confirmed
+by `git diff b685c13 -- <those three files>` returning empty before
+any further commit was made, per the standing practice of diffing an
+unexpected auto-backup against intended changes rather than trusting
+it blindly. No amendment to those three files was needed.
+
+**Ordering constraint carried forward, unchanged and still binding**:
+this fix must not be deployed together with the Task AC lock. Device
+1319 sits in `ACTIVE_INVENTORY`; the ruled Task AC fix adds
+`ACTIVE_INVENTORY` (and downstream statuses) to
+`CORRECTION_LOCKED_STATUSES`. Landing that before the operator re-runs
+the device-1319 correction (same SKU, prompt now genuinely reachable,
+cascade fires) would strand `expected_devices` id=2602 at the wrong SKU
+with no operator-reachable fix path ever again. Sequence: deploy this
+fix alone → operator re-runs the correction → confirm the cascade fired
+(second `SKU_CORRECTION` event, `expected_devices` id=2602 updated) →
+only then proceed to the Task Z bundle carrying the Task AC lock.
