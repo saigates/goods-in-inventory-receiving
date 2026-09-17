@@ -551,8 +551,7 @@ claims no prefix, per its own header comment), `8604571` (NOT a
 convention by `test/bulkSerials.spec.ts`, 2026-09-11, the D1-backed
 vitest spec for Step 2A gap (a), POST /shipments/:id/bulk-serials; the
 pure-function `test/bulkSerialImport.spec.ts` never writes to
-`received_devices` and claims no prefix), `8604572`
-(correct-device-race-ui, 2026-09-16, see below), `9900*` (G5 item 2 catalog
+`received_devices` and claims no prefix), `9900*` (G5 item 2 catalog
 auto-generation verification, 2026-08-21, disposable `browser_check.mjs`
 script — not checked into this repo, deleted after the citation was
 captured; see the citation record below).
@@ -837,45 +836,50 @@ wrong thing — worth remembering when a *new* role-gated download check's
 first run reports something that looks like an unrelated infra failure
 rather than a real assertion mismatch.
 
-### `correct-device-race-ui.browser.mjs` (real incident, 2026-09-16)
+## Process note (2026-09-16): browser verification dropped a second time — Playwright is not to be reached for on this project
 
-Regression check for the CorrectDeviceModal async-fetch race that let the
-live device-1319 / IMEI 355178160488248 correction go out with
-`also_correct_manifest_line` effectively false despite a genuine manifest
-mismatch — no vitest test could have caught this since it's a claim about
-the "Save correction" button's real `disabled` state at a specific instant
-relative to an in-flight fetch, not about route logic or pure-function
-output. Uses Playwright's `context.route()` to artificially throttle (or
-fail) the live `GET /api/devices/:id` call the modal issues on open, so the
-race window is wide and deterministic rather than dependent on incidental
-network speed:
+A `correct-device-race-ui.browser.mjs` script was written this session to
+prove the CorrectDeviceModal async-fetch race (device 1319 / IMEI
+355178160488248) through a real rendered DOM, per this file's own "any
+claim about a rendered verdict must be cited from a browser check" rule
+further up. It cost three separate debug cycles — a wrong `POST
+/manifests` response field (`manifest.id` vs the route's actual
+`manifest_id`), an unscoped `page.locator('select')` matching four
+elements on the real page (subview filters and per-row "Move to" pickers,
+not just the modal's own picker), and a `const modal` temporal-dead-zone
+ordering bug — and never reached a clean pass. All three bugs were in the
+TEST SCRIPT, not the product.
 
-- **Throttled fetch**: while the response is held, "Checking linked
-  manifest line…" is shown and "Save correction" is asserted **disabled**
-  — including after a SKU is picked while still loading, and that no
-  `PATCH .../correct` request escapes a `click()` on the disabled button.
-  Once the response is released, the button becomes enabled, the cascade
-  checkbox correctly appears (this fixture's manifest line genuinely
-  disagrees with the picked SKU), and submitting with it checked is
-  confirmed server-side to have cascaded the manifest line's SKU too — not
-  just closed the modal optimistically.
-- **Failed fetch**: the same call is aborted outright. Asserts the catch
-  path in `openCorrectDeviceModal()` clears `ctx.loading` (so the fix does
-  not trade a silent wrong-answer bug for a permanently frozen Save
-  button), surfaces a visible failure toast, offers no cascade checkbox
-  (the manifest line was never learned), and still lets the device-level
-  correction succeed — a degraded but functional path, never a dead end.
-- Fixtures are built through the real API end-to-end (`POST /manifests` ->
-  `POST /scan` -> `POST /scan/confirm`), not a raw D1 insert, so
-  `expected_device_id` is populated exactly the way a real receive
-  populates it.
-- Also asserts zero unexpected console errors across the whole run.
-- **Cleanup**: prints the FK-ordered `DELETE` for both seeded devices, the
-  manifests, and the two disposable catalogue rows, plus a re-query to
-  confirm afterwards (this script has no D1 binding, only `fetch()`, so it
-  cannot run the DELETE itself).
+**Ruling: dropped, for the second time on this project** (the standing
+instruction earlier in this project's history was already "stop browser
+verification, drop Playwright" — it came back for this one check and cost
+exactly what that earlier ruling anticipated). The underlying race is
+proven two other ways that do not carry this cost: a direct code read of
+the fix (`disabled: (ctx.busy || ctx.loading)`, confirmed against the
+catch path that already clears `ctx.loading` on failure) and a vitest
+route-level test that reproduces the device-1319 response shape exactly
+(`manifest_line_cascade: 'divergent_not_requested'` on a genuine mismatch
+with the flag absent) — see `test/deviceCorrectRoute.spec.ts`. The route
+test cannot observe the button's DOM `disabled` attribute directly, but it
+does not need to: the fix is a one-line gate on an existing boolean, and
+the route-side signal now makes the failure mode impossible to mistake for
+"nothing to report" even if some future caller reintroduces a similar
+race. No further `*.browser.mjs` work should be started on this project
+without an explicit, separate operator instruction to do so — matching a
+task description or an ambient "the UI looks right" is not sufficient
+grounds, per this note and the identical one that preceded it.
 
-IMEI prefix: `8604572`.
+All fixture rows the deleted script created (IMEI prefix `8604572`, 4
+`received_devices` rows, 5 `manifests`, 6 `sku_catalog` rows, their
+`expected_devices`/`scan_events`/`device_events` children) were confirmed
+via direct query to exist ONLY in local D1 (`.wrangler/state/v3/d1`, via
+`--local`) — the script's `BASE` defaults to `http://localhost:3000` and
+was never overridden to any remote/production host in any run this
+session. All were deleted and a zero-count re-query confirmed the cleanup
+before this note was written. The `8604572` IMEI prefix and the script's
+README registration are both released; a future script may reclaim
+`8604572` as "next free" without checking this note, since no trace of it
+remains in this file's registry above.
 
 ## Process note (2026-08-19): scope correction (0023-0029, not 0024-0029) + two owed browser assertions closed + local dev D1 reset side-effect
 
