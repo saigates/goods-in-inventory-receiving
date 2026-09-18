@@ -124,10 +124,15 @@ action (`1bcd49cb...`), fresh approval obtained, deploy succeeded.
 ```
 du -sh --exclude=node_modules --exclude=.git --exclude=dist .
 ```
-and flag anything over ~50MB before submitting. **28MB is the
-known-good figure** for this project's actual source (everything
-excluding `node_modules`/`.git`/`dist`). This turns this whole class of
-failure into a pre-submit warning instead of a burned handshake.
+and flag anything over ~50MB before submitting. **31MB is the current
+known-good baseline** for this project's actual source (everything
+excluding `node_modules`/`.git`/`dist`), as measured 2026-09-17.
+Superseded from the original 28MB figure (2026-09-14) — the growth is
+accounted for by the §8 doc addition, the `deviceCorrectRoute.spec.ts`
+changes, and normal accumulation, not a stray artifact; each pass
+should update this figure to whatever it actually measures rather than
+letting a stale number stand as the reference while a larger one
+passes unremarked. Still flag anything over ~50MB before submitting.
 
 Also worth noting: `ulimit -c` in this sandbox is `unlimited`, so any
 future `workerd`/`node` crash can silently deposit another large core
@@ -492,3 +497,15 @@ with no operator-reachable fix path ever again. Sequence: deploy this
 fix alone → operator re-runs the correction → confirm the cascade fired
 (second `SKU_CORRECTION` event, `expected_devices` id=2602 updated) →
 only then proceed to the Task Z bundle carrying the Task AC lock.
+
+**Correction: this project has two remotes, not three (2026-09-17).**
+`origin` (GitHub, `saigates/goods-in-inventory-receiving`) and
+`genspark` (SB-Git auto-backup) — confirmed by a zero-match grep across
+`.git/config`, `git remote -v`, `git worktree list`, and full history
+(`git log --all`, 279 commits). "All three remotes" had been repeated
+in reports since roughly the Task L pass; the error was miscounting
+the local checkout itself as a remote alongside the two actual ones,
+and it propagated because each report echoed the previous one back
+rather than re-deriving it. Going forward: two remotes. "Three HEADs
+aligned" means local plus those two, not three distinct remote
+targets.
