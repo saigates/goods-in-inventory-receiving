@@ -10,15 +10,22 @@
 //
 // This module is the single place that owns the chunk size and the
 // never-silently-truncate row-count check, so the fix (and its test
-// coverage) lives in one auditable spot rather than three near-identical
+// coverage) lives in one auditable spot rather than four near-identical
 // inline loops that could drift apart. It deliberately does NOT try to
-// own the actual SQL/bind construction at each call site: the three named
-// locations (opr.ts, inventory.ts, manifests.ts) each bind their fixed
-// extra params (org_id, a SET value, a status literal) in a DIFFERENT
-// position relative to the IN-list — a pre-existing inconsistency across
-// the codebase, not something this fix should paper over by forcing one
-// rigid bind order. Each call site builds its own statement per chunk;
-// this module only decides HOW MANY chunks and CHECKS the combined count.
+// own the actual SQL/bind construction at each call site: the four
+// locations that use it (opr.ts, inventory.ts, manifests.ts, devices.ts)
+// each bind their fixed extra params (org_id, a SET value, a status
+// literal) in a DIFFERENT position relative to the IN-list.
+//
+// KNOWN WART, left deliberately unfixed: this bind-order inconsistency
+// predates this module and is NOT normalised by it. Forcing one bind
+// order would mean rewriting working statements at every call site for a
+// cosmetic reason, inside a ticket that's already load-bearing (Z-1 is
+// the gate every Sprint-1/2 ticket sits behind) — not worth the risk.
+// Each call site builds its own SQL/bind list per chunk; this module only
+// decides HOW MANY chunks and CHECKS the combined count. Do not assume a
+// consistent bind position across call sites when adding a fifth one —
+// check each site's own WHERE clause.
 //
 // NEVER SILENTLY TRUNCATE (the OTHER standing rule this ticket exists to
 // serve — the 210-vs-217 and 52-vs-155 incidents). chunkArray splits

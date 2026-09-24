@@ -15,6 +15,7 @@ import { dispatchDeviceStatusWebhooks } from '../lib/webhook'
 import { startRepair, scanBackRepair, recordQc, reopenRepair, closeToInventory, recordRepairCost, postRepairCostToLedger, RepairJobError } from '../lib/repairWorkflow'
 import { postPurchaseCostToLedger, CostEntryError } from '../lib/costEntry'
 import { cleanString } from '../lib/validate'
+import { chunkArray } from '../lib/d1Chunk'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -564,58 +565,13 @@ const escapeCsv = (v: unknown) => {
   return /["\r\n,]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
 }
 
-app.get('/export/csv', async (c) => {
-  const user = currentUser(c)
-  const q = c.req.query()
-  const includeCostColumns = requireManager(c)
-  const excelSafe = q.excel === '1'
-
-  const where: string[] = ['rd.organisation_id = ?']
-  const binds: unknown[] = [user.organisation_id]
-
-  if (q.ids) {
-    const raw = q.ids.split(',').map(s => s.trim()).filter(s => s !== '')
-    if (!raw.length) return c.json({ error: 'ids must contain at least one numeric id' }, 400)
-    // Reject junk loudly: silently dropping an unparseable id would hand the
-    // operator a file that is missing rows they believe they selected.
-    const invalid = raw.filter(s => !/^[1-9][0-9]*$/.test(s))
-    if (invalid.length) {
-      return c.json({ error: `ids must be positive integers — invalid: ${invalid.join(', ')}` }, 400)
-    }
-    const ids = raw.map(Number)
-    where.push(`rd.id IN (${ids.map(() => '?').join(',')})`)
-    binds.push(...ids)
-  } else {
-    if (q.status) {
-      const statuses = q.status.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
-      const invalid = statuses.filter(s => !DEVICE_STATUSES.includes(s as DeviceStatus))
-      if (invalid.length) {
-        return c.json({ error: `Invalid status value(s): ${invalid.join(', ')}` }, 400)
-      }
-      if (statuses.length) {
-        where.push(`rd.status IN (${statuses.map(() => '?').join(',')})`)
-        binds.push(...statuses)
-      }
-    }
-    if (q.source) {
-      const source = q.source.trim().toLowerCase()
-      if (!DEVICE_SOURCES.includes(source as typeof DEVICE_SOURCES[number])) {
-        return c.json({ error: `Invalid source value: ${q.source} — must be one of: ${DEVICE_SOURCES.join(', ')}` }, 400)
-      }
-      where.push('rd.source = ?')
-      binds.push(source)
-    }
-  }
-
-  const whereSql = where.join(' AND ')
-
-  // No LIMIT/OFFSET, no row cap — unbounded by design (see comment above).
-  // bill_ref and the two cost sums are correlated subqueries rather than a
-  // JOIN+GROUP BY: each device has at most one 'purchase' cost_ledger row
-  // under the current guard (postPurchaseCostToLedger's duplicate-row
-  // guard, src/lib/costEntry.ts), so a scalar subquery is exact and keeps
-  // this a plain per-row streamed SELECT rather than an aggregate query.
-  const sql = `
+// Shared SELECT body for /export/csv — takes a WHERE clause fragment
+// (everything after "WHERE ") and returns the exact column list every
+// caller (chunked ids= path or single status/source path) must agree on.
+// Kept as a function rather than a second copy of the SQL string so the
+// two paths below can never drift out of sync on column order/aliasing.
+function exportCsvSelectSql(whereSql: string): string {
+  return `
     SELECT
       rd.id AS id,
       rd.uuid AS uuid,
@@ -647,6 +603,98 @@ app.get('/export/csv', async (c) => {
     WHERE ${whereSql}
     ORDER BY rd.id ASC
   `
+}
+
+app.get('/export/csv', async (c) => {
+  const user = currentUser(c)
+  const q = c.req.query()
+  const includeCostColumns = requireManager(c)
+  const excelSafe = q.excel === '1'
+
+  // Two structurally different fetch paths below: `?ids=` chunks across
+  // possibly-several D1 statements (Z-1, 2026-09-24 — see the chunking
+  // note where it's built), everything else is a single bounded query.
+  // `rows` is always the FULL result set in memory before any CSV byte is
+  // written — this route already worked this way before Z-1 (a single
+  // `.all()` call, not true row-at-a-time streaming; the `stream()` below
+  // only staggers the HTTP write, not the D1 read) so chunking does not
+  // change that property, only how many D1 round-trips build `rows`.
+  let rows: Record<string, unknown>[]
+
+  if (q.ids) {
+    const raw = q.ids.split(',').map(s => s.trim()).filter(s => s !== '')
+    if (!raw.length) return c.json({ error: 'ids must contain at least one numeric id' }, 400)
+    // Reject junk loudly: silently dropping an unparseable id would hand the
+    // operator a file that is missing rows they believe they selected.
+    const invalid = raw.filter(s => !/^[1-9][0-9]*$/.test(s))
+    if (invalid.length) {
+      return c.json({ error: `ids must be positive integers — invalid: ${invalid.join(', ')}` }, 400)
+    }
+    const ids = raw.map(Number)
+
+    // Chunked at D1_IN_CHUNK_SIZE: a single `rd.id IN (?,?,...)` statement
+    // is capped by D1 at 100 bound params, and an operator's explicit
+    // multi-select can exceed that (this is the same class of production
+    // batch — 155/162/181/217/341 — the other three Z-1 sites hit).
+    //
+    // NOT changed here: an id that is simply not found (wrong org,
+    // deleted, never existed) remains the pre-existing, explicitly TESTED
+    // contract — 200 with a short file, detectable via the trailing
+    // `# row_count=<n>` line (test/csvExport.spec.ts, "silently ignores
+    // ids that do not exist rather than erroring (partial selection)").
+    // That is a deliberate, named, reasoned behaviour, not the truncation
+    // bug this ticket targets — the bug was the query CRASHING outright
+    // past 100 ids, which chunking fixes; it was never about an operator
+    // asking for an id that turns out not to exist.
+    rows = []
+    for (const chunk of chunkArray(ids)) {
+      const whereSql = `rd.organisation_id = ? AND rd.id IN (${chunk.map(() => '?').join(',')})`
+      const { results } = await c.env.DB.prepare(exportCsvSelectSql(whereSql))
+        .bind(user.organisation_id, ...chunk).all<Record<string, unknown>>()
+      rows.push(...(results || []))
+    }
+    // Chunks are independently ORDER BY rd.id ASC but concatenated in
+    // chunk order, not id order — re-sort once in memory so the merged
+    // set matches the pre-chunking single-query contract exactly (tests
+    // below assert row order by id).
+    rows.sort((a, b) => Number(a.id) - Number(b.id))
+  } else {
+    const where: string[] = ['rd.organisation_id = ?']
+    const binds: unknown[] = [user.organisation_id]
+
+    if (q.status) {
+      const statuses = q.status.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
+      const invalid = statuses.filter(s => !DEVICE_STATUSES.includes(s as DeviceStatus))
+      if (invalid.length) {
+        return c.json({ error: `Invalid status value(s): ${invalid.join(', ')}` }, 400)
+      }
+      // Bounded by the fixed DEVICE_STATUSES enum (~13 values) regardless
+      // of how many the caller lists — cannot exceed D1's param cap, so
+      // no chunking needed here (confirmed during the Z-1 audit).
+      if (statuses.length) {
+        where.push(`rd.status IN (${statuses.map(() => '?').join(',')})`)
+        binds.push(...statuses)
+      }
+    }
+    if (q.source) {
+      const source = q.source.trim().toLowerCase()
+      if (!DEVICE_SOURCES.includes(source as typeof DEVICE_SOURCES[number])) {
+        return c.json({ error: `Invalid source value: ${q.source} — must be one of: ${DEVICE_SOURCES.join(', ')}` }, 400)
+      }
+      where.push('rd.source = ?')
+      binds.push(source)
+    }
+
+    // No LIMIT/OFFSET, no row cap — unbounded by design (see original
+    // module comment history). bill_ref and the two cost sums are
+    // correlated subqueries rather than a JOIN+GROUP BY: each device has
+    // at most one 'purchase' cost_ledger row under the current guard
+    // (postPurchaseCostToLedger's duplicate-row guard, src/lib/costEntry.ts),
+    // so a scalar subquery is exact.
+    const { results } = await c.env.DB.prepare(exportCsvSelectSql(where.join(' AND ')))
+      .bind(...binds).all<Record<string, unknown>>()
+    rows = results || []
+  }
 
   // Superset shape (STEP 1 correction, 2026-09-07): restores uuid/
   // created_at/brand/capacity/color/source alongside the new lifecycle +
@@ -663,8 +711,7 @@ app.get('/export/csv', async (c) => {
     await writer.write(headers.join(',') + '\r\n')
     let rowCount = 0
 
-    const { results } = await c.env.DB.prepare(sql).bind(...binds).all<Record<string, unknown>>()
-    for (const row of results) {
+    for (const row of rows) {
       // STEP 2: IMEI encoding is query-controlled — see module comment.
       // Default = plain digits (machine-readable); ?excel=1 = ="..." form.
       const cells = headers.map(h => (h === 'imei' && excelSafe ? imeiAsText(row[h]) : escapeCsv(row[h])))
