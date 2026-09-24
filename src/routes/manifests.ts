@@ -6,6 +6,7 @@ import { currentUser } from '../lib/auth'
 import { validateImei, cleanString, validateBuyPrice, isValidCurrency, normalizeCurrency, isValidVatType } from '../lib/validate'
 import { reconcileManifestAgainstBill, type ManifestLineForReconciliation } from '../lib/manifestBillReconciliation'
 import { deriveConditionFromGrade } from '../lib/condition'
+import { runChunked, ChunkCountMismatchError } from '../lib/d1Chunk'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -455,14 +456,47 @@ app.post('/:id/apply-sku-to-batch', async (c) => {
     return c.json({ ok: true, applied: 0, sku: catalogRow.sku, message: 'No other pending lines share this signature.' })
   }
 
-  const placeholders = matchingIds.map(() => '?').join(',')
-  await c.env.DB.prepare(
-    `UPDATE expected_devices SET sku = ? WHERE id IN (${placeholders}) AND organisation_id = ? AND manifest_id = ? AND status = 'pending'`
-  ).bind(catalogRow.sku, ...(matchingIds as unknown[]), orgId, manifestId).run()
+  // Chunked at D1_IN_CHUNK_SIZE (Z-1, 2026-09-24): a single
+  // `id IN (?,?,...)` statement is capped by D1 at 100 bound params, and a
+  // manifest can legitimately have several hundred lines sharing one
+  // signature. Unlike the SELECT-side chunking in opr.ts/inventory.ts, a
+  // shortfall HERE is a real problem, not an expected "not found" case:
+  // every id in matchingIds was JUST selected under the identical
+  // model/capacity/color/grade/status='pending' filter this UPDATE
+  // re-applies, so every one of them should update — a mismatch means
+  // something raced between the SELECT and this UPDATE (another request
+  // moved a line off 'pending', for instance), and the "never silently
+  // truncate" rule means that must surface as a loud error with counts,
+  // not a quietly-smaller `applied` figure (the exact shape of the
+  // 210-vs-217 and 52-vs-155 incidents this ticket exists to prevent).
+  let totalChanges: number
+  try {
+    totalChanges = await runChunked(
+      matchingIds,
+      matchingIds.length,
+      async (chunk, placeholders) => {
+        const res = await c.env.DB.prepare(
+          `UPDATE expected_devices SET sku = ? WHERE id IN (${placeholders}) AND organisation_id = ? AND manifest_id = ? AND status = 'pending'`
+        ).bind(catalogRow.sku, ...chunk, orgId, manifestId).run()
+        return Number(res.meta.changes ?? 0)
+      },
+      { context: `apply-sku-to-batch on manifest ${manifestId}` },
+    )
+  } catch (e) {
+    if (e instanceof ChunkCountMismatchError) {
+      return c.json({
+        error: `Expected to update ${e.expected} line(s) but only ${e.actual} actually changed — refusing to report success. A line may have moved off 'pending' between selection and update; retry the operation.`,
+        code: 'chunk_count_mismatch',
+        expected: e.expected,
+        actual: e.actual,
+      }, 409)
+    }
+    throw e
+  }
 
   return c.json({
     ok: true,
-    applied: matchingIds.length,
+    applied: totalChanges,
     sku: catalogRow.sku,
     expected_device_ids: matchingIds,
   })

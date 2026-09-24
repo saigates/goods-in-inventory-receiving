@@ -5,6 +5,7 @@ import { currentUser } from '../lib/auth'
 import { logDeviceEvent } from '../lib/deviceLifecycle'
 import { cleanString } from '../lib/validate'
 import { resolveCatalogSkuBulk, parseSkuGradeSuffix } from '../lib/catalog'
+import { chunkArray, BULK_SERIAL_CAP } from '../lib/d1Chunk'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -158,6 +159,12 @@ app.post('/grade', async (c) => {
 
   const ids: number[] = Array.from(new Set((body.ids || []).map(Number).filter(Boolean)))
   if (ids.length === 0) return c.json({ error: 'ids[] required' }, 400)
+  // Application-layer ceiling (Z-1, 2026-09-24) — same BULK_SERIAL_CAP used
+  // by opr.ts's bulk-serials endpoint, shared here since this route had no
+  // equivalent input-size cap of its own before this pass.
+  if (ids.length > BULK_SERIAL_CAP) {
+    return c.json({ error: `Maximum ${BULK_SERIAL_CAP} ids per request` }, 422)
+  }
 
   const grade = normalizeGrade(body.grade)
   // Be strict: if the caller sent something not in the set we refuse rather
@@ -180,16 +187,27 @@ app.post('/grade', async (c) => {
   // pulls uuid/brand/model/capacity/color: needed both to re-resolve the
   // catalogue SKU for the new grade, and to build a fresh print-job payload
   // if that resolution changes the SKU (see below).
-  const placeholders = ids.map(() => '?').join(',')
-  const { results: current } = await c.env.DB.prepare(
-    `SELECT id, uuid, imei, sku, grade, status, brand, model, capacity, color
-       FROM received_devices WHERE id IN (${placeholders}) AND organisation_id = ?`
-  ).bind(...(ids as unknown[]), orgId).all<{
+  //
+  // Chunked at D1_IN_CHUNK_SIZE (Z-1, 2026-09-24): a single `id IN (?,?,...)`
+  // statement is capped by D1 at 100 bound params, and real bulk-regrade
+  // batches run well past that (155/162/181/217/341 in production). A
+  // device id simply not matching (wrong org, already deleted) is the
+  // existing, intentional "not found" skip path below — not a truncation —
+  // so this reads via plain chunk-and-concatenate, same reasoning as the
+  // bulk-serials SELECT in opr.ts.
+  type DeviceRow = {
     id: number; uuid: string; imei: string; sku: string; grade: string; status: string
     brand: string | null; model: string | null; capacity: string | null; color: string | null
-  }>()
-
-  type DeviceRow = (typeof current)[number]
+  }
+  const current: DeviceRow[] = []
+  for (const chunk of chunkArray(ids)) {
+    const placeholders = chunk.map(() => '?').join(',')
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, uuid, imei, sku, grade, status, brand, model, capacity, color
+         FROM received_devices WHERE id IN (${placeholders}) AND organisation_id = ?`
+    ).bind(...(chunk as unknown[]), orgId).all<DeviceRow>()
+    current.push(...(results || []))
+  }
 
   const updated: number[] = []
   const skipped: { id: number; reason: string }[] = []

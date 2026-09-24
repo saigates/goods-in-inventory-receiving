@@ -108,6 +108,7 @@ import {
   isValidEori,
   isValidIsoDate,
 } from '../lib/opr'
+import { chunkArray, BULK_SERIAL_CAP } from '../lib/d1Chunk'
 
 type OprEnv = { Bindings: Bindings; Variables: { user: AuthUser } }
 type OprContext = Context<OprEnv>
@@ -2479,7 +2480,10 @@ app.post('/shipments/:id/scan-bulk', async (c) => {
 // so this endpoint can never diverge from single /scan's guarantees:
 // no money column written, cost basis untouched, grade captured per
 // line exactly as /scan already does it.
-const BULK_SERIAL_CAP = 500
+//
+// BULK_SERIAL_CAP now lives in ../lib/d1Chunk (Z-1, 2026-09-24) as the
+// canonical application-layer ceiling shared with inventory.ts and
+// manifests.ts, which had no equivalent cap of their own before this pass.
 
 app.post('/shipments/:id/bulk-serials', async (c) => {
   const user = currentUser(c)
@@ -2511,15 +2515,24 @@ app.post('/shipments/:id/bulk-serials', async (c) => {
     ? (gate.shipment.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'TEMP_EXPORTED_STANDARD' : 'EXPORTED_UNDER_OPR')
     : 'READY_FOR_EXPORT'
 
-  // Single batched read for every distinct normalised serial in the
-  // submission — never one query per serial.
+  // Batched read for every distinct normalised serial in the submission —
+  // never one query per serial. Chunked at D1_IN_CHUNK_SIZE (Z-1,
+  // 2026-09-24): D1 rejects a single statement with >100 bound params, and
+  // BULK_SERIAL_CAP (500) alone does not protect this query — a single
+  // batch of 155+ serials (the real production sizes: 155, 162, 181, 217,
+  // 341) blew straight through the old one-statement version. A SELECT
+  // legitimately returning fewer rows than IMEIs requested is NOT a
+  // truncation bug here — classifyBulkSerials below already gives every
+  // unmatched serial its own explicit 'unknown' outcome — so this uses
+  // plain chunkArray + concatenation, not the throwing runChunked helper
+  // (which is for write paths where every input must produce an effect).
   const normalisedSerials = [...new Set(parsed.serials.map(s => s.trim().toUpperCase()).filter(Boolean))]
   const devicesByImeiUpper = new Map<string, BulkSerialDeviceLookup & { row: Record<string, unknown> }>()
-  if (normalisedSerials.length > 0) {
-    const placeholders = normalisedSerials.map(() => '?').join(',')
+  for (const chunk of chunkArray(normalisedSerials)) {
+    const placeholders = chunk.map(() => '?').join(',')
     const { results: rows } = await c.env.DB.prepare(
       `SELECT * FROM received_devices WHERE organisation_id = ? AND UPPER(imei) IN (${placeholders})`
-    ).bind(user.organisation_id, ...normalisedSerials).all<Record<string, unknown>>()
+    ).bind(user.organisation_id, ...chunk).all<Record<string, unknown>>()
     for (const row of rows || []) {
       devicesByImeiUpper.set(String(row.imei).toUpperCase(), { id: Number(row.id), status: String(row.status), row })
     }
