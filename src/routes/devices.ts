@@ -620,6 +620,17 @@ app.get('/export/csv', async (c) => {
   // only staggers the HTTP write, not the D1 read) so chunking does not
   // change that property, only how many D1 round-trips build `rows`.
   let rows: Record<string, unknown>[]
+  // Shortfall reporting on the ids= path (2026-09-24 ruling, Master
+  // Checklist "keep the partial-selection contract, remove the silence"):
+  // the endpoint still never errors and never withholds a row for an id
+  // that turns out not to exist — that tested contract is unchanged. What
+  // changes is that the shortfall, if any, is no longer only recoverable
+  // by re-counting CSV rows against the URL by hand: it is surfaced as
+  // response headers (set before streaming starts, since Workers cannot
+  // add headers after) and logged at warn level. `null` here means "the
+  // ids= path was not used" — the status/source path has no equivalent
+  // "requested set" to diff against, so it never sets these headers.
+  let idsShortfall: { requestedCount: number; returnedCount: number; missingIds: number[] } | null = null
 
   if (q.ids) {
     const raw = q.ids.split(',').map(s => s.trim()).filter(s => s !== '')
@@ -658,6 +669,26 @@ app.get('/export/csv', async (c) => {
     // set matches the pre-chunking single-query contract exactly (tests
     // below assert row order by id).
     rows.sort((a, b) => Number(a.id) - Number(b.id))
+
+    // Shortfall detection: requested vs returned. "Requested" is
+    // raw.length — the count AFTER trimming/dropping blanks but BEFORE
+    // any dedup, since this route has never deduplicated ids= (a repeated
+    // id was already, silently, counted twice in the pre-Z-1 behaviour —
+    // not changing that here, only reporting against it honestly). A
+    // duplicate id that matches a real row will make missingIds shorter
+    // than (requestedCount - returnedCount) might suggest; that's a
+    // caller-input quirk (repeating an id in the URL), not a data-loss
+    // signal, so it is not specially called out beyond the raw numbers.
+    if (rows.length < ids.length) {
+      const foundIds = new Set(rows.map(r => Number(r.id)))
+      const missingIds = [...new Set(ids)].filter(id => !foundIds.has(id)).sort((a, b) => a - b)
+      idsShortfall = { requestedCount: raw.length, returnedCount: rows.length, missingIds }
+      console.warn(
+        `GET /api/devices/export/csv?ids=... requested ${idsShortfall.requestedCount} id(s), ` +
+        `returned ${idsShortfall.returnedCount} row(s) — missing ids: ${missingIds.join(',')} ` +
+        `(org ${user.organisation_id})`
+      )
+    }
   } else {
     const where: string[] = ['rd.organisation_id = ?']
     const binds: unknown[] = [user.organisation_id]
@@ -706,6 +737,19 @@ app.get('/export/csv', async (c) => {
 
   c.header('Content-Type', 'text/csv; charset=utf-8')
   c.header('Content-Disposition', `attachment; filename="devices-export-${Date.now()}.csv"`)
+  // Shortfall headers (2026-09-24 ruling) — set BEFORE stream() starts,
+  // since Cloudflare Workers cannot add response headers once streaming
+  // has begun (the same constraint that already forced row_count onto a
+  // trailing comment line instead of a header, see below). Only present
+  // on the ids= path, and only when it actually detected a shortfall —
+  // absent entirely on a full match or on the status/source path, so a
+  // caller can check `res.headers.has('X-Export-Ids-Missing')` rather
+  // than parse an always-present-but-empty value.
+  if (idsShortfall) {
+    c.header('X-Export-Ids-Requested', String(idsShortfall.requestedCount))
+    c.header('X-Export-Ids-Returned', String(idsShortfall.returnedCount))
+    c.header('X-Export-Ids-Missing', idsShortfall.missingIds.join(','))
+  }
 
   return stream(c, async (writer) => {
     await writer.write(headers.join(',') + '\r\n')

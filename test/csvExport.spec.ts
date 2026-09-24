@@ -822,6 +822,86 @@ describe('GET /api/devices/export/csv — filters select exactly, or fail loudly
   })
 })
 
+// Shortfall reporting (2026-09-24 Master Checklist ruling): "keep the
+// partial-selection contract, remove the silence." The route above still
+// never errors and never withholds a found row for a missing id — that
+// contract is asserted unchanged by the describe block above. What these
+// tests cover is new: the shortfall is now ALSO surfaced as response
+// headers (set before stream() starts) so a caller doesn't have to
+// hand-diff the URL against the CSV row count to notice a short file.
+describe('GET /api/devices/export/csv — shortfall headers on ids=', () => {
+  it('sets no shortfall headers at all when every requested id is found', async () => {
+    const a = await seedDevice()
+    const b = await seedDevice()
+    const { res } = await exportCsv(`?ids=${a},${b}`)
+    expect(res.status).toBe(200)
+    expect(res.headers.has('X-Export-Ids-Requested')).toBe(false)
+    expect(res.headers.has('X-Export-Ids-Returned')).toBe(false)
+    expect(res.headers.has('X-Export-Ids-Missing')).toBe(false)
+  })
+
+  it('reports requested/returned counts and the exact missing id when one of two is not found', async () => {
+    const a = await seedDevice()
+    const missing = 999999997
+    const { res, text } = await exportCsv(`?ids=${a},${missing}`)
+    expect(res.status).toBe(200)
+    // Contract from the describe block above is unchanged: still 200,
+    // still one real row, still no error.
+    expect(rowCountLine(text)).toBe(1)
+    expect(res.headers.get('X-Export-Ids-Requested')).toBe('2')
+    expect(res.headers.get('X-Export-Ids-Returned')).toBe('1')
+    expect(res.headers.get('X-Export-Ids-Missing')).toBe(String(missing))
+  })
+
+  it('reports every missing id, comma-separated, when several are not found', async () => {
+    const a = await seedDevice()
+    const m1 = 999999990
+    const m2 = 999999991
+    const m3 = 999999992
+    const { res } = await exportCsv(`?ids=${m1},${a},${m2},${m3}`)
+    expect(res.status).toBe(200)
+    expect(res.headers.get('X-Export-Ids-Requested')).toBe('4')
+    expect(res.headers.get('X-Export-Ids-Returned')).toBe('1')
+    // Order is not the caller's submission order (missingIds is sorted
+    // numerically for a stable, deterministic header value) — assert the
+    // set, not the string, so a future sort-key change doesn't spuriously
+    // break this test.
+    const missing = res.headers.get('X-Export-Ids-Missing')!.split(',').map(Number)
+    expect(missing.sort((x, y) => x - y)).toEqual([m1, m2, m3].sort((x, y) => x - y))
+  })
+
+  it('requested count uses the pre-dedup id count, matching this route\'s pre-existing no-dedup behaviour', async () => {
+    // This route has never deduplicated ids= — a repeated id was already
+    // silently counted twice before Z-1. Not changing that; only
+    // reporting against it honestly, per the ruling. Two DISTINCT real
+    // ids, one repeated: requestedCount counts the repeat, returnedCount
+    // reflects the actual row set (repeats don't produce duplicate rows —
+    // SQL IN() doesn't return a row twice for a repeated value), so
+    // returnedCount can legitimately be LESS than the distinct id count
+    // even with nothing missing.
+    const a = await seedDevice()
+    const b = await seedDevice()
+    const { res, text } = await exportCsv(`?ids=${a},${a},${b}`)
+    expect(res.status).toBe(200)
+    const ids = rowsOf(text).slice(1, -1).map(r => Number(parseCsvRecord(r)[0]))
+    expect(ids.sort((x, y) => x - y)).toEqual([a, b].sort((x, y) => x - y))
+    expect(res.headers.get('X-Export-Ids-Requested')).toBe('3')
+    // 2 distinct rows returned for 3 requested (1 duplicate) — not itself
+    // a "missing" id, so X-Export-Ids-Missing must be ABSENT (empty),
+    // not claim `a` is both found and missing.
+    expect(res.headers.get('X-Export-Ids-Returned')).toBe('2')
+    expect(res.headers.get('X-Export-Ids-Missing')).toBe('')
+  })
+
+  it('never sets shortfall headers on the status/source filter path (no requested-id set to diff against)', async () => {
+    await seedDevice({ status: 'SORTING' })
+    const { res } = await exportCsv('?status=SORTING')
+    expect(res.status).toBe(200)
+    expect(res.headers.has('X-Export-Ids-Requested')).toBe(false)
+    expect(res.headers.has('X-Export-Ids-Missing')).toBe(false)
+  })
+})
+
 describe('GET /api/devices/export/csv — organisation scoping', () => {
   it('never exports another organisation\'s devices via the status filter', async () => {
     const mine = await seedDevice({ status: 'SORTING', organisation_id: 1 })
