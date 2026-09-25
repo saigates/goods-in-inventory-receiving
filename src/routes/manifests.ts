@@ -354,10 +354,20 @@ app.post('/', async (c) => {
 //  - only lines with status = 'pending' (a received line is a permanent
 //    audit record — sku is never rewritten after receipt);
 //  - only lines whose CURRENT (model_no||description, capacity, color, grade)
-//    tuple matches the line the operator started from, using the exact same
+//    tuple matches the target signature, using the exact same
 //    norm()/normalizeCapacity() rules the catalog matcher itself uses (so
 //    "128GB" and "128 GB" are treated as the same signature, matching what
-//    the operator saw as "the same unresolved SKU" in the modal);
+//    the operator saw as "the same unresolved SKU" in the modal). NOTE
+//    (documented behaviour, not "every OTHER pending line" as the name
+//    might suggest — see test/manifestApplySkuToBatch.spec.ts, 2026-09-25):
+//    when source_expected_device_id is supplied, its own row is NOT
+//    excluded from this match — if it is still 'pending' (the normal case,
+//    since this runs from the Confirm-SKU modal typically before the
+//    source line itself has been scanned/received), it self-matches its
+//    own derived signature and IS counted in `applied`. Re-applying the
+//    identical sku to the row it was just derived from is a harmless
+//    no-op today; if that ever stops being true, treat it as a defect to
+//    fix then, not something to silently correct here now;
 //  - the target sku MUST already exist in this organisation's sku_catalog —
 //    refuses otherwise, same rule as /scan/confirm, so a batch-apply can
 //    never assign a SKU that isn't a real catalogue entry;
