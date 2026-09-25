@@ -8,7 +8,12 @@
 # test/oprImport.spec.ts is EXCLUDED — it runs separately via
 # vitest.serial.config.ts (see that file's header for why).
 #
-# GROUP 1 (12 files)
+# Regenerated 2026-09-25 (Z-1 row-count regression pass): two new spec
+# files added this segment — test/manifestApplySkuToBatch.spec.ts and
+# test/rowCountRegression.spec.ts — changing the count from 35 to 37 files
+# and shifting the alphabetical group boundaries accordingly.
+#
+# GROUP 1 (13 files)
 test/auth.spec.ts
 test/billBuilder.spec.ts
 test/bills.spec.ts
@@ -21,8 +26,8 @@ test/condition.spec.ts
 test/costEntry.spec.ts
 test/csvExport.spec.ts
 test/customsApportionment.spec.ts
-# GROUP 2 (12 files)
 test/deviceCorrectRoute.spec.ts
+# GROUP 2 (12 files)
 test/deviceLifecycle.spec.ts
 test/devicesRejectRoute.spec.ts
 test/docToken.spec.ts
@@ -30,11 +35,12 @@ test/forceAddValuation.spec.ts
 test/freightApportionment.spec.ts
 test/inventoryGradeSkuResolution.spec.ts
 test/inventoryValuationReport.spec.ts
+test/manifestApplySkuToBatch.spec.ts
 test/manifestBillLink.spec.ts
 test/manifestBillReconciliation.spec.ts
 test/manifestCleanupPrompt.spec.ts
 test/manifestConditionDerivation.spec.ts
-# GROUP 3 (11 files)
+# GROUP 3 (12 files)
 test/manifestValuation.spec.ts
 test/manualValuation.spec.ts
 test/oprAutomation.spec.ts
@@ -42,6 +48,7 @@ test/oprComms.spec.ts
 test/oprExport.spec.ts
 test/oprFoundation.spec.ts
 test/repairWorkflow.spec.ts
+test/rowCountRegression.spec.ts
 test/skuMapImport.spec.ts
 test/validate.spec.ts
 test/zohoSaleImport.spec.ts

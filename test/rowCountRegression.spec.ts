@@ -182,10 +182,17 @@ describe('Row-count regression — inventory.ts /grade (SELECT chunking)', () =>
       expect(json.updated_count).toBe(n)
       expect(json.skipped).toHaveLength(0)
 
+      // Cross-check by `sku` alone (unique per test run, per n), NOT
+      // `id IN (...)` — an unchunked id-list re-check here would blow the
+      // exact same 100-param cap this file exists to test for, just in
+      // the test's own verification query instead of the route (this bit
+      // a first draft of this test at n>100; fixed by relying on the
+      // fresh-per-test sku's uniqueness instead of the id list).
       const check = await db().prepare(
-        `SELECT COUNT(*) AS c FROM received_devices WHERE id IN (${ids.map(() => '?').join(',')}) AND grade = 'B' AND sku = ?`
-      ).bind(...ids, sku).all<{ c: number }>()
-      expect((check.results?.[0] as unknown as { c: number }).c).toBe(n)
+        `SELECT COUNT(*) AS c FROM received_devices WHERE sku = ? AND grade = 'B'`
+      ).bind(sku).first<{ c: number }>()
+      expect(check!.c).toBe(n)
+      expect(ids).toHaveLength(n)
     }, 30000)
   }
 })
