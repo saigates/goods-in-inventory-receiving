@@ -934,6 +934,41 @@ describe('GET /api/devices/export/csv — organisation scoping', () => {
     expect(rowCountLine(asTheirs.text)).toBe(1)
     expect(rowsOf(asTheirs.text).slice(1, -1).map(r => Number(parseCsvRecord(r)[0]))).toEqual([theirs])
   })
+
+  // Explicit assertion of the property the 2026-09-25 Master Checklist
+  // called out as more important than the shortfall count itself: a
+  // leaky shortfall report (org A's X-Export-Ids-Missing header naming an
+  // id that actually belongs to, and exists for, org B) would be a
+  // data-disclosure bug, not merely a wrong count — it would tell org A
+  // "this id exists but wasn't returned to you", which is meaningfully
+  // different from "this id doesn't exist at all". Both orgs query the
+  // SAME two-id set here (their own real device id + the other org's real
+  // device id) — each must see ONLY their own id as missing when the
+  // other's isn't found, with counts scoped to what THEY asked for, and
+  // must never learn anything about whether the id they can't see exists
+  // for someone else.
+  it('never leaks cross-organisation existence via the shortfall headers when both orgs query overlapping id sets', async () => {
+    const mine = await seedDevice({ organisation_id: 1 })
+    const theirs = await seedDevice({ organisation_id: 42 })
+
+    const asMine = await exportCsv(`?ids=${mine},${theirs}`)
+    expect(asMine.res.status).toBe(200)
+    expect(asMine.res.headers.get('X-Export-Ids-Requested')).toBe('2')
+    expect(asMine.res.headers.get('X-Export-Ids-Returned')).toBe('1')
+    // From org 1's perspective, `theirs` is indistinguishable from an id
+    // that simply doesn't exist — reported as missing, not as
+    // "belongs to another organisation" or any other org-revealing detail.
+    expect(asMine.res.headers.get('X-Export-Ids-Missing')).toBe(String(theirs))
+
+    const asTheirs = await exportCsv(`?ids=${mine},${theirs}`, { as: OTHER_ORG_USER })
+    expect(asTheirs.res.status).toBe(200)
+    expect(asTheirs.res.headers.get('X-Export-Ids-Requested')).toBe('2')
+    expect(asTheirs.res.headers.get('X-Export-Ids-Returned')).toBe('1')
+    // Symmetric check from the other side: org 42 sees `mine` as missing,
+    // never `theirs` (which IS returned to them, correctly) and never any
+    // hint that `mine` exists under a different organisation.
+    expect(asTheirs.res.headers.get('X-Export-Ids-Missing')).toBe(String(mine))
+  })
 })
 
 // The old "the row cap refuses truncation" describe block asserted an

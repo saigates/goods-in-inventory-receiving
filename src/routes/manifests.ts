@@ -484,8 +484,27 @@ app.post('/:id/apply-sku-to-batch', async (c) => {
     )
   } catch (e) {
     if (e instanceof ChunkCountMismatchError) {
+      // IMPORTANT — this message must not claim "no changes were made".
+      // Empirically confirmed (2026-09-25 probe, see commit) that a
+      // shortfall here can and does leave a PARTIAL write committed: each
+      // chunk is its own independently-committing D1 statement (runChunked
+      // awaits them sequentially, not inside a shared db.batch()
+      // transaction), so a chunk that completes before the race lands
+      // stays committed even though the overall operation reports 409.
+      // db.batch() would not fix this either — D1 only rolls a batch back
+      // on a thrown SQL error, and a shortfall here is a clean UPDATE that
+      // simply matched fewer rows, not an error; true atomicity across
+      // chunks would need either a permanent schema-level trigger (D1
+      // blocks ad-hoc DDL at request time — confirmed, SQLITE_AUTH) or
+      // hand-rolled compensating rollback, both out of scope for this
+      // ticket. So: tell the operator the truth — some lines may already
+      // carry the new sku — and that retrying is SAFE and CONVERGENT (a
+      // retry re-selects only lines still 'pending' under the same
+      // signature; a line the race excluded is correctly excluded from
+      // re-selection too, and a line already updated is harmlessly
+      // re-updated to the same value), not that nothing happened.
       return c.json({
-        error: `Expected to update ${e.expected} line(s) but only ${e.actual} actually changed — refusing to report success. A line may have moved off 'pending' between selection and update; retry the operation.`,
+        error: `Expected to update ${e.expected} line(s); ${e.actual} were actually changed before a mismatch was detected — some lines may already carry the new SKU. This does not roll back automatically. Retrying is safe: it will only touch lines still pending under this signature and will converge to the correct result.`,
         code: 'chunk_count_mismatch',
         expected: e.expected,
         actual: e.actual,

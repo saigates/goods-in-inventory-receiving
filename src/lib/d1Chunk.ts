@@ -61,6 +61,21 @@ export function chunkArray<T>(items: readonly T[], size: number = D1_IN_CHUNK_SI
  * boolean a caller could ignore. Carries expected vs actual so a route
  * handler can build a loud 5xx response with counts, per the standing
  * rule, without re-deriving the numbers itself.
+ *
+ * NOT ATOMIC ACROSS CHUNKS (empirically confirmed 2026-09-25, see
+ * manifests.ts's apply-sku-to-batch commit for the reproduction): each
+ * chunk run by runChunked() below is its own independently-committing D1
+ * statement. If chunk 1 succeeds and chunk 2 comes up short, chunk 1's
+ * write is NOT rolled back when this error throws — the caller has a
+ * PARTIAL result, not a clean no-op, despite the operation reporting
+ * failure. db.batch() does not close this gap either: D1 only rolls a
+ * batch back on a thrown SQL error, and a shortfall (a clean UPDATE that
+ * simply matched fewer rows than hoped) is not one. Any caller-facing
+ * error message built from this error must say so explicitly — do not
+ * write "no changes were made" or equivalent unless the specific
+ * operation is verified idempotent/convergent AND actually safe to
+ * retry, the way apply-sku-to-batch's UPDATE (re-selecting only rows
+ * still matching the original filter) is.
  */
 export class ChunkCountMismatchError extends Error {
   readonly expected: number
