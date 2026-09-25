@@ -286,6 +286,17 @@ export type Shipment = {
   repair_cost: number | null            // repairer invoice amount, as invoiced
   repair_cost_currency: string | null   // ISO 4217 of that invoice
   customs_exchange_rate: number | null  // HMRC monthly rate (foreign units per £1)
+  // Z-11 (0038): the calendar month ('YYYY-MM') the above rate was
+  // published for — HMRC publishes monthly, and a consignment accepted
+  // near a month boundary must use the rate for the month of acceptance.
+  // A rate stored without its month cannot be audited later. Mandatory
+  // whenever customs_exchange_rate is set (see parseRepairFields);
+  // meaningless (and rejected) when the invoice currency is GBP, same as
+  // the rate itself. "Customs value GBP" from the Z-11 spec is NOT a
+  // column — it is Ce1154.process_charge_gbp (computeCe1154(),
+  // oprImport.ts): repair_cost/customs_exchange_rate converted to GBP,
+  // always computed, never hand-entered.
+  customs_exchange_rate_month: string | null
   duty_rate_pct: number | null          // duty rate for the commodity (0 valid)
   import_mrn: string | null             // MRN of the 6121 import declaration
   // ── Value reconciliation (0019): export shipments only ──

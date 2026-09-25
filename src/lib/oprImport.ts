@@ -311,6 +311,10 @@ export type Ce1154 = {
   device_value_gbp: number
   process_charge: { amount: number; currency: string } | null
   customs_exchange_rate: number | null
+  // Z-11 (migration 0038): the HMRC calendar month (YYYY-MM) the rate
+  // above was published for. Always null when customs_exchange_rate is
+  // null (GBP invoice, no rate needed) — populated 1:1 with the rate.
+  customs_exchange_rate_month: string | null
   process_charge_gbp: number | null
   inbound_freight_gbp: number | null
   non_eu_freight_share_gbp: number | null
@@ -451,10 +455,24 @@ export function computeCe1154(
     const costCurrency = (importShipment.repair_cost_currency || 'GBP').toUpperCase()
     if (costCurrency === 'GBP') {
       processChargeGbp = cost
+      // Z-11: a rate month with no rate is meaningless leftover state —
+      // refuse rather than silently ignore it (mirrors the "a zero duty is
+      // never silently implied" discipline elsewhere in this function).
+      if (importShipment.customs_exchange_rate_month != null) {
+        return { ok: false, error: 'customs_exchange_rate_month is set but repair_cost_currency is GBP (no rate applies) — clear the rate month or set a non-GBP invoice currency' }
+      }
     } else {
       rate = Number(importShipment.customs_exchange_rate)
       if (importShipment.customs_exchange_rate == null || Number.isNaN(rate) || rate <= 0) {
         return { ok: false, error: `repair_cost (process charge) is in ${costCurrency} — customs_exchange_rate (HMRC monthly rate, ${costCurrency} per GBP 1) is required to convert it` }
+      }
+      // Z-11: a rate stored without its HMRC publication month cannot be
+      // audited later (HMRC publishes monthly; a consignment accepted near
+      // a month boundary must use the rate for the month of acceptance) —
+      // mandatory whenever a rate is present, same hard-refusal tier as
+      // the rate itself.
+      if (!importShipment.customs_exchange_rate_month) {
+        return { ok: false, error: 'customs_exchange_rate_month is required whenever customs_exchange_rate is set — a rate without its HMRC publication month cannot be audited later' }
       }
       processChargeGbp = round2(cost / rate)
     }
@@ -630,6 +648,7 @@ export function computeCe1154(
       device_value_gbp: deviceValueGbp,
       process_charge: processCharge,
       customs_exchange_rate: rate,
+      customs_exchange_rate_month: rate != null ? importShipment.customs_exchange_rate_month : null,
       process_charge_gbp: processChargeGbp,
       inbound_freight_gbp: importShipment.inbound_freight_gbp,
       non_eu_freight_share_gbp: importShipment.non_eu_freight_share_gbp,
@@ -725,7 +744,7 @@ export function buildCe1154Html(ce: Ce1154, importShipment: Shipment, lines: Shi
       <tr><td>Quantity of exported goods (this consignment)</td><td>${ce.quantity}</td></tr>
       <tr><td>Device value (computed — sum of returning line values)</td><td>${money(ce.device_value_gbp)}</td></tr>
       ${ce.process_charge ? `<tr><td>Process (repair) charge (as invoiced)</td><td>${ce.process_charge.amount.toFixed(2)} ${ce.process_charge.currency}</td></tr>` : ''}
-      ${ce.customs_exchange_rate != null ? `<tr><td>Customs exchange rate (${ce.process_charge?.currency} per £1)</td><td>${ce.customs_exchange_rate}</td></tr>` : ''}
+      ${ce.customs_exchange_rate != null ? `<tr><td>Customs exchange rate (${ce.process_charge?.currency} per £1)</td><td>${ce.customs_exchange_rate}${ce.customs_exchange_rate_month ? ` (HMRC rate for ${ce.customs_exchange_rate_month})` : ''}</td></tr>` : ''}
       ${ce.process_charge_gbp != null ? `<tr><td>Process charge in GBP</td><td>${money(ce.process_charge_gbp)}</td></tr>` : ''}
       ${ce.inbound_freight_gbp != null ? `<tr><td>Inbound freight</td><td>${money(ce.inbound_freight_gbp)}</td></tr>` : ''}
       ${ce.non_eu_freight_share_gbp != null ? `<tr><td>Non-EU inbound freight share</td><td>${money(ce.non_eu_freight_share_gbp)}</td></tr>` : ''}
@@ -787,7 +806,7 @@ export function buildClearanceInstructionDraft(
     `  Units returning: ${lines.length}`,
     `  Device value (computed, returning units): £${deviceValue.toFixed(2)} GBP`,
     ce1154 && ce1154.process_charge
-      ? `  Process (repair) charge: ${ce1154.process_charge.amount.toFixed(2)} ${ce1154.process_charge.currency} (£${ce1154.process_charge_gbp?.toFixed(2)} GBP)`
+      ? `  Process (repair) charge: ${ce1154.process_charge.amount.toFixed(2)} ${ce1154.process_charge.currency} (£${ce1154.process_charge_gbp?.toFixed(2)} GBP${ce1154.customs_exchange_rate_month ? `, HMRC rate for ${ce1154.customs_exchange_rate_month}` : ''})`
       : '',
     ce1154
       ? `  Duty base £${ce1154.duty_base_gbp.toFixed(2)}, duty £${ce1154.duty_gbp.toFixed(2)}; VAT base £${ce1154.vat_base_gbp.toFixed(2)}, VAT £${ce1154.pva_amount_gbp.toFixed(2)} (POSTPONED — PVA, not payable at the border)`
@@ -899,7 +918,15 @@ export function runImportValidation(
       const rate = Number(importShipment.customs_exchange_rate)
       if (importShipment.customs_exchange_rate == null || Number.isNaN(rate) || rate <= 0) {
         costProblems.push(`customs_exchange_rate is required to convert the ${costCur} repair cost to GBP`)
+      } else if (!importShipment.customs_exchange_rate_month) {
+        // Z-11: mandatory whenever a rate is present — a rate without its
+        // HMRC publication month cannot be audited later.
+        costProblems.push('customs_exchange_rate_month is required whenever customs_exchange_rate is set')
       }
+    } else if (importShipment.customs_exchange_rate_month != null) {
+      // Z-11: forbidden when the invoice is GBP — no rate applies, so a
+      // stored month is meaningless leftover state, not a harmless extra.
+      costProblems.push('customs_exchange_rate_month is set but repair_cost_currency is GBP (no rate applies)')
     }
     if (costProblems.length) add('IMP_REPAIR_COST', 'red', costProblems.join('; '))
     else add('IMP_REPAIR_COST', 'green', `Repair cost ${cost.toFixed(2)} ${costCur} with usable conversion inputs`)

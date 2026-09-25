@@ -107,6 +107,7 @@ import {
   isDeclarationSafeText,
   isValidEori,
   isValidIsoDate,
+  isValidIsoMonth,
 } from '../lib/opr'
 import { chunkArray, BULK_SERIAL_CAP } from '../lib/d1Chunk'
 
@@ -348,6 +349,14 @@ type ShipmentBody = Record<string, unknown>
 // repair_cost / repair_cost_currency / customs_exchange_rate carry the
 // "process (repair) charge" domain concept (reused column names — see
 // oprImport.ts header). duty_rate_pct is the tariff duty rate.
+// customs_exchange_rate_month (Z-11, migration 0038) is the HMRC calendar
+// month the rate was published for — mandatory whenever a rate is stored,
+// forbidden when the invoice is GBP (no rate, so no month either); see the
+// IMP_REPAIR_COST check in oprImport.ts for the enforced cross-field rule
+// (structural shape only — YYYY-MM format — is checked in
+// parseRepairFields below). "Customs value GBP" is NOT a column: it is
+// Ce1154.process_charge_gbp, computed fresh on every read from repair_cost
+// and customs_exchange_rate — never hand-entered, never stored.
 // inbound_freight_gbp / non_eu_freight_share_gbp / export_freight_gbp /
 // insurance_gbp / value_adjustment_gbp / commodity_code /
 // duty_override_claimed / entry_accepted_at / entry_cleared_at /
@@ -368,7 +377,7 @@ function parseRepairFields(body: ShipmentBody, direction: string):
   | { ok: false; error: string } {
   const fields: Record<string, unknown> = {}
   const allKeys = [
-    'repair_cost', 'repair_cost_currency', 'customs_exchange_rate', 'duty_rate_pct',
+    'repair_cost', 'repair_cost_currency', 'customs_exchange_rate', 'customs_exchange_rate_month', 'duty_rate_pct',
     ...NON_NEGATIVE_MONEY_FIELDS,
     'commodity_code', 'duty_override_claimed', 'entry_accepted_at', 'entry_cleared_at',
     'supplementary_units', 'declared_piece_count',
@@ -401,6 +410,25 @@ function parseRepairFields(body: ShipmentBody, direction: string):
       const v = Number(body.customs_exchange_rate)
       if (Number.isNaN(v) || v <= 0) return { ok: false, error: 'customs_exchange_rate must be a positive number (HMRC monthly rate, foreign units per GBP 1)' }
       fields.customs_exchange_rate = v
+    }
+  }
+  // Z-11 (migration 0038) — the calendar month the rate above was
+  // published for. Structural shape check only here (format + presence);
+  // the CROSS-field rules ("mandatory whenever a rate is stored",
+  // "forbidden when the invoice is GBP") are enforced downstream against
+  // the full merged row, in computeCe1154()/runImportValidation's
+  // IMP_REPAIR_COST check — same architectural placement already used for
+  // customs_exchange_rate's own "mandatory when currency != GBP" rule
+  // (also NOT enforced here, for the same reason: PATCH is field-by-field
+  // and a single call may legitimately touch only one of these fields,
+  // so a plain-body-only check here would misfire against an
+  // already-consistent stored row it can't see).
+  if (body.customs_exchange_rate_month !== undefined) {
+    if (body.customs_exchange_rate_month === null) fields.customs_exchange_rate_month = null
+    else {
+      const v = String(body.customs_exchange_rate_month).trim()
+      if (!isValidIsoMonth(v)) return { ok: false, error: 'customs_exchange_rate_month must be an ISO calendar month (YYYY-MM) — the HMRC month the rate was published for' }
+      fields.customs_exchange_rate_month = v
     }
   }
   if (body.duty_rate_pct !== undefined) {
@@ -541,7 +569,7 @@ app.post('/shipments', async (c) => {
   // applicable to a TEMP_EXPORT_STANDARD shipment (no customs arithmetic
   // in this flow).
   const WORKSHEET_FIELD_NAMES = [
-    'repair_cost', 'repair_cost_currency', 'customs_exchange_rate', 'duty_rate_pct',
+    'repair_cost', 'repair_cost_currency', 'customs_exchange_rate', 'customs_exchange_rate_month', 'duty_rate_pct',
     ...NON_NEGATIVE_MONEY_FIELDS, 'commodity_code', 'duty_override_claimed',
     'entry_accepted_at', 'entry_cleared_at', 'supplementary_units', 'declared_piece_count',
   ]

@@ -1,0 +1,78 @@
+-- Migration 0038 — Z-11: HMRC monthly exchange-rate month + real customs
+-- value column.
+--
+-- Numbering: `ls migrations/ | sort -V | tail` immediately before writing
+-- this file confirms 0037 (shipment_consignee_code_and_display_label) is
+-- the highest applied migration; this is the next number.
+--
+-- ───────── Why a new column, not a repurpose ─────────
+-- Z-11's spec named 5 fields: Invoice amount / Invoice currency /
+-- Exchange rate / Rate month (new) / Customs value GBP (computed,
+-- read-only). Before writing this migration the first four were checked
+-- against the existing schema and confirmed to be repair_cost /
+-- repair_cost_currency / customs_exchange_rate — already exactly this
+-- shape (0012), already validated exchange-rate-mandatory-when-≠GBP by
+-- parseRepairFields/runImportValidation's IMP_REPAIR_COST check. Only
+-- "Rate month" is genuinely new — added below as customs_exchange_rate_month.
+--
+-- The apparent fifth-field conflict — declared_invoice_total_gbp sitting
+-- in NON_NEGATIVE_MONEY_FIELDS as directly editable, seemingly clashing
+-- with "Customs value GBP: computed, read-only" — does NOT exist once the
+-- actual code is read (not just grepped): declared_invoice_total_gbp is
+-- the BROKER'S declared figure on the C&E1154 (migration 0024's own
+-- comment: "the BROKER's declared figure, kept distinct and compared
+-- against the computed sum"), used only by checkMisdeclaration() to flag
+-- broker-vs-computed variance. It was never a candidate for "Customs
+-- value GBP" in the Z-11 sense. The actual computed customs value GBP
+-- Z-11 describes already exists too: Ce1154.process_charge_gbp
+-- (oprImport.ts computeCe1154(), lines ~443-460) — repair_cost converted
+-- to GBP at customs_exchange_rate, entirely derived, never a column, never
+-- hand-entered. Batch 3's own numbers confirm the identification: invoice
+-- 20,627.40 AED / rate 4.9776 → 20627.40 / 4.9776 = 4144.05 = the exact
+-- "Customs value GBP" Z-11 states. So "Customs value GBP" IS
+-- process_charge_gbp under its Z-11 name, already computed/read-only by
+-- construction (it is a return value, not a column — there is nothing to
+-- migrate or gate here). No column is added for it.
+--
+-- ───────── Migration decision for existing rows ─────────
+-- Operator's instruction: inspect the actual data before finalising the
+-- "leave historic rows untouched, flag as legacy-format" approach. Done
+-- (gsk hosted d1_query against the live production DB, 2026-09-25):
+-- production has exactly ONE shipment row with repair_cost/
+-- customs_exchange_rate set at all (id 3, reference 877564146355 — the
+-- AWB already named in the operator's own action-item list). That row:
+--   repair_cost=20627.21, repair_cost_currency='AED',
+--   customs_exchange_rate=4.9776, declared_invoice_total_gbp=NULL
+-- This is NOT the "GBP figure sitting in the amount field with a rate
+-- alongside" shape the operator was pre-empting — repair_cost is already
+-- correctly in the ORIGINAL invoice currency (AED), not GBP, and
+-- declared_invoice_total_gbp (the separate broker-declared-figure column)
+-- is empty, not double-booked. Zero rows anywhere in production match the
+-- "legacy GBP-in-amount-field" shape described. There is nothing to
+-- reverse-engineer and nothing to flag: the legacy-format concern the
+-- operator raised does not apply to any existing row. (Confirmed
+-- additionally: repair_cost IS NOT NULL AND repair_cost_currency IS NULL
+-- → 0 rows; repair_cost_currency = 'GBP' AND customs_exchange_rate IS NOT
+-- NULL → 0 rows — the two shapes a genuine legacy ambiguity would produce
+-- are both empty.)
+--
+-- Per the operator's own stated preference for the (here, hypothetical)
+-- case, customs_exchange_rate_month is added NULLable with no backfill —
+-- the one existing rate-bearing row (id 3) has no rate month recorded
+-- anywhere upstream (not on the invoice fixture, not in any prior
+-- migration) to backfill from, so it is left NULL rather than guessed.
+-- Existing rows are otherwise unaffected: this migration is additive-only
+-- (same convention as 0012/0024/0027 — plain ADD COLUMN, no CHECK
+-- constraint at the SQLite level; server-side validators in
+-- src/routes/opr.ts and src/lib/oprImport.ts are the authority).
+--
+-- Format: 'YYYY-MM' (calendar month only — HMRC publishes monthly, so a
+-- day-of-month is meaningless and would invite false precision). Enforced
+-- server-side by isValidIsoMonth() (src/lib/opr.ts), not a CHECK
+-- constraint (matches the file's existing convention for every other
+-- format-constrained TEXT column on this table).
+--
+-- (No explicit transaction wrapper: remote D1 rejects BEGIN/COMMIT
+-- [CF 7500]; wrangler applies this file as a single batch.)
+
+ALTER TABLE shipments ADD COLUMN customs_exchange_rate_month TEXT;

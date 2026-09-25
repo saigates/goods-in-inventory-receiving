@@ -20,6 +20,7 @@
     "currency": "GBP"
   },
   "customs_exchange_rate": null,
+  "customs_exchange_rate_month": null,
   "process_charge_gbp": 1556.09,
   "inbound_freight_gbp": 101.7,
   "non_eu_freight_share_gbp": 43.73,

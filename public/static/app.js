@@ -2692,13 +2692,35 @@
       repair_cost: s.repair_cost ?? '',
       repair_cost_currency: s.repair_cost_currency || 'GBP',
       customs_exchange_rate: s.customs_exchange_rate ?? '',
+      // Z-11: rate month — mandatory whenever a rate is present, forbidden
+      // when the invoice currency is GBP (see parseRepairFields/
+      // IMP_REPAIR_COST). <input type=month> already speaks YYYY-MM.
+      customs_exchange_rate_month: s.customs_exchange_rate_month || '',
       duty_rate_pct: s.duty_rate_pct ?? '',
+    };
+    // Customs value GBP is NEVER an input — it mirrors the server's own
+    // Ce1154.process_charge_gbp computation (repair_cost converted at
+    // customs_exchange_rate, or the raw amount when already GBP), so this
+    // card shows a live preview without a round trip; the AUTHORITATIVE
+    // figure is always whatever GET /shipments/:id/ce1154 returns, never
+    // this preview. Nothing here writes it — there is no column to write.
+    const customsValuePreview = () => {
+      const amount = Number(f.repair_cost);
+      if (!amount || Number.isNaN(amount)) return null;
+      if (f.repair_cost_currency === 'GBP') return amount;
+      const rate = Number(f.customs_exchange_rate);
+      if (!rate || Number.isNaN(rate) || rate <= 0) return null;
+      return Math.round((amount / rate) * 100) / 100;
     };
     const save = async () => {
       const body = {};
       if (String(f.repair_cost).trim() !== '') body.repair_cost = Number(f.repair_cost);
       body.repair_cost_currency = f.repair_cost_currency;
       if (String(f.customs_exchange_rate).trim() !== '') body.customs_exchange_rate = Number(f.customs_exchange_rate);
+      // Sent as null (not omitted) when blank so a GBP switch actually
+      // clears a previously-set month rather than leaving stale state the
+      // server would then reject on the next save.
+      body.customs_exchange_rate_month = String(f.customs_exchange_rate_month).trim() || null;
       if (String(f.duty_rate_pct).trim() !== '') body.duty_rate_pct = Number(f.duty_rate_pct);
       try {
         await http.patch(`/opr/shipments/${s.id}`, body);
@@ -2718,15 +2740,25 @@
         h('h3', { class: 'font-semibold text-sm' }, 'Repair invoice (C&E1154 inputs)'),
         h('span', { class: 'text-[11px] text-slate-500' }, 'Receipt is blocked until repair cost and duty rate are recorded — duty is relieved on everything except the repair charge.')
       ),
-      h('div', { class: 'grid grid-cols-2 md:grid-cols-4 gap-3' },
-        Num('Repair cost *', 'repair_cost', '350.00', 'opr-repair-cost'),
+      h('div', { class: 'grid grid-cols-2 md:grid-cols-5 gap-3' },
+        Num('Invoice amount *', 'repair_cost', '350.00', 'opr-repair-cost'),
         h('div', {},
           h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Invoice currency'),
           h('select', { class: 'input mono', onchange: (e) => { f.repair_cost_currency = e.target.value; } },
             ['GBP', 'USD', 'EUR', 'CNY', 'HKD', 'AED'].map(cur =>
               h('option', { value: cur, selected: f.repair_cost_currency === cur ? 'selected' : null }, cur)))),
         Num('Exchange rate (per £1)', 'customs_exchange_rate', 'blank for GBP', 'opr-exchange-rate'),
+        h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Rate month',
+            h('span', { class: 'block text-[10px] text-amber-400/80 font-normal' }, 'Required whenever a rate is set — HMRC publishes monthly.')),
+          h('input', { id: 'opr-exchange-rate-month', class: 'input mono', type: 'month', value: f.customs_exchange_rate_month,
+            oninput: (e) => { f.customs_exchange_rate_month = e.target.value; } })),
         Num('Duty rate % *', 'duty_rate_pct', '0 for duty-free', 'opr-duty-rate')
+      ),
+      h('div', { class: 'mt-3 text-xs text-slate-400' },
+        h('span', { class: 'text-slate-500' }, 'Customs value GBP (computed, read-only): '),
+        h('span', { class: 'mono text-slate-200', id: 'opr-customs-value-gbp' },
+          (() => { const v = customsValuePreview(); return v != null ? `£${v.toFixed(2)}` : '—'; })())
       ),
       h('div', { class: 'flex justify-end mt-3' },
         h('button', { id: 'opr-repair-save', class: 'btn btn-primary text-xs', onclick: save },

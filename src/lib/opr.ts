@@ -117,3 +117,13 @@ export function isValidIsoDate(raw: unknown): raw is string {
   const d = new Date(raw + 'T00:00:00Z')
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === raw
 }
+
+// ISO calendar month (YYYY-MM), month 01-12 only — no day component (Z-11,
+// migration 0038's customs_exchange_rate_month). HMRC publishes exchange
+// rates monthly, so a day-of-month here would be false precision the
+// column was deliberately built to not carry.
+export function isValidIsoMonth(raw: unknown): raw is string {
+  if (typeof raw !== 'string' || !/^\d{4}-\d{2}$/.test(raw)) return false
+  const month = Number(raw.slice(5, 7))
+  return month >= 1 && month <= 12
+}

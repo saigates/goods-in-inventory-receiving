@@ -124,6 +124,24 @@
 // unattributed-variance placeholder — every monetary/quantity figure is
 // byte-identical. The JSON fixture required NO change (this pass only
 // touches rendering, not computeCe1154()'s output shape).
+//
+// REGENERATED 2026-09-25 (Z-11, migration 0038, customs_exchange_rate_month):
+// the JSON fixture was regenerated to add ONE new field —
+// `customs_exchange_rate_month` — introduced by computeCe1154() gaining the
+// HMRC rate-month cross-field rules. R1's process charge is GBP with no
+// exchange rate, so the new field is `null` for R1, exactly mirroring the
+// existing (already-null) `customs_exchange_rate` field right above it in
+// the JSON shape. Diffed against the prior frozen copy and confirmed the
+// ONLY difference is that one new `"customs_exchange_rate_month": null,`
+// line, inserted immediately after `"customs_exchange_rate": null,`; every
+// existing figure (£1,556.09 process charge, £43.73 non-EU freight share,
+// £101.70 inbound/export freight, £1,957.79 compensatory value, £1,599.82
+// duty base, £1,760.80 VAT base, £0.00 duty, £352.16 PVA) remains
+// byte-identical. The HTML fixture required NO change: buildCe1154Html()
+// only renders the rate-month suffix when customs_exchange_rate is
+// non-null, which is not R1's case, so the exchange-rate row's HTML is
+// unaffected (confirmed: this file's HTML byte-for-byte test already
+// passed unmodified against the existing frozen HTML fixture).
 import { describe, it, expect } from 'vitest'
 // Tests run inside workerd (no `fs`/`node:fs`) — fixtures are bundled as
 // raw text via Vite's `?raw` import suffix, not read at runtime.
@@ -192,6 +210,7 @@ const exportShipment: Shipment = {
   repair_cost: null,
   repair_cost_currency: null,
   customs_exchange_rate: null,
+  customs_exchange_rate_month: null,
   duty_rate_pct: null,
   import_mrn: null,
   reconciled_value_gbp: null,

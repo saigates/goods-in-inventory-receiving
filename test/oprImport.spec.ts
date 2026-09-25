@@ -360,29 +360,46 @@ describe('OPR 3 — computeCe1154', () => {
   // 1.25 = £800. Duty 2% is nonzero so duty_override_claimed doesn't
   // gate these by default; tests targeting the 0%-duty/override
   // interaction override duty_rate_pct and duty_override_claimed together.
-  const mkImport = (over: Partial<Shipment> = {}): Shipment => ({
-    id: 2, organisation_id: 1, reference: 'IMP X', direction: 'import',
-    shipment_type: 'OPR_REPAIR', status: 'DRAFT', authorisation_id: 1,
-    procedure_code: '6121', additional_procedure_code: null,
-    consignee_name: null, consignee_address: null, carrier: null, carrier_account: null,
-    incoterm: null, currency: 'GBP', ship_date: '2026-09-01',
-    related_export_shipment_id: 1, export_mrn: null, ducr: null, ead_mrn: null, mucr: null,
-    finalised_at: null, finalised_by_user_id: null,
-    repair_cost: 1000, repair_cost_currency: 'USD', customs_exchange_rate: 1.25,
-    duty_rate_pct: 2, import_mrn: null,
-    reconciled_value_gbp: null,
-    customs_entry_ref: null, vat_evidence_ref: null,
-    repair_cost_confirmed_at: null, repair_cost_confirmed_by_user_id: null,
-    inbound_freight_gbp: 100, non_eu_freight_share_gbp: 40, export_freight_gbp: 100,
-    insurance_gbp: null, value_adjustment_gbp: null, worksheet_input_provenance: null,
-    commodity_code: null, duty_override_claimed: 0,
-    entry_accepted_at: null, entry_cleared_at: null, supplementary_units: null,
-    entry_duty_base_gbp: null, entry_vat_base_gbp: null, entry_duty_gbp: null, entry_vat_gbp: null,
-    declared_invoice_total_gbp: null, declared_piece_count: null, declared_gross_weight_kg: null,
-    misdeclaration_ack_at: null, misdeclaration_ack_by_user_id: null,
-    notes: null, created_by_user_id: null, created_at: '', updated_at: null,
-    ...over,
-  })
+  // Z-11: the base USD/1.25 pairing below always needed an HMRC rate month
+  // — a real invoice in this shape isn't valid without one — so the
+  // missing month here was a fixture gap the new rule correctly surfaces,
+  // not evidence the rule is too strict (per the operator's instruction to
+  // judge each case rather than mechanically patch to green). But several
+  // existing call sites override down to `repair_cost_currency: 'GBP',
+  // customs_exchange_rate: null` on top of this factory, and GBP forbids a
+  // stored month — so the default month is computed from the EFFECTIVE
+  // (post-override) currency/rate a given call produces, not hardcoded,
+  // so those GBP-override sites keep getting month: null automatically
+  // and don't need touching individually.
+  const mkImport = (over: Partial<Shipment> = {}): Shipment => {
+    const effectiveCurrency = over.repair_cost_currency !== undefined ? over.repair_cost_currency : 'USD'
+    const effectiveRate = over.customs_exchange_rate !== undefined ? over.customs_exchange_rate : 1.25
+    const defaultMonth = (effectiveCurrency && effectiveCurrency !== 'GBP' && effectiveRate != null) ? '2026-09' : null
+    return {
+      id: 2, organisation_id: 1, reference: 'IMP X', direction: 'import',
+      shipment_type: 'OPR_REPAIR', status: 'DRAFT', authorisation_id: 1,
+      procedure_code: '6121', additional_procedure_code: null,
+      consignee_name: null, consignee_address: null, carrier: null, carrier_account: null,
+      incoterm: null, currency: 'GBP', ship_date: '2026-09-01',
+      related_export_shipment_id: 1, export_mrn: null, ducr: null, ead_mrn: null, mucr: null,
+      finalised_at: null, finalised_by_user_id: null,
+      repair_cost: 1000, repair_cost_currency: 'USD', customs_exchange_rate: 1.25,
+      customs_exchange_rate_month: defaultMonth,
+      duty_rate_pct: 2, import_mrn: null,
+      reconciled_value_gbp: null,
+      customs_entry_ref: null, vat_evidence_ref: null,
+      repair_cost_confirmed_at: null, repair_cost_confirmed_by_user_id: null,
+      inbound_freight_gbp: 100, non_eu_freight_share_gbp: 40, export_freight_gbp: 100,
+      insurance_gbp: null, value_adjustment_gbp: null, worksheet_input_provenance: null,
+      commodity_code: null, duty_override_claimed: 0,
+      entry_accepted_at: null, entry_cleared_at: null, supplementary_units: null,
+      entry_duty_base_gbp: null, entry_vat_base_gbp: null, entry_duty_gbp: null, entry_vat_gbp: null,
+      declared_invoice_total_gbp: null, declared_piece_count: null, declared_gross_weight_kg: null,
+      misdeclaration_ack_at: null, misdeclaration_ack_by_user_id: null,
+      notes: null, created_by_user_id: null, created_at: '', updated_at: null,
+      ...over,
+    }
+  }
   const mkExport = (over: Partial<Shipment> = {}): Shipment => mkImport({
     id: 1, reference: 'EXP X', direction: 'export', procedure_code: '2100',
     related_export_shipment_id: null, export_mrn: '26GB1111111111XX01', status: 'FINALISED',
@@ -485,6 +502,48 @@ describe('OPR 3 — computeCe1154', () => {
     expect(r.ok).toBe(false)
     if (r.ok) return
     expect(r.error).toMatch(/customs_exchange_rate/)
+  })
+
+  // ── Z-11: customs_exchange_rate_month cross-field rules ──
+  it('Z-11: refuses a customs exchange rate stored without its HMRC publication month (rate-without-month)', () => {
+    const r = computeCe1154(
+      mkImport({ customs_exchange_rate_month: null }), // rate/currency stay at the USD/1.25 default, month cleared
+      mkExport(), baseAuth, [mkLine(150)],
+    )
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error).toMatch(/customs_exchange_rate_month/)
+    expect(r.error).toMatch(/required whenever customs_exchange_rate is set/)
+  })
+
+  it('Z-11: refuses a rate month stored when the invoice currency is GBP (month-with-GBP, no rate applies)', () => {
+    const r = computeCe1154(
+      mkImport({
+        repair_cost: 500, repair_cost_currency: 'GBP', customs_exchange_rate: null,
+        customs_exchange_rate_month: '2026-09', duty_rate_pct: 0, duty_override_claimed: 1,
+      }),
+      mkExport(), baseAuth, [mkLine(150)],
+    )
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error).toMatch(/customs_exchange_rate_month/)
+    expect(r.error).toMatch(/repair_cost_currency is GBP/)
+  })
+
+  it('Z-11 Batch 3 acceptance case: AED 20,627.40 / HMRC rate 4.9776 (Sep 2026) converts to £4,144.05 exactly via process_charge_gbp', () => {
+    const r = computeCe1154(
+      mkImport({
+        repair_cost: 20627.40, repair_cost_currency: 'AED', customs_exchange_rate: 4.9776,
+        customs_exchange_rate_month: '2026-09', duty_rate_pct: 2,
+      }),
+      mkExport(), baseAuth, [mkLine(150)],
+    )
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.ce1154.process_charge).toEqual({ amount: 20627.40, currency: 'AED' })
+    expect(r.ce1154.customs_exchange_rate).toBe(4.9776)
+    expect(r.ce1154.customs_exchange_rate_month).toBe('2026-09')
+    expect(r.ce1154.process_charge_gbp).toBe(4144.05)
   })
 
   it('refuses when the related export has no MRN', () => {
@@ -1790,7 +1849,11 @@ describe('OPR — value reconciliation: durable delta record (end-to-end)', () =
 describe('OPR — value reconciliation: isolation from the C&E1154 VAT/duty basis (protected invariant)', () => {
   it('reconciling an EXPORT batch\'s goods value does not change repair_cost / customs_exchange_rate / duty_rate_pct on ANY import shipment, nor computeCe1154()\'s output', async () => {
     const { shipment: exp, devices } = await makeFinalisedExport(2, '26GB0000000000AA14')
-    const ret = await makeReturnShipment(exp.id, { repair_cost: 800, repair_cost_currency: 'USD', customs_exchange_rate: 1.25, duty_rate_pct: 2 })
+    // Z-11: this test is about value-reconciliation isolation, unrelated to
+    // the repair-cost/rate fields it sets up as fixture scaffolding — the
+    // missing rate month here is a fixture gap (a real USD invoice with a
+    // rate always needs one), not evidence the new rule is too strict.
+    const ret = await makeReturnShipment(exp.id, { repair_cost: 800, repair_cost_currency: 'USD', customs_exchange_rate: 1.25, customs_exchange_rate_month: '2026-09', duty_rate_pct: 2 })
     for (const d of devices) {
       const s = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: d.imei }) })
       expect(s.status).toBe(201)
@@ -1799,8 +1862,8 @@ describe('OPR — value reconciliation: isolation from the C&E1154 VAT/duty basi
     // Snapshot the import shipment's VAT/duty-basis fields AND the full
     // computed C&E1154 BEFORE any value-reconciliation activity.
     const beforeShip = await env.DB.prepare(
-      'SELECT repair_cost, repair_cost_currency, customs_exchange_rate, duty_rate_pct FROM shipments WHERE id = ?'
-    ).bind(ret.id).first<{ repair_cost: number; repair_cost_currency: string; customs_exchange_rate: number; duty_rate_pct: number }>()
+      'SELECT repair_cost, repair_cost_currency, customs_exchange_rate, customs_exchange_rate_month, duty_rate_pct FROM shipments WHERE id = ?'
+    ).bind(ret.id).first<{ repair_cost: number; repair_cost_currency: string; customs_exchange_rate: number; customs_exchange_rate_month: string | null; duty_rate_pct: number }>()
     const ceBefore = await api(`/api/opr/shipments/${ret.id}/ce1154?format=json`)
     expect(ceBefore.status).toBe(200)
     const ceBeforeBody = await ceBefore.json()
@@ -1816,8 +1879,8 @@ describe('OPR — value reconciliation: isolation from the C&E1154 VAT/duty basi
 
     // AFTER: the import shipment's VAT/duty-basis fields must be BYTE-IDENTICAL.
     const afterShip = await env.DB.prepare(
-      'SELECT repair_cost, repair_cost_currency, customs_exchange_rate, duty_rate_pct FROM shipments WHERE id = ?'
-    ).bind(ret.id).first<{ repair_cost: number; repair_cost_currency: string; customs_exchange_rate: number; duty_rate_pct: number }>()
+      'SELECT repair_cost, repair_cost_currency, customs_exchange_rate, customs_exchange_rate_month, duty_rate_pct FROM shipments WHERE id = ?'
+    ).bind(ret.id).first<{ repair_cost: number; repair_cost_currency: string; customs_exchange_rate: number; customs_exchange_rate_month: string | null; duty_rate_pct: number }>()
     expect(afterShip).toEqual(beforeShip)
 
     // And computeCe1154()'s full output — including repair_cost_gbp, duty
