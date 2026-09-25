@@ -35,6 +35,22 @@
 // common "N items in, N rows/changes out" shape, and throws loudly
 // (ChunkCountMismatchError) rather than returning a partial result as if
 // it were complete.
+//
+// TEST HELPERS ARE NOT EXEMPT (2026-09-25, found while writing
+// test/rowCountRegression.spec.ts): while building that file's own fixture
+// seeding and cross-check queries, TWO of them independently re-derived the
+// exact same unchunked `id IN (?,?,...)` / `imei IN (?,?,...)` pattern this
+// module exists to eliminate — at n>100, both hit the identical
+// SQLITE_ERROR: "too many SQL variables" the four production routes used to
+// hit. Nobody was deliberately careless; it is just the natural, un-reviewed
+// way to write "look these up by id list" in this codebase, and test
+// scaffolding gets far less scrutiny than route code. The lesson: this
+// module's job — "don't build an IN-list without going through chunkArray/
+// runChunked first" — applies equally to test helpers and fixtures, not just
+// to src/routes/*.ts. A future 5th call site (production OR test) should
+// import chunkArray here rather than hand-rolling the list, even for a
+// "surely this one's small" lookup — the four routes fixed by this module
+// all started out as exactly that assumption too.
 
 export const BULK_SERIAL_CAP = 500
 export const D1_IN_CHUNK_SIZE = 90
