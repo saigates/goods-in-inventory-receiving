@@ -130,6 +130,23 @@ export type MisdeclarationAckLite = {
   acknowledged_at: string
 }
 
+// Z-9 (0039) — the LATEST return_line_corrections row per shipment_line_id,
+// as loaded by the caller (route layer). Only requires_review/reviewed_at
+// matter to the validation engine here — the full correction row (all
+// seven corrected identity fields) is not needed to decide whether
+// finalise is blocked, only whether an unreviewed flag exists. This is
+// Z-9's OWN Amendment-4 hard-block obligation for lines that DID match an
+// export line (a return_line_corrections row can only exist for a line
+// that exists in shipment_lines at all) — separate from Z-15's "wrong
+// device, no export-line match whatsoever" scope, which return_line_corrections
+// cannot represent by construction.
+export type ReturnLineCorrectionLite = {
+  shipment_line_id: number
+  requires_review: number | boolean
+  reviewed_at: string | null
+  review_reason: string | null
+}
+
 export type MisdeclarationCheckResult = {
   value: { declared_gbp: number | null; computed_gbp: number; variance_gbp: number | null; misdeclared: boolean; acknowledged: boolean; acknowledged_at: string | null }
   piece_count: { declared: number | null; suspect_carried_forward_from: string | null; misdeclared: boolean; acknowledged: boolean; acknowledged_at: string | null }
@@ -671,8 +688,37 @@ export function computeCe1154(
   }
 }
 
-// Print-ready A4 rendering of the computed C&E1154 figures.
-export function buildCe1154Html(ce: Ce1154, importShipment: Shipment, lines: ShipmentLine[]): string {
+// Z-9 — the presentation-only "declared as X, corrected to Y" side-by-side
+// view (operator's two smaller v1 asks, 2026-09-26). No arithmetic
+// changes — device_value_gbp/duty/VAT all still read shipment_lines
+// (frozen at export) exactly as before; this purely lets a reviewer see a
+// correction without querying the database directly. Keyed by
+// shipment_line_id (the RETURN leg's line id) so the caller can pass the
+// latest return_line_corrections row per line straight through.
+export type ReturnLineCorrectionDisplay = {
+  shipment_line_id: number
+  corrected_imei: string
+  corrected_sku: string | null
+  corrected_brand: string | null
+  corrected_model: string | null
+  corrected_capacity: string | null
+  corrected_color: string | null
+  corrected_grade: string
+  requires_review: number | boolean
+  reviewed_at: string | null
+  review_reason: string | null
+}
+
+// Print-ready A4 rendering of the computed C&E1154 figures. `corrections`
+// is additive/optional (default {}) — every existing call site (none of
+// which pass it yet) renders byte-identically to before (see
+// ce1154Golden.spec.ts's frozen fixture assertion).
+export function buildCe1154Html(
+  ce: Ce1154,
+  importShipment: Shipment,
+  lines: ShipmentLine[],
+  corrections: Record<number, ReturnLineCorrectionDisplay> = {},
+): string {
   const money = (v: number | null) => v == null ? '—' : `£${v.toFixed(2)}`
   // Owner finding (2026-08-17, "first item of the next pass"): this document
   // is what a filing party actually reads, and it previously rendered
@@ -688,13 +734,36 @@ export function buildCe1154Html(ce: Ce1154, importShipment: Shipment, lines: Shi
       : ce.value_adjustment_provenance === 'solved'
         ? ' — SOLVED (derived from the entry VAT base; not directly supplied)'
         : ''
-  const rows = lines.map((l, i) => `
+  const rows = lines.map((l, i) => {
+    const declared = `${l.imei} — ${[l.brand, l.model, l.capacity, l.color, l.grade].filter(Boolean).join(' ')}`
+    const corr = corrections[l.id]
+    if (!corr) {
+      return `
         <tr>
           <td>${i + 1}</td>
           <td>${l.imei}</td>
           <td>${[l.brand, l.model, l.capacity, l.color].filter(Boolean).join(' ')}</td>
           <td class="num">${money(Number(l.unit_value))}</td>
-        </tr>`).join('')
+        </tr>`
+    }
+    // Side-by-side "declared as X, corrected to Y" — presentation only, no
+    // arithmetic change: the "Export value" column still reads
+    // l.unit_value (the frozen customs figure), never a corrected value
+    // (return_line_corrections has no such column at all — see migration
+    // 0039's header comment on why that is a structural guarantee, not a
+    // display choice).
+    const correctedDesc = [corr.corrected_brand, corr.corrected_model, corr.corrected_capacity, corr.corrected_color, corr.corrected_grade].filter(Boolean).join(' ')
+    const reviewNote = Number(corr.requires_review) === 1
+      ? (corr.reviewed_at ? ` — reviewed ${corr.reviewed_at}` : ' — REQUIRES REVIEW, not yet acknowledged')
+      : ''
+    return `
+        <tr class="${Number(corr.requires_review) === 1 && !corr.reviewed_at ? 'warn' : ''}">
+          <td>${i + 1}</td>
+          <td>${l.imei}${corr.corrected_imei !== l.imei ? ` → ${corr.corrected_imei}` : ''}</td>
+          <td>Declared as: ${declared}<br>Corrected to: ${corr.corrected_imei} — ${correctedDesc}${reviewNote}</td>
+          <td class="num">${money(Number(l.unit_value))}</td>
+        </tr>`
+  }).join('')
   const misdeclarationRows = [
     ce.misdeclaration.value.declared_gbp != null && ce.misdeclaration.value.misdeclared
       ? `<tr><td>Broker-declared invoice total vs. app-computed device value</td><td>${money(ce.misdeclaration.value.declared_gbp)} vs. ${money(ce.misdeclaration.value.computed_gbp)} (variance ${money(ce.misdeclaration.value.variance_gbp)}) — REQUIRES ACKNOWLEDGEMENT</td></tr>`
@@ -856,6 +925,11 @@ export function runImportValidation(
   today = new Date().toISOString().slice(0, 10),
   siblingLegs: SiblingLegLite[] = [],
   misdeclarationAcks: MisdeclarationAckLite[] = [],
+  // Z-9 (0039) — latest return_line_corrections row per shipment_line_id,
+  // loaded by the caller. Defaults to [] so every existing call site
+  // (none of which pass this yet) is unaffected — additive parameter,
+  // same convention as siblingLegs/misdeclarationAcks above.
+  returnLineCorrections: ReturnLineCorrectionLite[] = [],
 ): ValidationResult {
   const checks: ValidationCheck[] = []
   const add = (code: string, level: CheckLevel, message: string) => checks.push({ code, level, message })
@@ -1039,6 +1113,33 @@ export function runImportValidation(
       } else {
         add('IMP_MISDECLARATION_CHECK', 'green', 'Declared figures (where present) match the computed device value; no carried-forward piece count/gross weight detected against sibling legs')
       }
+    }
+  }
+
+  // ── IMP_RETURN_LINE_REVIEW (Z-9, operator amendment 4) ──
+  // requires_review=1 is amber-only DISPLAY while the return is DRAFT (the
+  // operator must always be able to record physical scanner reality
+  // without being blocked mid-scan — see return_line_corrections' own
+  // header comment) but HARD-BLOCKS finalise here, unconditionally, until
+  // reviewed_at is set (cleared via the reuse of the
+  // shipment_misdeclaration_acks pattern: an admin review+ack). This is
+  // Z-9's OWN obligation for a line that DID match an export line — the
+  // return_line_corrections table can only carry a row for a
+  // shipment_line_id that already exists, so a scan matching NO export
+  // line at all (the wrong-device case) is Z-15's separate scope, not this
+  // check's. Not applicable to TEMP_EXPORT_STANDARD, matching every other
+  // customs-specific check above (no customs identity assertion applies).
+  if (isStandardTemp) {
+    add('IMP_RETURN_LINE_REVIEW', 'green', 'Not applicable — no return-line correction review on a TEMP_EXPORT_STANDARD shipment')
+  } else {
+    const unreviewed = returnLineCorrections.filter(r => Number(r.requires_review) === 1 && !r.reviewed_at)
+    if (unreviewed.length) {
+      add('IMP_RETURN_LINE_REVIEW', 'red', `${unreviewed.length} return-line correction(s) require review before receipt: ${unreviewed.map(r => `line ${r.shipment_line_id} (${r.review_reason ?? 'unspecified'})`).join('; ')}`)
+    } else {
+      const reviewed = returnLineCorrections.filter(r => Number(r.requires_review) === 1 && r.reviewed_at)
+      add('IMP_RETURN_LINE_REVIEW', 'green', reviewed.length
+        ? `${reviewed.length} return-line correction(s) flagged for review, all reviewed/acknowledged`
+        : 'No return-line corrections require review')
     }
   }
 

@@ -81,7 +81,7 @@ import { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Bindings, AuthUser, Shipment, ShipmentLine, OprAuthorisation, DeviceStatus } from '../types'
 import { currentUser } from '../lib/auth'
-import { cleanString, isValidCurrency } from '../lib/validate'
+import { cleanString, isValidCurrency, validateImei } from '../lib/validate'
 import { transitionDevice, logDeviceEvent } from '../lib/deviceLifecycle'
 import { runExportValidation, sumLineValues, type ExportProcedurePolicyLite } from '../lib/oprValidation'
 import { buildCommercialInvoiceHtml, buildScanOutList, buildPreAlertDraft } from '../lib/oprDocs'
@@ -96,6 +96,8 @@ import {
   type SiblingLegLite,
   type MisdeclarationAckLite,
   type MisdeclarationVarianceType,
+  type ReturnLineCorrectionLite,
+  type ReturnLineCorrectionDisplay,
 } from '../lib/oprImport'
 import { computeFollowUpStatus, computeOutstandingChecklist, type SentEmailLite, type ShipmentReplyLite } from '../lib/oprComms'
 import { parseBulkSerialInput, classifyBulkSerials, type BulkSerialDeviceLookup } from '../lib/bulkSerialImport'
@@ -110,6 +112,16 @@ import {
   isValidIsoMonth,
 } from '../lib/opr'
 import { chunkArray, BULK_SERIAL_CAP } from '../lib/d1Chunk'
+import { normalizeGrade, VALID_GRADES } from '../lib/grade'
+import { resolveCatalogSku } from '../lib/catalog'
+import {
+  parseModelGeneration, compareGenerations, compareCatalogValues, computeReturnLineReview,
+  mergeCorrectionSnapshot, type FrozenLineSpec, type CorrectedLineSpec,
+} from '../lib/returnCorrections'
+import {
+  planGradeCorrection, buildGradeCorrectionStmts, logGradeCorrectionEvent,
+  type GradeCorrectionDeviceRow, type IdentityFieldOverrides,
+} from '../lib/gradeCorrection'
 
 type OprEnv = { Bindings: Bindings; Variables: { user: AuthUser } }
 type OprContext = Context<OprEnv>
@@ -746,7 +758,7 @@ app.patch('/shipments/:id', async (c) => {
   const bundle = await loadShipmentBundle(c, user, id)
   const validation = bundle.ok
     ? (bundle.shipment.direction === 'import'
-        ? runImportValidation(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, await loadSiblingLegs(c, user, bundle.shipment), await loadMisdeclarationAcks(c, user, bundle.shipment.id))
+        ? runImportValidation(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, await loadSiblingLegs(c, user, bundle.shipment), await loadMisdeclarationAcks(c, user, bundle.shipment.id), await loadReturnLineCorrections(c, user, bundle.shipment.id))
         : runExportValidation(bundle.shipment, bundle.authorisation, bundle.lines, undefined, await loadExportProcedurePolicy(c, user, bundle.shipment)))
     : null
 
@@ -1118,6 +1130,44 @@ async function loadMisdeclarationAcks(
   }))
 }
 
+// Z-9 (0039) — the LATEST return_line_corrections row per shipment_line_id
+// on this import shipment. "Latest per line" is the current effective
+// correction because every row is a full snapshot (see migration 0039's
+// header — snapshot, not diff), so the highest id per shipment_line_id is
+// simply the most recent statement of "what did the operator actually
+// observe on re-scan" for that line. Lines with no correction at all
+// simply have no row here — that is the "never corrected, frozen export
+// value stands" state, not an error.
+async function loadReturnLineCorrections(
+  c: OprContext,
+  user: AuthUser,
+  shipmentId: number,
+): Promise<Array<ReturnLineCorrectionLite & ReturnLineCorrectionDisplay>> {
+  const { results } = await c.env.DB.prepare(`
+    SELECT rc.*
+      FROM return_line_corrections rc
+      JOIN shipment_lines sl ON sl.id = rc.shipment_line_id
+     WHERE sl.shipment_id = ? AND rc.organisation_id = ?
+       AND rc.id = (
+         SELECT MAX(id) FROM return_line_corrections
+          WHERE shipment_line_id = rc.shipment_line_id
+       )
+  `).bind(shipmentId, user.organisation_id).all<Record<string, unknown>>()
+  return (results || []).map(r => ({
+    shipment_line_id: Number(r.shipment_line_id),
+    corrected_imei: String(r.corrected_imei),
+    corrected_sku: (r.corrected_sku as string | null) ?? null,
+    corrected_brand: (r.corrected_brand as string | null) ?? null,
+    corrected_model: (r.corrected_model as string | null) ?? null,
+    corrected_capacity: (r.corrected_capacity as string | null) ?? null,
+    corrected_color: (r.corrected_color as string | null) ?? null,
+    corrected_grade: String(r.corrected_grade),
+    requires_review: Number(r.requires_review),
+    reviewed_at: (r.reviewed_at as string | null) ?? null,
+    review_reason: (r.review_reason as string | null) ?? null,
+  }))
+}
+
 // Effective-dated procedure-code / supervising-office policy (migration
 // 0026) — same "resolve by the RECORD'S OWN DATE, never today" mechanism
 // as value_adjustment_defaults (0025). Resolved by the shipment's own
@@ -1160,7 +1210,7 @@ app.get('/shipments/:id/validation', async (c) => {
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
   const validation = bundle.shipment.direction === 'import'
-    ? runImportValidation(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, await loadSiblingLegs(c, user, bundle.shipment), await loadMisdeclarationAcks(c, user, bundle.shipment.id))
+    ? runImportValidation(bundle.shipment, bundle.relatedExport, bundle.authorisation, bundle.lines, undefined, await loadSiblingLegs(c, user, bundle.shipment), await loadMisdeclarationAcks(c, user, bundle.shipment.id), await loadReturnLineCorrections(c, user, bundle.shipment.id))
     : runExportValidation(bundle.shipment, bundle.authorisation, bundle.lines, undefined, await loadExportProcedurePolicy(c, user, bundle.shipment))
   return c.json({ shipment_id: id, status: bundle.shipment.status, direction: bundle.shipment.direction, validation })
 })
@@ -1229,7 +1279,15 @@ app.get('/shipments/:id/ce1154', async (c) => {
   if (c.req.query('format') === 'json') {
     return c.json({ ce1154: ce.ce1154 })
   }
-  return c.html(buildCe1154Html(ce.ce1154, bundle.shipment, bundle.lines))
+  // Z-9 — "declared as X, corrected to Y" side-by-side (operator's smaller
+  // v1 ask): pass the latest correction per line through to the HTML
+  // builder, keyed by shipment_line_id, so a reviewer can see a
+  // correction without querying the database directly. Presentation
+  // only — computeCe1154() above already ran on the frozen lines alone.
+  const corrections = await loadReturnLineCorrections(c, user, bundle.shipment.id)
+  const correctionsByLine: Record<number, ReturnLineCorrectionDisplay> = {}
+  for (const cr of corrections) correctionsByLine[cr.shipment_line_id] = cr
+  return c.html(buildCe1154Html(ce.ce1154, bundle.shipment, bundle.lines, correctionsByLine))
 })
 
 // GET /shipments/:id/clearance — re-import clearance-instruction DRAFT
@@ -1504,6 +1562,244 @@ app.get('/shipments/:id/misdeclaration-acks', async (c) => {
   return c.json({ acks: results || [] })
 })
 
+// ═════════ Z-9 — return-consignment re-identify/re-grade (0039) ═════════
+//
+// Amendment 2's catalog-value comparator: sku_catalog carries NO price
+// column at all (confirmed via the full production schema dump — only
+// id/sku/brand/model/capacity/color/created_at/grade/organisation_id).
+// Pricing lives exclusively on received_devices.buy_price, and it varies
+// meaningfully even within one nominal SKU (e.g. APL-I13-128-STL-A
+// averaged £183.47 across 157 production units vs. APL-I13-128-STL-C's
+// £149.63 across 3) — so "current catalog value" is implemented here as
+// the AVERAGE buy_price of every received_devices row matching (model,
+// capacity, color, grade), computed fresh at correction time. Returns
+// null (unresolvable) when no device anywhere matches that exact tuple —
+// computeReturnLineReview/compareCatalogValues already treat a null side
+// as "cannot compare" rather than a false negative.
+async function catalogValueForSpec(
+  c: OprContext,
+  user: AuthUser,
+  spec: { model: string | null; capacity: string | null; color: string | null; grade: string | null },
+): Promise<number | null> {
+  if (!spec.model || !spec.grade) return null
+  const row = await c.env.DB.prepare(
+    `SELECT AVG(buy_price) AS avg_price, COUNT(*) AS n FROM received_devices
+      WHERE organisation_id = ? AND model = ? AND capacity = ? AND color = ? AND grade = ?`
+  ).bind(user.organisation_id, spec.model, spec.capacity, spec.color, spec.grade)
+    .first<{ avg_price: number | null; n: number }>()
+  if (!row || !row.n) return null
+  return row.avg_price != null ? Number(row.avg_price) : null
+}
+
+// POST /shipments/:id/lines/:lineId/correction — record what the operator
+// actually observed on re-scan, as a FULL snapshot (Amendment 1 — see
+// migration 0039's header for why "latest row wins" requires this).
+// Declaration-only while the return is DRAFT (amber display, never
+// blocked mid-scan); the finalise-time hard-block is enforced by
+// IMP_RETURN_LINE_REVIEW in runImportValidation() above, not here.
+app.post('/shipments/:id/lines/:lineId/correction', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  const lineId = Number(c.req.param('lineId'))
+  if (!id || !lineId) return c.json({ error: 'Invalid id' }, 400)
+
+  const bundle = await loadShipmentBundle(c, user, id)
+  if (!bundle.ok) return bundle.response
+  const { shipment } = bundle
+  if (shipment.direction !== 'import') {
+    return c.json({ error: 'Return-line corrections apply to IMPORT (return) consignments' }, 409)
+  }
+  if (shipment.status !== 'DRAFT') {
+    return c.json({ error: `Shipment is ${shipment.status} — corrections can only be recorded while the return is DRAFT` }, 409)
+  }
+
+  const line = await c.env.DB.prepare(
+    'SELECT * FROM shipment_lines WHERE id = ? AND shipment_id = ? AND organisation_id = ?'
+  ).bind(lineId, id, user.organisation_id).first<ShipmentLine>()
+  if (!line) return c.json({ error: 'Line not found' }, 404)
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>))
+  const reason = cleanString(body.reason, 500)
+  if (!reason) return c.json({ error: 'reason is required — a free-text explanation of what was observed on re-scan' }, 422)
+
+  // Frozen half — the return leg's OWN line (already a copy of the
+  // original export line's frozen values; see addDeviceToReturnShipment's
+  // header comment). Never mutated by this route.
+  const frozen: FrozenLineSpec = {
+    imei: line.imei, sku: line.sku, brand: line.brand, model: line.model,
+    capacity: line.capacity, color: line.color, grade: line.grade,
+  }
+
+  // Latest existing correction for this line (if any) — the merge
+  // baseline, per Amendment 1.
+  const prevRow = await c.env.DB.prepare(
+    'SELECT * FROM return_line_corrections WHERE shipment_line_id = ? ORDER BY id DESC LIMIT 1'
+  ).bind(lineId).first<Record<string, unknown>>()
+  const previousCorrection: CorrectedLineSpec | null = prevRow ? {
+    imei: String(prevRow.corrected_imei), sku: (prevRow.corrected_sku as string | null) ?? null,
+    brand: (prevRow.corrected_brand as string | null) ?? null, model: (prevRow.corrected_model as string | null) ?? null,
+    capacity: (prevRow.corrected_capacity as string | null) ?? null, color: (prevRow.corrected_color as string | null) ?? null,
+    grade: String(prevRow.corrected_grade),
+  } : null
+
+  const partial: Record<string, unknown> = {}
+  if (body.imei !== undefined) partial.imei = body.imei
+  if (body.sku !== undefined) partial.sku = body.sku
+  if (body.brand !== undefined) partial.brand = body.brand
+  if (body.model !== undefined) partial.model = body.model
+  if (body.capacity !== undefined) partial.capacity = body.capacity
+  if (body.color !== undefined) partial.color = body.color
+  if (body.grade !== undefined) partial.grade = normalizeGrade(body.grade)
+
+  if (body.grade !== undefined && (!VALID_GRADES.includes(normalizeGrade(body.grade)) || String(body.grade).toUpperCase() !== normalizeGrade(body.grade))) {
+    return c.json({ error: `Invalid grade '${body.grade}'. Allowed: ${VALID_GRADES.join(', ')}` }, 422)
+  }
+
+  const merged = mergeCorrectionSnapshot(frozen, previousCorrection, partial as any)
+
+  // IMEI format + global-uniqueness pre-check (Amendment 4) — only when
+  // this correction actually changes the effective IMEI from the frozen
+  // export line's. A correction that merely carries the SAME imei forward
+  // (via mergeCorrectionSnapshot's baseline) is not an IMEI correction at
+  // all and skips this block entirely.
+  if (merged.imei !== frozen.imei) {
+    const imeiCheck = validateImei(merged.imei)
+    if (!imeiCheck.ok) return c.json({ error: `corrected_imei: ${imeiCheck.reason}` }, 422)
+    merged.imei = imeiCheck.imei
+    // received_devices.imei is UNIQUE org-wide — explicit pre-check (for a
+    // clean error message) supplementing that constraint, per Amendment 4:
+    // reject if the corrected IMEI is already present on ANY OTHER device.
+    const clash = await c.env.DB.prepare(
+      'SELECT id FROM received_devices WHERE imei = ? AND organisation_id = ?'
+    ).bind(merged.imei, user.organisation_id).first<{ id: number }>()
+    if (clash && clash.id !== line.received_device_id) {
+      return c.json({ error: `corrected_imei ${merged.imei} is already present on device ${clash.id} — cannot correct to an IMEI that exists elsewhere in the system` }, 409)
+    }
+  }
+
+  // Catalog-value comparator (Amendment 2) — both sides read from
+  // received_devices NOW, never from shipment_lines.unit_value.
+  const frozenCatalogValueGbp = await catalogValueForSpec(c, user, frozen)
+  const correctedCatalogValueGbp = await catalogValueForSpec(c, user, merged)
+
+  const review = computeReturnLineReview({
+    frozen, corrected: merged, frozenCatalogValueGbp, correctedCatalogValueGbp,
+  })
+
+  const ins = await c.env.DB.prepare(`
+    INSERT INTO return_line_corrections
+      (organisation_id, shipment_line_id, received_device_id,
+       corrected_imei, corrected_sku, corrected_brand, corrected_model, corrected_capacity, corrected_color, corrected_grade,
+       is_generation_boundary, frozen_generation, corrected_generation, generation_unparseable,
+       frozen_catalog_value_gbp, corrected_catalog_value_gbp, catalog_value_diff_pct,
+       requires_review, review_reason, reason, actor_user_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    user.organisation_id, lineId, line.received_device_id,
+    merged.imei, merged.sku, merged.brand, merged.model, merged.capacity, merged.color, merged.grade,
+    review.is_generation_boundary ? 1 : 0, review.frozen_generation, review.corrected_generation, review.generation_unparseable ? 1 : 0,
+    review.frozen_catalog_value_gbp, review.corrected_catalog_value_gbp, review.catalog_value_diff_pct,
+    review.requires_review ? 1 : 0, review.review_reasons.length ? review.review_reasons.join(',') : null, reason, user.id,
+  ).run()
+
+  // X-7 (Sprint 3, IMEI history chain) — reserve the event type now,
+  // per operator instruction, without building X-7 itself. Fires only on
+  // an actual IMEI change; device_events.event_type has no CHECK
+  // constraint so this needs no schema change.
+  if (review.imei_changed) {
+    await logDeviceEvent(c.env.DB, {
+      organisationId: user.organisation_id,
+      deviceId: line.received_device_id,
+      eventType: 'RETURN_IMEI_CORRECTED',
+      userId: user.id,
+      reference: shipment.reference,
+      metadata: {
+        shipment_id: id, shipment_line_id: lineId,
+        old_imei: frozen.imei, new_imei: merged.imei, reason,
+      },
+    })
+  }
+
+  const correction = await c.env.DB.prepare('SELECT * FROM return_line_corrections WHERE id = ?')
+    .bind(ins.meta.last_row_id).first()
+  return c.json({ ok: true, correction, review }, 201)
+})
+
+// GET /shipments/:id/corrections — the LATEST correction per line
+// (mirrors GET .../misdeclaration-acks / .../value-deltas in spirit, but
+// "latest per line" rather than "every row ever written" — see migration
+// 0039's header on why latest-per-line is the well-defined "current"
+// state here).
+app.get('/shipments/:id/corrections', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const { results } = await c.env.DB.prepare(`
+    SELECT rc.*
+      FROM return_line_corrections rc
+      JOIN shipment_lines sl ON sl.id = rc.shipment_line_id
+     WHERE sl.shipment_id = ? AND rc.organisation_id = ?
+       AND rc.id = (SELECT MAX(id) FROM return_line_corrections WHERE shipment_line_id = rc.shipment_line_id)
+     ORDER BY rc.shipment_line_id ASC
+  `).bind(id, user.organisation_id).all()
+  return c.json({ corrections: results || [] })
+})
+
+// POST /shipments/:id/lines/:lineId/correction/review { note? } — the
+// clearing side of IMP_RETURN_LINE_REVIEW's hard-block, admin-gated (same
+// "owner has no distinct role value" resolution as requireAdmin above).
+// Reuses the shipment_misdeclaration_acks pattern per Amendment 4: an
+// UPDATE on the correction row itself is safe here (not a second
+// append-only ack table) because a correction row's identity fields never
+// change after insert — see migration 0039's header for why there is
+// nothing for a review-clearing ack to lapse against.
+//
+// EXCEPTION, per Amendment 4 verbatim: an IMEI correction "ALWAYS
+// hard-blocks finalisation with no override path described" — stricter
+// than every other trigger, which DOES clear via review+ack. This route
+// therefore REFUSES to clear a correction whose review_reason includes
+// imei_change; that block has no override in this ticket (X-7, Sprint 3,
+// is the only place an IMEI-change resolution belongs).
+app.post('/shipments/:id/lines/:lineId/correction/review', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  const lineId = Number(c.req.param('lineId'))
+  if (!id || !lineId) return c.json({ error: 'Invalid id' }, 400)
+  const adminGate = requireAdmin(c, user)
+  if (adminGate) return adminGate
+
+  const line = await c.env.DB.prepare(
+    'SELECT sl.id FROM shipment_lines sl JOIN shipments s ON s.id = sl.shipment_id WHERE sl.id = ? AND sl.shipment_id = ? AND s.organisation_id = ?'
+  ).bind(lineId, id, user.organisation_id).first<{ id: number }>()
+  if (!line) return c.json({ error: 'Line not found' }, 404)
+
+  const latest = await c.env.DB.prepare(
+    'SELECT * FROM return_line_corrections WHERE shipment_line_id = ? ORDER BY id DESC LIMIT 1'
+  ).bind(lineId).first<Record<string, unknown>>()
+  if (!latest) return c.json({ error: 'No correction exists on this line' }, 404)
+  if (Number(latest.requires_review) !== 1) {
+    return c.json({ error: 'This line does not currently require review' }, 409)
+  }
+  if (latest.reviewed_at) {
+    return c.json({ error: `Already reviewed at ${latest.reviewed_at}` }, 409)
+  }
+  const reviewReasons = String(latest.review_reason ?? '').split(',').filter(Boolean)
+  if (reviewReasons.includes('imei_change')) {
+    return c.json({ error: 'IMEI corrections have no override path — an IMEI change hard-blocks finalisation unconditionally (see X-7, Sprint 3)' }, 409)
+  }
+
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>))
+  const note = cleanString(body.note, 500)
+
+  await c.env.DB.prepare(
+    `UPDATE return_line_corrections SET reviewed_by_user_id = ?, reviewed_at = CURRENT_TIMESTAMP, review_note = ? WHERE id = ?`
+  ).bind(user.id, note, latest.id).run()
+
+  const updated = await c.env.DB.prepare('SELECT * FROM return_line_corrections WHERE id = ?')
+    .bind(latest.id).first()
+  return c.json({ ok: true, correction: updated })
+})
+
 // Proof-of-export fields share one validator: declaration-safe-ish refs
 // (letters/digits/spaces and the dash used in MRN/DUCR formats).
 function cleanProofRef(raw: unknown, label: string):
@@ -1546,7 +1842,7 @@ async function finaliseImportShipment(
     finalisedAt = body.finalised_at
   }
 
-  const validation = runImportValidation(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment), await loadMisdeclarationAcks(c, user, shipment.id))
+  const validation = runImportValidation(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment), await loadMisdeclarationAcks(c, user, shipment.id), await loadReturnLineCorrections(c, user, shipment.id))
   if (validation.result === 'red') {
     return c.json({ error: 'Receipt blocked — validation has red results', validation }, 422)
   }
@@ -1946,6 +2242,86 @@ app.post('/shipments/:id/import-proof', async (c) => {
   return c.json({ ok: true, shipment: updated })
 })
 
+// Z-9 Amendment 5 — applies the LATEST return_line_correction for one
+// restocked device by routing through the SAME shared writer /inventory/grade
+// uses (gradeCorrection.ts), so grade_audit + GRADE_CHANGE/SKU_CORRECTION
+// device_events fire NATURALLY rather than via new bespoke logic. Resolves
+// the catalogue for the CORRECTED (model, capacity, color, grade) tuple —
+// single-device, since restock write-through processes one device at a time
+// (unlike /grade's bulk path). Explicit constraint (Amendment 5): a missing
+// catalogue/Zoho mapping for the corrected SKU must NEVER block restock —
+// planGradeCorrection() already 'skip's with a reason in that case (same
+// fail-closed-on-no-catalogue-match behaviour /inventory/grade already has),
+// so this function simply returns without writing rather than throwing.
+// A genuine throw here (e.g. an IMEI clash that only appears at this later
+// moment) is caught by the caller and surfaced via correction_apply_errors,
+// never allowed to undo the restock transition that already committed.
+async function applyReturnCorrectionAtRestock(
+  c: OprContext,
+  user: AuthUser,
+  shipment: Shipment,
+  receivedDeviceId: number,
+  correction: ReturnLineCorrectionDisplay,
+): Promise<void> {
+  const device = await c.env.DB.prepare(
+    `SELECT id, uuid, imei, sku, grade, status, brand, model, capacity, color
+       FROM received_devices WHERE id = ? AND organisation_id = ?`
+  ).bind(receivedDeviceId, user.organisation_id).first<GradeCorrectionDeviceRow>()
+  if (!device) return // device vanished between restock-transition and here; nothing to write through
+
+  const targetGrade = normalizeGrade(correction.corrected_grade)
+  if (!targetGrade || !VALID_GRADES.includes(targetGrade)) return // defensive; correction rows are grade-validated at write time
+
+  const identityOverrides: IdentityFieldOverrides = {
+    imei: correction.corrected_imei,
+    brand: correction.corrected_brand,
+    model: correction.corrected_model,
+    capacity: correction.corrected_capacity,
+    color: correction.corrected_color,
+  }
+
+  // Resolve the catalogue against the CORRECTED identity (not the device's
+  // current/frozen one) — the whole point of the write-through is to land
+  // the device on the SKU that matches its corrected spec.
+  const lookup = await resolveCatalogSku(
+    c.env.DB,
+    {
+      model: correction.corrected_model,
+      capacity: correction.corrected_capacity,
+      color: correction.corrected_color,
+      grade: targetGrade,
+    },
+    user.organisation_id,
+  )
+
+  const plan = planGradeCorrection(device, targetGrade, lookup)
+  // planGradeCorrection's 'skip' branch is fine here even when it's a
+  // no-catalogue-match skip: per Amendment 5, that is Z-4's export-gate
+  // problem, never a restock blocker — buildGradeCorrectionStmts() below
+  // still applies the non-grade/sku identity fields (imei/brand/model/
+  // capacity/color) via the identity_corrected path even when the plan
+  // is 'skip', so the device's identity is corrected regardless of
+  // whether a SKU could be resolved for it.
+
+  const stmts: D1PreparedStatement[] = []
+  const reason = `return correction write-through at restock (shipment ${shipment.reference})`
+  const effect = await buildGradeCorrectionStmts(c.env.DB, stmts, {
+    organisationId: user.organisation_id,
+    device,
+    plan,
+    targetGrade,
+    actor: user.email ?? null,
+    reason,
+    userId: user.id,
+    bulkId: shipment.reference,
+    identityOverrides,
+  })
+  if (!effect) return // truly nothing changed (grade+sku already correct AND identity already matches)
+
+  if (stmts.length) await c.env.DB.batch(stmts)
+  await logGradeCorrectionEvent(c.env.DB, user.organisation_id, user.id, reason, shipment.reference, effect)
+}
+
 // POST /shipments/:id/restock — move the received consignment's devices
 // RETURNED_UNDER_OPR → ACTIVE_INVENTORY (or, for a TEMP_EXPORT_STANDARD
 // return, RETURNED_UNDER_STANDARD → ACTIVE_INVENTORY — same target,
@@ -1973,6 +2349,19 @@ app.post('/shipments/:id/restock', async (c) => {
   const expectedReturnedStatus = shipment.shipment_type === 'TEMP_EXPORT_STANDARD' ? 'RETURNED_UNDER_STANDARD' : 'RETURNED_UNDER_OPR'
   let restocked = 0
   const skipped: { device_id: number; status: string }[] = []
+  // Z-9 Amendment 5 — write-through of the LATEST return_line_correction
+  // per line, applied at THIS moment (restock) because that's when the
+  // device re-enters sellable inventory; the correction stays
+  // declaration-only for the entire DRAFT lifetime of the return. Not
+  // applicable to TEMP_EXPORT_STANDARD returns — return_line_corrections
+  // is only ever written against an OPR return (Z-9's route above does
+  // not gate on shipment_type, but TEMP_EXPORT_STANDARD returns have no
+  // customs identity assertion to correct in the first place; an empty
+  // corrections map here is simply the expected state for that type).
+  const correctionsByLine = new Map(
+    (await loadReturnLineCorrections(c, user, id)).map(cr => [cr.shipment_line_id, cr] as const),
+  )
+  const correctionApplyErrors: { device_id: number; error: string }[] = []
   for (const line of lines) {
     const d = await c.env.DB.prepare('SELECT id, status FROM received_devices WHERE id = ? AND organisation_id = ?')
       .bind(line.received_device_id, user.organisation_id).first<{ id: number; status: DeviceStatus }>()
@@ -1985,6 +2374,21 @@ app.post('/shipments/:id/restock', async (c) => {
       eventType: 'RETURN_RESTOCKED',
     })
     restocked++
+
+    const correction = correctionsByLine.get(line.id)
+    if (correction) {
+      try {
+        await applyReturnCorrectionAtRestock(c, user, shipment, d.id, correction)
+      } catch (e: unknown) {
+        // Per Amendment 5's explicit constraint, a write-through problem
+        // (e.g. an IMEI clash that arose AFTER correction submission, or a
+        // missing Zoho mapping — which is Z-4's export-gate problem, never
+        // a restock blocker) must never undo or block the restock itself,
+        // which already committed above. Surfaced separately so it is not
+        // silently lost.
+        correctionApplyErrors.push({ device_id: d.id, error: String(e instanceof Error ? e.message : e) })
+      }
+    }
   }
   if (restocked > 0) {
     await notifyShipmentEvent(c, {
@@ -2000,7 +2404,7 @@ app.post('/shipments/:id/restock', async (c) => {
       occurred_at: new Date().toISOString(),
     })
   }
-  return c.json({ ok: true, restocked, skipped })
+  return c.json({ ok: true, restocked, skipped, correction_apply_errors: correctionApplyErrors })
 })
 
 // ───────── OPR 4: actually sending email (Gmail REST) ─────────
