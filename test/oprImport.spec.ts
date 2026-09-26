@@ -171,6 +171,14 @@ beforeAll(async () => {
 
 afterAll(async () => {
   // Leave the shared local D1 clean for other suites / manual smokes.
+  // Z-9: return_line_corrections FK-references shipment_lines — must be
+  // cleared BEFORE shipment_lines itself, same ordering constraint as
+  // shipment_value_deltas below.
+  await env.DB.prepare(`
+    DELETE FROM return_line_corrections WHERE shipment_line_id IN (
+      SELECT id FROM shipment_lines WHERE imei LIKE '8604551%'
+    )
+  `).run()
   await env.DB.prepare("DELETE FROM shipment_lines WHERE imei LIKE '8604551%'").run()
   // shipment_value_deltas FK-references shipments — must be cleared first.
   await env.DB.prepare(`
@@ -178,8 +186,20 @@ afterAll(async () => {
       SELECT id FROM shipments WHERE reference LIKE 'EXP RTN %' OR reference LIKE 'IMP RTN %'
     )
   `).run()
+  // Z-9 catch-all — a correction row's shipment_line_id may reference a
+  // line whose IMEI prefix check above missed it for any reason (defensive,
+  // should be redundant with the delete above given this suite's IMEI range).
+  await env.DB.prepare(`
+    DELETE FROM return_line_corrections WHERE shipment_line_id IN (
+      SELECT sl.id FROM shipment_lines sl JOIN shipments s ON s.id = sl.shipment_id
+       WHERE s.reference LIKE 'EXP RTN %' OR s.reference LIKE 'IMP RTN %'
+    )
+  `).run()
   await env.DB.prepare("DELETE FROM shipments WHERE reference LIKE 'EXP RTN %' OR reference LIKE 'IMP RTN %'").run()
   await env.DB.prepare('DELETE FROM opr_authorisations WHERE id = ?').bind(authId).run()
+  // Z-9 test-only catalogue/device fixtures (catalog-value-difference test).
+  await env.DB.prepare("DELETE FROM sku_catalog WHERE sku = 'SMSG-S23-256-BLK-C'").run()
+  await env.DB.prepare("DELETE FROM received_devices WHERE uuid LIKE 'test-catval-%'").run()
 })
 
 // ═════════ Return-consignment builder ═════════
@@ -1643,6 +1663,327 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     const restock = await api(`/api/opr/shipments/${ret.id}/restock`, { method: 'POST' })
     expect(restock.status).toBe(200)
     expect(await deviceStatus(device.id)).toBe('ACTIVE_INVENTORY')
+  })
+})
+
+// ═════════ Z-9 — return-line corrections (submit/list/review-clear,
+// restock write-through, finalise-time hard-block) ═════════
+//
+// End-to-end, against the real app + real D1, same house style as the
+// rest of this file. A local sku_catalog row is inserted per test where a
+// correction needs to resolve a NEW grade/identity at restock time — the
+// seeded catalogue only carries UG for Galaxy S23, and the default test
+// device (makeDevice()) is grade A, so most of these tests supply their
+// own catalogue rows rather than relying on seed.sql.
+describe('OPR 3 — Z-9 return-line corrections', () => {
+  async function insertCatalogRow(row: { sku: string; brand: string; model: string; capacity: string | null; color: string | null; grade: string }) {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO sku_catalog (organisation_id, sku, brand, model, capacity, color, grade)
+       VALUES (1, ?, ?, ?, ?, ?, ?)`
+    ).bind(row.sku, row.brand, row.model, row.capacity, row.color, row.grade).run()
+  }
+
+  it('submits a correction and returns the merged snapshot + review verdict; a no-op re-scan (nothing changed) requires no review', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000BB01')
+    const ret = await makeReturnShipment(exp.id)
+    const scan = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: devices[0].imei }) })
+    expect(scan.status).toBe(201)
+    const lineId = ((await scan.json()) as { line: { id: number } }).line.id
+
+    const corr = await api(`/api/opr/shipments/${ret.id}/lines/${lineId}/correction`, {
+      method: 'POST', body: JSON.stringify({ reason: 'confirmed on re-scan, nothing different', color: 'Phantom Black' }),
+    })
+    expect(corr.status).toBe(201)
+    const body = await corr.json() as { correction: { corrected_grade: string; corrected_imei: string }; review: { requires_review: boolean } }
+    expect(body.correction.corrected_grade).toBe('A') // carried forward from frozen (makeDevice default)
+    expect(body.correction.corrected_imei).toBe(devices[0].imei)
+    expect(body.review.requires_review).toBe(false)
+  })
+
+  it('grade correction alone sets no review trigger; is amber-visible on GET .../corrections but does not block a later finalise', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000BB02')
+    const ret = await makeReturnShipment(exp.id)
+    const scan = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: devices[0].imei }) })
+    expect(scan.status).toBe(201)
+    const lineId = ((await scan.json()) as { line: { id: number } }).line.id
+
+    const corr = await api(`/api/opr/shipments/${ret.id}/lines/${lineId}/correction`, {
+      method: 'POST', body: JSON.stringify({ reason: 'grade was actually B on re-scan', grade: 'B' }),
+    })
+    expect(corr.status).toBe(201)
+
+    const list = await api(`/api/opr/shipments/${ret.id}/corrections`)
+    expect(list.status).toBe(200)
+    const corrections = ((await list.json()) as { corrections: Array<{ corrected_grade: string }> }).corrections
+    expect(corrections.length).toBe(1)
+    expect(corrections[0].corrected_grade).toBe('B')
+
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, { method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222BB02' }) })
+    expect(fin.status).toBe(200)
+  })
+
+  it('generation-boundary correction (S23 -> S24): requires_review=1 with review_reason generation_boundary, but does NOT block finalise (operator ruling: not a misdeclaration on the export)', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000BB03')
+    const ret = await makeReturnShipment(exp.id)
+    const scan = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: devices[0].imei }) })
+    expect(scan.status).toBe(201)
+    const lineId = ((await scan.json()) as { line: { id: number } }).line.id
+
+    const corr = await api(`/api/opr/shipments/${ret.id}/lines/${lineId}/correction`, {
+      method: 'POST', body: JSON.stringify({ reason: 'wrong generation recorded at export', model: 'Galaxy S24' }),
+    })
+    expect(corr.status).toBe(201)
+    const corrBody = await corr.json() as { review: { requires_review: boolean; review_reasons: string[]; is_generation_boundary: boolean } }
+    expect(corrBody.review.requires_review).toBe(true)
+    expect(corrBody.review.review_reasons).toEqual(['generation_boundary'])
+    expect(corrBody.review.is_generation_boundary).toBe(true)
+
+    // The check is amber, not red, and finalise proceeds unreviewed.
+    const val = await api(`/api/opr/shipments/${ret.id}/validation`)
+    const valData = await val.json() as { validation: { checks: Array<{ code: string; level: string }>; result: string } }
+    const check = valData.validation.checks.find(c => c.code === 'IMP_RETURN_LINE_REVIEW')
+    expect(check!.level).toBe('amber')
+
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, { method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222BB03' }) })
+    expect(fin.status).toBe(200)
+    expect(await deviceStatus(devices[0].id)).toBe('RETURNED_UNDER_OPR')
+  })
+
+  it('IMEI-driven correction: requires_review=1 with review_reason imei_change HARD-BLOCKS finalise (red), and the review-clear route refuses to clear it (no override path)', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000BB04')
+    const ret = await makeReturnShipment(exp.id)
+    const scan = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: devices[0].imei }) })
+    expect(scan.status).toBe(201)
+    const lineId = ((await scan.json()) as { line: { id: number } }).line.id
+
+    const newImei = luhnImei()
+    const corr = await api(`/api/opr/shipments/${ret.id}/lines/${lineId}/correction`, {
+      method: 'POST', body: JSON.stringify({ reason: 'wrong device physically returned', imei: newImei }),
+    })
+    expect(corr.status).toBe(201)
+    const corrBody = await corr.json() as { review: { requires_review: boolean; review_reasons: string[]; imei_changed: boolean } }
+    expect(corrBody.review.requires_review).toBe(true)
+    expect(corrBody.review.imei_changed).toBe(true)
+    expect(corrBody.review.review_reasons).toContain('imei_change')
+
+    // RETURN_IMEI_CORRECTED fires on the original device (X-7 reservation).
+    const ev = await latestEvent(devices[0].id)
+    expect(ev!.event_type).toBe('RETURN_IMEI_CORRECTED')
+
+    // Finalise is hard-blocked (red), unlike the generation-boundary case above.
+    const val = await api(`/api/opr/shipments/${ret.id}/validation`)
+    const valData = await val.json() as { validation: { checks: Array<{ code: string; level: string }> } }
+    expect(valData.validation.checks.find(c => c.code === 'IMP_RETURN_LINE_REVIEW')!.level).toBe('red')
+
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, { method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222BB04' }) })
+    expect(fin.status).toBe(422)
+    expect(((await fin.json()) as { validation: { result: string } }).validation.result).toBe('red')
+
+    // Review-clear route refuses (no override path for an IMEI correction).
+    const clear = await api(`/api/opr/shipments/${ret.id}/lines/${lineId}/correction/review`, {
+      method: 'POST', body: JSON.stringify({ note: 'attempting to force-clear' }),
+    })
+    expect(clear.status).toBe(409)
+    expect(((await clear.json()) as { error: string }).error).toMatch(/no override path/)
+
+    // Still blocked after the failed clear attempt.
+    const finAgain = await api(`/api/opr/shipments/${ret.id}/finalise`, { method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222BB04' }) })
+    expect(finAgain.status).toBe(422)
+  })
+
+  it('rejects a correction to an IMEI already present on another device (409, uniqueness pre-check)', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000BB05')
+    const other = await makeDevice() // a distinct, already-received device elsewhere in the system
+    const ret = await makeReturnShipment(exp.id)
+    const scan = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: devices[0].imei }) })
+    expect(scan.status).toBe(201)
+    const lineId = ((await scan.json()) as { line: { id: number } }).line.id
+
+    const corr = await api(`/api/opr/shipments/${ret.id}/lines/${lineId}/correction`, {
+      method: 'POST', body: JSON.stringify({ reason: 'attempting to correct to a clashing imei', imei: other.imei }),
+    })
+    expect(corr.status).toBe(409)
+    expect(((await corr.json()) as { error: string }).error).toMatch(/already present on device/)
+    // Zero side-effects — no row written.
+    const list = await api(`/api/opr/shipments/${ret.id}/corrections`)
+    expect(((await list.json()) as { corrections: unknown[] }).corrections.length).toBe(0)
+  })
+
+  it('catalog-value-difference correction (grade A -> C, >20% swing) sets requires_review with catalog_value_diff, amber not red, finalise proceeds', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000BB06')
+    // Seed received_devices rows so catalogValueForSpec() has something to
+    // average for BOTH grade A (frozen) and grade C (corrected) — the
+    // shipment's own device is grade A already; add one more A and two Cs
+    // spanning a >20% gap. makeDevice() supplies no capacity/color, so
+    // /scan/manual's buildSku() fallback applies: capacity stays NULL
+    // (no digit+G token in "Galaxy S23"), but color defaults to
+    // 'Phantom Black' (buildSku: `opts.color || 'Phantom Black'`) — NOT
+    // NULL. These fixture rows match that actual fallback exactly.
+    await env.DB.prepare(
+      `INSERT INTO received_devices (organisation_id, uuid, imei, sku, brand, model, capacity, color, grade, source, status, buy_price, currency, vat_type)
+       VALUES (1, ?, ?, 'SMSG-S23-256-BLK', 'Samsung', 'Galaxy S23', NULL, 'Phantom Black', 'A', 'manual', 'ACTIVE_INVENTORY', 150, 'GBP', 'MARGIN')`
+    ).bind(`test-catval-a-${luhnImei()}`, luhnImei()).run()
+    await env.DB.prepare(
+      `INSERT INTO received_devices (organisation_id, uuid, imei, sku, brand, model, capacity, color, grade, source, status, buy_price, currency, vat_type)
+       VALUES (1, ?, ?, 'SMSG-S23-256-BLK-C', 'Samsung', 'Galaxy S23', NULL, 'Phantom Black', 'C', 'manual', 'ACTIVE_INVENTORY', 60, 'GBP', 'MARGIN')`
+    ).bind(`test-catval-c-${luhnImei()}`, luhnImei()).run()
+
+    const ret = await makeReturnShipment(exp.id)
+    const scan = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: devices[0].imei }) })
+    expect(scan.status).toBe(201)
+    const lineId = ((await scan.json()) as { line: { id: number } }).line.id
+
+    const corr = await api(`/api/opr/shipments/${ret.id}/lines/${lineId}/correction`, {
+      method: 'POST', body: JSON.stringify({ reason: 'grade actually C, much cheaper', grade: 'C' }),
+    })
+    expect(corr.status).toBe(201)
+    const corrBody = await corr.json() as { review: { requires_review: boolean; review_reasons: string[]; catalog_value_diff_pct: number | null } }
+    expect(corrBody.review.requires_review).toBe(true)
+    expect(corrBody.review.review_reasons).toEqual(['catalog_value_diff'])
+    expect(corrBody.review.catalog_value_diff_pct).toBeLessThan(-0.2)
+
+    const val = await api(`/api/opr/shipments/${ret.id}/validation`)
+    const valData = await val.json() as { validation: { checks: Array<{ code: string; level: string }> } }
+    expect(valData.validation.checks.find(c => c.code === 'IMP_RETURN_LINE_REVIEW')!.level).toBe('amber')
+
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, { method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222BB06' }) })
+    expect(fin.status).toBe(200)
+  })
+
+  it('snapshot semantics end-to-end: correction 1 sets grade, correction 2 sets ONLY color — GET .../corrections shows grade still correction 1\'s value (latest row, full snapshot, no silent revert)', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000BB07')
+    const ret = await makeReturnShipment(exp.id)
+    const scan = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: devices[0].imei }) })
+    expect(scan.status).toBe(201)
+    const lineId = ((await scan.json()) as { line: { id: number } }).line.id
+
+    const c1 = await api(`/api/opr/shipments/${ret.id}/lines/${lineId}/correction`, {
+      method: 'POST', body: JSON.stringify({ reason: 'grade correction #1', grade: 'B' }),
+    })
+    expect(c1.status).toBe(201)
+
+    const c2 = await api(`/api/opr/shipments/${ret.id}/lines/${lineId}/correction`, {
+      method: 'POST', body: JSON.stringify({ reason: 'color correction #2, grade not touched this time', color: 'Cream' }),
+    })
+    expect(c2.status).toBe(201)
+    const c2Body = await c2.json() as { correction: { corrected_grade: string; corrected_color: string } }
+    // THE assertion that matters: grade is STILL 'B' from correction #1,
+    // not reverted to the frozen export line's original grade ('A').
+    expect(c2Body.correction.corrected_grade).toBe('B')
+    expect(c2Body.correction.corrected_color).toBe('Cream')
+
+    // GET .../corrections returns only the LATEST row per line (one row,
+    // not two) — and that latest row carries the full merged snapshot.
+    const list = await api(`/api/opr/shipments/${ret.id}/corrections`)
+    const corrections = ((await list.json()) as { corrections: Array<{ shipment_line_id: number; corrected_grade: string; corrected_color: string }> }).corrections
+    expect(corrections.length).toBe(1)
+    expect(corrections[0].corrected_grade).toBe('B')
+    expect(corrections[0].corrected_color).toBe('Cream')
+
+    // Both rows still physically exist (append-only) — two writes, one wins for display.
+    const rawCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM return_line_corrections WHERE shipment_line_id = ?').bind(lineId).first<{ n: number }>()
+    expect(rawCount!.n).toBe(2)
+  })
+
+  it('restock write-through WITH a catalogue match: corrected grade+identity land on received_devices via the shared /inventory/grade code path — grade_audit + GRADE_CHANGE event fire naturally', async () => {
+    // makeDevice() -> /scan/manual's buildSku() fallback: capacity stays
+    // NULL, color defaults to 'Phantom Black' (not NULL) — see the
+    // catalog-value-difference test's comment above for the full reasoning.
+    // The correction below only touches grade, so the merged corrected
+    // spec's capacity/color carry forward from the frozen line unchanged.
+    await insertCatalogRow({ sku: 'SMSG-S23-256-BLK-C', brand: 'Samsung', model: 'Galaxy S23', capacity: null, color: 'Phantom Black', grade: 'C' })
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000BB08')
+    const ret = await makeReturnShipment(exp.id)
+    const scan = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: devices[0].imei }) })
+    expect(scan.status).toBe(201)
+    const lineId = ((await scan.json()) as { line: { id: number } }).line.id
+
+    const corr = await api(`/api/opr/shipments/${ret.id}/lines/${lineId}/correction`, {
+      method: 'POST', body: JSON.stringify({ reason: 'actually grade C on re-scan', grade: 'C' }),
+    })
+    expect(corr.status).toBe(201)
+
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, { method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222BB08' }) })
+    expect(fin.status).toBe(200)
+
+    const restock = await api(`/api/opr/shipments/${ret.id}/restock`, { method: 'POST' })
+    expect(restock.status).toBe(200)
+    const restockBody = await restock.json() as { restocked: number; correction_apply_errors: unknown[] }
+    expect(restockBody.restocked).toBe(1)
+    expect(restockBody.correction_apply_errors).toEqual([])
+
+    const row = await env.DB.prepare('SELECT grade, sku, status FROM received_devices WHERE id = ?').bind(devices[0].id).first<{ grade: string; sku: string; status: string }>()
+    expect(row!.grade).toBe('C')
+    expect(row!.sku).toBe('SMSG-S23-256-BLK-C')
+    expect(row!.status).toBe('ACTIVE_INVENTORY')
+
+    // grade_audit written, and the event is GRADE_CHANGE (fired naturally
+    // via the shared gradeCorrection.ts writer, not bespoke Z-9 logic).
+    const audit = await env.DB.prepare('SELECT old_grade, new_grade FROM grade_audit WHERE received_device_id = ? ORDER BY id DESC LIMIT 1').bind(devices[0].id).first<{ old_grade: string; new_grade: string }>()
+    expect(audit!.old_grade).toBe('A')
+    expect(audit!.new_grade).toBe('C')
+    const ev = await latestEvent(devices[0].id)
+    expect(ev!.event_type).toBe('GRADE_CHANGE')
+  })
+
+  it('restock write-through WITHOUT a catalogue match: identity fields still write through (RETURN_IDENTITY_CORRECTED), and — per Amendment 5 — the missing mapping never blocks restock itself', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000BB09')
+    const ret = await makeReturnShipment(exp.id)
+    const scan = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: devices[0].imei }) })
+    expect(scan.status).toBe(201)
+    const lineId = ((await scan.json()) as { line: { id: number } }).line.id
+
+    // Correct the colour only (grade untouched, so planGradeCorrection
+    // would 'skip' on the grade+sku axis) to a value that has NO
+    // catalogue row at all for (model, capacity, THIS color, grade) —
+    // exercising the 'identity_corrected' path with no SKU resolution.
+    const corr = await api(`/api/opr/shipments/${ret.id}/lines/${lineId}/correction`, {
+      method: 'POST', body: JSON.stringify({ reason: 'actually a colour with no catalogue SKU', color: 'Nonexistent Colour XYZ' }),
+    })
+    expect(corr.status).toBe(201)
+
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, { method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222BB09' }) })
+    expect(fin.status).toBe(200)
+
+    const restock = await api(`/api/opr/shipments/${ret.id}/restock`, { method: 'POST' })
+    expect(restock.status).toBe(200)
+    const restockBody = await restock.json() as { restocked: number; correction_apply_errors: unknown[] }
+    // Restock itself is NEVER blocked by the missing mapping (Amendment 5).
+    expect(restockBody.restocked).toBe(1)
+    expect(restockBody.correction_apply_errors).toEqual([])
+    expect(await deviceStatus(devices[0].id)).toBe('ACTIVE_INVENTORY')
+
+    // Identity field (color) still wrote through even with no SKU resolved;
+    // grade/sku are untouched (no catalogue match to resolve them against).
+    const row = await env.DB.prepare('SELECT grade, sku, color, status FROM received_devices WHERE id = ?').bind(devices[0].id).first<{ grade: string; sku: string; color: string; status: string }>()
+    expect(row!.color).toBe('Nonexistent Colour XYZ')
+    expect(row!.grade).toBe('A') // unchanged — makeDevice() default, correction didn't touch grade
+    const ev = await latestEvent(devices[0].id)
+    expect(ev!.event_type).toBe('RETURN_IDENTITY_CORRECTED')
+  })
+
+  it('an IMEI-corrected line, once past the hard-block via a finalise on a DIFFERENT line, never auto-applies at restock for the blocked line — blocked lines simply are not FINALISED at all (whole-shipment gate)', async () => {
+    // This is really re-confirming the whole-shipment nature of the
+    // finalise block: an IMEI-flagged line prevents the ENTIRE return
+    // from finalising, so there is no partial-finalise path where an
+    // unrelated line's restock write-through could race ahead of it.
+    const { shipment: exp, devices } = await makeFinalisedExport(2, '26GB0000000000BB10')
+    const ret = await makeReturnShipment(exp.id)
+    const scanA = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: devices[0].imei }) })
+    expect(scanA.status).toBe(201)
+    const lineIdA = ((await scanA.json()) as { line: { id: number } }).line.id
+    const scanB = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: devices[1].imei }) })
+    expect(scanB.status).toBe(201)
+
+    const corr = await api(`/api/opr/shipments/${ret.id}/lines/${lineIdA}/correction`, {
+      method: 'POST', body: JSON.stringify({ reason: 'wrong device', imei: luhnImei() }),
+    })
+    expect(corr.status).toBe(201)
+
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, { method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222BB10' }) })
+    expect(fin.status).toBe(422) // whole shipment blocked, not just line A
+    expect(await deviceStatus(devices[0].id)).toBe('EXPORTED_UNDER_OPR')
+    expect(await deviceStatus(devices[1].id)).toBe('EXPORTED_UNDER_OPR')
   })
 })
 

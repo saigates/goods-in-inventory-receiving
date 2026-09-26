@@ -1582,9 +1582,20 @@ async function catalogValueForSpec(
   spec: { model: string | null; capacity: string | null; color: string | null; grade: string | null },
 ): Promise<number | null> {
   if (!spec.model || !spec.grade) return null
+  // NULL-safe equality on capacity/color, mirroring resolveCatalogSku's own
+  // COALESCE(capacity,'') convention (src/lib/catalog.ts) — a plain
+  // `capacity = ?` never matches when the column is NULL (a normal case:
+  // /scan/manual and other intake paths commonly leave capacity/color
+  // unset), which would otherwise silently starve Amendment 2's
+  // catalog-value comparator of any rows for a large share of real
+  // devices, making it look like "no catalogue coverage" when the real
+  // issue is a NULL-vs-NULL equality bug, not missing data.
   const row = await c.env.DB.prepare(
     `SELECT AVG(buy_price) AS avg_price, COUNT(*) AS n FROM received_devices
-      WHERE organisation_id = ? AND model = ? AND capacity = ? AND color = ? AND grade = ?`
+      WHERE organisation_id = ? AND model = ?
+        AND COALESCE(capacity, '') = COALESCE(?, '')
+        AND COALESCE(color, '') = COALESCE(?, '')
+        AND grade = ?`
   ).bind(user.organisation_id, spec.model, spec.capacity, spec.color, spec.grade)
     .first<{ avg_price: number | null; n: number }>()
   if (!row || !row.n) return null

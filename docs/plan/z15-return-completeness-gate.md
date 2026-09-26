@@ -108,13 +108,27 @@ ships) doesn't merely diverge in grade/colour — it resolves to a
 fundamentally different device than any line on the related export. This
 is not a new endpoint; it is a new check that runs Z-9's generation-boundary
 detector (§5/Amendment 3) against the *whole* consignment at finalise time,
-not just per-line: if a `requires_review` correction is still unreviewed
-anywhere on the return, finalisation is blocked — this is the mechanism
-Amendment 4 already specified, and Z-15 is simply the shipment-level
-enforcement point that calls it. **Dependency**: this sub-scope cannot be
-implemented before Z-9 ships its `return_line_corrections` table and
-`requires_review` flag — Z-15's finalise-time block reads that flag, it
-does not duplicate the detection logic.
+not just per-line.
+
+**Correction (2026-09-26, same day as this doc, post-write): narrowed to
+match the operator's ruling on Z-9's own finalise-time block.** The
+operator has since ruled that a generation-boundary correction is NOT a
+misdeclaration on the original export — Z-9's `IMP_RETURN_LINE_REVIEW`
+check was corrected accordingly to hard-block ONLY on an IMEI-driven
+correction (`review_reason` includes `imei_change`), never on
+`generation_boundary`/`generation_unparseable`/`catalog_value_diff` alone.
+Z-15's shipment-level enforcement point MUST read the same distinction,
+not `requires_review` generically, or it would silently reintroduce
+exactly the over-broad block Z-9 just had corrected out of it. So: if an
+IMEI-driven correction is still unreviewed anywhere on the return,
+finalisation is blocked, no override (Amendment 4's "sharp case," X-7
+reserved). A non-IMEI `requires_review` correction (generation-boundary,
+unparseable, or catalog-value-diff alone) does NOT block Z-15's gate
+either — same amber-informational treatment as Z-9's own check.
+**Dependency unchanged**: this sub-scope cannot be implemented before
+Z-9 ships `return_line_corrections`/`requires_review`/`review_reason` —
+Z-15's finalise-time block reads those columns, it does not duplicate
+the detection logic.
 
 ### (d) Finalisation block, general
 
@@ -124,8 +138,11 @@ that function, with three failure modes:
 1. `returned > exported` (cumulative, including this return) — hard block, no override.
 2. `returned < exported` (cumulative) with no `partial_return_declarations`
    row supplied in the finalise request body — block, "reason required."
-3. Any line on this return has an unreviewed `requires_review` correction
-   (Z-9 dependency) — hard block, no override (per Amendment 4).
+3. Any line on this return has an unreviewed IMEI-driven correction
+   (`review_reason` includes `imei_change`; Z-9 dependency) — hard block,
+   no override (per Amendment 4, narrowed per the operator's
+   generation-boundary ruling — see (c) above). A non-IMEI
+   `requires_review` correction does not trigger this failure mode.
 
 ## Explicit non-goals
 
