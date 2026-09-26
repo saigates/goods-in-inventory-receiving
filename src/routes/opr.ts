@@ -1748,6 +1748,14 @@ app.get('/shipments/:id/corrections', async (c) => {
 // POST /shipments/:id/lines/:lineId/correction/review { note? } — the
 // clearing side of IMP_RETURN_LINE_REVIEW's hard-block, admin-gated (same
 // "owner has no distinct role value" resolution as requireAdmin above).
+// Since the operator's ruling narrowed the finalise-time block to
+// IMEI-driven corrections only (see IMP_RETURN_LINE_REVIEW in
+// oprImport.ts), a non-IMEI requires_review=1 row (generation_boundary /
+// generation_unparseable / catalog_value_diff) no longer NEEDS review to
+// unblock finalise — but this route still accepts it (as long as
+// requires_review=1 and unreviewed), so an admin can voluntarily log a
+// review/ack against an amber-only row for the audit trail. Only
+// imei_change is refused unconditionally, per the paragraph below.
 // Reuses the shipment_misdeclaration_acks pattern per Amendment 4: an
 // UPDATE on the correction row itself is safe here (not a second
 // append-only ack table) because a correction row's identity fields never

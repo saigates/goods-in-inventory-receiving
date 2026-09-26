@@ -1116,30 +1116,50 @@ export function runImportValidation(
     }
   }
 
-  // ── IMP_RETURN_LINE_REVIEW (Z-9, operator amendment 4) ──
-  // requires_review=1 is amber-only DISPLAY while the return is DRAFT (the
-  // operator must always be able to record physical scanner reality
-  // without being blocked mid-scan — see return_line_corrections' own
-  // header comment) but HARD-BLOCKS finalise here, unconditionally, until
-  // reviewed_at is set (cleared via the reuse of the
-  // shipment_misdeclaration_acks pattern: an admin review+ack). This is
-  // Z-9's OWN obligation for a line that DID match an export line — the
-  // return_line_corrections table can only carry a row for a
+  // ── IMP_RETURN_LINE_REVIEW (Z-9, operator amendment 4, NARROWED per
+  // operator ruling 2026-09-26 on the generation-boundary-as-misdeclaration
+  // question) ──
+  // The operator's customs-policy default (flag+block without auto-amend,
+  // pending Neil Platts) resolved to: a generation-boundary correction is
+  // NOT treated as a misdeclaration on the original export. Consequence:
+  // this check now HARD-BLOCKS (red) ONLY for an IMEI-driven correction
+  // (review_reason includes 'imei_change') — the one trigger Amendment 4
+  // itself singles out as "the sharp case", stricter than every other
+  // trigger, with NO override path (see the review/review-clear route's
+  // own refusal for imei_change rows). generation_boundary,
+  // generation_unparseable, and catalog_value_diff ALONE (no imei_change)
+  // still set requires_review=1 at write time (unchanged — that flag is
+  // the amber-display signal on the consignment header and the C&E1154
+  // side-by-side view) but are NO LONGER a finalise blocker and need NO
+  // acknowledgement to proceed: amber, informational, receipt continues.
+  // Getting this wrong is exactly the failure mode flagged in review —
+  // Batch 3 is the first consignment through this check, and a
+  // generation-boundary row wrongly held at 'red' would stop it on a case
+  // the operator has explicitly declassified.
+  //
+  // This remains Z-9's OWN obligation for a line that DID match an export
+  // line — return_line_corrections can only carry a row for a
   // shipment_line_id that already exists, so a scan matching NO export
-  // line at all (the wrong-device case) is Z-15's separate scope, not this
-  // check's. Not applicable to TEMP_EXPORT_STANDARD, matching every other
-  // customs-specific check above (no customs identity assertion applies).
+  // line at all (the wrong-device case) is Z-15's separate scope, not
+  // this check's. Not applicable to TEMP_EXPORT_STANDARD, matching every
+  // other customs-specific check above (no customs identity assertion applies).
   if (isStandardTemp) {
     add('IMP_RETURN_LINE_REVIEW', 'green', 'Not applicable — no return-line correction review on a TEMP_EXPORT_STANDARD shipment')
   } else {
-    const unreviewed = returnLineCorrections.filter(r => Number(r.requires_review) === 1 && !r.reviewed_at)
-    if (unreviewed.length) {
-      add('IMP_RETURN_LINE_REVIEW', 'red', `${unreviewed.length} return-line correction(s) require review before receipt: ${unreviewed.map(r => `line ${r.shipment_line_id} (${r.review_reason ?? 'unspecified'})`).join('; ')}`)
+    const hasImeiReason = (r: ReturnLineCorrectionLite) =>
+      String(r.review_reason ?? '').split(',').includes('imei_change')
+    const imeiBlocking = returnLineCorrections.filter(
+      r => Number(r.requires_review) === 1 && !r.reviewed_at && hasImeiReason(r)
+    )
+    const nonImeiFlagged = returnLineCorrections.filter(
+      r => Number(r.requires_review) === 1 && !hasImeiReason(r)
+    )
+    if (imeiBlocking.length) {
+      add('IMP_RETURN_LINE_REVIEW', 'red', `${imeiBlocking.length} IMEI correction(s) require review before receipt (no override path): ${imeiBlocking.map(r => `line ${r.shipment_line_id} (${r.review_reason ?? 'unspecified'})`).join('; ')}`)
+    } else if (nonImeiFlagged.length) {
+      add('IMP_RETURN_LINE_REVIEW', 'amber', `${nonImeiFlagged.length} return-line correction(s) flagged for review (generation-boundary / catalog-value-difference) — informational only, does not block receipt: ${nonImeiFlagged.map(r => `line ${r.shipment_line_id} (${r.review_reason ?? 'unspecified'})`).join('; ')}`)
     } else {
-      const reviewed = returnLineCorrections.filter(r => Number(r.requires_review) === 1 && r.reviewed_at)
-      add('IMP_RETURN_LINE_REVIEW', 'green', reviewed.length
-        ? `${reviewed.length} return-line correction(s) flagged for review, all reviewed/acknowledged`
-        : 'No return-line corrections require review')
+      add('IMP_RETURN_LINE_REVIEW', 'green', 'No return-line corrections require review')
     }
   }
 
