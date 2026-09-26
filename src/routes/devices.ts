@@ -597,7 +597,41 @@ function exportCsvSelectSql(whereSql: string): string {
       COALESCE((SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
                  WHERE cl.received_device_id = rd.id AND cl.cost_type = 'purchase'), 0) AS purchase_cost_gbp,
       COALESCE((SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
-                 WHERE cl.received_device_id = rd.id AND cl.cost_type = 'repair'), 0) AS repair_cost_gbp
+                 WHERE cl.received_device_id = rd.id AND cl.cost_type = 'repair'), 0) AS repair_cost_gbp,
+      -- Z-2 (2026-09-26): acquisition_cost_gbp prefers the cost_ledger
+      -- 'purchase' sum when any such row exists, else falls back to the
+      -- goods-in buy_price — see src/lib/acquisitionCost.ts and
+      -- docs/plan/z2-acquisition-cost.md for why this differs from the
+      -- existing purchase_cost_gbp column above (which has NO fallback
+      -- and stays untouched for backward compatibility). The "Rate"
+      -- column below is the Zoho-bill-import-facing alias of this SAME
+      -- figure -- never repair/freight -- per the operator's explicit
+      -- instruction that only acquisition cost reaches the Zoho bill
+      -- Rate field. (Comment intentionally avoids backtick characters:
+      -- this whole SQL block is itself a JS template literal, and an
+      -- embedded backtick would terminate it early -- caught by tsc.)
+      COALESCE(
+        (SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
+          WHERE cl.received_device_id = rd.id AND cl.cost_type = 'purchase'),
+        rd.buy_price
+      ) AS acquisition_cost_gbp,
+      COALESCE((SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
+                 WHERE cl.received_device_id = rd.id AND cl.cost_type = 'freight'), 0) AS freight_cost_gbp,
+      ( COALESCE(
+          (SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
+            WHERE cl.received_device_id = rd.id AND cl.cost_type = 'purchase'),
+          rd.buy_price, 0
+        )
+        + COALESCE((SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
+                     WHERE cl.received_device_id = rd.id AND cl.cost_type = 'repair'), 0)
+        + COALESCE((SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
+                     WHERE cl.received_device_id = rd.id AND cl.cost_type = 'freight'), 0)
+      ) AS total_cost_gbp,
+      COALESCE(
+        (SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
+          WHERE cl.received_device_id = rd.id AND cl.cost_type = 'purchase'),
+        rd.buy_price
+      ) AS "Rate"
     FROM received_devices rd
     LEFT JOIN suppliers s ON s.id = rd.supplier_id
     WHERE ${whereSql}
@@ -732,7 +766,7 @@ app.get('/export/csv', async (c) => {
   // costing columns — see the module comment above for exactly what was
   // dropped (currency, label_printed_at) and why.
   const baseHeaders = ['id', 'uuid', 'imei', 'sku', 'brand', 'model', 'capacity', 'color', 'grade', 'status', 'source', 'vat_type', 'created_at', 'received_date', 'vendor']
-  const costHeaders = ['bill_ref', 'purchase_cost_gbp', 'repair_cost_gbp']
+  const costHeaders = ['bill_ref', 'purchase_cost_gbp', 'repair_cost_gbp', 'acquisition_cost_gbp', 'freight_cost_gbp', 'total_cost_gbp', 'Rate']
   const headers = includeCostColumns ? [...baseHeaders, ...costHeaders] : baseHeaders
 
   c.header('Content-Type', 'text/csv; charset=utf-8')

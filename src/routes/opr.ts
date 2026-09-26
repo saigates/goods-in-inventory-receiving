@@ -118,6 +118,7 @@ import {
   parseModelGeneration, compareGenerations, compareCatalogValues, computeReturnLineReview,
   mergeCorrectionSnapshot, type FrozenLineSpec, type CorrectedLineSpec,
 } from '../lib/returnCorrections'
+import { computeAcquisitionCostGbp } from '../lib/acquisitionCost'
 import {
   planGradeCorrection, buildGradeCorrectionStmts, logGradeCorrectionEvent,
   type GradeCorrectionDeviceRow, type IdentityFieldOverrides,
@@ -781,11 +782,25 @@ async function addDeviceToShipment(
   const shipmentId = Number(shipment.id)
   const deviceId = Number(device.id)
 
-  // Customs documents need a declared unit value. A device with no buy
-  // price cannot go on a consignment — same valuation rule as goods-in,
-  // enforced at the point the snapshot is taken.
-  if (device.buy_price == null) {
-    return c.json({ error: `Device ${deviceId} (IMEI ${device.imei}) has no buy_price — a unit value is required before it can be added to a consignment` }, 422)
+  // Customs documents need a declared unit value. Z-2 (2026-09-26):
+  // widened from a plain `buy_price == null` check to the full
+  // acquisition-cost computation (see src/lib/acquisitionCost.ts and
+  // docs/plan/z2-acquisition-cost.md) — a device with buy_price = 0 used
+  // to pass this check untouched and could join a consignment with a
+  // customs unit value of £0, which is exactly what this gate exists to
+  // prevent. Two distinct 422 messages so an operator seeing the block
+  // knows whether the fix is "enter a buy_price at goods-in" (no cost
+  // recorded at all) vs. "the recorded acquisition cost is £0 — check the
+  // ledger/goods-in entry" (a value was entered but computes to zero).
+  const acquisition = await computeAcquisitionCostGbp(
+    c.env.DB, user.organisation_id, deviceId,
+    device.buy_price == null ? null : Number(device.buy_price),
+  )
+  if (acquisition.acquisition_cost_gbp == null) {
+    return c.json({ error: `Device ${deviceId} (IMEI ${device.imei}) has no acquisition cost — a unit value is required before it can be added to a consignment` }, 422)
+  }
+  if (acquisition.acquisition_cost_gbp <= 0) {
+    return c.json({ error: `Device ${deviceId} (IMEI ${device.imei}) has a zero/negative acquisition cost (£${acquisition.acquisition_cost_gbp}, source: ${acquisition.acquisition_source}) — a positive unit value is required before it can be added to a consignment` }, 422)
   }
 
   // Export consignments only take devices staged for export. (Import/return
@@ -794,6 +809,15 @@ async function addDeviceToShipment(
     return c.json({ error: `Device ${deviceId} (IMEI ${device.imei}) is ${device.status} — only READY_FOR_EXPORT devices can be added to an export consignment` }, 409)
   }
 
+  // unit_value uses the SAME acquisition_cost_gbp figure the gate above
+  // just validated as positive — not a bare device.buy_price re-read,
+  // which would be NULL (and violate shipment_lines.unit_value's NOT
+  // NULL constraint) for exactly the goods_in_buy_price-absent-but-
+  // cost_ledger-present case Z-2 introduced. Previously this column was
+  // always device.buy_price verbatim; devices costed only via the
+  // ledger (no goods-in buy_price at all) could not reach this INSERT
+  // before Z-2's gate change, so this is a widening, not a behaviour
+  // change for any device that already had a buy_price.
   let lineId: number
   try {
     const result = await c.env.DB.prepare(`
@@ -805,7 +829,7 @@ async function addDeviceToShipment(
       user.organisation_id, shipmentId, deviceId,
       device.imei, device.sku, device.brand, device.model,
       device.capacity, device.color, device.grade,
-      device.buy_price, 'GBP', user.id,
+      acquisition.acquisition_cost_gbp, 'GBP', user.id,
     ).run()
     lineId = Number(result.meta.last_row_id)
   } catch (e: unknown) {
