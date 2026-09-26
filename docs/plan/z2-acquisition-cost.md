@@ -112,20 +112,35 @@ needed — both already have dedicated, working writers:
 figures (`acquisition_cost_gbp`, `repair_cost_gbp`, `freight_cost_gbp`,
 `total_cost_gbp`) plus `acquisition_source`.
 
-## "Only `acquisition_cost` reaches the Zoho bill Rate"
+## "Only `acquisition_cost` reaches the Zoho bill Rate" — REVISED, no `Rate` column here
 
-`GET /api/devices/export/csv` (`src/routes/devices.ts`) is this codebase's
-existing Zoho-reconciliation-facing export surface (the column-naming
-convention there already borrows Zoho's own field vocabulary, e.g.
-`skuMapImport.ts`'s literal `'Zoho Item Name'` header). Z-2 adds a `Rate`
-column (Zoho's own bill-import field name for unit cost) to that export's
-manager-gated cost-column set, populated with `acquisition_cost_gbp` ONLY
-— `repair_cost_gbp` and `freight_cost_gbp` are computed and exposed
-alongside it (as `total_cost_gbp`) but never folded into `Rate`. The
+**Superseded design (as first implemented, now reversed):** Z-2 originally
+added a `Rate` column (Zoho's own bill-import field name for unit cost) to
+`GET /api/devices/export/csv`'s manager-gated cost-column set, populated
+with `acquisition_cost_gbp` ONLY.
+
+**Operator ruling (2026-09-26, §3 of that pass) — reversed this:** `Rate`
+is Zoho-bill-import vocabulary that belongs exclusively to a future ticket
+**Y-1**, which will build a 26-column `Zoho_Bill_Template` mapping file —
+the single place this codebase's fields map onto Zoho's own bill-import
+column names. A second `Rate` alias living here, in the general-purpose
+device CSV export, would be a second, independently-driftable mapping of
+the exact same underlying figure. The first time the two mappings diverged
+(a rename in one file and not the other, a rounding difference, a future
+edit that touches only one), it would surface to **Y-4**'s reconciliation
+as an apparent "Zoho-side edit" that is actually just this codebase
+disagreeing with itself.
+
+**Current, correct design:** this export exposes only
+`acquisition_cost_gbp` (plus `freight_cost_gbp` and `total_cost_gbp`).
+Whichever future code actually builds the Zoho bill payload — Y-1's
+mapping file — reads `acquisition_cost_gbp` and renames it to `Rate`
+itself, in exactly one place. This export never uses the word `Rate`. The
 existing `purchase_cost_gbp` column is left untouched (still the raw
 `cost_ledger` sum with no goods-in fallback) so no existing consumer's
-column semantics silently changes; `acquisition_cost_gbp`, `total_cost_gbp`,
-and `Rate` are net-new, additive columns.
+column semantics silently changes; `acquisition_cost_gbp`, `freight_cost_gbp`,
+and `total_cost_gbp` are net-new, additive columns — `Rate` is not one of
+them.
 
 ## Export-gate block — "devices with zero acquisition cost block"
 
@@ -138,6 +153,52 @@ of £0. Z-2 replaces that check with a call to
 `<= 0`, with a message that names which case applied (no buy_price entered
 at all, vs. a zero/negative computed acquisition cost) so an operator
 seeing the 422 knows which of the two to fix.
+
+## Y-3/Y-4 requirement: snapshot acquisition cost as sent, never recompute at reconciliation (operator §1, 2026-09-26)
+
+`acquisition_cost_gbp` is a **live computed read** (see Decision, above) —
+its value can change after the fact. Concretely: a device is exported to
+Zoho at a `Rate` derived from its goods-in `buy_price` (no `cost_ledger`
+`'purchase'` row exists yet); a week later a bill closes and posts a
+`cost_ledger` `'purchase'` row for that same device. From that moment on,
+`computeAcquisitionCostGbp()` returns the ledger sum instead of
+`buy_price` — the figure we originally sent Zoho no longer reproduces from
+a fresh call.
+
+**The risk this creates for Y-4:** if a future **Y-3** (the Zoho
+batch-export ticket) persists a device into `zoho_batch_devices` by
+storing only identifying keys and re-deriving the acquisition cost at
+reconciliation time via a fresh `computeAcquisitionCostGbp()` call, then
+**every** such after-the-fact ledger posting would make Y-4's reconciliation
+logic see "our figure" and "Zoho's figure" diverge — permanently, for that
+device, from the moment the ledger row posts onward. Y-4 has no way to
+tell that apart from an actual, genuine edit made on the Zoho side. The
+false-positive is not a one-off glitch; it is a standing, silent drift
+that would need to be manually re-investigated and dismissed every time it
+fires, for a device that was in fact billed correctly.
+
+**Required fix, owned by Y-3/Y-4, not implemented by Z-2 (Z-2 has no
+`zoho_batch_devices` writer — see Non-goals):**
+
+- When Y-3 persists a device row into `zoho_batch_devices`, it MUST
+  **snapshot** — write down as a stored value on that row, at send time —
+  both:
+  1. the `acquisition_cost_gbp` figure actually sent, and
+  2. the `acquisition_source` flag (`'cost_ledger' | 'goods_in_buy_price' | 'none'`)
+     that was live at that same moment (already returned by
+     `computeAcquisitionCostGbp()` — Y-3 has this value for free from the
+     same call it uses to build the sent figure; it only needs to persist
+     it rather than discard it).
+- Y-4's reconciliation MUST compare Zoho's reported value against this
+  **frozen snapshot** — never against a fresh call to
+  `computeAcquisitionCostGbp()` for the same device. A genuine
+  post-export ledger posting is allowed to change what a NEW export would
+  send; it must never retroactively change what an ALREADY-SENT batch is
+  judged against.
+- This is recorded here, in the Z-2 doc, specifically so Y-3 inherits the
+  requirement when it is scoped/started, rather than rediscovering the
+  same failure mode from a live incident after batches are already
+  flowing.
 
 ## X-8 follow-on (noted, not actioned this ticket)
 
@@ -170,3 +231,12 @@ pre-empt X-8's design.
   raw `cost_ledger`-only aggregates they always were; `acquisition_cost_gbp`
   is a new, separate, CSV-export-facing figure with the goods-in fallback,
   not a replacement for the report's existing basis.
+- Does not touch `zoho_batches` / `zoho_batch_devices` (confirmed via grep
+  to have zero application-code writers as of this ticket) or implement
+  the snapshot-at-send-time requirement described above — that write path
+  belongs to Y-3, and the reconciliation-against-snapshot logic belongs to
+  Y-4. Z-2's only obligation here is to make sure the requirement is
+  documented before either ticket starts, which this section does.
+- Does not add a `Rate` column or any Zoho-bill-vocabulary field name to
+  this export — see the revised section above; that naming is Y-1's
+  exclusively.

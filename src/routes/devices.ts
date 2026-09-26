@@ -603,13 +603,15 @@ function exportCsvSelectSql(whereSql: string): string {
       -- goods-in buy_price — see src/lib/acquisitionCost.ts and
       -- docs/plan/z2-acquisition-cost.md for why this differs from the
       -- existing purchase_cost_gbp column above (which has NO fallback
-      -- and stays untouched for backward compatibility). The "Rate"
-      -- column below is the Zoho-bill-import-facing alias of this SAME
-      -- figure -- never repair/freight -- per the operator's explicit
-      -- instruction that only acquisition cost reaches the Zoho bill
-      -- Rate field. (Comment intentionally avoids backtick characters:
-      -- this whole SQL block is itself a JS template literal, and an
-      -- embedded backtick would terminate it early -- caught by tsc.)
+      -- and stays untouched for backward compatibility).
+      -- NO "Rate" alias here (operator ruling, 2026-09-26, this doc's
+      -- own §3): Rate is Zoho bill vocabulary and Y-1's 26-column
+      -- Zoho_Bill_Template is the SINGLE place our fields map to Zoho's
+      -- — a second Rate alias in this export would be a second mapping
+      -- that could silently drift from Y-1's and get misread by Y-4 as
+      -- a Zoho-side edit. This CSV exposes only acquisition_cost_gbp;
+      -- whichever later stage builds the Zoho bill payload reads this
+      -- column and names it Rate itself, once, in one place.
       COALESCE(
         (SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
           WHERE cl.received_device_id = rd.id AND cl.cost_type = 'purchase'),
@@ -626,12 +628,7 @@ function exportCsvSelectSql(whereSql: string): string {
                      WHERE cl.received_device_id = rd.id AND cl.cost_type = 'repair'), 0)
         + COALESCE((SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
                      WHERE cl.received_device_id = rd.id AND cl.cost_type = 'freight'), 0)
-      ) AS total_cost_gbp,
-      COALESCE(
-        (SELECT SUM(cl.amount_gbp) FROM cost_ledger cl
-          WHERE cl.received_device_id = rd.id AND cl.cost_type = 'purchase'),
-        rd.buy_price
-      ) AS "Rate"
+      ) AS total_cost_gbp
     FROM received_devices rd
     LEFT JOIN suppliers s ON s.id = rd.supplier_id
     WHERE ${whereSql}
@@ -766,7 +763,7 @@ app.get('/export/csv', async (c) => {
   // costing columns — see the module comment above for exactly what was
   // dropped (currency, label_printed_at) and why.
   const baseHeaders = ['id', 'uuid', 'imei', 'sku', 'brand', 'model', 'capacity', 'color', 'grade', 'status', 'source', 'vat_type', 'created_at', 'received_date', 'vendor']
-  const costHeaders = ['bill_ref', 'purchase_cost_gbp', 'repair_cost_gbp', 'acquisition_cost_gbp', 'freight_cost_gbp', 'total_cost_gbp', 'Rate']
+  const costHeaders = ['bill_ref', 'purchase_cost_gbp', 'repair_cost_gbp', 'acquisition_cost_gbp', 'freight_cost_gbp', 'total_cost_gbp']
   const headers = includeCostColumns ? [...baseHeaders, ...costHeaders] : baseHeaders
 
   c.header('Content-Type', 'text/csv; charset=utf-8')

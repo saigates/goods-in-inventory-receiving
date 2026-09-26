@@ -351,7 +351,7 @@ describe('shipment lines — frozen snapshots', () => {
     expect(after!.grade).toBe('B')
   })
 
-  it('rejects devices with no buy_price — no line created', async () => {
+  it('rejects devices with no buy_price and no cost_ledger purchase row — no line created', async () => {
     const device = await makeDevice({ buy_price: 10 })
     await env.DB.prepare('UPDATE received_devices SET buy_price = NULL WHERE id = ?').bind(device.id).run()
 
@@ -360,7 +360,12 @@ describe('shipment lines — frozen snapshots', () => {
       method: 'POST', body: JSON.stringify({ device_id: device.id }),
     })
     expect(res.status).toBe(422)
-    expect(((await res.json()) as { error: string }).error).toMatch(/buy_price/)
+    // Z-2 (2026-09-26): the gate now calls computeAcquisitionCostGbp()
+    // (see src/lib/acquisitionCost.ts) instead of checking buy_price
+    // directly — no cost_ledger 'purchase' row exists here either, so the
+    // computed result is null and the message names "acquisition cost",
+    // not the literal column name "buy_price" any more.
+    expect(((await res.json()) as { error: string }).error).toMatch(/no acquisition cost/)
     const after = await env.DB.prepare('SELECT COUNT(*) AS n FROM shipment_lines').first<{ n: number }>()
     expect(after!.n).toBe(before!.n)
   })
