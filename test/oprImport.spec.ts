@@ -371,6 +371,16 @@ describe('OPR 3 — computeCe1154', () => {
   // (post-override) currency/rate a given call produces, not hardcoded,
   // so those GBP-override sites keep getting month: null automatically
   // and don't need touching individually.
+  //
+  // CAVEAT: because this derivation mirrors the same currency/rate logic
+  // the two month rules enforce, mkImport() can never produce a state
+  // those rules would reject — this factory provides ZERO regression
+  // pressure on rate-without-month / month-with-GBP. That coverage rests
+  // entirely on the three explicit tests below ('Z-11: refuses ... rate-
+  // without-month', 'Z-11: refuses ... month-with-GBP', and the AED
+  // Batch 3 acceptance case), which construct the bad states by hand. If
+  // any of those three is ever deleted or weakened, the rule it covers
+  // becomes untested — this helper will NOT catch that silently.
   const mkImport = (over: Partial<Shipment> = {}): Shipment => {
     const effectiveCurrency = over.repair_cost_currency !== undefined ? over.repair_cost_currency : 'USD'
     const effectiveRate = over.customs_exchange_rate !== undefined ? over.customs_exchange_rate : 1.25
