@@ -306,6 +306,24 @@ PENDING   -- default until QC is recorded; scan-back does NOT itself set
    SKU must be validated against the catalog (condition 4) like any
    other SKU change, not assumed valid because the old one was.
 
+   **Named count, not an obscure downstream rejection (2026-09-26).**
+   Condition 6 is not hypothetical — it already has a live population
+   to block. Batch 3 (production shipment 3, AWB `877564146355`,
+   discharging export shipment 1 `OPR20260826003`) has 112
+   `shipment_lines`, of which 81 carry `grade='UG'`. All 81 trace back
+   to a genuinely-ungraded source declaration (manifest 17 and others —
+   see the Ungraded batch-3 return investigation, 2026-09-26) rather
+   than a data-loss bug, so condition 6 is expected to reject all 81
+   the moment they're restocked and pushed toward `READY_FOR_ZOHO`.
+   That's roughly two-thirds of this one batch unbillable into Zoho
+   until someone grades them by hand. Y-2 (the validation-gate work)
+   should surface this as an explicit, named block condition — e.g. a
+   count of "N devices blocked: grade not in A/B/C" — rather than
+   letting it appear as a generic 409/422 per device with no aggregate
+   visibility. This is not a design change to condition 6 itself, just
+   a requirement that Y-2's implementation report the count, not just
+   reject one device at a time.
+
 Any failure of 1–6 blocks the transition; the endpoint returns 409/422
 with the specific unmet condition, mirroring the existing
 `runExportValidation`/`runImportValidation` pattern of explicit, named
