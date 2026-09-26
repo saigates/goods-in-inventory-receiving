@@ -392,6 +392,42 @@ export type ShipmentValueDelta = {
   created_at: string
 }
 
+// Z-9 (0039): mutable return-leg identity/grade correction, sitting BESIDE
+// the frozen shipment_lines row it corrects — never editing it. Full
+// snapshot per row (see migration 0039's header comment): every field here
+// is the EFFECTIVE corrected value, whether or not this particular
+// correction changed it, so "latest row per shipment_line_id" is
+// unambiguous. Deliberately no corrected_unit_value/currency — the
+// declared customs value stays pinned to shipment_lines.unit_value always.
+export type ReturnLineCorrection = {
+  id: number
+  organisation_id: number
+  shipment_line_id: number
+  received_device_id: number
+  corrected_imei: string
+  corrected_sku: string | null
+  corrected_brand: string | null
+  corrected_model: string | null
+  corrected_capacity: string | null
+  corrected_color: string | null
+  corrected_grade: string
+  is_generation_boundary: number
+  frozen_generation: number | null
+  corrected_generation: number | null
+  generation_unparseable: number
+  frozen_catalog_value_gbp: number | null
+  corrected_catalog_value_gbp: number | null
+  catalog_value_diff_pct: number | null
+  requires_review: number
+  review_reason: string | null
+  reviewed_by_user_id: number | null
+  reviewed_at: string | null
+  review_note: string | null
+  reason: string | null
+  actor_user_id: number
+  created_at: string
+}
+
 // Received correspondence logged against a shipment (0020). The counterpart
 // of sent_emails (kind='correspondence' for outbound) — this is inbound.
 export type ShipmentReply = {
