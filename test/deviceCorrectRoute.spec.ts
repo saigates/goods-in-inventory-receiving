@@ -869,4 +869,23 @@ describe('GET /api/devices/:id — manifest_line field', () => {
     const body = await res.json() as any
     expect(body.manifest_line).toMatchObject({ id: expectedId, sku: 'TEST-GETID-LINKED-SKU' })
   })
+
+  // Z-5 (2026-09-27): device.location is DERIVED (deviceLocation(status)),
+  // added to the response alongside the pre-existing device fields — see
+  // deviceLifecycle.ts's LOCATION_ABROAD_STATUSES comment.
+  it("device.location is 'Warehouse' for an ordinary RECEIVED device", async () => {
+    const device = await seedDevice({ sku: 'TEST-GETID-LOC-WH-SKU', brand: 'APPLE', model: 'IPHONE TESTG', capacity: '128GB', color: 'RED', grade: 'A' })
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}`)
+    expect(res.status).toBe(200)
+    const body = await res.json() as any
+    expect(body.device.location).toBe('Warehouse')
+  })
+
+  it("device.location is 'SW001' for an EXPORTED_UNDER_OPR device", async () => {
+    const device = await seedDevice({ sku: 'TEST-GETID-LOC-SW-SKU', brand: 'APPLE', model: 'IPHONE TESTG', capacity: '128GB', color: 'RED', grade: 'A', status: 'EXPORTED_UNDER_OPR' })
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}`)
+    expect(res.status).toBe(200)
+    const body = await res.json() as any
+    expect(body.device.location).toBe('SW001')
+  })
 })

@@ -15,6 +15,8 @@ import {
   DeviceNotFoundError,
   InvalidTransitionError,
   transitionDevice,
+  deviceLocation,
+  LOCATION_ABROAD_STATUSES,
 } from '../src/lib/deviceLifecycle'
 import type { AuthUser, DeviceStatus } from '../src/types'
 import { DEVICE_STATUSES } from '../src/types'
@@ -471,5 +473,38 @@ describe('DEVICE_STATUSES / ALLOWED_TRANSITIONS sanity', () => {
     for (const status of DEVICE_STATUSES) {
       expect(Object.prototype.hasOwnProperty.call(ALLOWED_TRANSITIONS, status)).toBe(true)
     }
+  })
+})
+
+// Z-5 (2026-09-27): the display-only location helper for GET /api/devices,
+// GET /:id, and the CSV export. DISPLAY ONLY — see deviceLifecycle.ts's
+// LOCATION_ABROAD_STATUSES comment for why V-6's cost-feed exclusion
+// filter must NOT reuse this predicate (IN_EXPORT_CONSIGNMENT and both
+// RETURNED_* statuses read 'Warehouse' here despite being unsellable —
+// packed-for-export or not-yet-restocked). V-6 needs
+// OPR_WORKFLOW_ONLY_STATUSES directly, not this function.
+describe('deviceLocation() — Z-5 single derived location rule', () => {
+  it("returns 'SW001' for EXPORTED_UNDER_OPR and TEMP_EXPORTED_STANDARD only", () => {
+    expect(deviceLocation('EXPORTED_UNDER_OPR')).toBe('SW001')
+    expect(deviceLocation('TEMP_EXPORTED_STANDARD')).toBe('SW001')
+  })
+
+  it("returns 'Warehouse' for every other DeviceStatus, including the other OPR_WORKFLOW_ONLY_STATUSES members", () => {
+    const abroad = new Set(LOCATION_ABROAD_STATUSES as readonly string[])
+    for (const status of DEVICE_STATUSES) {
+      if (abroad.has(status)) continue
+      expect(deviceLocation(status)).toBe('Warehouse')
+    }
+    // Explicitly named per the deviceLifecycle.ts comment: these ARE
+    // OPR_WORKFLOW_ONLY_STATUSES members, but physically in the building —
+    // IN_EXPORT_CONSIGNMENT (still here, merely on a DRAFT export) and
+    // both RETURNED_* statuses (consignment discharged, back on site).
+    expect(deviceLocation('IN_EXPORT_CONSIGNMENT')).toBe('Warehouse')
+    expect(deviceLocation('RETURNED_UNDER_OPR')).toBe('Warehouse')
+    expect(deviceLocation('RETURNED_UNDER_STANDARD')).toBe('Warehouse')
+  })
+
+  it('LOCATION_ABROAD_STATUSES contains exactly the 2 abroad statuses, no more no less', () => {
+    expect([...LOCATION_ABROAD_STATUSES].sort()).toEqual(['EXPORTED_UNDER_OPR', 'TEMP_EXPORTED_STANDARD'])
   })
 })

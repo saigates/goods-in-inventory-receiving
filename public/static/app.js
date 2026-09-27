@@ -4971,6 +4971,9 @@ into each Condition, each VAT Type, and each Currency.`;
               h('th', { class: 'text-left px-4 py-3' }, 'Device'),
               h('th', { class: 'text-left px-4 py-3' }, 'Grade'),
               h('th', { class: 'text-left px-4 py-3' }, 'Source'),
+              // Z-5: derived from status server-side (GET /api/devices'
+              // location field), never independently computed here.
+              h('th', { class: 'text-left px-4 py-3' }, 'Location'),
               h('th', { class: 'text-left px-4 py-3' }, 'Received'),
               h('th', { class: 'text-left px-4 py-3' }, 'Label'),
               h('th', { class: 'text-right px-4 py-3' }, '')
@@ -4978,7 +4981,7 @@ into each Condition, each VAT Type, and each Currency.`;
           ),
           h('tbody', { class: 'divide-y divide-slate-800' },
             state.inventory.length === 0
-              ? h('tr', {}, h('td', { colspan: 10, class: 'text-center py-10 text-slate-500' }, 'No devices yet.'))
+              ? h('tr', {}, h('td', { colspan: 11, class: 'text-center py-10 text-slate-500' }, 'No devices yet.'))
               : state.inventory.map(d => h('tr', { class: 'row-strip ' + (selected.has(d.id) ? 'bg-cyan-500/5' : '') },
                 h('td', { class: 'px-3 py-2' },
                   h('input', {
@@ -5008,6 +5011,15 @@ into each Condition, each VAT Type, and each Currency.`;
                     : d.source === 'manual'
                       ? h('span', { class: 'badge badge-cyan text-[10px]' }, 'manual')
                       : h('span', { class: 'badge badge-red text-[10px]' }, 'unreconciled')),
+                // Z-5: d.location comes straight from the API response
+                // (deviceLocation(status), computed server-side) — never
+                // re-derived from d.status here. Display only — V-6's
+                // sellability filter must NOT use this field (see
+                // deviceLifecycle.ts's LOCATION_ABROAD_STATUSES comment).
+                h('td', { class: 'px-4 py-2 text-xs' },
+                  d.location === 'SW001'
+                    ? h('span', { class: 'badge badge-amber text-[10px]' }, 'SW001')
+                    : h('span', { class: 'text-slate-400' }, 'Warehouse')),
                 h('td', { class: 'px-4 py-2 text-xs text-slate-400' }, fmtDate(d.created_at)),
                 h('td', { class: 'px-4 py-2 text-xs' },
                   d.label_printed_at
