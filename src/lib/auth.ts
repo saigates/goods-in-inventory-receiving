@@ -84,6 +84,10 @@ const DOC_TOKEN_ALLOWED_PATHS: RegExp[] = [
   // short-lived, route-scoped doc-token fallback rather than the old
   // full-session-token-in-a-URL exposure this mechanism was built to close.
   /^\/api\/devices\/export\/csv$/,
+  // Z-4 phase 2 (2026-09-27): the SKU-map unmapped-queue export button is
+  // the same plain browser navigation as the CSV export above (can't
+  // carry an Authorization header on a window.open() download).
+  /^\/api\/sku-map\/unmapped\/export$/,
 ]
 
 export async function signDocToken(

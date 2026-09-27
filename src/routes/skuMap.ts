@@ -6,6 +6,7 @@
 // cost columns (manager/admin), same convention as requireManager() in
 // devices.ts.
 import { Hono } from 'hono'
+import { stream } from 'hono/streaming'
 import type { Bindings, AuthUser } from '../types'
 import { currentUser } from '../lib/auth'
 import { cleanString, validateZohoItemId } from '../lib/validate'
@@ -16,6 +17,14 @@ import {
 } from '../lib/skuMapImport'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
+
+// Same minimal CSV-cell escaping devices.ts's /export/csv uses — quote only
+// when the value actually needs it (contains a comma/quote/newline).
+const escapeCsv = (v: unknown) => {
+  if (v == null) return ''
+  const s = String(v)
+  return /["\r\n,]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
 
 function requireManager(c: any): boolean {
   const role = (c.var.user as AuthUser).role
@@ -87,6 +96,68 @@ app.get('/unmapped', async (c) => {
      ORDER BY device_count DESC, rd.sku ASC`
   ).bind(user.organisation_id).all()
   return c.json({ unmapped: results })
+})
+
+// GET /api/sku-map/unmapped/export — Z-4 phase 2 (Excel round trip), the
+// DOWNLOAD half. A plain browser navigation (window.open(), same
+// Authorization-header limitation as devices.ts's /export/csv — see
+// src/lib/auth.ts's DOC_TOKEN_ALLOWED_PATHS, which this path must be
+// added to), so this needs the ?token= doc-token fallback, not header
+// auth.
+//
+// Column order is EXACTLY parseSkuMapCsv's REQUIRED_HEADERS
+// (SKU,Brand,Model,Capacity,Color,Grade,Zoho Item ID,Zoho SKU,Zoho Item
+// Name) so the completed file round-trips straight into POST /import
+// unchanged — no separate "phase 2 import format" was introduced. One
+// extra trailing "Device Count" column is informational only; the parser
+// only requires its own 9 headers to be PRESENT (extra columns are
+// ignored, confirmed by reading parseSkuMapCsv — it builds each row from
+// `header` positions, never rejects an unrecognised extra column).
+//
+// SKU/Brand/Model/Capacity/Color/Grade are pre-filled from
+// received_devices (one representative row per goods_in_sku — brand/
+// model/capacity/color/grade are already uniform per-SKU in practice,
+// since goods_in_sku is itself derived from exactly these fields via
+// buildSku(); MIN(id) picks a stable, deterministic representative
+// rather than an arbitrary one). The three Zoho columns are left BLANK
+// for the operator to complete — this is the whole point of the
+// template, not an oversight.
+app.get('/unmapped/export', async (c) => {
+  const user = currentUser(c)
+  if (!requireManager(c)) return c.json({ error: 'Manager or admin role required' }, 403)
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT rd.sku AS goods_in_sku, COUNT(*) AS device_count,
+            MIN(rd.brand) AS brand, MIN(rd.model) AS model,
+            MIN(rd.capacity) AS capacity, MIN(rd.color) AS color, MIN(rd.grade) AS grade
+     FROM received_devices rd
+     WHERE rd.organisation_id = ?
+       AND NOT EXISTS (
+         SELECT 1 FROM sku_map m
+         WHERE m.goods_in_sku = rd.sku AND m.organisation_id = rd.organisation_id AND m.orphaned_at IS NULL
+       )
+     GROUP BY rd.sku
+     ORDER BY device_count DESC, rd.sku ASC`
+  ).bind(user.organisation_id).all<{
+    goods_in_sku: string; device_count: number
+    brand: string | null; model: string | null; capacity: string | null; color: string | null; grade: string | null
+  }>()
+
+  c.header('Content-Type', 'text/csv; charset=utf-8')
+  c.header('Content-Disposition', `attachment; filename="sku-map-unmapped-${Date.now()}.csv"`)
+
+  const headers = ['SKU', 'Brand', 'Model', 'Capacity', 'Color', 'Grade', 'Zoho Item ID', 'Zoho SKU', 'Zoho Item Name', 'Device Count']
+  return stream(c, async (writer) => {
+    await writer.write(headers.join(',') + '\r\n')
+    for (const row of results) {
+      const cells = [
+        row.goods_in_sku, row.brand, row.model, row.capacity, row.color, row.grade,
+        '', '', '', // Zoho Item ID / Zoho SKU / Zoho Item Name — blank, operator fills these
+        row.device_count,
+      ]
+      await writer.write(cells.map(escapeCsv).join(',') + '\r\n')
+    }
+  })
 })
 
 // POST /api/sku-map — manual single-row create (Z-4 phase 1's "manual
