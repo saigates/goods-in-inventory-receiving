@@ -190,41 +190,47 @@ export const REPAIR_WORKFLOW_ONLY_STATUSES: readonly DeviceStatus[] = [
   'READY_FOR_ZOHO',
 ] as const
 
-// ── Z-5 (2026-09-27): location display/exclusion rule ──
-// Originally scoped as display-only: a device's location string reads
-// 'SW001' while it is physically abroad under an OPR/temp-export
-// consignment, 'Warehouse' otherwise. It has since grown a SECOND
-// consumer — V-6's cost-feed exclusion filter, which must hide OPR stock
-// from Amazon precisely because it is not physically in the warehouse to
-// ship. Both consumers are really asking the exact same underlying
-// question ("is this device currently out of the building under an
-// OPR/temp-export consignment?"), so this is written ONCE, as a single
-// derived function of DeviceStatus, and BOTH the display layer (GET
-// /api/devices, GET /:id, the CSV export) and V-6's filter call it — not
-// two independently-maintained conditions that happen to agree today and
-// can silently drift apart tomorrow. That drift-between-two-copies shape
-// is the exact failure mode this codebase has already produced four
-// times (per the Z-16 tracking note) — this ticket exists specifically
-// to not add a fifth instance.
+// ── Z-5 (2026-09-27): location DISPLAY rule — NOT a sellability test ──
+// A device's location string reads 'SW001' while it is physically abroad
+// under a FINALISED OPR/temp-export consignment ('device is currently out
+// of the building, between finalise and return-receipt'), 'Warehouse' at
+// every other status. This is display/reporting ONLY — it answers "where
+// is this device sitting right now", nothing more.
 //
-// Deliberately keyed off EXPORTED_UNDER_OPR / TEMP_EXPORTED_STANDARD
-// only — the two statuses meaning "consignment finalised, device is
-// abroad right now" — not the full OPR_WORKFLOW_ONLY_STATUSES union
-// above. IN_EXPORT_CONSIGNMENT (still physically in the warehouse,
-// merely scanned onto a DRAFT export) and RETURNED_UNDER_OPR /
-// RETURNED_UNDER_STANDARD (physically back, consignment discharged) are
-// both 'Warehouse' by this rule — a device is only genuinely away from
-// the building between finalise and return-receipt, not for the whole
-// OPR-adjacent status lifecycle. If the intent was ever "any
-// OPR-workflow-only status counts", that is a one-line change from here
-// (swap the two-status list for OPR_WORKFLOW_ONLY_STATUSES itself), but
-// IN_EXPORT_CONSIGNMENT/RETURNED_* both describe devices that ARE in the
-// warehouse right now, so this was written narrower on purpose.
+// 🔴 CORRECTED (operator ruling, 2026-09-27, this pass's §2 — the original
+// version of this comment wrongly told V-6's cost-feed exclusion filter
+// to call deviceLocation()/LOCATION_ABROAD_STATUSES directly, and that
+// would have been a live bug once V-6 shipped): DO NOT use this function,
+// or LOCATION_ABROAD_STATUSES, as a sellability/exclusion test.
+// IN_EXPORT_CONSIGNMENT reads 'Warehouse' here (the device has not left
+// the building yet — merely scanned onto a DRAFT export) but the device
+// is packed and already committed to that outbound consignment, so it is
+// NOT sellable. Likewise RETURNED_UNDER_OPR/RETURNED_UNDER_STANDARD read
+// 'Warehouse' (physically back on site) but a returned-and-not-yet-
+// restocked device is also not sellable stock. A filter of
+// `location === 'Warehouse'` would offer devices that are in a box about
+// to leave, or physically back but not yet restocked, on Amazon — exactly
+// the desync this rule exists to prevent for the display case, silently
+// reintroduced on the sellability case if the same predicate were reused.
+//
+// V-6's exclusion filter must instead exclude on STATUS directly: the
+// full OPR_WORKFLOW_ONLY_STATUSES union above (IN_EXPORT_CONSIGNMENT,
+// EXPORTED_UNDER_OPR, RETURNED_UNDER_OPR, TEMP_EXPORTED_STANDARD,
+// RETURNED_UNDER_STANDARD — every status where the device is either
+// already committed to a consignment or not yet restocked from one),
+// PLUS ungraded stock and any device already committed to a Zoho batch
+// per Z-5/V-6's original ticket description — none of which is expressed
+// through this file's location helper. This file is intentionally silent
+// on sellability; that logic belongs entirely in V-6 when it is built.
 export const LOCATION_ABROAD_STATUSES: readonly DeviceStatus[] = [
   'EXPORTED_UNDER_OPR',
   'TEMP_EXPORTED_STANDARD',
 ] as const
 
+// Display-only, per the header comment above — read "where does this
+// device's location column say it is right now", not "is this device
+// sellable". See OPR_WORKFLOW_ONLY_STATUSES for the status set V-6 must
+// use instead for its exclusion filter.
 export function deviceLocation(status: DeviceStatus): 'SW001' | 'Warehouse' {
   return LOCATION_ABROAD_STATUSES.includes(status) ? 'SW001' : 'Warehouse'
 }

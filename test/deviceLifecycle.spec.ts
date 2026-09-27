@@ -476,11 +476,13 @@ describe('DEVICE_STATUSES / ALLOWED_TRANSITIONS sanity', () => {
   })
 })
 
-// Z-5 (2026-09-27): the single derived location helper both the display
-// layer (GET /api/devices, GET /:id, CSV export) and V-6's cost-feed
-// exclusion filter call — see deviceLifecycle.ts's LOCATION_ABROAD_STATUSES
-// comment for why this is deliberately ONE function, not two independent
-// conditions.
+// Z-5 (2026-09-27): the display-only location helper for GET /api/devices,
+// GET /:id, and the CSV export. DISPLAY ONLY — see deviceLifecycle.ts's
+// LOCATION_ABROAD_STATUSES comment for why V-6's cost-feed exclusion
+// filter must NOT reuse this predicate (IN_EXPORT_CONSIGNMENT and both
+// RETURNED_* statuses read 'Warehouse' here despite being unsellable —
+// packed-for-export or not-yet-restocked). V-6 needs
+// OPR_WORKFLOW_ONLY_STATUSES directly, not this function.
 describe('deviceLocation() — Z-5 single derived location rule', () => {
   it("returns 'SW001' for EXPORTED_UNDER_OPR and TEMP_EXPORTED_STANDARD only", () => {
     expect(deviceLocation('EXPORTED_UNDER_OPR')).toBe('SW001')

@@ -62,9 +62,11 @@ app.get('/', async (c) => {
   ).bind(...binds, pageSize, offset).all<Record<string, unknown>>()
 
   // Z-5: location is DERIVED from status via deviceLocation(), never its
-  // own stored column — see deviceLifecycle.ts's LOCATION_ABROAD_STATUSES
-  // comment for why this must be the single shared function V-6's
-  // exclusion filter also calls, not a second independent condition here.
+  // own stored column. DISPLAY ONLY — see deviceLifecycle.ts's
+  // LOCATION_ABROAD_STATUSES comment: this is NOT the predicate V-6's
+  // sellability/exclusion filter should use (that needs the status set,
+  // not the location string — a device mid-export or mid-return also
+  // reads 'Warehouse' here but is not sellable).
   const devices = results.map(d => ({ ...d, location: deviceLocation(d.status as DeviceStatus) }))
 
   return c.json({

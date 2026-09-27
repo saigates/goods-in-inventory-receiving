@@ -5013,9 +5013,9 @@ into each Condition, each VAT Type, and each Currency.`;
                       : h('span', { class: 'badge badge-red text-[10px]' }, 'unreconciled')),
                 // Z-5: d.location comes straight from the API response
                 // (deviceLocation(status), computed server-side) — never
-                // re-derived from d.status here, so the display can never
-                // drift from the single shared helper V-6's filter also
-                // calls.
+                // re-derived from d.status here. Display only — V-6's
+                // sellability filter must NOT use this field (see
+                // deviceLifecycle.ts's LOCATION_ABROAD_STATUSES comment).
                 h('td', { class: 'px-4 py-2 text-xs' },
                   d.location === 'SW001'
                     ? h('span', { class: 'badge badge-amber text-[10px]' }, 'SW001')
