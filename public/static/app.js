@@ -237,6 +237,8 @@
     skuMapUnmapped: [],          // GET /api/sku-map/unmapped rows — grouped by our SKU, with device_count
     skuMapNewOpen: false,        // create/edit modal state — { mode: 'create'|'edit', ...fields } or null
     skuMapBusy: false,           // in-flight guard for sku-map mutations
+    // ───── Z-4 phase 2 — Excel round trip (upload modal) ─────
+    skuMapUploadOpen: false,     // { fileName, csvText, dryRunResult, error, busy } or null
   };
   function setLabelSize(v) { state.labelSize = v; localStorage.setItem('labelSize.v2', v); }
   function setLabelRotate(on) { state.labelRotate = !!on; localStorage.setItem('labelRotate.v1', on ? '1' : '0'); }
@@ -653,6 +655,7 @@
       ),
       state.showChangePw ? ChangePasswordModal() : null,
       state.skuMapNewOpen ? SkuMapEditModal() : null,
+      state.skuMapUploadOpen ? SkuMapUploadModal() : null,
       state.pendingMatch ? ConfirmSkuModal() : null,
       state.pendingUnrec ? UnreconciledModal() : null,
       state.labelPreview ? LabelPreviewModal() : null,
@@ -6540,6 +6543,112 @@ into each Condition, each VAT Type, and each Currency.`;
     }
   }
 
+  // ───────── Z-4 phase 2 — Excel round trip ─────────
+  // GET /api/sku-map/unmapped/export is a plain browser download (same
+  // Authorization-header limitation as doExportCsv above), so it reuses
+  // openWithDocToken() rather than a raw fetch.
+  async function doExportUnmappedCsv() {
+    try {
+      await openWithDocToken('/api/sku-map/unmapped/export');
+    } catch (err) {
+      toast(err.response?.data?.error || err.message, 'err', 5000);
+    }
+  }
+
+  function openSkuMapUpload() {
+    state.skuMapUploadOpen = { fileName: null, csvText: null, dryRunResult: null, error: null, busy: false };
+    render();
+  }
+  function closeSkuMapUpload() { state.skuMapUploadOpen = null; render(); }
+
+  // Reads the file as TEXT (not XLSX.read()/ArrayBuffer like CatalogView's
+  // manifest uploader) — this round trip is CSV-only by design: the
+  // download side above only ever emits CSV, and POST /import's contract
+  // (src/lib/skuMapImport.ts's parseSkuMapCsv) is a CSV parser, not a
+  // sheet reader. Uploading the SAME file XLSX.read() could also open
+  // (e.g. the operator re-saved as .xlsx in Excel) is intentionally out of
+  // scope for this pass — .csv only, both ways.
+  function handleSkuMapUploadFile(file) {
+    if (!file) return;
+    const ctx = state.skuMapUploadOpen;
+    ctx.fileName = file.name;
+    ctx.error = null;
+    ctx.dryRunResult = null;
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      ctx.csvText = e.target.result;
+      await runSkuMapDryRun();
+    };
+    reader.onerror = () => { ctx.error = 'Failed to read file'; render(); };
+    reader.readAsText(file);
+  }
+
+  // dry_run=1 preview — computes and returns the diff WITHOUT writing
+  // anything (src/lib/skuMapImport.ts's applySkuMapImport). Every problem
+  // validateSkuMapCsv finds is returned as a full list in one response
+  // (never partially applied while any error exists, never silent — see
+  // POST /import's module comment) — this is the "rejected-rows report
+  // rather than silent partial" the brief asked for: nothing commits until
+  // ctx.dryRunResult.ok is true and the operator explicitly confirms.
+  async function runSkuMapDryRun() {
+    const ctx = state.skuMapUploadOpen;
+    if (!ctx || !ctx.csvText) return;
+    ctx.busy = true;
+    render();
+    try {
+      const r = await http.post('/sku-map/import?dry_run=1', ctx.csvText, {
+        headers: { 'Content-Type': 'text/csv' },
+      }).then(r => r.data);
+      ctx.dryRunResult = r;
+      ctx.error = null;
+    } catch (err) {
+      // 422 from validateSkuMapCsv carries the SAME shape as a 200 (ok,
+      // errors[], diff, sharedZohoItems, rowCount, fileLineCount) — show
+      // it exactly like a successful dry run so every rejected row is
+      // visible, not just a generic error toast.
+      const data = err.response?.data;
+      if (data && Object.prototype.hasOwnProperty.call(data, 'errors')) {
+        ctx.dryRunResult = data;
+        ctx.error = null;
+      } else {
+        ctx.error = data?.error || err.message || 'Preview failed';
+        ctx.dryRunResult = null;
+      }
+    } finally {
+      ctx.busy = false;
+      render();
+    }
+  }
+
+  async function commitSkuMapUpload() {
+    const ctx = state.skuMapUploadOpen;
+    if (!ctx || !ctx.csvText || ctx.busy) return;
+    if (!ctx.dryRunResult?.ok) return; // guarded by the disabled button too
+    ctx.busy = true;
+    render();
+    try {
+      const r = await http.post('/sku-map/import', ctx.csvText, {
+        headers: { 'Content-Type': 'text/csv' },
+      }).then(r => r.data);
+      const d = r.diff || {};
+      const parts = [];
+      if (d.adds?.length) parts.push(`${d.adds.length} added`);
+      if (d.changes?.length) parts.push(`${d.changes.length} changed`);
+      if (d.renames?.length) parts.push(`${d.renames.length} Zoho rename(s)`);
+      if (d.newOrphans?.length) parts.push(`${d.newOrphans.length} orphaned`);
+      if (d.reReOrphaned?.length) parts.push(`${d.reReOrphaned.length} revived`);
+      toast(`Import applied — ${parts.join(', ') || 'no changes'}`, 'ok', 6000);
+      state.skuMapUploadOpen = null;
+      await refreshSkuMapAll();
+      render();
+    } catch (err) {
+      ctx.error = err.response?.data?.error || 'Import failed';
+      render();
+    } finally {
+      ctx.busy = false;
+    }
+  }
+
   function SkuMapView() {
     return h('div', { class: 'space-y-5' },
       h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
@@ -6553,6 +6662,10 @@ into each Condition, each VAT Type, and each Currency.`;
             class: 'input', placeholder: 'Search our SKU / Zoho SKU / item name', value: state.skuMapSearch,
             oninput: (e) => debouncedSkuMapSearch(e.target.value),
           }),
+          h('button', { class: 'btn btn-ghost', onclick: doExportUnmappedCsv, title: 'Download the unmapped queue as a CSV pre-filled with our SKU / brand / model / capacity / color / grade / device count — fill in the three Zoho columns and re-upload.' },
+            h('i', { class: 'fas fa-file-arrow-down' }), 'Download unmapped'),
+          h('button', { class: 'btn btn-ghost', onclick: openSkuMapUpload, title: 'Upload the completed mapping CSV — upserts on our SKU, previews the diff before committing.' },
+            h('i', { class: 'fas fa-file-arrow-up' }), 'Upload mapping CSV'),
           h('button', { class: 'btn btn-primary', onclick: () => openSkuMapCreate() },
             h('i', { class: 'fas fa-plus' }), 'Add mapping')
         )
@@ -6688,6 +6801,71 @@ into each Condition, each VAT Type, and each Currency.`;
           h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
           h('button', { class: 'btn btn-primary', disabled: state.skuMapBusy, onclick: submitSkuMapModal },
             h('i', { class: 'fas fa-check' }), isEdit ? 'Save' : 'Create')
+        )
+      )
+    );
+  }
+
+  // Z-4 phase 2 upload modal. Two states: no file chosen yet (picker
+  // only), or a file has been read and a dry-run preview came back —
+  // shown as the diff (adds/changes/renames/orphans/revives) if clean, or
+  // the FULL list of rejected-row errors if not (validateSkuMapCsv never
+  // partially reports — every problem in one pass, per its own module
+  // comment) — nothing commits until dryRunResult.ok is true AND the
+  // operator clicks Commit.
+  function SkuMapUploadModal() {
+    const ctx = state.skuMapUploadOpen;
+    const close = closeSkuMapUpload;
+    const dr = ctx.dryRunResult;
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-2xl' },
+        h('div', { class: 'flex items-center justify-between mb-4' },
+          h('h2', { class: 'text-lg font-semibold' }, 'Upload mapping CSV'),
+          h('button', { class: 'btn btn-ghost text-xs', onclick: close }, h('i', { class: 'fas fa-times' }))
+        ),
+        h('p', { class: 'text-slate-400 text-sm mb-3' },
+          'Upserts on our SKU. Every zoho_item_id change is audited. A SKU missing from the file is orphaned, never deleted. Absence is never a delete.'),
+        h('input', {
+          type: 'file', accept: '.csv', class: 'input mb-3',
+          onchange: (e) => handleSkuMapUploadFile(e.target.files[0]),
+        }),
+        ctx.fileName ? h('p', { class: 'text-xs text-slate-500 mb-3' }, `File: ${ctx.fileName}`) : null,
+        ctx.busy ? h('p', { class: 'text-xs text-cyan-300 mb-3' }, h('i', { class: 'fas fa-spinner fa-spin mr-1' }), 'Working…') : null,
+        ctx.error ? h('div', { class: 'text-xs text-red-400 mb-3 whitespace-pre-wrap' }, ctx.error) : null,
+
+        // Rejected-rows report — the full error list, not a generic
+        // "import failed". dr can be present with ok=false (validation
+        // errors) even though ctx.error is null (see runSkuMapDryRun).
+        dr && !dr.ok ? h('div', { class: 'mb-4' },
+          h('p', { class: 'text-xs font-semibold text-red-400 mb-1' },
+            `${dr.errors?.length || 0} problem(s) — nothing will be imported until these are fixed:`),
+          h('ul', { class: 'text-xs text-red-300 list-disc list-inside space-y-0.5 max-h-40 overflow-y-auto' },
+            (dr.errors || []).map(e => h('li', {}, e)))
+        ) : null,
+
+        // Clean preview — the diff, informational sharedZohoItems, and the
+        // rowCount/fileLineCount cross-check (never silently absorbed —
+        // see parseSkuMapCsv's module comment on fileLineCount).
+        dr && dr.ok ? h('div', { class: 'mb-4 space-y-3' },
+          dr.rowCountDelta !== 0 ? h('p', { class: 'text-xs text-amber-300' },
+            `Row count delta: ${dr.rowCountDelta} (parsed ${dr.rowCount} rows from ${dr.fileLineCount} file lines) — check for a parse-time drop before continuing.`) : null,
+          h('div', { class: 'grid grid-cols-2 gap-2 text-xs' },
+            h('div', { class: 'card p-2' }, h('span', { class: 'text-green-400 font-semibold' }, dr.diff.adds.length), ' new mapping(s)'),
+            h('div', { class: 'card p-2' }, h('span', { class: 'text-cyan-300 font-semibold' }, dr.diff.changes.length), ' field change(s)'),
+            h('div', { class: 'card p-2' }, h('span', { class: 'text-purple-300 font-semibold' }, dr.diff.renames.length), ' Zoho rename(s)'),
+            h('div', { class: 'card p-2' }, h('span', { class: 'text-amber-300 font-semibold' }, dr.diff.newOrphans.length), ' newly orphaned'),
+            h('div', { class: 'card p-2' }, h('span', { class: 'text-blue-300 font-semibold' }, dr.diff.reReOrphaned.length), ' revived'),
+            h('div', { class: 'card p-2' }, h('span', { class: 'text-slate-300 font-semibold' }, dr.sharedZohoItems.length), ' shared Zoho item(s)'),
+          ),
+          dr.diff.newOrphans.length ? h('p', { class: 'text-xs text-amber-400' },
+            `Orphaned (kept, not deleted — reappears in the unmapped queue): ${dr.diff.newOrphans.map(o => o.goods_in_sku).join(', ')}`) : null,
+        ) : null,
+
+        h('div', { class: 'mt-2 flex justify-end gap-2' },
+          h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
+          h('button', {
+            class: 'btn btn-primary', disabled: !dr?.ok || ctx.busy, onclick: commitSkuMapUpload,
+          }, h('i', { class: 'fas fa-check' }), 'Commit import')
         )
       )
     );

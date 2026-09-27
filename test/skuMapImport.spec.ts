@@ -661,6 +661,60 @@ describe('GET /api/sku-map/unmapped — grouped by our SKU with device counts, n
   })
 })
 
+describe('GET /api/sku-map/unmapped/export — the download half of the Excel round trip (Z-4 phase 2)', () => {
+  it('emits a CSV with the exact 9 headers parseSkuMapCsv requires, plus a trailing Device Count column, pre-filled attributes and BLANK Zoho columns', async () => {
+    for (let i = 0; i < 2; i++) {
+      await db().prepare(
+        `INSERT INTO received_devices (organisation_id, uuid, imei, sku, brand, model, capacity, color, grade, source, status)
+         VALUES (1, ?, ?, 'EXPORT-TEST-SKU', 'APPLE', 'IPHONE 15', '128GB', 'BLACK', 'A', 'manual', 'RECEIVED')`
+      ).bind(`export-test-uuid-${i}`, `99300000000000${i}`).run()
+    }
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/unmapped/export')
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/csv')
+    expect(res.headers.get('content-disposition')).toContain('attachment')
+    const text = await res.text()
+    const lines = text.trim().split('\r\n')
+    expect(lines[0]).toBe('SKU,Brand,Model,Capacity,Color,Grade,Zoho Item ID,Zoho SKU,Zoho Item Name,Device Count')
+    const row = lines.find(l => l.startsWith('EXPORT-TEST-SKU,'))
+    expect(row).toBeDefined()
+    const cells = row!.split(',')
+    expect(cells[0]).toBe('EXPORT-TEST-SKU')
+    expect(cells[1]).toBe('APPLE')
+    expect(cells[2]).toBe('IPHONE 15')
+    expect(cells[3]).toBe('128GB')
+    expect(cells[4]).toBe('BLACK')
+    expect(cells[5]).toBe('A')
+    // The three Zoho columns are blank — this is the whole point of the
+    // template, the operator fills these in before re-uploading.
+    expect(cells[6]).toBe('')
+    expect(cells[7]).toBe('')
+    expect(cells[8]).toBe('')
+    expect(cells[9]).toBe('2') // device_count
+  })
+
+  it('a SKU with a live mapping is excluded from the export, same as the JSON /unmapped endpoint', async () => {
+    await db().prepare(
+      `INSERT INTO received_devices (organisation_id, uuid, imei, sku, source, status) VALUES (1, ?, ?, 'EXPORT-MAPPED-EXCLUDED', 'manual', 'RECEIVED')`
+    ).bind('export-mapped-excluded-uuid', '993100000000001').run()
+    await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'EXPORT-MAPPED-EXCLUDED', zoho_item_id: '900000000000000117',
+        zoho_sku: 'R117', zoho_item_name: 'Export Excluded Test', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/unmapped/export')
+    const text = await res.text()
+    expect(text).not.toContain('EXPORT-MAPPED-EXCLUDED')
+  })
+
+  it('rejects a non-manager with 403, same role gate as the rest of the write/export surface', async () => {
+    const res = await apiAs(OPERATOR_USER, '/api/sku-map/unmapped/export')
+    expect(res.status).toBe(403)
+  })
+})
+
 describe('GUARD: /api/sku-map re-mounted on the deployed production app (2026-09-11, Quick Item B)', () => {
   // Flipped from the prior "stays unmounted" guard (2026-09-10 incident
   // response) per its own documented trigger: Quick Item B's precondition

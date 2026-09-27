@@ -137,6 +137,17 @@ describe('doc token on the allow-listed print/label path', () => {
   })
 })
 
+describe('doc token on the Z-4 phase 2 allow-listed export path (/api/sku-map/unmapped/export)', () => {
+  it('a doc token via ?token= succeeds against the REAL mounted production app, proving the allow-list entry actually took effect', async () => {
+    const docRes = await api('/auth/doc-token', { method: 'POST' })
+    const { token: docToken } = await docRes.json<{ token: string }>()
+
+    const res = await app.request(`/api/sku-map/unmapped/export?token=${encodeURIComponent(docToken)}`, {}, testEnv())
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/csv')
+  })
+})
+
 describe('session tokens can no longer be presented via ?token= — the actual regression this pass fixes', () => {
   it('a normal session token via ?token= on the allow-listed print/label path is REJECTED', async () => {
     const jobId = await makePrintJobId()
