@@ -230,6 +230,13 @@
     billNewOpen: false,          // new-bill modal visibility
     billForceCloseOpen: false,   // force-close reason modal visibility (holds the bill id)
     billBusy: false,             // in-flight guard for bill mutations
+    // ───── SKU Map (Z-4 phase 1 — Zoho item mapping) ─────
+    skuMapTab: 'mapped',         // 'mapped' | 'unmapped'
+    skuMap: [],                  // GET /api/sku-map rows (joined with zoho_items)
+    skuMapSearch: '',            // last search box value
+    skuMapUnmapped: [],          // GET /api/sku-map/unmapped rows — grouped by our SKU, with device_count
+    skuMapNewOpen: false,        // create/edit modal state — { mode: 'create'|'edit', ...fields } or null
+    skuMapBusy: false,           // in-flight guard for sku-map mutations
   };
   function setLabelSize(v) { state.labelSize = v; localStorage.setItem('labelSize.v2', v); }
   function setLabelRotate(on) { state.labelRotate = !!on; localStorage.setItem('labelRotate.v1', on ? '1' : '0'); }
@@ -640,10 +647,12 @@
         : state.view === 'devices' ? DevicesView()
         : state.view === 'bills' ? BillsView()
         : state.view === 'opr' ? OprView()
+        : state.view === 'sku-map' ? SkuMapView()
         : state.view === 'settings' ? SettingsView()
         : h('div', {}, 'Not found')
       ),
       state.showChangePw ? ChangePasswordModal() : null,
+      state.skuMapNewOpen ? SkuMapEditModal() : null,
       state.pendingMatch ? ConfirmSkuModal() : null,
       state.pendingUnrec ? UnreconciledModal() : null,
       state.labelPreview ? LabelPreviewModal() : null,
@@ -695,6 +704,10 @@
           Tab('print', 'Print Queue', 'print'),
           Tab('devices', 'Devices', 'mobile-screen-button'),
           Tab('opr', 'OPR', 'plane-departure'),
+          // Manager/admin only — mirrors requireManager() in skuMap.ts (server
+          // enforces the real 403 regardless; this is UI decluttering only,
+          // same convention as isManagerOrAdmin()'s other call sites).
+          isManagerOrAdmin() ? Tab('sku-map', 'SKU Map', 'link') : null,
           Tab('settings', 'Settings', 'gear'),
         ),
         h('div', { class: 'ml-auto flex items-center gap-3' },
@@ -751,6 +764,7 @@
     else if (v === 'devices') refreshDevicesSubview().then(render);
     else if (v === 'bills') refreshBillsList().then(render);
     else if (v === 'opr') refreshOprAll().then(render);
+    else if (v === 'sku-map') refreshSkuMapAll().then(render);
     else if (v === 'settings') refreshSettings().then(render);
     render();
   }
@@ -6427,6 +6441,257 @@ into each Condition, each VAT Type, and each Currency.`;
     if (['input','select','textarea','button','option','label'].includes(tag)) return;
     setTimeout(() => $('#scan-input')?.focus(), 10);
   });
+
+  // ───────── SKU Map (Z-4 phase 1 — Zoho item mapping) ─────────
+  // Manual CRUD + unmapped queue over /api/sku-map/*. The Excel/CSV bulk
+  // round trip (POST /import) is unchanged and already covered by
+  // test/skuMapImport.spec.ts — this view is the manual path only, per
+  // "report before the Excel round trip".
+  async function refreshSkuMapAll() {
+    await Promise.all([refreshSkuMap(), refreshSkuMapUnmapped()]);
+  }
+  async function refreshSkuMap(q) {
+    const query = q !== undefined ? q : state.skuMapSearch;
+    const url = query ? `/sku-map?q=${encodeURIComponent(query)}` : '/sku-map';
+    const r = await api.get(url);
+    state.skuMap = r.sku_map || [];
+  }
+  async function refreshSkuMapUnmapped() {
+    const r = await api.get('/sku-map/unmapped');
+    state.skuMapUnmapped = r.unmapped || [];
+  }
+
+  let skuMapSearchTimer;
+  function debouncedSkuMapSearch(q) {
+    state.skuMapSearch = q;
+    clearTimeout(skuMapSearchTimer);
+    skuMapSearchTimer = setTimeout(async () => {
+      await refreshSkuMap(q);
+      render();
+    }, 200);
+  }
+
+  function openSkuMapCreate(prefillSku) {
+    state.skuMapNewOpen = {
+      mode: 'create',
+      goods_in_sku: prefillSku || '', zoho_item_id: '', zoho_sku: '', zoho_item_name: '',
+      brand: '', model: '', capacity: '', color: '', grade: '', note: '',
+      row_version: null, error: null,
+    };
+    render();
+  }
+  function openSkuMapEdit(row) {
+    state.skuMapNewOpen = {
+      mode: 'edit',
+      goods_in_sku: row.goods_in_sku, zoho_item_id: row.zoho_item_id,
+      zoho_sku: row.zoho_sku || '', zoho_item_name: row.zoho_item_name || '',
+      brand: row.brand || '', model: row.model || '', capacity: row.capacity || '',
+      color: row.color || '', grade: row.grade || '', note: row.note || '',
+      row_version: row.row_version, error: null,
+    };
+    render();
+  }
+  function closeSkuMapModal() { state.skuMapNewOpen = null; render(); }
+
+  async function submitSkuMapModal() {
+    const ctx = state.skuMapNewOpen;
+    if (!ctx || state.skuMapBusy) return;
+    state.skuMapBusy = true;
+    try {
+      if (ctx.mode === 'create') {
+        await api.post('/sku-map', {
+          goods_in_sku: ctx.goods_in_sku, zoho_item_id: ctx.zoho_item_id,
+          zoho_sku: ctx.zoho_sku || undefined, zoho_item_name: ctx.zoho_item_name || undefined,
+          brand: ctx.brand, model: ctx.model, capacity: ctx.capacity || null,
+          color: ctx.color || null, grade: ctx.grade || null, note: ctx.note || null,
+        });
+        toast(`Mapped ${ctx.goods_in_sku}`, 'ok');
+      } else {
+        // PATCH edits zoho_item_id/note only (server contract) — brand/model/
+        // capacity/color/grade on an existing row are not re-sent here since
+        // PATCH /:goods_in_sku doesn't accept them; re-mapping those requires
+        // Remove + re-create, which is the revive path POST already covers.
+        await api.patch(`/sku-map/${encodeURIComponent(ctx.goods_in_sku)}`, {
+          zoho_item_id: ctx.zoho_item_id, note: ctx.note || null,
+          reason: 'Manual edit via SKU Map page', row_version: ctx.row_version,
+        });
+        toast(`Updated ${ctx.goods_in_sku}`, 'ok');
+      }
+      state.skuMapNewOpen = null;
+      await refreshSkuMapAll();
+      render();
+    } catch (err) {
+      ctx.error = err.response?.data?.error || 'Save failed';
+      render();
+    } finally {
+      state.skuMapBusy = false;
+    }
+  }
+
+  async function removeSkuMapping(row) {
+    if (!confirm(`Remove the mapping for "${row.goods_in_sku}"?\nThe row is kept (orphaned), not deleted — Zoho history and past bills stay explainable. Re-mapping this SKU later revives it.`)) return;
+    try {
+      await api.del(`/sku-map/${encodeURIComponent(row.goods_in_sku)}`);
+      toast(`Removed mapping for ${row.goods_in_sku}`, 'warn');
+      await refreshSkuMapAll();
+      render();
+    } catch (err) {
+      toast(err.response?.data?.error || 'Failed to remove mapping', 'err');
+    }
+  }
+
+  function SkuMapView() {
+    return h('div', { class: 'space-y-5' },
+      h('div', { class: 'flex items-center justify-between flex-wrap gap-3' },
+        h('div', {},
+          h('h1', { class: 'text-2xl font-bold' }, 'SKU Map'),
+          h('p', { class: 'text-slate-400 text-sm' },
+            'Maps our own SKU (goods-in) to Zoho\'s Item ID. One our-SKU maps to exactly one Zoho item; a Zoho item may be shared by more than one our-SKU (e.g. physical-SIM/eSIM pairs).')
+        ),
+        h('div', { class: 'flex gap-2 items-center' },
+          h('input', {
+            class: 'input', placeholder: 'Search our SKU / Zoho SKU / item name', value: state.skuMapSearch,
+            oninput: (e) => debouncedSkuMapSearch(e.target.value),
+          }),
+          h('button', { class: 'btn btn-primary', onclick: () => openSkuMapCreate() },
+            h('i', { class: 'fas fa-plus' }), 'Add mapping')
+        )
+      ),
+      h('div', { class: 'flex gap-1 border-b border-slate-800' },
+        h('div', {
+          class: 'tab-btn ' + (state.skuMapTab === 'mapped' ? 'active' : ''),
+          onclick: () => { state.skuMapTab = 'mapped'; render(); },
+        }, `Mapped (${state.skuMap.length})`),
+        h('div', {
+          class: 'tab-btn ' + (state.skuMapTab === 'unmapped' ? 'active' : ''),
+          onclick: () => { state.skuMapTab = 'unmapped'; render(); },
+        }, `Unmapped queue (${state.skuMapUnmapped.length})`)
+      ),
+      state.skuMapTab === 'mapped' ? SkuMapMappedTable() : SkuMapUnmappedTable()
+    );
+  }
+
+  function SkuMapMappedTable() {
+    return h('div', { class: 'card overflow-hidden' },
+      h('table', { class: 'w-full text-sm' },
+        h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+          h('tr', {},
+            h('th', { class: 'text-left px-4 py-3' }, 'Our SKU'),
+            h('th', { class: 'text-left px-4 py-3' }, 'Zoho Item ID'),
+            h('th', { class: 'text-left px-4 py-3' }, 'Zoho SKU'),
+            h('th', { class: 'text-left px-4 py-3' }, 'Zoho Item Name'),
+            h('th', { class: 'text-left px-4 py-3' }, 'Brand / Model'),
+            h('th', { class: 'text-left px-4 py-3' }, 'Note'),
+            h('th', { class: 'text-right px-4 py-3' }, '')
+          )
+        ),
+        h('tbody', { class: 'divide-y divide-slate-800' },
+          state.skuMap.length === 0
+            ? h('tr', {}, h('td', { colspan: 7, class: 'text-center py-10 text-slate-500' },
+                'No mappings yet — add one manually or upload the mapping CSV.'))
+            : state.skuMap.map(m => h('tr', { class: 'row-strip' },
+                h('td', { class: 'px-4 py-2 mono text-xs font-semibold text-cyan-300' }, m.goods_in_sku),
+                h('td', { class: 'px-4 py-2 mono text-xs' }, m.zoho_item_id),
+                h('td', { class: 'px-4 py-2 mono text-xs' }, m.zoho_sku),
+                h('td', { class: 'px-4 py-2 text-xs' }, m.zoho_item_name),
+                h('td', { class: 'px-4 py-2 text-xs' }, [m.brand, m.model].filter(Boolean).join(' / ') || '—'),
+                h('td', { class: 'px-4 py-2 text-xs text-slate-400' }, m.note || '—'),
+                h('td', { class: 'px-4 py-2 text-right whitespace-nowrap' },
+                  h('button', { class: 'btn btn-ghost text-xs mr-1', title: 'Edit', onclick: () => openSkuMapEdit(m) },
+                    h('i', { class: 'fas fa-pen' })),
+                  h('button', {
+                    class: 'btn btn-danger text-xs', title: 'Remove mapping (soft — orphans the row, never deletes it)',
+                    onclick: () => removeSkuMapping(m),
+                  }, h('i', { class: 'fas fa-link-slash' })))
+              ))
+        )
+      )
+    );
+  }
+
+  function SkuMapUnmappedTable() {
+    return h('div', { class: 'card overflow-hidden' },
+      h('table', { class: 'w-full text-sm' },
+        h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
+          h('tr', {},
+            h('th', { class: 'text-left px-4 py-3' }, 'Our SKU'),
+            h('th', { class: 'text-right px-4 py-3' }, 'Devices'),
+            h('th', { class: 'text-right px-4 py-3' }, '')
+          )
+        ),
+        h('tbody', { class: 'divide-y divide-slate-800' },
+          state.skuMapUnmapped.length === 0
+            ? h('tr', {}, h('td', { colspan: 3, class: 'text-center py-10 text-slate-500' },
+                'Nothing unmapped — every received SKU has a live Zoho mapping.'))
+            : state.skuMapUnmapped.map(u => h('tr', { class: 'row-strip' },
+                h('td', { class: 'px-4 py-2 mono text-xs font-semibold text-amber-300' }, u.goods_in_sku),
+                h('td', { class: 'px-4 py-2 text-right text-xs' }, u.device_count),
+                h('td', { class: 'px-4 py-2 text-right' },
+                  h('button', { class: 'btn btn-primary text-xs', onclick: () => openSkuMapCreate(u.goods_in_sku) },
+                    h('i', { class: 'fas fa-link' }), 'Map now'))
+              ))
+        )
+      )
+    );
+  }
+
+  function SkuMapEditModal() {
+    const ctx = state.skuMapNewOpen;
+    const isEdit = ctx.mode === 'edit';
+    const set = (k) => (e) => { ctx[k] = e.target.value; };
+    const close = closeSkuMapModal;
+    return h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target.classList.contains('modal-backdrop')) close(); } },
+      h('div', { class: 'modal p-6 max-w-lg' },
+        h('div', { class: 'flex items-center justify-between mb-4' },
+          h('h2', { class: 'text-lg font-semibold' }, isEdit ? `Edit mapping — ${ctx.goods_in_sku}` : 'Add mapping'),
+          h('button', { class: 'btn btn-ghost text-xs', onclick: close }, h('i', { class: 'fas fa-times' }))
+        ),
+        ctx.error ? h('div', { class: 'text-xs text-red-400 mb-3' }, ctx.error) : null,
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Our SKU (goods-in)'),
+        h('input', {
+          class: 'input mb-3', value: ctx.goods_in_sku, disabled: isEdit,
+          oninput: (e) => { ctx.goods_in_sku = e.target.value; },
+        }),
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Zoho Item ID (18 digits)'),
+        h('input', {
+          class: 'input mb-3 mono', value: ctx.zoho_item_id, maxlength: 18,
+          placeholder: '900000000000001234',
+          oninput: (e) => { ctx.zoho_item_id = e.target.value.replace(/[^0-9]/g, ''); },
+        }),
+        // zoho_sku/zoho_item_name are only needed when the Zoho item doesn't
+        // exist yet — reusing an existing ID (shared/many-to-one case) needs
+        // neither, the server looks the existing item up. Shown always for
+        // simplicity; left blank is fine on the reuse path.
+        !isEdit ? h('div', {},
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Zoho SKU (only needed if this Item ID is new)'),
+          h('input', { class: 'input mb-3', value: ctx.zoho_sku, oninput: set('zoho_sku') }),
+          h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Zoho Item Name (only needed if this Item ID is new)'),
+          h('input', { class: 'input mb-3', value: ctx.zoho_item_name, oninput: set('zoho_item_name') }),
+        ) : null,
+        !isEdit ? h('div', { class: 'grid grid-cols-2 gap-3 mb-3' },
+          h('div', {},
+            h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Brand'),
+            h('input', { class: 'input', value: ctx.brand, oninput: set('brand') })),
+          h('div', {},
+            h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Model'),
+            h('input', { class: 'input', value: ctx.model, oninput: set('model') })),
+          h('div', {},
+            h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Capacity'),
+            h('input', { class: 'input', value: ctx.capacity, oninput: set('capacity') })),
+          h('div', {},
+            h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Color'),
+            h('input', { class: 'input', value: ctx.color, oninput: set('color') })),
+        ) : null,
+        h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Note'),
+        h('textarea', { class: 'input mb-3', rows: 2, value: ctx.note, oninput: set('note') }),
+        h('div', { class: 'mt-2 flex justify-end gap-2' },
+          h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
+          h('button', { class: 'btn btn-primary', disabled: state.skuMapBusy, onclick: submitSkuMapModal },
+            h('i', { class: 'fas fa-check' }), isEdit ? 'Save' : 'Create')
+        )
+      )
+    );
+  }
 
   async function boot() {
     // No stored token at all — show the login screen immediately, no need

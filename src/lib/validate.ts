@@ -143,3 +143,36 @@ export function cleanString(raw: unknown, maxLen = 500): string | null {
   if (!s) return null
   return s.slice(0, maxLen)
 }
+
+// ───────── Zoho Item ID (Z-4) ─────────
+// Shape only — this is Zoho's own internal numeric primary key as it
+// appears in the CSV export and API responses: strictly 18 digits, no
+// letters, no separators. Not a checksum (Zoho does not publish one, and
+// none is needed here — zoho_items.zoho_item_id is a TEXT PRIMARY KEY, so
+// a wrong-shape value is caught as a shape error, not a silent mis-join).
+// Kept in this shared file (not skuMapImport.ts) because Z-4 phase 1 adds
+// a SECOND write path — manual create/edit in the UI — that must enforce
+// the exact same rule the loader already relies on implicitly via TEXT
+// storage; neither path should be trusted to duplicate the other's logic.
+export function isValidZohoItemIdFormat(raw: unknown): boolean {
+  if (typeof raw !== 'string' && typeof raw !== 'number') return false
+  return /^\d{18}$/.test(String(raw).trim())
+}
+
+export type ZohoItemIdValidation =
+  | { ok: true; value: string }
+  | { ok: false; reason: string }
+
+export function validateZohoItemId(raw: unknown): ZohoItemIdValidation {
+  if (raw == null || String(raw).trim() === '') {
+    return { ok: false, reason: 'Zoho Item ID is required' }
+  }
+  const s = String(raw).trim()
+  if (!/^\d+$/.test(s)) {
+    return { ok: false, reason: 'Zoho Item ID must be numeric (18 digits)' }
+  }
+  if (s.length !== 18) {
+    return { ok: false, reason: `Zoho Item ID must be exactly 18 digits (got ${s.length})` }
+  }
+  return { ok: true, value: s }
+}
