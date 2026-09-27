@@ -493,6 +493,28 @@ describe('POST /api/sku-map — manual single-row create (Z-4 phase 1)', () => {
     })
     expect(res2.status).toBe(409)
   })
+
+  it('the bijection-conflict 409 names the conflicting our-SKU, not just the Zoho Item ID, so the operator can find the row without a separate query', async () => {
+    await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'MANUAL-BIJ-NAMED-A', zoho_item_id: '900000000000000107',
+        zoho_sku: 'M107-SHARED-SKU', zoho_item_name: 'Bijection Named A', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    const res2 = await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'MANUAL-BIJ-NAMED-B', zoho_item_id: '900000000000000108',
+        zoho_sku: 'M107-SHARED-SKU', zoho_item_name: 'Bijection Named B', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    expect(res2.status).toBe(409)
+    const body = await res2.json() as { error: string; conflicting_zoho_item_id: string; conflicting_goods_in_skus: string[] }
+    expect(body.error).toContain('MANUAL-BIJ-NAMED-A')
+    expect(body.conflicting_zoho_item_id).toBe('900000000000000107')
+    expect(body.conflicting_goods_in_skus).toEqual(['MANUAL-BIJ-NAMED-A'])
+  })
 })
 
 describe('DELETE /api/sku-map/:goods_in_sku — remove mapping = orphan, never a hard delete (Z-4 phase 1)', () => {

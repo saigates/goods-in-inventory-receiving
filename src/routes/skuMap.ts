@@ -154,7 +154,21 @@ app.post('/', async (c) => {
       'SELECT zoho_item_id FROM zoho_items WHERE zoho_sku = ? AND organisation_id = ?'
     ).bind(zsku, user.organisation_id).first<{ zoho_item_id: string }>()
     if (clash) {
-      return c.json({ error: `Zoho SKU ${zsku} is already used by Zoho Item ID ${clash.zoho_item_id} — bijection would break` }, 409)
+      // Name the conflicting our-SKU(s), not just the Zoho Item ID — the
+      // operator needs to find the existing row without a separate query.
+      // zoho_item_id can legitimately have several live goods_in_sku
+      // (many-to-one), so list all of them, not just one.
+      const { results: clashingSkus } = await c.env.DB.prepare(
+        'SELECT goods_in_sku FROM sku_map WHERE zoho_item_id = ? AND organisation_id = ? AND orphaned_at IS NULL'
+      ).bind(clash.zoho_item_id, user.organisation_id).all<{ goods_in_sku: string }>()
+      const skuList = clashingSkus.map(r => r.goods_in_sku)
+      return c.json({
+        error: `Zoho SKU ${zsku} is already used by Zoho Item ID ${clash.zoho_item_id}`
+          + (skuList.length ? ` (mapped from our SKU${skuList.length > 1 ? 's' : ''}: ${skuList.join(', ')})` : ' (not yet mapped from any our-SKU)')
+          + ' — bijection would break',
+        conflicting_zoho_item_id: clash.zoho_item_id,
+        conflicting_goods_in_skus: skuList,
+      }, 409)
     }
     await c.env.DB.prepare(
       'INSERT INTO zoho_items (zoho_item_id, zoho_sku, zoho_item_name, organisation_id) VALUES (?, ?, ?, ?)'
