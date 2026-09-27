@@ -87,6 +87,14 @@ const DOC_TOKEN_ALLOWED_PATHS: RegExp[] = [
   // Z-4 phase 2 (2026-09-27): the SKU-map unmapped-queue export button is
   // the same plain browser navigation as the CSV export above (can't
   // carry an Authorization header on a window.open() download).
+  //
+  // SCOPE CONSTRAINT (operator ruling, this pass's §3): accepted only
+  // because the current payload is our-SKU/attribute-strings/device-count
+  // — no IMEIs, no costs, no customs values. If src/routes/skuMap.ts's
+  // unmapped/export SELECT ever grows an acquisition-cost, IMEI, or
+  // customs-facing column, remove this entry FIRST and make that route
+  // bearer-only before the column ships — see the matching note on the
+  // route itself for the full reasoning.
   /^\/api\/sku-map\/unmapped\/export$/,
 ]
 

@@ -122,6 +122,23 @@ app.get('/unmapped', async (c) => {
 // rather than an arbitrary one). The three Zoho columns are left BLANK
 // for the operator to complete — this is the whole point of the
 // template, not an oversight.
+//
+// PAYLOAD-SCOPE CONSTRAINT ON THE DOC-TOKEN GATING (operator ruling,
+// 2026-09-27, this pass's §3): doc-token gating this route alongside
+// devices.ts's /export/csv is a real exception to this project's
+// otherwise header-only-bearer auth wall, and it was accepted ONLY
+// because today's payload is our own SKU list, attribute strings, and
+// device counts — no IMEIs, no costs, no customs values. This is a
+// narrower bar than "manager/admin can see it" (requireManager() above
+// already covers that); it is specifically about what is safe to let
+// leak into browser history / a shared link / a proxy log via a doc
+// token's 5-minute window, however short.
+// IF a future change adds acquisition cost, IMEI, or any customs-facing
+// column to this SELECT, remove this path from DOC_TOKEN_ALLOWED_PATHS
+// (src/lib/auth.ts) FIRST — the export must become bearer-only (regular
+// Authorization header, no browser-navigation download) before that
+// column ships, not after. Do not assume "it already has a doc-token
+// route" extends to a payload nobody scoped it for.
 app.get('/unmapped/export', async (c) => {
   const user = currentUser(c)
   if (!requireManager(c)) return c.json({ error: 'Manager or admin role required' }, 403)
