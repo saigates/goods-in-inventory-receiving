@@ -246,18 +246,25 @@ async function exportCsv(
 // The canonical header rows, asserted literally in one place so a column
 // rename/reorder must be a deliberate edit to these constants.
 //
-// HEADER — manager/admin shape (18 columns): the STEP-1-corrected superset
-// (uuid/created_at/brand/capacity/color/source restored) plus the new
+// HEADER — manager/admin shape (21 columns): the STEP-1-corrected superset
+// (uuid/created_at/brand/capacity/color/source restored) plus the
 // lifecycle/costing columns (vendor, bill_ref, purchase_cost_gbp,
-// repair_cost_gbp) and received_date. buy_price/currency/label_printed_at
-// are gone — see src/routes/devices.ts's module comment for why each one
-// specifically was or wasn't restored.
+// repair_cost_gbp) and received_date, plus Z-2's (2026-09-26)
+// acquisition_cost_gbp/freight_cost_gbp/total_cost_gbp — see
+// src/lib/acquisitionCost.ts and docs/plan/z2-acquisition-cost.md.
+// buy_price/currency/label_printed_at/Rate are NOT in this export: the
+// first three predate this file's header (see src/routes/devices.ts's
+// module comment); Rate was deliberately dropped by Z-2 §3 — it is Zoho
+// bill vocabulary that belongs exclusively to a future Y-1 mapping file,
+// not a second name for acquisition_cost_gbp here.
 const HEADER =
-  'id,uuid,imei,sku,brand,model,capacity,color,grade,status,source,vat_type,created_at,received_date,vendor,bill_ref,purchase_cost_gbp,repair_cost_gbp'
+  'id,uuid,imei,sku,brand,model,capacity,color,grade,status,source,vat_type,created_at,received_date,vendor,bill_ref,purchase_cost_gbp,repair_cost_gbp,acquisition_cost_gbp,freight_cost_gbp,total_cost_gbp'
 
 // OPERATOR_HEADER — non-manager shape (15 columns): identical to HEADER
-// minus the 3 cost columns, which are omitted from the header row ENTIRELY
-// (not blanked) per the standing role-filtered-export rule.
+// minus the 6 cost columns (including Z-2's three new ones — they are
+// gated by the same includeCostColumns check as the pre-existing three),
+// which are omitted from the header row ENTIRELY (not blanked) per the
+// standing role-filtered-export rule.
 const OPERATOR_HEADER =
   'id,uuid,imei,sku,brand,model,capacity,color,grade,status,source,vat_type,created_at,received_date,vendor'
 
@@ -400,13 +407,13 @@ describe('GET /api/devices/export/csv — response shape', () => {
     expect(res.headers.get('Content-Disposition')).toMatch(/^attachment; filename="devices-export-\d+\.csv"$/)
   })
 
-  it('emits the exact 18-column manager header, in order, even when zero rows match', async () => {
+  it('emits the exact 21-column manager header, in order, even when zero rows match', async () => {
     // An id that cannot exist → a legitimately empty export.
     const { res, text } = await exportCsv('?ids=999999999')
     expect(res.status).toBe(200)
     const rows = rowsOf(text)
     expect(rows[0]).toBe(HEADER)
-    expect(parseCsvRecord(rows[0])).toHaveLength(18)
+    expect(parseCsvRecord(rows[0])).toHaveLength(21)
     // Header + trailing row_count comment only: no data row, no phantom row.
     expect(rows).toHaveLength(2)
     expect(rowCountLine(text)).toBe(0)
@@ -430,6 +437,7 @@ describe('GET /api/devices/export/csv — response shape', () => {
     })
     await seedCostLedgerRow(id, 'purchase', 249.99, billLineId)
     await seedCostLedgerRow(id, 'repair', 15.5, null)
+    await seedCostLedgerRow(id, 'freight', 4.01, null)
 
     const { res, text } = await exportCsv(`?ids=${id}`)
     expect(res.status).toBe(200)
@@ -471,6 +479,14 @@ describe('GET /api/devices/export/csv — response shape', () => {
     expect(cell('bill_ref')).toBe(bill!.invoice_number)
     expect(cell('purchase_cost_gbp')).toBe('249.99')
     expect(cell('repair_cost_gbp')).toBe('15.5')
+    // Z-2 (2026-09-26): acquisition_cost_gbp = the cost_ledger 'purchase'
+    // sum (249.99) — it wins over any goods-in buy_price fallback because a
+    // purchase row exists for this device. freight_cost_gbp is the
+    // cost_ledger 'freight' sum (4.01, seeded above). total_cost_gbp =
+    // acquisition + repair + freight = 249.99 + 15.5 + 4.01 = 269.5.
+    expect(cell('acquisition_cost_gbp')).toBe('249.99')
+    expect(cell('freight_cost_gbp')).toBe('4.01')
+    expect(cell('total_cost_gbp')).toBe('269.5')
     expect(rowCountLine(text)).toBe(1)
   })
 
@@ -501,6 +517,16 @@ describe('GET /api/devices/export/csv — response shape', () => {
     // an uncosted device must read as the string "0", not empty and not null.
     expect(cell('purchase_cost_gbp')).toBe('0')
     expect(cell('repair_cost_gbp')).toBe('0')
+    // Z-2 (2026-09-26): no cost_ledger 'purchase' row exists for this device,
+    // so acquisition_cost_gbp falls back to the goods-in buy_price —
+    // seedDevice() always writes buy_price=100 (a harmless constant, see
+    // seedDevice's own comment), so the fallback renders '100', not '0' and
+    // not empty. freight_cost_gbp has no fallback (COALESCE(...,0)) and
+    // reads '0'. total_cost_gbp = 100 (acquisition) + 0 (repair) + 0
+    // (freight) = 100.
+    expect(cell('acquisition_cost_gbp')).toBe('100')
+    expect(cell('freight_cost_gbp')).toBe('0')
+    expect(cell('total_cost_gbp')).toBe('100')
     // received_at was NULL, so received_date must fall back to created_at.
     const stored = await db()
       .prepare('SELECT created_at FROM received_devices WHERE id = ?')
@@ -509,8 +535,8 @@ describe('GET /api/devices/export/csv — response shape', () => {
     expect(cell('received_date')).toBe(stored!.created_at)
     // The literal words must not appear anywhere in the record.
     expect(rowsOf(text)[1]).not.toMatch(/null|undefined|NaN/)
-    // Column count is still exactly 18 — nulls must not collapse fields.
-    expect(fields).toHaveLength(18)
+    // Column count is still exactly 21 — nulls must not collapse fields.
+    expect(fields).toHaveLength(21)
   })
 
   it('orders records by id ascending regardless of the order ids are requested in', async () => {
@@ -542,6 +568,12 @@ describe('GET /api/devices/export/csv — role-gated cost columns (operator vs. 
     expect(header).not.toContain('bill_ref')
     expect(header).not.toContain('purchase_cost_gbp')
     expect(header).not.toContain('repair_cost_gbp')
+    // Z-2's three new cost columns are gated by the same includeCostColumns
+    // check as the three pre-existing ones — must be absent for an operator
+    // too, not just blanked.
+    expect(header).not.toContain('acquisition_cost_gbp')
+    expect(header).not.toContain('freight_cost_gbp')
+    expect(header).not.toContain('total_cost_gbp')
 
     // The data row itself must also carry exactly 15 fields — the omission
     // is structural (fewer columns), not values silently blanked while the
@@ -553,16 +585,24 @@ describe('GET /api/devices/export/csv — role-gated cost columns (operator vs. 
     expect(fields[header.indexOf('vendor')]).toBe('Operator-View Vendor')
   })
 
-  it('includes all three cost columns for a manager/admin caller, on the very same device', async () => {
+  it('includes all six cost columns for a manager/admin caller, on the very same device', async () => {
     const id = await seedDevice()
     await seedCostLedgerRow(id, 'purchase', 42, null)
 
     const { text } = await exportCsv(`?ids=${id}`)
     const header = parseCsvRecord(rowsOf(text)[0])
-    expect(header).toHaveLength(18)
+    expect(header).toHaveLength(21)
     expect(header).toContain('purchase_cost_gbp')
+    expect(header).toContain('acquisition_cost_gbp')
+    expect(header).toContain('freight_cost_gbp')
+    expect(header).toContain('total_cost_gbp')
     const fields = parseCsvRecord(rowsOf(text)[1])
     expect(fields[header.indexOf('purchase_cost_gbp')]).toBe('42')
+    // A cost_ledger 'purchase' row exists (42), so acquisition_cost_gbp
+    // takes the ledger sum, not the goods-in buy_price fallback (100).
+    expect(fields[header.indexOf('acquisition_cost_gbp')]).toBe('42')
+    expect(fields[header.indexOf('freight_cost_gbp')]).toBe('0')
+    expect(fields[header.indexOf('total_cost_gbp')]).toBe('42')
   })
 })
 
@@ -618,7 +658,7 @@ describe('GET /api/devices/export/csv — RFC 4180 quoting cannot corrupt the gr
     const header = parseCsvRecord(rowsOf(text)[0])
     const fields = parseCsvRecord(record)
     // The critical assertion: the comma did NOT create an extra column.
-    expect(fields).toHaveLength(18)
+    expect(fields).toHaveLength(21)
     expect(fields[header.indexOf('model')]).toBe('iPhone 13, Pro Max')
   })
 
@@ -630,7 +670,7 @@ describe('GET /api/devices/export/csv — RFC 4180 quoting cannot corrupt the gr
     expect(record).toContain('"Space ""Grey"""')
     const header = parseCsvRecord(rowsOf(text)[0])
     const fields = parseCsvRecord(record)
-    expect(fields).toHaveLength(18)
+    expect(fields).toHaveLength(21)
     expect(fields[header.indexOf('color')]).toBe('Space "Grey"')
   })
 
@@ -643,7 +683,7 @@ describe('GET /api/devices/export/csv — RFC 4180 quoting cannot corrupt the gr
     const rows = rowsOf(text)
     expect(rows).toHaveLength(3)
     expect(rows[1]).toContain('"iPhone 13\nrefurb"')
-    expect(parseCsvRecord(rows[1])).toHaveLength(18)
+    expect(parseCsvRecord(rows[1])).toHaveLength(21)
   })
 
   it('quotes an embedded CR so a bare carriage return cannot split the record', async () => {
@@ -668,7 +708,7 @@ describe('GET /api/devices/export/csv — RFC 4180 quoting cannot corrupt the gr
     expect(rows[1]).not.toMatch(/,iPhone 13\rrefurb,/)
 
     const fields = parseCsvRecord(rows[1])
-    expect(fields).toHaveLength(18)
+    expect(fields).toHaveLength(21)
     const header = parseCsvRecord(rows[0])
     expect(fields[header.indexOf('model')]).toBe('iPhone 13\rrefurb')
   })
