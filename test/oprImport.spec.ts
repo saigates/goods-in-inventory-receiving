@@ -195,6 +195,16 @@ afterAll(async () => {
        WHERE s.reference LIKE 'EXP RTN %' OR s.reference LIKE 'IMP RTN %'
     )
   `).run()
+  // Z-15: partial_return_declarations FK-references shipments (both the
+  // export and return leg) — must be cleared before shipments itself, same
+  // ordering constraint as shipment_value_deltas / return_line_corrections above.
+  await env.DB.prepare(`
+    DELETE FROM partial_return_declarations WHERE export_shipment_id IN (
+      SELECT id FROM shipments WHERE reference LIKE 'EXP RTN %' OR reference LIKE 'IMP RTN %'
+    ) OR return_shipment_id IN (
+      SELECT id FROM shipments WHERE reference LIKE 'EXP RTN %' OR reference LIKE 'IMP RTN %'
+    )
+  `).run()
   await env.DB.prepare("DELETE FROM shipments WHERE reference LIKE 'EXP RTN %' OR reference LIKE 'IMP RTN %'").run()
   await env.DB.prepare('DELETE FROM opr_authorisations WHERE id = ?').bind(authId).run()
   // Z-9 test-only catalogue/device fixtures (catalog-value-difference test).
@@ -1353,9 +1363,11 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     expect(clearance.body).not.toContain('repair cost only')
     expect(clearance.note).toMatch(/no email is sent/)
 
-    // Receipt.
+    // Receipt. Z-15 (0040): this is a genuine partial return (2 of 3
+    // exported units) — needs a partial_return_reason to pass
+    // IMP_RETURN_BALANCE now that the balance is checked at finalise time.
     const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, {
-      method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222YY02' }),
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222YY02', partial_return_reason: 'third unit still with the repairer' }),
     })
     expect(fin.status).toBe(200)
     const finBody = await fin.json() as { devices_returned: number; shipment: { status: string; import_mrn: string } }
@@ -1422,14 +1434,21 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     // pre-fix raw COUNT(*) of shipment_lines, `returned` would read 1, not
     // 5 — a deliberately DIFFERENT value from the line count so the two
     // codepaths cannot coincidentally agree.
-    const { shipment: exp, devices } = await makeFinalisedExport(2, '26GB0000000000AA20')
+    // Z-15 (0040) update: exported bumped from 2 to 6 so supplementary_units
+    // (5) no longer EXCEEDS exported — that specific over-declaration shape
+    // is now a live hard-block at finalise time (IMP_RETURN_BALANCE), tested
+    // separately below ('returning MORE units than the export declared...').
+    // This test's own point — GET /discharge reads the DECLARED
+    // supplementary_units, not the raw scanned-line count — still holds
+    // fully at 5-of-6 (a legitimate partial return, needs a reason).
+    const { shipment: exp, devices } = await makeFinalisedExport(6, '26GB0000000000AA20')
     const ret = await makeReturnShipment(exp.id, { supplementary_units: 5 })
     const scan = await api(`/api/opr/shipments/${ret.id}/scan`, {
       method: 'POST', body: JSON.stringify({ imei: devices[0].imei }),
     })
     expect(scan.status).toBe(201)
     const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, {
-      method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222YY20' }),
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222YY20', partial_return_reason: 'remaining unit outstanding' }),
     })
     expect(fin.status).toBe(200)
 
@@ -1437,14 +1456,11 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     expect(tracker.status).toBe(200)
     const rows = ((await tracker.json()) as { discharge: { export_shipment_id: number; exported: number; returned: number; outstanding: number }[] }).discharge
     const row = rows.find(r => r.export_shipment_id === exp.id)!
-    // exported stays a raw line count (2) — supplementary_units is
-    // documented/enforced as import-shipment-only data, never set on the
-    // export leg itself.
-    expect(row.exported).toBe(2)
+    expect(row.exported).toBe(6)
     // returned reflects the DECLARED supplementary_units (5), not the raw
     // scanned-line count (1) of the single FINALISED import leg.
     expect(row.returned).toBe(5)
-    expect(row.outstanding).toBe(-3) // 2 - 5; a real over-declaration would be investigated, but the arithmetic must be honest either way
+    expect(row.outstanding).toBe(1) // 6 - 5
   })
 
   it('Sprint A 2b: GET /discharge sums supplementary_units ACROSS MULTIPLE FINALISED import legs (per-leg COALESCE, not one pooled COUNT)', async () => {
@@ -1454,13 +1470,18 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
     // lines could never reproduce correctly (it has no per-leg boundary),
     // and mirrors the Item C worked example's R1(90)+R2(72)=162 shape at
     // small scale.
-    const { shipment: exp, devices } = await makeFinalisedExport(2, '26GB0000000000AA21')
+    // Z-15 (0040) update: exported raised from 2 to 16 (9+7) so neither
+    // leg's supplementary_units exceeds the export on its own — ret1
+    // alone (9 of 16) is a legitimate partial return (needs a reason);
+    // ret2 completes the cumulative total exactly (9+7=16), a full
+    // discharge on its own, needing none.
+    const { shipment: exp, devices } = await makeFinalisedExport(16, '26GB0000000000AA21')
     const ret1 = await makeReturnShipment(exp.id, { supplementary_units: 9 })
     expect((await api(`/api/opr/shipments/${ret1.id}/scan`, {
       method: 'POST', body: JSON.stringify({ imei: devices[0].imei }),
     })).status).toBe(201)
     expect((await api(`/api/opr/shipments/${ret1.id}/finalise`, {
-      method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222YY21' }),
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222YY21', partial_return_reason: 'first tranche, 9 of 16' }),
     })).status).toBe(200)
 
     const ret2 = await makeReturnShipment(exp.id, { supplementary_units: 7 })
@@ -1523,8 +1544,11 @@ describe('OPR 3 — import validation, receipt, restock, discharge (end-to-end)'
         method: 'POST', body: JSON.stringify({ imei: d.imei }),
       })).status).toBe(201)
     }
+    // Z-15 (0040): R1 alone (90 of 162) is a genuine partial return — the
+    // real-world two-tranche pattern this whole gate exists to allow —
+    // so it now needs a partial_return_reason to pass IMP_RETURN_BALANCE.
     expect((await api(`/api/opr/shipments/${r1.id}/finalise`, {
-      method: 'POST', body: JSON.stringify({ import_mrn: '26GB8ILNEI7EFJPAR1' }),
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB8ILNEI7EFJPAR1', partial_return_reason: 'R2 (72 units) ships as a second tranche' }),
     })).status).toBe(200)
 
     // Return leg R2: 72 devices scanned, declared supplementary_units: 72
@@ -1984,6 +2008,250 @@ describe('OPR 3 — Z-9 return-line corrections', () => {
     expect(fin.status).toBe(422) // whole shipment blocked, not just line A
     expect(await deviceStatus(devices[0].id)).toBe('EXPORTED_UNDER_OPR')
     expect(await deviceStatus(devices[1].id)).toBe('EXPORTED_UNDER_OPR')
+  })
+})
+
+// ═════════ Z-15 — return-completeness gate (0040), (a)/(b)/(d.1)/(d.2) ═════════
+//
+// Scope per docs/plan/z15-return-completeness-gate.md: the exported-vs-
+// returned balance is now checked AT FINALISE TIME (IMP_RETURN_BALANCE in
+// runImportValidation), not just displayed on the read-only GET /discharge
+// tracker. (c)/(d.3) — the wrong-device / requires_review finalise block —
+// is Z-9's own IMP_RETURN_LINE_REVIEW check, already covered by the Z-9
+// describe block above; not duplicated here.
+describe('OPR 3 — Z-15 return-completeness gate (exported-vs-returned balance at finalise)', () => {
+  it('a return that exactly matches the export (returned == exported) finalises green on IMP_RETURN_BALANCE with no partial_return_reason and writes no declaration row', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(2, '26GB0000000000CC01')
+    const ret = await makeReturnShipment(exp.id)
+    for (const d of devices) {
+      expect((await api(`/api/opr/shipments/${ret.id}/scan`, {
+        method: 'POST', body: JSON.stringify({ imei: d.imei }),
+      })).status).toBe(201)
+    }
+
+    // GET /validation is pre-finalise and by design never receives
+    // returnBalance (operator ruling, this pass) — it always reports
+    // 'Not checked at this call site' here, not the eventual outcome.
+    // IMP_RETURN_BALANCE's real green/'Fully discharges' verdict is only
+    // visible in the finalise response itself, asserted below.
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, {
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222CC01' }),
+    })
+    expect(fin.status).toBe(200)
+    const finBody = await fin.json() as { validation: { checks: Array<{ code: string; level: string; message: string }> } }
+    const balanceCheck = finBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
+    expect(balanceCheck.level).toBe('green')
+    expect(balanceCheck.message).toMatch(/Fully discharges/)
+
+    const decls = await api(`/api/opr/shipments/${exp.id}/partial-return-declarations`)
+    expect(decls.status).toBe(200)
+    expect(((await decls.json()) as { declarations: unknown[] }).declarations.length).toBe(0)
+  })
+
+  it('a genuine partial return (Export 1\'s 90-plus-72 pattern) is BLOCKED (red, 422) without a partial_return_reason, then SUCCEEDS once one is supplied — writing a partial_return_declarations row carried against the export\'s own discharge deadline', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(3, '26GB0000000000CC02')
+    const ret = await makeReturnShipment(exp.id)
+    // Only 2 of the 3 exported devices come back on this leg — a
+    // legitimate partial return (the third ships later, a second tranche).
+    for (const d of devices.slice(0, 2)) {
+      expect((await api(`/api/opr/shipments/${ret.id}/scan`, {
+        method: 'POST', body: JSON.stringify({ imei: d.imei }),
+      })).status).toBe(201)
+    }
+
+    // Without a reason: IMP_RETURN_BALANCE is red, finalise is refused,
+    // zero side-effects (no declaration row, devices still exported). Not
+    // checked pre-finalise via GET /validation — that endpoint never
+    // receives returnBalance by design (operator ruling, this pass); the
+    // red verdict is only visible in the finalise response itself.
+    const finNoReason = await api(`/api/opr/shipments/${ret.id}/finalise`, {
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222CC02' }),
+    })
+    expect(finNoReason.status).toBe(422)
+    const finNoReasonBody = await finNoReason.json() as { validation: { result: string; checks: Array<{ code: string; level: string; message: string }> } }
+    expect(finNoReasonBody.validation.result).toBe('red')
+    const checkBefore = finNoReasonBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
+    expect(checkBefore.level).toBe('red')
+    expect(checkBefore.message).toMatch(/reason is required/)
+    expect(await deviceStatus(devices[0].id)).toBe('EXPORTED_UNDER_OPR')
+    const declsBefore = await api(`/api/opr/shipments/${exp.id}/partial-return-declarations`)
+    expect(((await declsBefore.json()) as { declarations: unknown[] }).declarations.length).toBe(0)
+
+    // With a reason: amber, not red — finalise proceeds.
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, {
+      method: 'POST',
+      body: JSON.stringify({ import_mrn: '26GB2222222222CC02', partial_return_reason: 'second tranche ships next week, third unit still with the repairer' }),
+    })
+    expect(fin.status).toBe(200)
+    const finBody = await fin.json() as { validation: { checks: Array<{ code: string; level: string; message: string }> } }
+    const balanceCheck = finBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
+    expect(balanceCheck.level).toBe('amber')
+    expect(balanceCheck.message).toMatch(/Partial return: 1 of 3/)
+    expect(await deviceStatus(devices[0].id)).toBe('RETURNED_UNDER_OPR')
+    expect(await deviceStatus(devices[1].id)).toBe('RETURNED_UNDER_OPR')
+    expect(await deviceStatus(devices[2].id)).toBe('EXPORTED_UNDER_OPR') // still outstanding
+
+    // Declaration row written, queryable from EITHER the export or the return id.
+    const declsAfterExport = await api(`/api/opr/shipments/${exp.id}/partial-return-declarations`)
+    const declList = ((await declsAfterExport.json()) as {
+      declarations: Array<{
+        export_shipment_id: number; return_shipment_id: number; exported_count: number
+        returned_count_cumulative: number; outstanding_count: number; reason: string; carried_forward_deadline: string
+      }>
+    }).declarations
+    expect(declList.length).toBe(1)
+    expect(declList[0].export_shipment_id).toBe(exp.id)
+    expect(declList[0].return_shipment_id).toBe(ret.id)
+    expect(declList[0].exported_count).toBe(3)
+    expect(declList[0].returned_count_cumulative).toBe(2)
+    expect(declList[0].outstanding_count).toBe(1)
+    expect(declList[0].reason).toMatch(/second tranche/)
+    // Carried forward against the EXPORT's own discharge deadline —
+    // export ship_date 2026-07-01 + this authorisation's discharge period
+    // (set in beforeAll; not re-derived or extended here).
+    expect(declList[0].carried_forward_deadline).toBeTruthy()
+
+    const declsAfterReturn = await api(`/api/opr/shipments/${ret.id}/partial-return-declarations`)
+    expect(((await declsAfterReturn.json()) as { declarations: unknown[] }).declarations.length).toBe(1)
+  })
+
+  it('a second tranche completing the balance (72-after-90 shape at small scale) finalises green with no new declaration row, once the cumulative total across BOTH legs reaches exported', async () => {
+    const { shipment: exp, devices } = await makeFinalisedExport(2, '26GB0000000000CC03')
+
+    // First tranche: 1 of 2, legitimately partial — declared.
+    const ret1 = await makeReturnShipment(exp.id)
+    expect((await api(`/api/opr/shipments/${ret1.id}/scan`, {
+      method: 'POST', body: JSON.stringify({ imei: devices[0].imei }),
+    })).status).toBe(201)
+    const fin1 = await api(`/api/opr/shipments/${ret1.id}/finalise`, {
+      method: 'POST',
+      body: JSON.stringify({ import_mrn: '26GB2222222222CC03', partial_return_reason: 'first tranche only' }),
+    })
+    expect(fin1.status).toBe(200)
+
+    // Second tranche: the remaining unit — cumulative (1 + 1 = 2) now
+    // equals exported (2), so this leg is a FULL discharge on its own
+    // even though it is individually a single-unit return, and needs no
+    // reason of its own.
+    const ret2 = await makeReturnShipment(exp.id)
+    expect((await api(`/api/opr/shipments/${ret2.id}/scan`, {
+      method: 'POST', body: JSON.stringify({ imei: devices[1].imei }),
+    })).status).toBe(201)
+    // NOT checked via GET /validation here (operator ruling, this pass):
+    // that read-only endpoint never receives returnBalance by design — it
+    // is called mid-scan, when the return is legitimately incomplete, and
+    // a balance check there would show red through the whole scan session
+    // and train the operator to ignore it. IMP_RETURN_BALANCE's real
+    // outcome (green/"Fully discharges" once the cumulative total across
+    // both legs reaches exported) is ONLY visible in the finalise
+    // response's own validation object, asserted below.
+    const fin2 = await api(`/api/opr/shipments/${ret2.id}/finalise`, {
+      method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222CC04' }),
+    })
+    expect(fin2.status).toBe(200)
+    const fin2Body = await fin2.json() as { validation: { checks: Array<{ code: string; level: string; message: string }> } }
+    const check2 = fin2Body.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
+    expect(check2.level).toBe('green')
+    expect(check2.message).toMatch(/Fully discharges/)
+
+    // Exactly ONE declaration row exists (from ret1), not two.
+    const decls = await api(`/api/opr/shipments/${exp.id}/partial-return-declarations`)
+    const declList = ((await decls.json()) as { declarations: Array<{ return_shipment_id: number }> }).declarations
+    expect(declList.length).toBe(1)
+    expect(declList[0].return_shipment_id).toBe(ret1.id)
+  })
+
+  it('returning MORE units than the export declared is a HARD BLOCK (red, no override) even with a partial_return_reason supplied', async () => {
+    // A single export of 1 device, but the return leg declares
+    // supplementary_units: 5 — an over-declaration that must never be
+    // allowed through regardless of any reason text supplied, unlike the
+    // under-declared (genuinely partial) case above.
+    const { shipment: exp, devices } = await makeFinalisedExport(1, '26GB0000000000CC05')
+    const ret = await makeReturnShipment(exp.id, { supplementary_units: 5 })
+    expect((await api(`/api/opr/shipments/${ret.id}/scan`, {
+      method: 'POST', body: JSON.stringify({ imei: devices[0].imei }),
+    })).status).toBe(201)
+
+    // NOT checked via GET /validation here (operator ruling, this pass):
+    // that read-only endpoint never receives returnBalance by design — it
+    // is called mid-scan, when the return is legitimately incomplete, and
+    // a balance check there would show red through the whole scan session
+    // and train the operator to ignore it. IMP_RETURN_BALANCE is red-hard-
+    // block ONLY visible in the finalise response's own validation object,
+    // asserted below — the balance question is meaningful only at the
+    // moment of finalisation.
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, {
+      method: 'POST',
+      body: JSON.stringify({ import_mrn: '26GB2222222222CC05', partial_return_reason: 'trying to force it through anyway' }),
+    })
+    expect(fin.status).toBe(422)
+    const finBody = await fin.json() as { validation: { result: string; checks: Array<{ code: string; level: string; message: string }> } }
+    expect(finBody.validation.result).toBe('red')
+    const check = finBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
+    expect(check.level).toBe('red')
+    expect(check.message).toMatch(/would exceed/)
+    expect(await deviceStatus(devices[0].id)).toBe('EXPORTED_UNDER_OPR')
+    const decls = await api(`/api/opr/shipments/${exp.id}/partial-return-declarations`)
+    expect(((await decls.json()) as { declarations: unknown[] }).declarations.length).toBe(0)
+  })
+
+  it('IMP_RETURN_BALANCE is not applicable (green) on a TEMP_EXPORT_STANDARD shipment — no discharge clock to balance against', async () => {
+    const expRes = await api('/api/opr/shipments', {
+      method: 'POST',
+      body: JSON.stringify({
+        reference: `EXP STD ${100 + shipmentSeq++}`, direction: 'export', shipment_type: 'TEMP_EXPORT_STANDARD',
+        ship_date: '2026-07-01', consignee_name: 'Overseas Repairer BV',
+        consignee_address: 'Repairstraat 1, Amsterdam, NL', carrier: 'FedEx', incoterm: 'DAP',
+      }),
+    })
+    expect(expRes.status).toBe(201)
+    const exp = ((await expRes.json()) as { shipment: { id: number } }).shipment
+    const d = await makeDevice()
+    const scanOut = await api(`/api/opr/shipments/${exp.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: d.imei }) })
+    expect(scanOut.status).toBe(201)
+    const finExp = await api(`/api/opr/shipments/${exp.id}/finalise`, { method: 'POST', body: JSON.stringify({}) })
+    expect(finExp.status).toBe(200)
+
+    const retRes = await api('/api/opr/shipments', {
+      method: 'POST',
+      body: JSON.stringify({
+        reference: `IMP STD ${100 + shipmentSeq++}`, direction: 'import', shipment_type: 'TEMP_EXPORT_STANDARD',
+        related_export_shipment_id: exp.id, ship_date: '2026-09-01',
+      }),
+    })
+    expect(retRes.status).toBe(201)
+    const ret = ((await retRes.json()) as { shipment: { id: number } }).shipment
+    const scanIn = await api(`/api/opr/shipments/${ret.id}/scan`, { method: 'POST', body: JSON.stringify({ imei: d.imei }) })
+    expect(scanIn.status).toBe(201)
+
+    const val = await api(`/api/opr/shipments/${ret.id}/validation`)
+    const valBody = await val.json() as { validation: { checks: Array<{ code: string; level: string; message: string }> } }
+    expect(valBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!.level).toBe('green')
+    expect(valBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!.message).toMatch(/Not applicable/)
+
+    const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, { method: 'POST', body: JSON.stringify({}) })
+    expect(fin.status).toBe(200)
+  })
+
+  it('GET /shipments/:id/validation (read-only display, not finalise) never blocks or requires a reason on IMP_RETURN_BALANCE even when the consignment is genuinely partial — the check is green/"not checked at this call site"', async () => {
+    // This is the documented behaviour of runImportValidation's optional
+    // returnBalance param (undefined at every call site except finalise
+    // itself) — GET /validation must stay a pure read with no side-effect
+    // requirement, never silently demanding a reason before an operator
+    // has even attempted to finalise.
+    const { shipment: exp, devices } = await makeFinalisedExport(3, '26GB0000000000CC06')
+    const ret = await makeReturnShipment(exp.id)
+    for (const d of devices.slice(0, 1)) {
+      expect((await api(`/api/opr/shipments/${ret.id}/scan`, {
+        method: 'POST', body: JSON.stringify({ imei: d.imei }),
+      })).status).toBe(201)
+    }
+    const val = await api(`/api/opr/shipments/${ret.id}/validation`)
+    expect(val.status).toBe(200)
+    const valBody = await val.json() as { validation: { checks: Array<{ code: string; level: string; message: string }>; result: string } }
+    const check = valBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
+    expect(check.level).toBe('green')
+    expect(check.message).toMatch(/Not checked at this call site/)
   })
 })
 
