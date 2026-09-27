@@ -95,6 +95,24 @@ async function seedExpectedDevice(opts: { manifestId: number; imei: string; sku:
   return result.meta.last_row_id as number
 }
 
+// Z-6 (2026-09-27): zoho_batches/zoho_batch_devices have no application
+// writer yet (Y-3, Sprint 2, not shipped — see devices.ts's batchLock
+// comment) so tests must seed both tables directly via raw SQL, same as
+// repairWorkflow.spec.ts's now-skipped Group D bodies do for the same
+// reason. status defaults to 'GENERATED' (the real default a fresh batch
+// would have); tests that care about a different status pass it explicitly
+// to exercise the "no status carve-out" behaviour noted in devices.ts.
+async function seedZohoBatch(deviceId: number, imei: string, sku: string, status: 'GENERATED' | 'CONFIRMED' | 'FAILED' = 'GENERATED'): Promise<number> {
+  const batchResult = await db().prepare(
+    `INSERT INTO zoho_batches (organisation_id, status, device_count, generated_by_user_id) VALUES (1, ?, 1, ?)`
+  ).bind(status, ADMIN_USER.id).run()
+  const batchId = batchResult.meta.last_row_id as number
+  await db().prepare(
+    `INSERT INTO zoho_batch_devices (batch_id, device_id, imei, sku) VALUES (?, ?, ?, ?)`
+  ).bind(batchId, deviceId, imei, sku).run()
+  return batchId
+}
+
 async function seedManifest(): Promise<number> {
   const suffix = uniqueSuffix()
   const result = await db()
@@ -651,6 +669,175 @@ describe('PATCH /api/devices/:id/correct', () => {
     const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
       method: 'PATCH',
       body: JSON.stringify({ sku: `TEST-REJECTED-OK-${suffix}`, reason: 'correcting a rejected device catalogue line' }),
+    })
+    expect(res.status).toBe(200)
+  })
+})
+
+// ── Z-6 (2026-09-27): zoho_batch_devices correction lock ──
+// A SEPARATE, SIBLING guard to the existing pushedToZoho (repair_jobs)
+// block above — see devices.ts's batchLock comment for why the two do
+// not overlap (repair_jobs.closed_at is blind to a straight-to-inventory
+// device Y-3 snapshots without ever routing it through repair).
+// zoho_batches/zoho_batch_devices have zero application writers today
+// (Y-3 is Sprint 2, not shipped), so every row here is seeded directly via
+// seedZohoBatch() — there is no real endpoint yet that would create one.
+describe('PATCH /api/devices/:id/correct — zoho_batch_devices correction lock (Z-6)', () => {
+  it('device present in a GENERATED zoho batch -> 409 naming the batch, zero writes', async () => {
+    const suffix = uniqueSuffix()
+    await insertCatalogRow({ sku: `TEST-Z6-LOCK-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTZ6', capacity: '128GB', color: 'GREEN', grade: 'A' })
+    const device = await seedDevice({ sku: 'TEST-STALE-Z6-SKU', brand: 'APPLE', model: 'IPHONE TESTZ6', capacity: '128GB', color: 'RED', grade: 'A' })
+    const batchId = await seedZohoBatch(device.id, device.imei, 'TEST-STALE-Z6-SKU')
+
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-Z6-LOCK-${suffix}`, reason: 'attempted on a device already batch-snapshotted' }),
+    })
+    expect(res.status).toBe(409)
+    const body = await res.json() as any
+    expect(body.error).toMatch(/committed to Zoho batch/i)
+    expect(body.error).toContain(String(batchId))
+    expect(body.error).toMatch(/override_batch_lock/)
+
+    const row = await deviceRow(device.id)
+    expect(row?.sku).toBe('TEST-STALE-Z6-SKU') // unchanged
+    expect((await eventsFor(device.id)).length).toBe(0)
+  })
+
+  it('device present in a FAILED zoho batch is STILL locked — no status carve-out', async () => {
+    const suffix = uniqueSuffix()
+    await insertCatalogRow({ sku: `TEST-Z6-FAILED-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTZ6F', capacity: '128GB', color: 'GREEN', grade: 'A' })
+    const device = await seedDevice({ sku: 'TEST-STALE-Z6-FAILED-SKU', brand: 'APPLE', model: 'IPHONE TESTZ6F', capacity: '128GB', color: 'RED', grade: 'A' })
+    await seedZohoBatch(device.id, device.imei, 'TEST-STALE-Z6-FAILED-SKU', 'FAILED')
+
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-Z6-FAILED-${suffix}`, reason: 'attempted on a device in a FAILED batch' }),
+    })
+    expect(res.status).toBe(409)
+    const body = await res.json() as any
+    expect(body.error).toMatch(/committed to Zoho batch/i)
+    expect(body.error).toMatch(/FAILED/)
+  })
+
+  it('owner override with a recorded reason -> 200, correction proceeds, override persisted in device_events metadata AND returned in the response', async () => {
+    const suffix = uniqueSuffix()
+    await insertCatalogRow({ sku: `TEST-Z6-OVERRIDE-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTZ6O', capacity: '128GB', color: 'GREEN', grade: 'A' })
+    const device = await seedDevice({ sku: 'TEST-STALE-Z6-OVERRIDE-SKU', brand: 'APPLE', model: 'IPHONE TESTZ6O', capacity: '128GB', color: 'RED', grade: 'A' })
+    const batchId = await seedZohoBatch(device.id, device.imei, 'TEST-STALE-Z6-OVERRIDE-SKU')
+
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        sku: `TEST-Z6-OVERRIDE-${suffix}`,
+        reason: 'legitimate catalogue fix, batch already confirmed correct with Zoho separately',
+        override_batch_lock: true,
+        override_reason: 'confirmed with Zoho support that the bill line will be manually corrected on their end',
+      }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as any
+    expect(body.device.sku).toBe(`TEST-Z6-OVERRIDE-${suffix}`)
+    expect(body.batch_lock_override).toMatchObject({
+      batch_id: batchId,
+      batch_status: 'GENERATED',
+      override_reason: 'confirmed with Zoho support that the bill line will be manually corrected on their end',
+    })
+
+    const row = await deviceRow(device.id)
+    expect(row?.sku).toBe(`TEST-Z6-OVERRIDE-${suffix}`)
+
+    const events = await eventsFor(device.id)
+    expect(events.length).toBe(1)
+    const metadata = JSON.parse(events[0].metadata as string)
+    expect(metadata.batch_lock_override).toMatchObject({
+      batch_id: batchId,
+      batch_status: 'GENERATED',
+      override_reason: 'confirmed with Zoho support that the bill line will be manually corrected on their end',
+    })
+  })
+
+  it('override_batch_lock: true WITHOUT override_reason -> 422, still blocked, zero writes', async () => {
+    const suffix = uniqueSuffix()
+    await insertCatalogRow({ sku: `TEST-Z6-NOREASON-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTZ6N', capacity: '128GB', color: 'GREEN', grade: 'A' })
+    const device = await seedDevice({ sku: 'TEST-STALE-Z6-NOREASON-SKU', brand: 'APPLE', model: 'IPHONE TESTZ6N', capacity: '128GB', color: 'RED', grade: 'A' })
+    await seedZohoBatch(device.id, device.imei, 'TEST-STALE-Z6-NOREASON-SKU')
+
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        sku: `TEST-Z6-NOREASON-${suffix}`,
+        reason: 'attempted override without a reason',
+        override_batch_lock: true,
+      }),
+    })
+    expect(res.status).toBe(422)
+    const body = await res.json() as any
+    expect(body.error).toMatch(/override_reason is required/i)
+
+    const row = await deviceRow(device.id)
+    expect(row?.sku).toBe('TEST-STALE-Z6-NOREASON-SKU') // unchanged
+    expect((await eventsFor(device.id)).length).toBe(0)
+  })
+
+  it('override_batch_lock: true with an empty-string override_reason -> 422, same as omitted (cleanString rejects blank)', async () => {
+    const suffix = uniqueSuffix()
+    await insertCatalogRow({ sku: `TEST-Z6-BLANKREASON-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTZ6B', capacity: '128GB', color: 'GREEN', grade: 'A' })
+    const device = await seedDevice({ sku: 'TEST-STALE-Z6-BLANKREASON-SKU', brand: 'APPLE', model: 'IPHONE TESTZ6B', capacity: '128GB', color: 'RED', grade: 'A' })
+    await seedZohoBatch(device.id, device.imei, 'TEST-STALE-Z6-BLANKREASON-SKU')
+
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        sku: `TEST-Z6-BLANKREASON-${suffix}`,
+        reason: 'attempted override with a blank reason',
+        override_batch_lock: true,
+        override_reason: '   ',
+      }),
+    })
+    expect(res.status).toBe(422)
+  })
+
+  it('device NOT present in any zoho batch -> unaffected, 200 as before (regression check)', async () => {
+    const suffix = uniqueSuffix()
+    await insertCatalogRow({ sku: `TEST-Z6-NOBATCH-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTZ6NB', capacity: '128GB', color: 'GREEN', grade: 'A' })
+    const device = await seedDevice({ sku: 'TEST-STALE-Z6-NOBATCH-SKU', brand: 'APPLE', model: 'IPHONE TESTZ6NB', capacity: '128GB', color: 'RED', grade: 'A' })
+
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-Z6-NOBATCH-${suffix}`, reason: 'ordinary correction, no batch involved' }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as any
+    expect(body.batch_lock_override).toBeNull()
+  })
+
+  it('device batch-locked for org 1 does NOT block a same-numbered device_id in a different organisation (organisation_id scoping via zoho_batches join)', async () => {
+    // zoho_batch_devices itself carries no organisation_id column — the
+    // batchLock query scopes via zb.organisation_id (the JOINed
+    // zoho_batches row), not zbd. This test exists specifically to prove
+    // that join clause is doing real scoping work, not silently ignoring
+    // organisation_id and matching by device_id alone across orgs.
+    const suffix = uniqueSuffix()
+    await insertCatalogRow({ sku: `TEST-Z6-CROSSORG-${suffix}`, brand: 'APPLE', model: 'IPHONE TESTZ6X', capacity: '128GB', color: 'GREEN', grade: 'A' })
+    const device = await seedDevice({ sku: 'TEST-STALE-Z6-CROSSORG-SKU', brand: 'APPLE', model: 'IPHONE TESTZ6X', capacity: '128GB', color: 'RED', grade: 'A' })
+
+    // Seed a batch for a DIFFERENT organisation (id 999) that happens to
+    // reference this same device_id — an org-2 zoho_batches row pointing
+    // at an org-1 device is not something real application code would
+    // ever produce, but the query must not be fooled by it if it existed.
+    await db().prepare(`INSERT OR IGNORE INTO organisations (id, name) VALUES (999, 'Z6 Cross-Org Test')`).run()
+    await db().prepare(
+      `INSERT INTO zoho_batches (organisation_id, status, device_count, generated_by_user_id) VALUES (999, 'GENERATED', 1, ?)`
+    ).bind(ADMIN_USER.id).run()
+    const crossOrgBatch = await db().prepare(`SELECT id FROM zoho_batches WHERE organisation_id = 999 ORDER BY id DESC LIMIT 1`).first<{ id: number }>()
+    await db().prepare(
+      `INSERT INTO zoho_batch_devices (batch_id, device_id, imei, sku) VALUES (?, ?, ?, ?)`
+    ).bind(crossOrgBatch!.id, device.id, device.imei, 'TEST-STALE-Z6-CROSSORG-SKU').run()
+
+    const res = await apiAs(ADMIN_USER, `/api/devices/${device.id}/correct`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sku: `TEST-Z6-CROSSORG-${suffix}`, reason: 'org-1 correction, cross-org batch row should not lock it' }),
     })
     expect(res.status).toBe(200)
   })

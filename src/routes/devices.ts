@@ -185,6 +185,8 @@ app.patch('/:id/correct', async (c) => {
     reason?: string
     also_correct_manifest_line?: boolean
     imei?: unknown
+    override_batch_lock?: unknown
+    override_reason?: unknown
   }>().catch(() => ({} as any))
 
   // IMEI is immutable on this route — its presence in the body at all is
@@ -262,6 +264,96 @@ app.patch('/:id/correct', async (c) => {
     }, 409)
   }
 
+  // zoho_batch_devices lock (Z-6, 2026-09-27): a SEPARATE, SIBLING guard to
+  // pushedToZoho above, not a replacement for it. pushedToZoho's
+  // repair_jobs.closed_at signal exists only because, until today, nothing
+  // wrote to zoho_batch_devices at all (confirmed by grep — zero INSERTs
+  // anywhere in src/, and 0 rows in production; see inventory.ts:308 and
+  // this route's own pushedToZoho comment above). That proxy is blind to a
+  // straight-to-inventory device that Y-3 (Sprint 2, not yet shipped)
+  // snapshots into a batch without the device ever entering the repair
+  // workflow — repair_jobs would never see it, so pushedToZoho would pass
+  // it clean while the device is in fact already committed to a Zoho
+  // bill. Hence: check zoho_batch_devices directly, by device_id, joined
+  // to zoho_batches for the organisation scope (zoho_batch_devices itself
+  // carries no organisation_id column — it inherits scope from its batch).
+  //
+  // UNTIL Y-3 SHIPS THIS IS A STRUCTURAL NO-OP: zoho_batch_devices has zero
+  // writers today, so this query can only ever return no rows in current
+  // production. That is intentional, deliberate "build the lock ahead of
+  // the writer" sequencing (operator's own Sprint-1/Sprint-2 rationale) —
+  // NOT a sign the check is dead code. It activates automatically, with no
+  // further change needed here, the moment Y-3's first batch-generation
+  // INSERT lands.
+  //
+  // MATCH SCOPE (🔵 operator ruling not explicit on this point — flagging
+  // rather than silently narrowing): matches ANY row in zoho_batch_devices
+  // for this device, regardless of the parent zoho_batches.status —
+  // including FAILED. The operator's own wording was "any device already
+  // present in zoho_batch_devices", with no status carve-out, and a FAILED
+  // batch still means a real snapshot (imei/sku at that instant) was taken
+  // and may already be sitting in a downstream Zoho draft/log outside this
+  // system's visibility — correcting the device without also accounting
+  // for that snapshot is exactly the desync this ticket exists to prevent.
+  // If the intent was actually "only GENERATED/CONFIRMED should lock,
+  // FAILED should not", that is a one-line WHERE-clause change from here.
+  //
+  // Ties to the MOST RECENT batch row (ORDER BY id DESC LIMIT 1) for the
+  // error message's batch reference — same "report the fact plainly, pick
+  // one canonical row to name" approach as pushedToZoho's
+  // MIN(closed_at)/EXISTS split above. A device could in principle appear
+  // in more than one batch (UNIQUE is per batch+device, not global); this
+  // does not attempt to enumerate every batch, only to name one so the
+  // operator has a concrete bill to go look at.
+  const batchLock = await c.env.DB.prepare(
+    `SELECT zb.id AS batch_id, zb.status AS batch_status, zb.generated_at AS batch_generated_at
+       FROM zoho_batch_devices zbd
+       JOIN zoho_batches zb ON zb.id = zbd.batch_id
+      WHERE zbd.device_id = ? AND zb.organisation_id = ?
+      ORDER BY zbd.id DESC LIMIT 1`
+  ).bind(id, orgId).first<{ batch_id: number; batch_status: string; batch_generated_at: string }>()
+
+  let batchLockOverride: { batch_id: number; batch_status: string; override_reason: string } | null = null
+  if (batchLock) {
+    const overrideRequested = body.override_batch_lock === true
+    const overrideReason = cleanString(body.override_reason, 500)
+
+    if (!overrideRequested) {
+      return c.json({
+        error:
+          `Device is committed to Zoho batch ${batchLock.batch_id} ` +
+          `(status: ${batchLock.batch_status}, generated ${batchLock.batch_generated_at}) — ` +
+          'it can no longer be corrected via this route. ' +
+          'Set override_batch_lock: true with a non-empty override_reason to proceed anyway.',
+      }, 409)
+    }
+    if (!overrideReason) {
+      return c.json({
+        error: 'override_reason is required (and must be non-empty) when override_batch_lock is set — ' +
+          `state why this correction must bypass the lock on Zoho batch ${batchLock.batch_id}`,
+      }, 422)
+    }
+    // OVERRIDE SIGNALLING (modelled on costEntry.ts's allow_duplicate_
+    // purchase_row, with one deliberate deviation): costEntry.ts logs its
+    // override via console.log ONLY, reasoning that the response is for
+    // the caller and a log line is for an operator/auditor, and the two
+    // should not be conflated. Z-6 keeps that console.log line for
+    // grep-parity with that precedent, but ALSO — per the operator's own
+    // wording, "owner override with a recorded reason" — writes the
+    // override + its reason into device_events below (via the ordinary
+    // SKU_CORRECTION metadata, extended with a batch_lock_override key),
+    // because "recorded" reads as "persisted and queryable", not merely
+    // printed to an ephemeral request-scoped console line. device_events
+    // already has an unconstrained metadata column built for exactly this
+    // (no CHECK constraint on event_type — migration 0039), so this needed
+    // no new table/migration.
+    console.log(
+      `[devices.correct] batch_lock_override_used device_id=${id} organisation_id=${orgId} ` +
+      `batch_id=${batchLock.batch_id} user_id=${user.id} override_reason=${JSON.stringify(overrideReason)}`
+    )
+    batchLockOverride = { batch_id: batchLock.batch_id, batch_status: batchLock.batch_status, override_reason: overrideReason }
+  }
+
   // SKU must resolve to a real catalogue row for this organisation — no
   // free-text SKU, ever (see catalog.ts's own "the catalog is the source
   // of truth" header note). Colour and grade are DERIVED from the chosen
@@ -323,6 +415,12 @@ app.patch('/:id/correct', async (c) => {
       old_grade: oldGrade, new_grade: newGrade,
       print_jobs_invalidated: queuedJobs.map(j => j.id),
       print_jobs_requeued: queuedJobs.length,
+      // Z-6: present only when this correction bypassed a zoho_batch_devices
+      // lock via override_batch_lock — the "recorded reason" the operator
+      // asked for, persisted here (not just console.log'd) so it is
+      // queryable later against device_events, not merely grep'able in an
+      // ephemeral request-scoped log line.
+      ...(batchLockOverride ? { batch_lock_override: batchLockOverride } : {}),
     },
   })
 
@@ -451,6 +549,7 @@ app.patch('/:id/correct', async (c) => {
     manifest_line_also_wrong: manifestLineAlsoWrong,
     manifest_line: manifestLineAlsoWrong ? manifestLine : null,
     manifest_line_cascade: manifestLineCascade,
+    batch_lock_override: batchLockOverride,
   })
 })
 
