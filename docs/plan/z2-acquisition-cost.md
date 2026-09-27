@@ -1,9 +1,10 @@
 # Z-2 — Acquisition Cost Fields: Scope + Design Decision
 
-Status: **IMPLEMENTED on branch `z2-acquisition-cost` (off `040b3eb`), NOT
-merged to `main`.** Per operator instruction this pass: `main` stays pinned
-at the deploy target (`040b3eb`) until the redeploy action has landed and
-been confirmed; Z-2 develops on its own branch until then.
+Status: **IMPLEMENTED and MERGED to `main`** (merge commit `2cd33b2`,
+"Merge Z-2 (acquisition_cost/total_cost + export-gate zero-cost block) into
+main"). The branch-pinning note that used to live here is now historical —
+recorded as of the pass that wrote the Z-3 closing note below, current as
+of that pass.
 
 ## Problem statement, per operator's next-pass item 2
 
@@ -199,6 +200,78 @@ fires, for a device that was in fact billed correctly.
   requirement when it is scoped/started, rather than rediscovering the
   same failure mode from a live incident after batches are already
   flowing.
+
+## Y-1/Y-3 requirement: export SKU must be read live, never from the frozen `shipment_lines.sku` (Z-3 closing note)
+
+**Origin.** Z-3 was raised against a real incident: a stale SKU appeared
+on a bill that had been produced by hand from the August workbook. The
+ticket's working title ("export SKU source") implied a live code path
+somewhere reads `shipment_lines.sku` when it should read
+`received_devices.sku`, and that path needed fixing plus a retro-fix of
+any past pushes carrying the stale value.
+
+**Finding, this pass — three paths checked, by direct code read, not by
+inspection of a plan doc (none existed for Z-3):**
+
+1. **`GET /api/devices/export/csv`** (`src/routes/devices.ts:639`,
+   `exportCsvSelectSql()` at line 573) — the CSV export that actually
+   feeds today's hand-built Zoho reconciliation workflow. Its `SELECT`
+   reads `rd.sku` — `received_devices.sku` — directly, live, with no
+   `shipment_lines` join anywhere in that query. This path already
+   satisfies "read SKU live from the device record."
+2. **`src/lib/zohoSaleImport.ts` / `src/routes/zohoSaleImport.ts`** — the
+   **inbound** Zoho→app importer (sale-attribution, matched by `imei`).
+   Its own header states explicitly "NO SKU translation on this path."
+   Not an export-SKU surface at all; irrelevant to Z-3's premise.
+3. **`src/lib/billBuilder.ts` / `src/routes/bills.ts`** — the one bill
+   builder for the two bill types that exist today, `purchase` and
+   `repair` (Sprint B §1). Neither type is a Zoho SALES/export bill.
+
+**Conclusion: there is no outbound Zoho bill-build code path in this
+codebase today, because Y-1 (the Zoho bill-mapping ticket) has not been
+written yet.** The stale SKU that motivated Z-3 could not have come from
+a live code defect — it came from a human building a bill by hand outside
+any of the three paths above. `shipment_lines.sku` staying frozen-at-
+add-time (Z-9's deliberate customs-record design) was never actually
+implicated; there is no code that reads it into an export or a bill.
+
+**Therefore Z-3, as a fix-a-bug ticket, is CLOSED — closing statement:**
+checked `devices.ts`'s CSV export (reads `received_devices.sku` live,
+already correct), `zohoSaleImport.ts` (inbound, explicitly no SKU
+translation, not in scope), and `billBuilder.ts`/`bills.ts` (purchase/
+repair invoicing only, not a Zoho export surface) — no live path reads a
+frozen SKU into an export or bill, so there is nothing to fix and nothing
+to retro-fix. The read-only stale-SKU comparison count that was to
+accompany this closure was explicitly skipped for the same reason: with
+no code path reading a frozen SKU into a bill, any divergence between
+`shipment_lines.sku` and `received_devices.sku` in production is either
+the intended Z-9 frozen snapshot or a recorded Z-9 correction — both
+correct, neither actionable — and running the count would produce a
+number with no decision attached to it.
+
+**What Z-3 actually leaves behind is a constraint for the tickets that
+will build the outbound path, pairing with the Y-3/Y-4 snapshot
+requirement immediately above — both now inherited by Y-1 and Y-3:**
+
+- **Y-1** (Zoho bill-mapping file) MUST read SKU live from
+  `received_devices.sku` at bill-build time. It must NEVER read
+  `sku` off `shipment_lines` — that column stays frozen-at-add-time for
+  Z-9's customs-record purposes and is not a safe source for a
+  Zoho-facing SKU, for exactly the same "figure can silently go stale
+  after the fact" reason the acquisition-cost snapshot requirement above
+  exists.
+- **Y-3** (Zoho batch-export ticket), when it writes a `zoho_batch_devices`
+  row, MUST **snapshot the SKU actually sent** on that row — not just
+  identifying keys to be re-resolved later — for the identical reason
+  or the acquisition-cost/acquisition-source snapshot already required
+  above: a device can be re-graded (new SKU) or corrected
+  (`PATCH /:id/correct`) AFTER a batch has already gone out, and Y-4's
+  reconciliation must judge that already-sent batch against what was
+  actually sent, not against a fresh live lookup that has since moved on.
+  Y-3's `zoho_batch_devices` row should carry the SKU (this section) and
+  the acquisition_cost_gbp + acquisition_source (Y-3/Y-4 section above)
+  as one paired snapshot, written at the same send-time moment, not two
+  separately-timed writes.
 
 ## X-8 follow-on (noted, not actioned this ticket)
 
