@@ -8,7 +8,7 @@
 import { Hono } from 'hono'
 import type { Bindings, AuthUser } from '../types'
 import { currentUser } from '../lib/auth'
-import { cleanString } from '../lib/validate'
+import { cleanString, validateZohoItemId } from '../lib/validate'
 import {
   applySkuMapImport,
   parseSkuMapCsv,
@@ -62,6 +62,184 @@ app.get('/orphans', async (c) => {
      ORDER BY z.zoho_item_id ASC`
   ).bind(user.organisation_id).all()
   return c.json({ orphaned_goods_in_skus: orphanedSkus, unreferenced_zoho_items: unreferencedZohoItems })
+})
+
+// GET /api/sku-map/unmapped — the unmapped queue (Z-4 phase 1). Grouped by
+// OUR sku (goods_in_sku / received_devices.sku), one row per SKU with a
+// device count — never per-device rows, per explicit instruction, since
+// the operator acts on "this SKU needs a mapping", not on individual
+// units. A goods_in_sku whose ONLY sku_map row is orphaned still counts as
+// unmapped here (operator ruling, this pass): an orphaned mapping must not
+// satisfy the export gate, so it must not disappear from this queue either
+// — NOT EXISTS is scoped to orphaned_at IS NULL, deliberately not just "any
+// row exists".
+app.get('/unmapped', async (c) => {
+  const user = currentUser(c)
+  const { results } = await c.env.DB.prepare(
+    `SELECT rd.sku AS goods_in_sku, COUNT(*) AS device_count
+     FROM received_devices rd
+     WHERE rd.organisation_id = ?
+       AND NOT EXISTS (
+         SELECT 1 FROM sku_map m
+         WHERE m.goods_in_sku = rd.sku AND m.organisation_id = rd.organisation_id AND m.orphaned_at IS NULL
+       )
+     GROUP BY rd.sku
+     ORDER BY device_count DESC, rd.sku ASC`
+  ).bind(user.organisation_id).all()
+  return c.json({ unmapped: results })
+})
+
+// POST /api/sku-map — manual single-row create (Z-4 phase 1's "manual
+// CRUD"; POST /import remains the ONLY bulk path, unchanged). Body:
+// { goods_in_sku, zoho_item_id, zoho_sku?, zoho_item_name?, brand, model,
+//   capacity?, color?, grade?, note? }.
+//
+// Cardinality, enforced here exactly as the schema already enforces it
+// (migration 0032): goods_in_sku is unique (sku_map's PRIMARY KEY) — a
+// second create for the same live goods_in_sku is a 409, use PATCH to
+// edit it instead. zoho_item_id has NO uniqueness constraint on this side
+// — reusing an existing Zoho item across multiple goods_in_sku rows
+// (physical-SIM/eSIM pairs) is allowed and expected.
+//
+// Revive-on-remap (operator ruling, this pass): if goods_in_sku already
+// exists but is ORPHANED, this is NOT a 409 — the existing row is revived
+// (orphaned_at cleared) and updated in place rather than a second row
+// being inserted, which the PRIMARY KEY would reject anyway. This is the
+// counterpart to DELETE below setting orphaned_at, not a separate code
+// path re-deciding the same rule.
+app.post('/', async (c) => {
+  const user = currentUser(c)
+  if (!requireManager(c)) return c.json({ error: 'Manager or admin role required' }, 403)
+  const body = await c.req.json<{
+    goods_in_sku?: string
+    zoho_item_id?: string
+    zoho_sku?: string
+    zoho_item_name?: string
+    brand?: string
+    model?: string
+    capacity?: string | null
+    color?: string | null
+    grade?: string | null
+    note?: string | null
+  }>().catch(() => ({} as any))
+
+  const goodsInSku = cleanString(body.goods_in_sku, 100)
+  if (!goodsInSku) return c.json({ error: 'goods_in_sku is required' }, 400)
+
+  const zid = validateZohoItemId(body.zoho_item_id)
+  if (!zid.ok) return c.json({ error: zid.reason }, 422)
+
+  const brand = cleanString(body.brand, 100)
+  const model = cleanString(body.model, 200)
+  if (!brand) return c.json({ error: 'brand is required' }, 400)
+  if (!model) return c.json({ error: 'model is required' }, 400)
+
+  // zoho_items side: reuse if the ID already exists (many-to-one — this is
+  // the expected physical/eSIM-pair path), otherwise create it. When
+  // reusing, the EXISTING zoho_sku/zoho_item_name win — this endpoint never
+  // silently renames a Zoho item as a side effect of mapping a new
+  // goods_in_sku to it; that's the loader's rename-detection job, not this
+  // one's.
+  const existingZoho = await c.env.DB.prepare(
+    'SELECT zoho_item_id, zoho_sku, zoho_item_name FROM zoho_items WHERE zoho_item_id = ? AND organisation_id = ?'
+  ).bind(zid.value, user.organisation_id).first<{ zoho_item_id: string; zoho_sku: string; zoho_item_name: string }>()
+
+  if (!existingZoho) {
+    const zsku = cleanString(body.zoho_sku, 100)
+    const zname = cleanString(body.zoho_item_name, 300)
+    if (!zsku || !zname) {
+      return c.json({ error: `Zoho Item ID ${zid.value} does not exist yet — zoho_sku and zoho_item_name are required to create it` }, 400)
+    }
+    const clash = await c.env.DB.prepare(
+      'SELECT zoho_item_id FROM zoho_items WHERE zoho_sku = ? AND organisation_id = ?'
+    ).bind(zsku, user.organisation_id).first<{ zoho_item_id: string }>()
+    if (clash) {
+      return c.json({ error: `Zoho SKU ${zsku} is already used by Zoho Item ID ${clash.zoho_item_id} — bijection would break` }, 409)
+    }
+    await c.env.DB.prepare(
+      'INSERT INTO zoho_items (zoho_item_id, zoho_sku, zoho_item_name, organisation_id) VALUES (?, ?, ?, ?)'
+    ).bind(zid.value, zsku, zname, user.organisation_id).run()
+  }
+
+  const existingMap = await c.env.DB.prepare(
+    'SELECT goods_in_sku, orphaned_at, row_version, zoho_item_id FROM sku_map WHERE goods_in_sku = ? AND organisation_id = ?'
+  ).bind(goodsInSku, user.organisation_id).first<{ goods_in_sku: string; orphaned_at: string | null; row_version: number; zoho_item_id: string }>()
+
+  if (existingMap && !existingMap.orphaned_at) {
+    return c.json({ error: `${goodsInSku} is already mapped — use PATCH to edit it`, current_row_version: existingMap.row_version }, 409)
+  }
+
+  const capacity = cleanString(body.capacity, 50)
+  const color = cleanString(body.color, 50)
+  const grade = cleanString(body.grade, 20)
+  const note = cleanString(body.note, 500)
+
+  if (existingMap) {
+    // Revive: clear orphaned_at, overwrite the mapped-side columns.
+    if (existingMap.zoho_item_id !== zid.value) {
+      await c.env.DB.prepare(
+        `INSERT INTO sku_map_audit (organisation_id, goods_in_sku, old_zoho_item_id, new_zoho_item_id, source, actor_user_id, reason)
+         VALUES (?, ?, ?, ?, 'ui_edit', ?, ?)`
+      ).bind(user.organisation_id, goodsInSku, existingMap.zoho_item_id, zid.value, user.id, 'revived from orphaned via manual create').run()
+    }
+    await c.env.DB.prepare(
+      `UPDATE sku_map SET
+         zoho_item_id = ?, brand = ?, model = ?, capacity = ?, color = ?, grade = ?,
+         orphaned_at = NULL, row_version = row_version + 1, updated_at = CURRENT_TIMESTAMP
+       WHERE goods_in_sku = ? AND organisation_id = ?`
+    ).bind(zid.value, brand, model, capacity, color, grade, goodsInSku, user.organisation_id).run()
+  } else {
+    await c.env.DB.prepare(
+      `INSERT INTO sku_map (goods_in_sku, organisation_id, zoho_item_id, brand, model, capacity, color, grade, note)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(goodsInSku, user.organisation_id, zid.value, brand, model, capacity, color, grade, note).run()
+  }
+
+  await c.env.DB.prepare(
+    'UPDATE sku_map_version SET mapping_version = mapping_version + 1, updated_at = CURRENT_TIMESTAMP WHERE organisation_id = ?'
+  ).bind(user.organisation_id).run()
+
+  const row = await c.env.DB.prepare(
+    'SELECT * FROM sku_map WHERE goods_in_sku = ? AND organisation_id = ?'
+  ).bind(goodsInSku, user.organisation_id).first()
+  return c.json({ sku_map: row }, existingMap ? 200 : 201)
+})
+
+// DELETE /api/sku-map/:goods_in_sku — "Remove mapping" (labelled that way
+// in the UI, deliberately not "Delete"). Soft delete only: sets
+// orphaned_at, never removes the row. Ruled this pass for three reasons —
+// (1) matches the schema's own existing convention that absence is never
+// a delete, so the manual page and the Excel round trip behave
+// consistently; (2) sku_map_audit already exists to record changes, and a
+// hard delete would leave audit rows pointing at a vanished parent;
+// (3) once Y-3 snapshots a mapping into zoho_batch_devices, deleting the
+// mapping here would break the ability to explain a bill already sent to
+// Zoho. Idempotent — removing an already-orphaned row is a no-op 200, not
+// a 404 or 409.
+app.delete('/:goods_in_sku', async (c) => {
+  const user = currentUser(c)
+  if (!requireManager(c)) return c.json({ error: 'Manager or admin role required' }, 403)
+  const goodsInSku = c.req.param('goods_in_sku')
+
+  const existing = await c.env.DB.prepare(
+    'SELECT goods_in_sku, orphaned_at FROM sku_map WHERE goods_in_sku = ? AND organisation_id = ?'
+  ).bind(goodsInSku, user.organisation_id).first<{ goods_in_sku: string; orphaned_at: string | null }>()
+  if (!existing) return c.json({ error: 'Mapping not found' }, 404)
+
+  if (!existing.orphaned_at) {
+    await c.env.DB.prepare(
+      `UPDATE sku_map SET orphaned_at = CURRENT_TIMESTAMP, row_version = row_version + 1, updated_at = CURRENT_TIMESTAMP
+       WHERE goods_in_sku = ? AND organisation_id = ?`
+    ).bind(goodsInSku, user.organisation_id).run()
+    await c.env.DB.prepare(
+      'UPDATE sku_map_version SET mapping_version = mapping_version + 1, updated_at = CURRENT_TIMESTAMP WHERE organisation_id = ?'
+    ).bind(user.organisation_id).run()
+  }
+
+  const row = await c.env.DB.prepare(
+    'SELECT * FROM sku_map WHERE goods_in_sku = ? AND organisation_id = ?'
+  ).bind(goodsInSku, user.organisation_id).first()
+  return c.json({ sku_map: row })
 })
 
 // GET /api/sku-map/shared — the intentional-shared-ID view: Zoho items

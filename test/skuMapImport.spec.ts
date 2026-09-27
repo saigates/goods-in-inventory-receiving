@@ -37,16 +37,18 @@ const OPERATOR_USER: AuthUser = {
   id: 802, email: 'operator-skumap@example.com', name: 'SkuMap Operator', role: 'operator', organisation_id: 1,
 }
 
-// Test-local harness: production retired /api/sku-map from the deployed
-// app (2026-09-10 incident response — see .deploy-checks/ addenda A22/A23)
-// while this route's own logic remains fully implemented, tested and
-// intentionally unmounted pending the item-5/6 sign-off. Mounting the SAME
+// Test-local harness. Originally written while production had /api/sku-map
+// unmounted (2026-09-10 incident response); the route was re-mounted in
+// src/index.tsx on 2026-09-11 (Quick Item B — see the GUARD describe block
+// below, which now proves the OPPOSITE fact and is the live source of
+// truth on mount status). This comment previously read "production
+// retired /api/sku-map" — stale as of the re-mount, corrected here
+// (2026-09-27) rather than left contradicting the GUARD block beneath it.
+// The harness itself needed no change either time: mounting the SAME
 // router (skuMapRoute, unmodified) under a test-local Hono instance with
 // the SAME auth middleware wiring as src/index.tsx lets these HTTP-level
-// tests keep proving the route's actual request/response contract without
-// depending on whether the production app currently exposes it. Re-mounting
-// in src/index.tsx later requires no change here — this harness already
-// drives the real router with the real middleware, unchanged.
+// tests keep proving the route's actual request/response contract
+// independently of whether the production app currently exposes it.
 const localApp = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 localApp.use('/api/*', async (c, next) => authMiddleware(c, next))
 localApp.route('/api/sku-map', skuMapRoute)
@@ -387,6 +389,253 @@ describe('applySkuMapImport — invalid file never writes anything (hard-fail on
     const rowB = await db().prepare('SELECT * FROM sku_map WHERE goods_in_sku = ?').bind('BAD-B').first()
     expect(rowA).toBeNull()
     expect(rowB).toBeNull()
+  })
+})
+
+describe('POST /api/sku-map — manual single-row create (Z-4 phase 1)', () => {
+  it('non-manager (operator) gets 403, nothing written', async () => {
+    const res = await apiAs(OPERATOR_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'MANUAL-403', zoho_item_id: '900000000000000100',
+        zoho_sku: 'M100', zoho_item_name: 'Manual Test 100', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    expect(res.status).toBe(403)
+    const row = await db().prepare('SELECT * FROM sku_map WHERE goods_in_sku = ?').bind('MANUAL-403').first()
+    expect(row).toBeNull()
+  })
+
+  it('rejects a zoho_item_id that is not exactly 18 numeric digits', async () => {
+    const res = await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'MANUAL-BADID', zoho_item_id: '12345', // too short
+        zoho_sku: 'BADID', zoho_item_name: 'Bad Id', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    expect(res.status).toBe(422)
+    const row = await db().prepare('SELECT * FROM sku_map WHERE goods_in_sku = ?').bind('MANUAL-BADID').first()
+    expect(row).toBeNull()
+  })
+
+  it('creates a new goods_in_sku + a new zoho_items row when the Zoho ID is unseen', async () => {
+    const res = await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'MANUAL-NEW-1', zoho_item_id: '900000000000000101',
+        zoho_sku: 'M101', zoho_item_name: 'Manual Test 101', brand: 'APPLE', model: 'TEST', capacity: '128GB',
+      }),
+    })
+    expect(res.status).toBe(201)
+    const row = await db().prepare('SELECT * FROM sku_map WHERE goods_in_sku = ?').bind('MANUAL-NEW-1').first<any>()
+    expect(row).not.toBeNull()
+    expect(row.zoho_item_id).toBe('900000000000000101')
+    const zitem = await db().prepare('SELECT * FROM zoho_items WHERE zoho_item_id = ?').bind('900000000000000101').first()
+    expect(zitem).not.toBeNull()
+  })
+
+  it('a second create against an already-mapped (live, non-orphaned) goods_in_sku is 409, not silently overwritten', async () => {
+    await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'MANUAL-DUP', zoho_item_id: '900000000000000102',
+        zoho_sku: 'M102', zoho_item_name: 'Manual Test 102', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    const res2 = await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'MANUAL-DUP', zoho_item_id: '900000000000000103',
+        zoho_sku: 'M103', zoho_item_name: 'Manual Test 103', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    expect(res2.status).toBe(409)
+    const row = await db().prepare('SELECT zoho_item_id FROM sku_map WHERE goods_in_sku = ?').bind('MANUAL-DUP').first<{ zoho_item_id: string }>()
+    expect(row!.zoho_item_id).toBe('900000000000000102') // untouched
+  })
+
+  it('reuses an EXISTING zoho_item_id across a second goods_in_sku (many-to-one Zoho side is allowed)', async () => {
+    await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'MANUAL-SHARE-PHYS', zoho_item_id: '900000000000000104',
+        zoho_sku: 'M104', zoho_item_name: 'Manual Shared Item', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    const res2 = await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      // No zoho_sku/zoho_item_name needed — the Zoho item already exists.
+      body: JSON.stringify({
+        goods_in_sku: 'MANUAL-SHARE-ESIM', zoho_item_id: '900000000000000104',
+        brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    expect(res2.status).toBe(201)
+    const rows = await db().prepare('SELECT goods_in_sku FROM sku_map WHERE zoho_item_id = ?').bind('900000000000000104').all<{ goods_in_sku: string }>()
+    expect(rows.results.map(r => r.goods_in_sku).sort()).toEqual(['MANUAL-SHARE-ESIM', 'MANUAL-SHARE-PHYS'])
+  })
+
+  it('creating against a zoho_sku already used by a DIFFERENT zoho_item_id is a 409 (bijection protected)', async () => {
+    await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'MANUAL-BIJ-A', zoho_item_id: '900000000000000105',
+        zoho_sku: 'M105-SHARED-SKU', zoho_item_name: 'Bijection A', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    const res2 = await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'MANUAL-BIJ-B', zoho_item_id: '900000000000000106',
+        zoho_sku: 'M105-SHARED-SKU', zoho_item_name: 'Bijection B', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    expect(res2.status).toBe(409)
+  })
+})
+
+describe('DELETE /api/sku-map/:goods_in_sku — remove mapping = orphan, never a hard delete (Z-4 phase 1)', () => {
+  it('non-manager (operator) gets 403, row untouched', async () => {
+    await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'REMOVE-403', zoho_item_id: '900000000000000110',
+        zoho_sku: 'R110', zoho_item_name: 'Remove Test 110', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    const res = await apiAs(OPERATOR_USER, '/api/sku-map/REMOVE-403', { method: 'DELETE' })
+    expect(res.status).toBe(403)
+    const row = await db().prepare('SELECT orphaned_at FROM sku_map WHERE goods_in_sku = ?').bind('REMOVE-403').first<{ orphaned_at: string | null }>()
+    expect(row!.orphaned_at).toBeNull()
+  })
+
+  it('404 for a goods_in_sku that has never existed', async () => {
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/NEVER-EXISTED-XYZ', { method: 'DELETE' })
+    expect(res.status).toBe(404)
+  })
+
+  it('sets orphaned_at, the row still exists (soft delete, not a real DELETE)', async () => {
+    await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'REMOVE-SOFT', zoho_item_id: '900000000000000111',
+        zoho_sku: 'R111', zoho_item_name: 'Remove Test 111', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/REMOVE-SOFT', { method: 'DELETE' })
+    expect(res.status).toBe(200)
+    const row = await db().prepare('SELECT * FROM sku_map WHERE goods_in_sku = ?').bind('REMOVE-SOFT').first<any>()
+    expect(row).not.toBeNull() // still exists
+    expect(row.orphaned_at).not.toBeNull()
+  })
+
+  it('is idempotent — removing an already-orphaned row is a 200 no-op, not a 409/404', async () => {
+    await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'REMOVE-TWICE', zoho_item_id: '900000000000000112',
+        zoho_sku: 'R112', zoho_item_name: 'Remove Test 112', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    const first = await apiAs(MANAGER_USER, '/api/sku-map/REMOVE-TWICE', { method: 'DELETE' })
+    expect(first.status).toBe(200)
+    const second = await apiAs(MANAGER_USER, '/api/sku-map/REMOVE-TWICE', { method: 'DELETE' })
+    expect(second.status).toBe(200)
+  })
+
+  it('an orphaned mapping does not satisfy the export gate — it appears in the unmapped queue', async () => {
+    await db().prepare(
+      `INSERT INTO received_devices (organisation_id, uuid, imei, sku, source, status) VALUES (1, ?, ?, 'ORPHAN-GATE-SKU', 'manual', 'RECEIVED')`
+    ).bind('orphan-gate-uuid-1', '990000000000001').run()
+    await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'ORPHAN-GATE-SKU', zoho_item_id: '900000000000000113',
+        zoho_sku: 'R113', zoho_item_name: 'Remove Test 113', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    // Mapped: must NOT appear in the unmapped queue.
+    const before = await apiAs(MANAGER_USER, '/api/sku-map/unmapped')
+    const beforeBody = await before.json() as { unmapped: Array<{ goods_in_sku: string }> }
+    expect(beforeBody.unmapped.find(r => r.goods_in_sku === 'ORPHAN-GATE-SKU')).toBeUndefined()
+
+    await apiAs(MANAGER_USER, '/api/sku-map/ORPHAN-GATE-SKU', { method: 'DELETE' })
+
+    // Orphaned: must reappear in the unmapped queue, same as if never mapped.
+    const after = await apiAs(MANAGER_USER, '/api/sku-map/unmapped')
+    const afterBody = await after.json() as { unmapped: Array<{ goods_in_sku: string; device_count: number }> }
+    const entry = afterBody.unmapped.find(r => r.goods_in_sku === 'ORPHAN-GATE-SKU')
+    expect(entry).toBeDefined()
+    expect(entry!.device_count).toBe(1)
+  })
+
+  it('re-mapping (POST) an orphaned goods_in_sku revives the existing row (updates in place) rather than erroring', async () => {
+    await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'REVIVE-ME', zoho_item_id: '900000000000000114',
+        zoho_sku: 'R114', zoho_item_name: 'Revive Test 114', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    await apiAs(MANAGER_USER, '/api/sku-map/REVIVE-ME', { method: 'DELETE' })
+
+    const revive = await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'REVIVE-ME', zoho_item_id: '900000000000000115',
+        zoho_sku: 'R115', zoho_item_name: 'Revive Test 115 New', brand: 'APPLE', model: 'TEST', capacity: '256GB',
+      }),
+    })
+    expect(revive.status).toBe(200) // revive, not 201 create — same row, not a new one
+
+    const rows = await db().prepare('SELECT * FROM sku_map WHERE goods_in_sku = ?').bind('REVIVE-ME').all<any>()
+    expect(rows.results).toHaveLength(1) // never a second row — PRIMARY KEY(goods_in_sku) would reject that anyway
+    const row = rows.results[0]
+    expect(row.orphaned_at).toBeNull()
+    expect(row.zoho_item_id).toBe('900000000000000115')
+    expect(row.capacity).toBe('256GB')
+
+    // Revival is audited like any other zoho_item_id change.
+    const audit = await db().prepare(
+      `SELECT * FROM sku_map_audit WHERE goods_in_sku = 'REVIVE-ME' ORDER BY id DESC LIMIT 1`
+    ).first<any>()
+    expect(audit.old_zoho_item_id).toBe('900000000000000114')
+    expect(audit.new_zoho_item_id).toBe('900000000000000115')
+  })
+})
+
+describe('GET /api/sku-map/unmapped — grouped by our SKU with device counts, not per-device rows (Z-4 phase 1)', () => {
+  it('groups multiple unmapped devices sharing a SKU into one row with the correct count', async () => {
+    for (let i = 0; i < 3; i++) {
+      await db().prepare(
+        `INSERT INTO received_devices (organisation_id, uuid, imei, sku, source, status) VALUES (1, ?, ?, 'UNMAPPED-GROUP-SKU', 'manual', 'RECEIVED')`
+      ).bind(`unmapped-group-uuid-${i}`, `99100000000000${i}`).run()
+    }
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/unmapped')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { unmapped: Array<{ goods_in_sku: string; device_count: number }> }
+    const entry = body.unmapped.find(r => r.goods_in_sku === 'UNMAPPED-GROUP-SKU')
+    expect(entry).toBeDefined()
+    expect(entry!.device_count).toBe(3)
+    // Exactly one row for this SKU — never one row per device.
+    expect(body.unmapped.filter(r => r.goods_in_sku === 'UNMAPPED-GROUP-SKU')).toHaveLength(1)
+  })
+
+  it('a SKU with a live (non-orphaned) mapping does not appear in the queue', async () => {
+    await db().prepare(
+      `INSERT INTO received_devices (organisation_id, uuid, imei, sku, source, status) VALUES (1, ?, ?, 'MAPPED-EXCLUDED-SKU', 'manual', 'RECEIVED')`
+    ).bind('mapped-excluded-uuid', '992000000000001').run()
+    await apiAs(MANAGER_USER, '/api/sku-map', {
+      method: 'POST',
+      body: JSON.stringify({
+        goods_in_sku: 'MAPPED-EXCLUDED-SKU', zoho_item_id: '900000000000000116',
+        zoho_sku: 'R116', zoho_item_name: 'Excluded Test 116', brand: 'APPLE', model: 'TEST',
+      }),
+    })
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/unmapped')
+    const body = await res.json() as { unmapped: Array<{ goods_in_sku: string }> }
+    expect(body.unmapped.find(r => r.goods_in_sku === 'MAPPED-EXCLUDED-SKU')).toBeUndefined()
   })
 })
 
