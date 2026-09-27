@@ -10,7 +10,7 @@ import { Hono } from 'hono'
 import { stream } from 'hono/streaming'
 import type { Bindings, AuthUser, DeviceStatus } from '../types'
 import { currentUser } from '../lib/auth'
-import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, TransitionGateError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES, REJECT_REASON_CODES, UNREJECT_REASON_CODES, checkRejectUnrejectGate, logDeviceEvent } from '../lib/deviceLifecycle'
+import { DEVICE_STATUSES, transitionDevice, InvalidTransitionError, DeviceNotFoundError, TransitionGateError, ALLOWED_TRANSITIONS, OPR_WORKFLOW_ONLY_STATUSES, REPAIR_WORKFLOW_ONLY_STATUSES, REJECT_REASON_CODES, UNREJECT_REASON_CODES, checkRejectUnrejectGate, logDeviceEvent, deviceLocation } from '../lib/deviceLifecycle'
 import { dispatchDeviceStatusWebhooks } from '../lib/webhook'
 import { startRepair, scanBackRepair, recordQc, reopenRepair, closeToInventory, recordRepairCost, postRepairCostToLedger, RepairJobError } from '../lib/repairWorkflow'
 import { postPurchaseCostToLedger, CostEntryError } from '../lib/costEntry'
@@ -59,10 +59,16 @@ app.get('/', async (c) => {
 
   const { results } = await c.env.DB.prepare(
     `SELECT * FROM received_devices ${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`
-  ).bind(...binds, pageSize, offset).all()
+  ).bind(...binds, pageSize, offset).all<Record<string, unknown>>()
+
+  // Z-5: location is DERIVED from status via deviceLocation(), never its
+  // own stored column — see deviceLifecycle.ts's LOCATION_ABROAD_STATUSES
+  // comment for why this must be the single shared function V-6's
+  // exclusion filter also calls, not a second independent condition here.
+  const devices = results.map(d => ({ ...d, location: deviceLocation(d.status as DeviceStatus) }))
 
   return c.json({
-    devices: results,
+    devices,
     page,
     page_size: pageSize,
     total: countRow?.total ?? 0,
@@ -135,7 +141,11 @@ app.get('/:id', async (c) => {
     ).bind(device.expected_device_id, user.organisation_id).first<{ id: number; sku: string | null }>()
   }
 
-  return c.json({ device, events, manifest_line: manifestLine })
+  // Z-5: same deviceLocation() call as the list endpoint above — see
+  // deviceLifecycle.ts's LOCATION_ABROAD_STATUSES comment.
+  const deviceWithLocation = { ...device, location: deviceLocation(device.status as DeviceStatus) }
+
+  return c.json({ device: deviceWithLocation, events, manifest_line: manifestLine })
 })
 
 // ───────── Task X — one-off device correction (2026-09-14) ─────────
@@ -861,7 +871,11 @@ app.get('/export/csv', async (c) => {
   // created_at/brand/capacity/color/source alongside the new lifecycle +
   // costing columns — see the module comment above for exactly what was
   // dropped (currency, label_printed_at) and why.
-  const baseHeaders = ['id', 'uuid', 'imei', 'sku', 'brand', 'model', 'capacity', 'color', 'grade', 'status', 'source', 'vat_type', 'created_at', 'received_date', 'vendor']
+  // Z-5: 'location' is a DERIVED column (deviceLocation(row.status)), not a
+  // raw SELECT column on exportCsvSelectSql — special-cased in the cell
+  // mapper below, same treatment as 'imei's excelSafe branch. Placed
+  // right after 'status' since it is a direct function of it.
+  const baseHeaders = ['id', 'uuid', 'imei', 'sku', 'brand', 'model', 'capacity', 'color', 'grade', 'status', 'location', 'source', 'vat_type', 'created_at', 'received_date', 'vendor']
   const costHeaders = ['bill_ref', 'purchase_cost_gbp', 'repair_cost_gbp', 'acquisition_cost_gbp', 'freight_cost_gbp', 'total_cost_gbp']
   const headers = includeCostColumns ? [...baseHeaders, ...costHeaders] : baseHeaders
 
@@ -888,7 +902,11 @@ app.get('/export/csv', async (c) => {
     for (const row of rows) {
       // STEP 2: IMEI encoding is query-controlled — see module comment.
       // Default = plain digits (machine-readable); ?excel=1 = ="..." form.
-      const cells = headers.map(h => (h === 'imei' && excelSafe ? imeiAsText(row[h]) : escapeCsv(row[h])))
+      const cells = headers.map(h =>
+        h === 'imei' && excelSafe ? imeiAsText(row[h])
+        : h === 'location' ? escapeCsv(deviceLocation(row.status as DeviceStatus))
+        : escapeCsv(row[h])
+      )
       await writer.write(cells.join(',') + '\r\n')
       rowCount++
     }

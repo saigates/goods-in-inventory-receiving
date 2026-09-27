@@ -190,6 +190,45 @@ export const REPAIR_WORKFLOW_ONLY_STATUSES: readonly DeviceStatus[] = [
   'READY_FOR_ZOHO',
 ] as const
 
+// ── Z-5 (2026-09-27): location display/exclusion rule ──
+// Originally scoped as display-only: a device's location string reads
+// 'SW001' while it is physically abroad under an OPR/temp-export
+// consignment, 'Warehouse' otherwise. It has since grown a SECOND
+// consumer — V-6's cost-feed exclusion filter, which must hide OPR stock
+// from Amazon precisely because it is not physically in the warehouse to
+// ship. Both consumers are really asking the exact same underlying
+// question ("is this device currently out of the building under an
+// OPR/temp-export consignment?"), so this is written ONCE, as a single
+// derived function of DeviceStatus, and BOTH the display layer (GET
+// /api/devices, GET /:id, the CSV export) and V-6's filter call it — not
+// two independently-maintained conditions that happen to agree today and
+// can silently drift apart tomorrow. That drift-between-two-copies shape
+// is the exact failure mode this codebase has already produced four
+// times (per the Z-16 tracking note) — this ticket exists specifically
+// to not add a fifth instance.
+//
+// Deliberately keyed off EXPORTED_UNDER_OPR / TEMP_EXPORTED_STANDARD
+// only — the two statuses meaning "consignment finalised, device is
+// abroad right now" — not the full OPR_WORKFLOW_ONLY_STATUSES union
+// above. IN_EXPORT_CONSIGNMENT (still physically in the warehouse,
+// merely scanned onto a DRAFT export) and RETURNED_UNDER_OPR /
+// RETURNED_UNDER_STANDARD (physically back, consignment discharged) are
+// both 'Warehouse' by this rule — a device is only genuinely away from
+// the building between finalise and return-receipt, not for the whole
+// OPR-adjacent status lifecycle. If the intent was ever "any
+// OPR-workflow-only status counts", that is a one-line change from here
+// (swap the two-status list for OPR_WORKFLOW_ONLY_STATUSES itself), but
+// IN_EXPORT_CONSIGNMENT/RETURNED_* both describe devices that ARE in the
+// warehouse right now, so this was written narrower on purpose.
+export const LOCATION_ABROAD_STATUSES: readonly DeviceStatus[] = [
+  'EXPORTED_UNDER_OPR',
+  'TEMP_EXPORTED_STANDARD',
+] as const
+
+export function deviceLocation(status: DeviceStatus): 'SW001' | 'Warehouse' {
+  return LOCATION_ABROAD_STATUSES.includes(status) ? 'SW001' : 'Warehouse'
+}
+
 export class InvalidTransitionError extends Error {
   code = 'invalid_transition' as const
   constructor(from: DeviceStatus, to: DeviceStatus) {

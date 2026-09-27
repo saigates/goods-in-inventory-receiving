@@ -23,8 +23,8 @@
 //     column-set correction: uuid/created_at/brand/capacity/color/source
 //     restored, buy_price/currency/label_printed_at dropped — see the
 //     route's own module comment for the full column-by-column rationale).
-//     OPERATOR_HEADER is the 15-column shape with the 3 cost columns
-//     entirely absent (not blanked) for a non-manager caller.
+//     OPERATOR_HEADER is the 16-column shape (post-Z-5) with the 3 cost
+//     columns entirely absent (not blanked) for a non-manager caller.
 //   - The old X-Export-Row-Count response HEADER no longer exists — the
 //     route now STREAMS the CSV body (no row cap, no LIMIT/OFFSET; see the
 //     route's module comment point 1), and Cloudflare Workers cannot add a
@@ -63,7 +63,7 @@ const ADMIN: AuthUser = {
 // New (B4, 2026-09-07): an operator-role fixture, same org as ADMIN, purely
 // in-memory (signAuthToken doesn't require a users table row — the route
 // only reads role/org_id off the verified JWT claims, never re-queries
-// `users`). requireManager() → false, so this exercises the 15-column
+// `users`). requireManager() → false, so this exercises the 16-column
 // non-manager header shape and the "cost columns absent entirely" contract.
 const OPERATOR: AuthUser = {
   id: 4243,
@@ -246,27 +246,32 @@ async function exportCsv(
 // The canonical header rows, asserted literally in one place so a column
 // rename/reorder must be a deliberate edit to these constants.
 //
-// HEADER — manager/admin shape (21 columns): the STEP-1-corrected superset
+// HEADER — manager/admin shape (22 columns): the STEP-1-corrected superset
 // (uuid/created_at/brand/capacity/color/source restored) plus the
 // lifecycle/costing columns (vendor, bill_ref, purchase_cost_gbp,
 // repair_cost_gbp) and received_date, plus Z-2's (2026-09-26)
 // acquisition_cost_gbp/freight_cost_gbp/total_cost_gbp — see
-// src/lib/acquisitionCost.ts and docs/plan/z2-acquisition-cost.md.
+// src/lib/acquisitionCost.ts and docs/plan/z2-acquisition-cost.md — plus
+// Z-5's (2026-09-27) 'location' column, inserted directly after 'status'
+// since it is a pure function of it (deviceLifecycle.ts's deviceLocation())
+// rather than a raw SELECT column — see src/routes/devices.ts's cell-mapper
+// special-case for 'location', same treatment as 'imei's excelSafe branch.
 // buy_price/currency/label_printed_at/Rate are NOT in this export: the
 // first three predate this file's header (see src/routes/devices.ts's
 // module comment); Rate was deliberately dropped by Z-2 §3 — it is Zoho
 // bill vocabulary that belongs exclusively to a future Y-1 mapping file,
 // not a second name for acquisition_cost_gbp here.
 const HEADER =
-  'id,uuid,imei,sku,brand,model,capacity,color,grade,status,source,vat_type,created_at,received_date,vendor,bill_ref,purchase_cost_gbp,repair_cost_gbp,acquisition_cost_gbp,freight_cost_gbp,total_cost_gbp'
+  'id,uuid,imei,sku,brand,model,capacity,color,grade,status,location,source,vat_type,created_at,received_date,vendor,bill_ref,purchase_cost_gbp,repair_cost_gbp,acquisition_cost_gbp,freight_cost_gbp,total_cost_gbp'
 
-// OPERATOR_HEADER — non-manager shape (15 columns): identical to HEADER
+// OPERATOR_HEADER — non-manager shape (16 columns): identical to HEADER
 // minus the 6 cost columns (including Z-2's three new ones — they are
 // gated by the same includeCostColumns check as the pre-existing three),
 // which are omitted from the header row ENTIRELY (not blanked) per the
-// standing role-filtered-export rule.
+// standing role-filtered-export rule. 'location' (Z-5) is NOT cost data —
+// it stays present in this shape.
 const OPERATOR_HEADER =
-  'id,uuid,imei,sku,brand,model,capacity,color,grade,status,source,vat_type,created_at,received_date,vendor'
+  'id,uuid,imei,sku,brand,model,capacity,color,grade,status,location,source,vat_type,created_at,received_date,vendor'
 
 // CSV is CRLF-delimited (RFC 4180). Split on CRLF only — splitting on \n
 // would hide a bug where a value's bare LF creates a phantom row.
@@ -407,13 +412,13 @@ describe('GET /api/devices/export/csv — response shape', () => {
     expect(res.headers.get('Content-Disposition')).toMatch(/^attachment; filename="devices-export-\d+\.csv"$/)
   })
 
-  it('emits the exact 21-column manager header, in order, even when zero rows match', async () => {
+  it('emits the exact 22-column manager header, in order, even when zero rows match', async () => {
     // An id that cannot exist → a legitimately empty export.
     const { res, text } = await exportCsv('?ids=999999999')
     expect(res.status).toBe(200)
     const rows = rowsOf(text)
     expect(rows[0]).toBe(HEADER)
-    expect(parseCsvRecord(rows[0])).toHaveLength(21)
+    expect(parseCsvRecord(rows[0])).toHaveLength(22)
     // Header + trailing row_count comment only: no data row, no phantom row.
     expect(rows).toHaveLength(2)
     expect(rowCountLine(text)).toBe(0)
@@ -536,7 +541,7 @@ describe('GET /api/devices/export/csv — response shape', () => {
     // The literal words must not appear anywhere in the record.
     expect(rowsOf(text)[1]).not.toMatch(/null|undefined|NaN/)
     // Column count is still exactly 21 — nulls must not collapse fields.
-    expect(fields).toHaveLength(21)
+    expect(fields).toHaveLength(22)
   })
 
   it('orders records by id ascending regardless of the order ids are requested in', async () => {
@@ -564,7 +569,7 @@ describe('GET /api/devices/export/csv — role-gated cost columns (operator vs. 
     const rows = rowsOf(text)
     expect(rows[0]).toBe(OPERATOR_HEADER)
     const header = parseCsvRecord(rows[0])
-    expect(header).toHaveLength(15)
+    expect(header).toHaveLength(16)
     expect(header).not.toContain('bill_ref')
     expect(header).not.toContain('purchase_cost_gbp')
     expect(header).not.toContain('repair_cost_gbp')
@@ -579,7 +584,7 @@ describe('GET /api/devices/export/csv — role-gated cost columns (operator vs. 
     // is structural (fewer columns), not values silently blanked while the
     // column count stays 18.
     const fields = parseCsvRecord(rows[1])
-    expect(fields).toHaveLength(15)
+    expect(fields).toHaveLength(16)
     // vendor is NOT cost-gated (only bill_ref/purchase/repair are) and must
     // still be visible to an operator.
     expect(fields[header.indexOf('vendor')]).toBe('Operator-View Vendor')
@@ -591,7 +596,7 @@ describe('GET /api/devices/export/csv — role-gated cost columns (operator vs. 
 
     const { text } = await exportCsv(`?ids=${id}`)
     const header = parseCsvRecord(rowsOf(text)[0])
-    expect(header).toHaveLength(21)
+    expect(header).toHaveLength(22)
     expect(header).toContain('purchase_cost_gbp')
     expect(header).toContain('acquisition_cost_gbp')
     expect(header).toContain('freight_cost_gbp')
@@ -658,7 +663,7 @@ describe('GET /api/devices/export/csv — RFC 4180 quoting cannot corrupt the gr
     const header = parseCsvRecord(rowsOf(text)[0])
     const fields = parseCsvRecord(record)
     // The critical assertion: the comma did NOT create an extra column.
-    expect(fields).toHaveLength(21)
+    expect(fields).toHaveLength(22)
     expect(fields[header.indexOf('model')]).toBe('iPhone 13, Pro Max')
   })
 
@@ -670,7 +675,7 @@ describe('GET /api/devices/export/csv — RFC 4180 quoting cannot corrupt the gr
     expect(record).toContain('"Space ""Grey"""')
     const header = parseCsvRecord(rowsOf(text)[0])
     const fields = parseCsvRecord(record)
-    expect(fields).toHaveLength(21)
+    expect(fields).toHaveLength(22)
     expect(fields[header.indexOf('color')]).toBe('Space "Grey"')
   })
 
@@ -683,7 +688,7 @@ describe('GET /api/devices/export/csv — RFC 4180 quoting cannot corrupt the gr
     const rows = rowsOf(text)
     expect(rows).toHaveLength(3)
     expect(rows[1]).toContain('"iPhone 13\nrefurb"')
-    expect(parseCsvRecord(rows[1])).toHaveLength(21)
+    expect(parseCsvRecord(rows[1])).toHaveLength(22)
   })
 
   it('quotes an embedded CR so a bare carriage return cannot split the record', async () => {
@@ -708,7 +713,7 @@ describe('GET /api/devices/export/csv — RFC 4180 quoting cannot corrupt the gr
     expect(rows[1]).not.toMatch(/,iPhone 13\rrefurb,/)
 
     const fields = parseCsvRecord(rows[1])
-    expect(fields).toHaveLength(21)
+    expect(fields).toHaveLength(22)
     const header = parseCsvRecord(rows[0])
     expect(fields[header.indexOf('model')]).toBe('iPhone 13\rrefurb')
   })
