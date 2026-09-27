@@ -147,6 +147,28 @@ export type ReturnLineCorrectionLite = {
   review_reason: string | null
 }
 
+// Z-15 (a)/(d.1)/(d.2) — the export/return balance, computed by the caller
+// (route layer) EXACTLY the way GET /discharge already does (same query,
+// scoped to one export_shipment_id), but with the return currently being
+// finalised counted as if it were ALREADY a FINALISED leg — that return is
+// mid-commit at the moment this runs, so "would this finalise leave the
+// export balanced" must include it, not just the legs that finalised
+// before it. `returned` is therefore the cumulative customs-declared
+// quantity across every OTHER FINALISED return plus THIS return's own
+// line count (this shipment is still DRAFT when the caller builds this,
+// so it is never itself counted by the GET /discharge query and must be
+// added explicitly). `hasDeclarationForThisReturn` tells the engine
+// whether the caller's finalise request body already supplied a
+// partial_return_declarations reason for this leg — computed by the route
+// layer from the request body, never from the database (the row is only
+// written AFTER validation passes, so it can never exist yet when this
+// check runs).
+export type ReturnBalanceLite = {
+  exported: number
+  returned_cumulative_including_this_return: number
+  has_declaration_for_this_return: boolean
+}
+
 export type MisdeclarationCheckResult = {
   value: { declared_gbp: number | null; computed_gbp: number; variance_gbp: number | null; misdeclared: boolean; acknowledged: boolean; acknowledged_at: string | null }
   piece_count: { declared: number | null; suspect_carried_forward_from: string | null; misdeclared: boolean; acknowledged: boolean; acknowledged_at: string | null }
@@ -930,6 +952,16 @@ export function runImportValidation(
   // (none of which pass this yet) is unaffected — additive parameter,
   // same convention as siblingLegs/misdeclarationAcks above.
   returnLineCorrections: ReturnLineCorrectionLite[] = [],
+  // Z-15 (0040) — exported-vs-returned balance INCLUDING this return,
+  // computed by the caller from the same aggregate GET /discharge uses.
+  // Undefined (not just an empty array, unlike the params above) is the
+  // "caller did not supply this yet" state — every EXISTING call site
+  // (GET /validation, PATCH .../header) passes nothing, and this check
+  // must stay green/not-applicable for those read-only call sites rather
+  // than pretending a balance of 0/0 was checked. Only the finalise route
+  // itself passes a real value, because only finalise is the moment the
+  // "would this leave the export balanced" question actually matters.
+  returnBalance: ReturnBalanceLite | undefined = undefined,
 ): ValidationResult {
   const checks: ValidationCheck[] = []
   const add = (code: string, level: CheckLevel, message: string) => checks.push({ code, level, message })
@@ -1160,6 +1192,46 @@ export function runImportValidation(
       add('IMP_RETURN_LINE_REVIEW', 'amber', `${nonImeiFlagged.length} return-line correction(s) flagged for review (generation-boundary / catalog-value-difference) — informational only, does not block receipt: ${nonImeiFlagged.map(r => `line ${r.shipment_line_id} (${r.review_reason ?? 'unspecified'})`).join('; ')}`)
     } else {
       add('IMP_RETURN_LINE_REVIEW', 'green', 'No return-line corrections require review')
+    }
+  }
+
+  // ── IMP_RETURN_BALANCE (Z-15, 0040) — exported-vs-returned balance,
+  // checked AT FINALISE TIME, not just displayed on the read-only
+  // /discharge tracker. Three outcomes, mirroring the operator's scope
+  // (a)/(d):
+  //   1. returnBalance is undefined — this call site did not supply it
+  //      (every existing caller except the finalise route itself). Green/
+  //      not-applicable: this check has nothing to say about a read-only
+  //      GET /validation or a header PATCH, only about an actual
+  //      finalise attempt.
+  //   2. returned_cumulative_including_this_return > exported — hard
+  //      block, no override. There is no legitimate reason more units
+  //      can return than the export ever declared; this signals a
+  //      device/shipment data error, not an operator judgement call.
+  //   3. returned_cumulative_including_this_return < exported — a
+  //      legitimate partial return (Export 1's 90-plus-72 two-tranche
+  //      pattern) IS allowed, but only when the caller's finalise
+  //      request already supplied a partial-return reason
+  //      (has_declaration_for_this_return) — otherwise this blocks with
+  //      "reason required", never silently discharging a balance nobody
+  //      declared.
+  // Not applicable to TEMP_EXPORT_STANDARD — no discharge clock, no
+  // export-declared quantity to balance against, matching every other
+  // customs-specific check above.
+  if (isStandardTemp) {
+    add('IMP_RETURN_BALANCE', 'green', 'Not applicable — no discharge balance on a TEMP_EXPORT_STANDARD shipment')
+  } else if (!returnBalance) {
+    add('IMP_RETURN_BALANCE', 'green', 'Not checked at this call site — the exported-vs-returned balance is only evaluated at finalise time')
+  } else {
+    const { exported, returned_cumulative_including_this_return: returned, has_declaration_for_this_return: declared } = returnBalance
+    if (returned > exported) {
+      add('IMP_RETURN_BALANCE', 'red', `Returning ${returned} units (cumulative, including this return) would exceed the ${exported} units this export declared — no override path; this signals a device/shipment data error`)
+    } else if (returned < exported && !declared) {
+      add('IMP_RETURN_BALANCE', 'red', `Finalising this return leaves ${exported - returned} of ${exported} exported units still outstanding — a partial-return reason is required before this can proceed (see POST .../finalise's partial_return_reason field)`)
+    } else if (returned < exported) {
+      add('IMP_RETURN_BALANCE', 'amber', `Partial return: ${exported - returned} of ${exported} exported units remain outstanding after this leg, carried forward against the export's existing discharge deadline (declared, not blocking)`)
+    } else {
+      add('IMP_RETURN_BALANCE', 'green', `Fully discharges the export: ${returned} of ${exported} exported units returned`)
     }
   }
 

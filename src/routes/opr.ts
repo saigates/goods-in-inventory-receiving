@@ -93,11 +93,13 @@ import {
   computeDischargeRow,
   computeValueDelta,
   round2,
+  addMonths,
   type SiblingLegLite,
   type MisdeclarationAckLite,
   type MisdeclarationVarianceType,
   type ReturnLineCorrectionLite,
   type ReturnLineCorrectionDisplay,
+  type ReturnBalanceLite,
 } from '../lib/oprImport'
 import { computeFollowUpStatus, computeOutstandingChecklist, type SentEmailLite, type ShipmentReplyLite } from '../lib/oprComms'
 import { parseBulkSerialInput, classifyBulkSerials, type BulkSerialDeviceLookup } from '../lib/bulkSerialImport'
@@ -1223,6 +1225,57 @@ async function loadExportProcedurePolicy(
   }
 }
 
+// Z-15 (0040) — the exported-vs-returned balance for the export
+// `importShipment` discharges, WITH `importShipment`'s own lines counted
+// as if this return were already FINALISED. Reuses the exact aggregate
+// GET /discharge already computes (same supplementary_units-aware COALESCE
+// per leg, per that route's header comment) for every OTHER FINALISED
+// return against the same export, then adds this shipment's own line
+// count on top — this shipment is still DRAFT at the moment finalise's
+// pre-commit check runs, so the GET /discharge query itself would not see
+// it yet. `hasDeclarationForThisReturn` is NOT read from the database (a
+// partial_return_declarations row for this leg cannot exist until AFTER
+// this check passes) — it reflects only whether the caller's finalise
+// request body supplied a reason this call.
+async function loadReturnBalance(
+  c: OprContext,
+  user: AuthUser,
+  importShipment: Shipment,
+  hasDeclarationForThisReturn: boolean,
+): Promise<ReturnBalanceLite | null> {
+  if (!importShipment.related_export_shipment_id) return null
+  const row = await c.env.DB.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM shipment_lines sl WHERE sl.shipment_id = ?) AS exported,
+      (SELECT COALESCE(SUM(
+           COALESCE(r.supplementary_units,
+             (SELECT COUNT(*) FROM shipment_lines rl WHERE rl.shipment_id = r.id)
+           )
+         ), 0)
+         FROM shipments r
+        WHERE r.direction = 'import' AND r.status = 'FINALISED'
+          AND r.related_export_shipment_id = ?) AS returned_other_legs
+  `).bind(importShipment.related_export_shipment_id, importShipment.related_export_shipment_id)
+    .first<{ exported: number; returned_other_legs: number }>()
+  if (!row) return null
+  // This shipment's own count towards "returned" is its CUSTOMS-DECLARED
+  // supplementary_units (falling back to its line count), mirroring
+  // exactly how a sibling FINALISED leg is counted above — not a raw line
+  // count, so a return whose declared quantity diverges from its scanned
+  // line count (same supplementary_units mechanism GET /discharge uses)
+  // is counted consistently on both sides of this comparison.
+  const { results: myLines } = await c.env.DB.prepare(
+    'SELECT COUNT(*) AS n FROM shipment_lines WHERE shipment_id = ?'
+  ).bind(importShipment.id).all<{ n: number }>()
+  const myLineCount = Number(myLines?.[0]?.n ?? 0)
+  const thisLegReturned = importShipment.supplementary_units ?? myLineCount
+  return {
+    exported: Number(row.exported),
+    returned_cumulative_including_this_return: Number(row.returned_other_legs) + thisLegReturned,
+    has_declaration_for_this_return: hasDeclarationForThisReturn,
+  }
+}
+
 // GET /shipments/:id/validation — run the green/amber/red engine.
 // Direction-aware: exports run the OPR 2 export engine, imports the OPR 3
 // import engine (procedure 6121, related export + MRN, C&E1154 inputs,
@@ -1586,6 +1639,25 @@ app.get('/shipments/:id/misdeclaration-acks', async (c) => {
   return c.json({ acks: results || [] })
 })
 
+// GET /shipments/:id/partial-return-declarations — Z-15 (0040). Both
+// sides accepted: pass an EXPORT shipment id to see every partial-return
+// declaration recorded against it (across however many return legs), or
+// an IMPORT (return) shipment id to see the single declaration (if any)
+// that return itself wrote at finalise time. shipment_id in the table
+// column check below picks the right column depending on which was
+// queried; the caller does not need to know direction in advance.
+app.get('/shipments/:id/partial-return-declarations', async (c) => {
+  const user = currentUser(c)
+  const id = Number(c.req.param('id'))
+  if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const { results } = await c.env.DB.prepare(
+    `SELECT * FROM partial_return_declarations
+      WHERE organisation_id = ? AND (export_shipment_id = ? OR return_shipment_id = ?)
+      ORDER BY id ASC`
+  ).bind(user.organisation_id, id, id).all()
+  return c.json({ declarations: results || [] })
+})
+
 // ═════════ Z-9 — return-consignment re-identify/re-grade (0039) ═════════
 //
 // Amendment 2's catalog-value comparator: sku_catalog carries NO price
@@ -1885,7 +1957,21 @@ async function finaliseImportShipment(
     finalisedAt = body.finalised_at
   }
 
-  const validation = runImportValidation(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment), await loadMisdeclarationAcks(c, user, shipment.id), await loadReturnLineCorrections(c, user, shipment.id))
+  // Z-15 — partial-return reason, required only when this finalise would
+  // leave the export's balance outstanding. Read from the body BEFORE
+  // validation runs (the validation engine needs to know whether a reason
+  // was supplied to decide red-vs-amber on IMP_RETURN_BALANCE), but the
+  // actual partial_return_declarations row is only written AFTER
+  // validation passes and the shipment successfully flips to FINALISED —
+  // never before, so a rejected finalise leaves zero rows behind.
+  const partialReturnReason = cleanString(body.partial_return_reason, 500)
+
+  const returnBalance: ReturnBalanceLite | null =
+    shipment.shipment_type === 'TEMP_EXPORT_STANDARD'
+      ? null
+      : await loadReturnBalance(c, user, shipment, partialReturnReason != null)
+
+  const validation = runImportValidation(shipment, relatedExport, authorisation, lines, undefined, await loadSiblingLegs(c, user, shipment), await loadMisdeclarationAcks(c, user, shipment.id), await loadReturnLineCorrections(c, user, shipment.id), returnBalance ?? undefined)
   if (validation.result === 'red') {
     return c.json({ error: 'Receipt blocked — validation has red results', validation }, 422)
   }
@@ -1911,6 +1997,35 @@ async function finaliseImportShipment(
   ).bind(mrn.value, finalisedAt, user.id, id, user.organisation_id).run()
   if (!upd.meta.changes) {
     return c.json({ error: 'Shipment was modified concurrently — reload and retry' }, 409)
+  }
+
+  // Z-15 (0040) — write the partial-return declaration row now that the
+  // finalise has actually committed. Only when the balance was genuinely
+  // partial (returned < exported) — a fully-discharging return never
+  // gets a row here (see migration 0040's header). The IMP_RETURN_BALANCE
+  // check above already refused to reach this point without a reason
+  // when partial, so partialReturnReason is guaranteed non-null in that
+  // branch; this re-checks the same condition rather than trusting that
+  // invariant blindly, in case the balance shifted between the check and
+  // the commit (D1 has no cross-statement transaction here — see
+  // standing-constraints.md's own note on this class of race, applied
+  // defensively rather than assumed away).
+  if (returnBalance && returnBalance.returned_cumulative_including_this_return < returnBalance.exported && partialReturnReason && relatedExport && authorisation) {
+    const deadline = addMonths(
+      relatedExport.ship_date || (relatedExport.finalised_at ? String(relatedExport.finalised_at).slice(0, 10) : new Date().toISOString().slice(0, 10)),
+      authorisation.discharge_period_months,
+    )
+    await c.env.DB.prepare(`
+      INSERT INTO partial_return_declarations
+        (organisation_id, export_shipment_id, return_shipment_id, exported_count,
+         returned_count_cumulative, outstanding_count, reason, carried_forward_deadline, declared_by_user_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      user.organisation_id, relatedExport.id, id,
+      returnBalance.exported, returnBalance.returned_cumulative_including_this_return,
+      returnBalance.exported - returnBalance.returned_cumulative_including_this_return,
+      partialReturnReason, deadline, user.id,
+    ).run()
   }
 
   // Finalise-time (receipt) transition diverges by shipment_type, mirroring
