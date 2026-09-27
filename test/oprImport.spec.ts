@@ -195,6 +195,16 @@ afterAll(async () => {
        WHERE s.reference LIKE 'EXP RTN %' OR s.reference LIKE 'IMP RTN %'
     )
   `).run()
+  // Z-15: partial_return_declarations FK-references shipments (both the
+  // export and return leg) — must be cleared before shipments itself, same
+  // ordering constraint as shipment_value_deltas / return_line_corrections above.
+  await env.DB.prepare(`
+    DELETE FROM partial_return_declarations WHERE export_shipment_id IN (
+      SELECT id FROM shipments WHERE reference LIKE 'EXP RTN %' OR reference LIKE 'IMP RTN %'
+    ) OR return_shipment_id IN (
+      SELECT id FROM shipments WHERE reference LIKE 'EXP RTN %' OR reference LIKE 'IMP RTN %'
+    )
+  `).run()
   await env.DB.prepare("DELETE FROM shipments WHERE reference LIKE 'EXP RTN %' OR reference LIKE 'IMP RTN %'").run()
   await env.DB.prepare('DELETE FROM opr_authorisations WHERE id = ?').bind(authId).run()
   // Z-9 test-only catalogue/device fixtures (catalog-value-difference test).
@@ -2019,18 +2029,19 @@ describe('OPR 3 — Z-15 return-completeness gate (exported-vs-returned balance 
       })).status).toBe(201)
     }
 
-    const val = await api(`/api/opr/shipments/${ret.id}/validation`)
-    const valBody = await val.json() as { validation: { checks: Array<{ code: string; level: string; message: string }> } }
-    const balanceCheck = valBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
-    expect(balanceCheck.level).toBe('green')
-    expect(balanceCheck.message).toMatch(/Fully discharges/)
-
+    // GET /validation is pre-finalise and by design never receives
+    // returnBalance (operator ruling, this pass) — it always reports
+    // 'Not checked at this call site' here, not the eventual outcome.
+    // IMP_RETURN_BALANCE's real green/'Fully discharges' verdict is only
+    // visible in the finalise response itself, asserted below.
     const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, {
       method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222CC01' }),
     })
     expect(fin.status).toBe(200)
-    const finBody = await fin.json() as { validation: { checks: Array<{ code: string; level: string }> } }
-    expect(finBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!.level).toBe('green')
+    const finBody = await fin.json() as { validation: { checks: Array<{ code: string; level: string; message: string }> } }
+    const balanceCheck = finBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
+    expect(balanceCheck.level).toBe('green')
+    expect(balanceCheck.message).toMatch(/Fully discharges/)
 
     const decls = await api(`/api/opr/shipments/${exp.id}/partial-return-declarations`)
     expect(decls.status).toBe(200)
@@ -2049,18 +2060,19 @@ describe('OPR 3 — Z-15 return-completeness gate (exported-vs-returned balance 
     }
 
     // Without a reason: IMP_RETURN_BALANCE is red, finalise is refused,
-    // zero side-effects (no declaration row, devices still exported).
-    const valBefore = await api(`/api/opr/shipments/${ret.id}/validation`)
-    const valBeforeBody = await valBefore.json() as { validation: { checks: Array<{ code: string; level: string; message: string }> } }
-    const checkBefore = valBeforeBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
-    expect(checkBefore.level).toBe('red')
-    expect(checkBefore.message).toMatch(/reason is required/)
-
+    // zero side-effects (no declaration row, devices still exported). Not
+    // checked pre-finalise via GET /validation — that endpoint never
+    // receives returnBalance by design (operator ruling, this pass); the
+    // red verdict is only visible in the finalise response itself.
     const finNoReason = await api(`/api/opr/shipments/${ret.id}/finalise`, {
       method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222CC02' }),
     })
     expect(finNoReason.status).toBe(422)
-    expect(((await finNoReason.json()) as { validation: { result: string } }).validation.result).toBe('red')
+    const finNoReasonBody = await finNoReason.json() as { validation: { result: string; checks: Array<{ code: string; level: string; message: string }> } }
+    expect(finNoReasonBody.validation.result).toBe('red')
+    const checkBefore = finNoReasonBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
+    expect(checkBefore.level).toBe('red')
+    expect(checkBefore.message).toMatch(/reason is required/)
     expect(await deviceStatus(devices[0].id)).toBe('EXPORTED_UNDER_OPR')
     const declsBefore = await api(`/api/opr/shipments/${exp.id}/partial-return-declarations`)
     expect(((await declsBefore.json()) as { declarations: unknown[] }).declarations.length).toBe(0)
@@ -2125,16 +2137,22 @@ describe('OPR 3 — Z-15 return-completeness gate (exported-vs-returned balance 
     expect((await api(`/api/opr/shipments/${ret2.id}/scan`, {
       method: 'POST', body: JSON.stringify({ imei: devices[1].imei }),
     })).status).toBe(201)
-    const val2 = await api(`/api/opr/shipments/${ret2.id}/validation`)
-    const val2Body = await val2.json() as { validation: { checks: Array<{ code: string; level: string; message: string }> } }
-    const check2 = val2Body.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
-    expect(check2.level).toBe('green')
-    expect(check2.message).toMatch(/Fully discharges/)
-
+    // NOT checked via GET /validation here (operator ruling, this pass):
+    // that read-only endpoint never receives returnBalance by design — it
+    // is called mid-scan, when the return is legitimately incomplete, and
+    // a balance check there would show red through the whole scan session
+    // and train the operator to ignore it. IMP_RETURN_BALANCE's real
+    // outcome (green/"Fully discharges" once the cumulative total across
+    // both legs reaches exported) is ONLY visible in the finalise
+    // response's own validation object, asserted below.
     const fin2 = await api(`/api/opr/shipments/${ret2.id}/finalise`, {
       method: 'POST', body: JSON.stringify({ import_mrn: '26GB2222222222CC04' }),
     })
     expect(fin2.status).toBe(200)
+    const fin2Body = await fin2.json() as { validation: { checks: Array<{ code: string; level: string; message: string }> } }
+    const check2 = fin2Body.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
+    expect(check2.level).toBe('green')
+    expect(check2.message).toMatch(/Fully discharges/)
 
     // Exactly ONE declaration row exists (from ret1), not two.
     const decls = await api(`/api/opr/shipments/${exp.id}/partial-return-declarations`)
@@ -2154,18 +2172,24 @@ describe('OPR 3 — Z-15 return-completeness gate (exported-vs-returned balance 
       method: 'POST', body: JSON.stringify({ imei: devices[0].imei }),
     })).status).toBe(201)
 
-    const val = await api(`/api/opr/shipments/${ret.id}/validation`)
-    const valBody = await val.json() as { validation: { checks: Array<{ code: string; level: string; message: string }> } }
-    const check = valBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
-    expect(check.level).toBe('red')
-    expect(check.message).toMatch(/would exceed/)
-
+    // NOT checked via GET /validation here (operator ruling, this pass):
+    // that read-only endpoint never receives returnBalance by design — it
+    // is called mid-scan, when the return is legitimately incomplete, and
+    // a balance check there would show red through the whole scan session
+    // and train the operator to ignore it. IMP_RETURN_BALANCE is red-hard-
+    // block ONLY visible in the finalise response's own validation object,
+    // asserted below — the balance question is meaningful only at the
+    // moment of finalisation.
     const fin = await api(`/api/opr/shipments/${ret.id}/finalise`, {
       method: 'POST',
       body: JSON.stringify({ import_mrn: '26GB2222222222CC05', partial_return_reason: 'trying to force it through anyway' }),
     })
     expect(fin.status).toBe(422)
-    expect(((await fin.json()) as { validation: { result: string } }).validation.result).toBe('red')
+    const finBody = await fin.json() as { validation: { result: string; checks: Array<{ code: string; level: string; message: string }> } }
+    expect(finBody.validation.result).toBe('red')
+    const check = finBody.validation.checks.find(c => c.code === 'IMP_RETURN_BALANCE')!
+    expect(check.level).toBe('red')
+    expect(check.message).toMatch(/would exceed/)
     expect(await deviceStatus(devices[0].id)).toBe('EXPORTED_UNDER_OPR')
     const decls = await api(`/api/opr/shipments/${exp.id}/partial-return-declarations`)
     expect(((await decls.json()) as { declarations: unknown[] }).declarations.length).toBe(0)
