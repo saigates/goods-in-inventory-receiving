@@ -21,7 +21,7 @@ sync with its own record for the exact reason it exists: a fact true in
 someone's head, not in a file. That gap is itself the drift mechanism
 Z-16 exists to catch, and it caught itself (2026-09-28, operator §3).
 
-## The eleven instances on record
+## The twelve instances on record
 
 1. **FK-ordered teardown needing three separate manual fixes** —
    `test/oprImport.spec.ts`'s `afterAll` cleanup deletes rows in an order
@@ -250,6 +250,56 @@ Z-16 exists to catch, and it caught itself (2026-09-28, operator §3).
    asked for a one-pass sweep of all mounted routes against the board
    for any other case in this state, ahead of Sprint 3 planning.
 
+12. **A red test tolerated on `main`, treated as a footnote instead of a
+   gate breach** — `test/rowCountRegression.spec.ts`'s
+   "adds exactly 341/341 devices with zero failures (chunked SELECT
+   lookup)" case failed on a full-suite run this pass (2026-09-28) with
+   `Error: Test timed out in 30000ms`, and the first pass over that
+   finding recorded it as "flagged for operator awareness only, not
+   investigated further this pass" — i.e. treated as an aside rather
+   than as the gate breach the standing discipline (full suite green
+   before any commit lands) actually requires. The operator (§3)
+   rejected that treatment outright and ordered a proper investigation
+   before any deploy could proceed. Investigation: the failure was a
+   TIMEOUT, not a count or chunking-boundary defect — the assertion
+   message named `test/rowCountRegression.spec.ts:127:5` (the response
+   awaited from `POST /shipments/:id/bulk-serials`), not a mismatched
+   `added`/`requested`/DB-cross-check number. Root cause: of the file's
+   four sites, Site 1 (`opr.ts`'s bulk-serials) is the only one that
+   writes sequentially — one `addDeviceToShipment()` call (its own
+   INSERT + `transitionDevice()`) per matched device — so its wall-clock
+   scales linearly with N, unlike Sites 2-4's single batched
+   read/write. At n=341 under the ORIGINAL run's full-suite PARALLEL
+   contention it took 36983ms against a flat 30000ms per-test timeout;
+   re-run in isolation immediately after, the identical case (same code,
+   same fixture, same assertions) completed in 12589ms, and a full,
+   freshly-captured, complete-suite run (38 files, 816 tests: 808 passed,
+   8 skipped, 0 failed, exit 0) passed the same case at 12589ms as well.
+   This rules OUT a chunking defect directly rather than assuming it away
+   — every SELECT/UPDATE chunking assertion at every size in the file,
+   including the operator-flagged 217 boundary case designed to expose an
+   off-by-one, passed in both the failing run and the clean rerun; only
+   the sequential-write site's margin at the largest size was thin enough
+   to be pushed over by ordinary contention from other test files'
+   workerd instances. This is the "stale fixture" branch of the
+   operator's instruction (a timeout margin too tight for one sequential
+   site under contention, not a row-count regression) — fixed by raising
+   this file's per-test timeout from a flat 30000ms to a named
+   `TEST_TIMEOUT_MS = 60000` constant, matching the existing precedent
+   for exactly this class of margin issue already set by
+   `test/oprExport.spec.ts`/`test/oprImport.spec.ts` (each already at
+   60000ms for their own heaviest real-HTTP-round-trip cases). The
+   convention-drift instance is not the timeout margin itself — margins
+   need occasional widening as suites grow, that is ordinary maintenance
+   — it is that a red test on `main` was FIRST characterized as a
+   footnote rather than as the gate breach the project's own standing
+   rule (full suite green before a commit lands) says it is. Standing
+   rule from here (2026-09-28, operator §3): a failing test discovered on
+   `main`, however unrelated it looks to the change in hand, gets the
+   same "investigate before anything else moves" treatment as a defect
+   found in new code — never a footnote, never deferred past the next
+   deploy without an explicit operator ruling to defer it.
+
 ## The through-line
 
 In cases 1-10, a STATEMENT (a comment, a test assertion, a design note,
@@ -271,6 +321,19 @@ system and a system drifting from anyone's awareness of it are the same
 underlying failure — an artefact's true state and what people believe
 about that state are allowed to silently diverge — just observed from
 opposite ends.
+
+Instance 12 is a third variant, one level up from the other eleven: the
+drift is not in a statement or in the system, but in the PROCESS meant
+to catch drift in either. A red test is the exact mechanism this project
+relies on to surface instances 1-11's kind of gap automatically — and
+that mechanism was itself, in the first pass over it, downgraded to a
+footnote instead of treated as the gate breach the project's own
+standing rule says it is. If a failing check can be waved past as an
+aside once, the next nine can be waved past the same way, and the whole
+apparatus of "full suite green before a commit lands" stops meaning
+anything. The fix for instances 1-11 is to look somewhere new (a mount
+point, a stale annotation); the fix for instance 12 is procedural
+discipline about a signal that was already firing correctly.
 
 ## Two forward rules this note exists to state
 
