@@ -6774,7 +6774,15 @@ into each Condition, each VAT Type, and each Currency.`;
         ctx.error ? h('div', { class: 'text-xs text-red-400 mb-3' }, ctx.error) : null,
         h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Our SKU (goods-in)'),
         h('input', {
-          class: 'input mb-3', value: ctx.goods_in_sku, disabled: isEdit,
+          // Bug fix (2026-09-28, found while fixing the same class of bug on
+          // the Commit-import button below): `disabled: isEdit` is a raw
+          // boolean — h()'s attribute setter only skips undefined/null, so
+          // `disabled="false"` still disables the field (HTML `disabled` is
+          // a presence attribute). On create (isEdit === false) this field
+          // was ALSO disabled, when it should only be locked during edit
+          // (an existing goods_in_sku is the primary key and must not be
+          // renamed via this modal). Ternary to null when not disabled.
+          class: 'input mb-3', value: ctx.goods_in_sku, disabled: isEdit ? 'disabled' : null,
           oninput: (e) => { ctx.goods_in_sku = e.target.value; },
         }),
         h('label', { class: 'text-xs text-slate-400 mb-1 block' }, 'Zoho Item ID (18 digits)'),
@@ -6811,8 +6819,14 @@ into each Condition, each VAT Type, and each Currency.`;
         h('textarea', { class: 'input mb-3', rows: 2, value: ctx.note, oninput: set('note') }),
         h('div', { class: 'mt-2 flex justify-end gap-2' },
           h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
-          h('button', { class: 'btn btn-primary', disabled: state.skuMapBusy, onclick: submitSkuMapModal },
-            h('i', { class: 'fas fa-check' }), isEdit ? 'Save' : 'Create')
+          h('button', {
+            // Bug fix (2026-09-28, same class as the two above): raw
+            // boolean disabled: state.skuMapBusy meant this Save/Create
+            // button was permanently disabled whenever NOT busy (false is
+            // not undefined/null, so setAttribute('disabled', false) still
+            // disables). Ternary to null when not disabled.
+            class: 'btn btn-primary', disabled: state.skuMapBusy ? 'disabled' : null, onclick: submitSkuMapModal,
+          }, h('i', { class: 'fas fa-check' }), isEdit ? 'Save' : 'Create')
         )
       )
     );
@@ -6876,7 +6890,19 @@ into each Condition, each VAT Type, and each Currency.`;
         h('div', { class: 'mt-2 flex justify-end gap-2' },
           h('button', { class: 'btn btn-ghost', onclick: close }, 'Cancel'),
           h('button', {
-            class: 'btn btn-primary', disabled: !dr?.ok || ctx.busy, onclick: commitSkuMapUpload,
+            // Bug fix (2026-09-28): h()'s attribute setter only skips
+            // `undefined`/`null` (see the h() definition at the top of this
+            // file) — HTML's `disabled` is a boolean PRESENCE attribute, so
+            // setAttribute('disabled', false) still disables the element,
+            // same as setAttribute('disabled', 'disabled'). The old
+            // `disabled: !dr?.ok || ctx.busy` expression always evaluates to
+            // an actual boolean, so this button was permanently disabled on
+            // every render regardless of dr.ok — a clean dry-run (154 new
+            // mappings, 0 problems) still left Commit import unclickable.
+            // Ternary to `null` when not disabled, matching the working
+            // pattern already used elsewhere in this file (e.g. the
+            // bulk-transition run button a few thousand lines up).
+            class: 'btn btn-primary', disabled: (!dr?.ok || ctx.busy) ? 'disabled' : null, onclick: commitSkuMapUpload,
           }, h('i', { class: 'fas fa-check' }), 'Commit import')
         )
       )
