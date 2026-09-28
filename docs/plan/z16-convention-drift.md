@@ -14,7 +14,7 @@ it recurs. Parked here per operator instruction (2026-09-27) rather than
 tracked as an open ticket, since there is no single fix — each instance
 below was fixed locally, in the commit that found it.
 
-## The five instances on record
+## The seven instances on record
 
 1. **FK-ordered teardown needing three separate manual fixes** —
    `test/oprImport.spec.ts`'s `afterAll` cleanup deletes rows in an order
@@ -107,9 +107,48 @@ below was fixed locally, in the commit that found it.
    process itself flags "the fact you are about to rely on has already
    changed."
 
+6. **`rm -rf .wrangler/state/v3/d1` treated as a routine pre-build
+   precaution, then reported as an incremental migration apply** — during
+   the Z-4 unmapped-queue-filter pass (2026-09-28), this command was run
+   against the local sandbox D1 without stating its blast radius first —
+   it was framed in the moment as ordinary pre-build hygiene. It actually
+   destroyed the entire local D1 (including seeded fixtures), not just
+   cleared stale state. The first status report of that same pass then
+   described the sandbox as "40/41 applied migrations (`0040` pending)" —
+   a fact that was true a few steps earlier but had already been
+   invalidated by the `rm -rf`. When migration 0040 was applied per the
+   operator's next-pass instruction, it silently became a from-scratch
+   41/41 apply rather than the described one-migration increment. Caught
+   only because the operator cross-checked the reported end state (41/41)
+   against what should have been possible from a "40/41" starting point
+   and asked what actually happened. No data of record was lost (local
+   dev fixtures only, prod untouched), but the same pattern as instances
+   1-3 above: a statement ("this is routine," "40/41 pending 0040") was
+   accurate when made and silently went stale, and nothing forced a
+   recheck before it was repeated in a report. Standing rule from here
+   (2026-09-28, operator §2): no destructive filesystem or database
+   command against ANY environment, local sandbox included, without
+   stating the intent and the expected blast radius in the same pass,
+   before running it.
+
+7. **Smoke-check hash algorithm not pinned across passes** — the
+   `/static/app.js` content-presence smoke check has been run at least
+   twice this project with two different hash algorithms reported: a
+   prior pass recorded a 64-hex SHA-256 digest (`840b9fef…`), this pass's
+   Z-4 deploy (2026-09-28) recorded a 32-hex MD5 digest (`4abb3c20…`).
+   Both checks were internally valid (deployed vs. local source matched
+   on each occasion), so no deploy was reopened over this, but the two
+   numbers are not comparable to each other — a future pass diffing "the
+   hash reported last time" against "the hash reported this time" would
+   see two structurally different strings and have no way to tell import
+   from a real content change. Standing rule from here (2026-09-28,
+   operator §3): the `/static/app.js` (and any equivalent static-asset)
+   smoke check standardises on SHA-256 going forward; `sha256sum`, not
+   `md5sum`.
+
 ## The through-line
 
-In all five cases, a STATEMENT (a comment, a test assertion, a design
+In all seven cases, a STATEMENT (a comment, a test assertion, a design
 note, an out-of-band git ref) described the system accurately at the
 moment it was written, and nothing in the system's own mechanics forced
 that statement to be re-checked or updated when the underlying reality
