@@ -40,16 +40,19 @@ function newImei(): string {
 // bills.ts's write-cost-ledger route, which requires a full
 // bill/bill_line/bill_line_serial chain — out of proportion for a unit
 // fixture here, so purchase rows are seeded directly too).
-async function seedDevice(status: DeviceStatus, opts: { vatType?: string | null } = {}): Promise<number> {
+async function seedDevice(
+  status: DeviceStatus,
+  opts: { vatType?: string | null; buyPrice?: number | null } = {},
+): Promise<number> {
   const imei = newImei()
   const uuid = `ivr-test-uuid-${imei}`
   const result = await db()
     .prepare(
       `INSERT INTO received_devices
-         (organisation_id, uuid, imei, sku, model, grade, source, status, vat_type)
-       VALUES (1, ?, ?, 'SAM-S26-256-CVT-A', 'Galaxy S24', 'A', 'manual', ?, ?)`
+         (organisation_id, uuid, imei, sku, model, grade, source, status, vat_type, buy_price)
+       VALUES (1, ?, ?, 'SAM-S26-256-CVT-A', 'Galaxy S24', 'A', 'manual', ?, ?, ?)`
     )
-    .bind(uuid, imei, status, opts.vatType ?? null)
+    .bind(uuid, imei, status, opts.vatType ?? null, opts.buyPrice ?? null)
     .run()
   return result.meta.last_row_id as number
 }
@@ -162,12 +165,17 @@ describe('GET /api/reports/inventory-valuation', () => {
     expect(json.reconciliation.included_count + json.reconciliation.rejected_count + json.reconciliation.sold_count)
       .toBe(json.reconciliation.total_devices)
 
-    // costed vs uncosted: A, B, C, E, F are costed (>=1 purchase row); D is not
-    // — this metric is independent of valuation-inclusion category, so
-    // REJECTED/SOLD devices still count here even though their value is
-    // excluded from the main headline totals.
-    expect(json.costed_vs_uncosted.costed).toBeGreaterThanOrEqual(5)
-    expect(json.costed_vs_uncosted.uncosted).toBeGreaterThanOrEqual(1)
+    // by_acquisition_source (operator ruling 2026-09-28, X-9 §2 — renamed
+    // and re-expressed from the original costed_vs_uncosted boolean):
+    // A, B, C, E, F all carry a cost_ledger 'purchase' row -> cost_ledger.
+    // D has neither a purchase row nor a seeded buy_price (seedDevice
+    // never sets buy_price, so it's NULL) -> none, not
+    // goods_in_buy_price — this metric is independent of
+    // valuation-inclusion category, so REJECTED/SOLD devices still count
+    // here even though their value is excluded from the main headline
+    // totals.
+    expect(json.by_acquisition_source.cost_ledger).toBeGreaterThanOrEqual(5)
+    expect(json.by_acquisition_source.none).toBeGreaterThanOrEqual(1)
 
     // by_stage: all 14 DEVICE_STATUSES present, zero-count stages included
     expect(json.by_stage.length).toBe(14)
@@ -230,7 +238,7 @@ describe('GET /api/reports/inventory-valuation', () => {
     expect(json.data_quality.devices_with_multiple_purchase_rows).toBeGreaterThanOrEqual(0)
   })
 
-  it('REJECTED and SOLD devices are excluded from the main headline but still appear in by_stage and costed_vs_uncosted', async () => {
+  it('REJECTED and SOLD devices are excluded from the main headline but still appear in by_stage and by_acquisition_source', async () => {
     const rejectedDevice = await seedDevice('REJECTED', { vatType: 'ZERO' })
     await seedCostLedgerRow(rejectedDevice, 'purchase', 45, 'supplier-invoiced')
 
@@ -274,6 +282,60 @@ describe('GET /api/reports/inventory-valuation', () => {
       .bind(device)
       .first<{ total: number }>()
     expect(row?.total).toBe(100)
+  })
+
+  it('a device with no cost_ledger purchase row falls back to goods-in buy_price, not zero (operator ruling 2026-09-28, X-9 §2)', async () => {
+    // No cost_ledger row at all for this device — only a goods-in
+    // buy_price. Prior to the ruling, purchase_gbp would have reported
+    // this device at £0 (raw cost_ledger sum, no fallback). The ruling
+    // requires the headline to use Z-2's acquisition_cost_gbp fallback
+    // instead, matching devices.ts's CSV export basis.
+    const fallbackDevice = await seedDevice('ACTIVE_INVENTORY', { vatType: 'STANDARD', buyPrice: 123.45 })
+
+    const res = await apiAs(MANAGER_USER, '/api/reports/inventory-valuation')
+    const json = await res.json() as any
+    expect(res.status).toBe(200)
+
+    // by_acquisition_source: this device must be counted under
+    // goods_in_buy_price, not cost_ledger and not none.
+    expect(json.by_acquisition_source.goods_in_buy_price).toBeGreaterThanOrEqual(1)
+
+    // The ACTIVE_INVENTORY stage total must include the buy_price value
+    // — confirmed directly against a fresh per-device read rather than
+    // the shared running stage total (which accumulates across every
+    // test in this file), so this assertion is unambiguous regardless
+    // of run order.
+    const row = await db()
+      .prepare(`SELECT buy_price FROM received_devices WHERE id = ?`)
+      .bind(fallbackDevice)
+      .first<{ buy_price: number }>()
+    expect(row?.buy_price).toBe(123.45)
+
+    // basis must state the buy-price-backed limitation in words.
+    expect(json.basis).toMatch(/buy_price/i)
+    expect(json.basis).toMatch(/computeAcquisitionCostGbp/)
+  })
+
+  it('a device with BOTH a cost_ledger purchase row and a buy_price prefers the ledger row (Z-2 precedence, unchanged by X-9 §2)', async () => {
+    const device = await seedDevice('SORTING', { vatType: 'ZERO', buyPrice: 999 })
+    await seedCostLedgerRow(device, 'purchase', 30, 'supplier-invoiced')
+
+    const res = await apiAs(MANAGER_USER, '/api/reports/inventory-valuation')
+    const json = await res.json() as any
+
+    // Ledger-backed, not buy_price-backed, despite buy_price being set —
+    // the ledger row wins per Z-2's precedence, confirmed via a direct
+    // per-device read for the SORTING stage this device alone occupies
+    // for this device id (avoids cross-test stage-total accumulation).
+    expect(json.by_acquisition_source.cost_ledger).toBeGreaterThanOrEqual(1)
+    const row = await db()
+      .prepare(
+        `SELECT COALESCE(SUM(amount_gbp), 0) AS total FROM cost_ledger
+          WHERE received_device_id = ? AND cost_type = 'purchase'`
+      )
+      .bind(device)
+      .first<{ total: number }>()
+    expect(row?.total).toBe(30) // NOT 999 — the buy_price is ignored once a ledger row exists
   })
 
   it('freight rows are excluded from the headline totals', async () => {

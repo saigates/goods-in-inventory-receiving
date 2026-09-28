@@ -99,7 +99,10 @@ async function inventoryValuation() {
   expect(res.status).toBe(200)
   return res.json() as Promise<{
     headline: { purchase_only: { count: number; value_gbp: number } }
-    costed_vs_uncosted: { costed: number; uncosted: number; total_devices: number }
+    // Renamed from costed_vs_uncosted (operator ruling 2026-09-28, X-9
+    // §2) — seedDevice() in this file never sets buy_price, so a device
+    // with no cost_ledger row starts in `none`, not `goods_in_buy_price`.
+    by_acquisition_source: { cost_ledger: number; goods_in_buy_price: number; none: number; total_devices: number }
   }>
 }
 
@@ -146,12 +149,12 @@ describe('POST /api/devices/:id/purchase/cost-ledger', () => {
     expect(rows).toHaveLength(1)
   })
 
-  it('device goes from uncosted to costed, and the valuation endpoint reflects both costed AND uncosted counts moving', async () => {
+  it('device goes from uncosted (none) to cost_ledger-backed, and the valuation endpoint reflects both counts moving', async () => {
     const deviceId = await seedDevice()
 
     const before = await inventoryValuation()
-    const uncostedBefore = before.costed_vs_uncosted.uncosted
-    const costedBefore = before.costed_vs_uncosted.costed
+    const noneBefore = before.by_acquisition_source.none
+    const ledgerBefore = before.by_acquisition_source.cost_ledger
 
     const res = await apiAs(MANAGER_USER, `/api/devices/${deviceId}/purchase/cost-ledger`, {
       method: 'POST',
@@ -161,14 +164,17 @@ describe('POST /api/devices/:id/purchase/cost-ledger', () => {
 
     const after = await inventoryValuation()
     // Assertion beyond the original test list, per explicit instruction:
-    // costed incrementing and uncosted decrementing are computed
-    // separately in src/routes/reports.ts (an if/else on
-    // purchase_row_count, not derived from one another), so a bug in
-    // either accumulator would not surface from asserting only the
-    // other. Both must be checked.
-    expect(after.costed_vs_uncosted.costed).toBe(costedBefore + 1)
-    expect(after.costed_vs_uncosted.uncosted).toBe(uncostedBefore - 1)
-    expect(after.costed_vs_uncosted.total_devices).toBe(before.costed_vs_uncosted.total_devices)
+    // cost_ledger incrementing and none decrementing are computed
+    // separately in src/routes/reports.ts (an if/else-if on
+    // purchase_row_count then buy_price, not derived from one another),
+    // so a bug in either accumulator would not surface from asserting
+    // only the other. Both must be checked. seedDevice() never sets
+    // buy_price, so this device starts in `none`, not
+    // `goods_in_buy_price` — the write moves it straight to
+    // `cost_ledger`.
+    expect(after.by_acquisition_source.cost_ledger).toBe(ledgerBefore + 1)
+    expect(after.by_acquisition_source.none).toBe(noneBefore - 1)
+    expect(after.by_acquisition_source.total_devices).toBe(before.by_acquisition_source.total_devices)
     expect(after.headline.purchase_only.value_gbp).toBeCloseTo(before.headline.purchase_only.value_gbp + 200, 2)
   })
 

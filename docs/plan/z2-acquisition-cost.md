@@ -313,11 +313,32 @@ this section is the entire scope of this ruling.
   `addDeviceToShipment()`'s `shipment_lines` insert (see Currency note
   above) — flagged, not fixed, as it predates this ticket and touching it
   is a separate, larger FX-handling piece of work.
-- Does not change `GET /api/reports/inventory-valuation`'s existing
-  `purchase_gbp` / `purchase_plus_repair_gbp` figures — those remain the
-  raw `cost_ledger`-only aggregates they always were; `acquisition_cost_gbp`
-  is a new, separate, CSV-export-facing figure with the goods-in fallback,
-  not a replacement for the report's existing basis.
+- **SUPERSEDED (2026-09-28, operator ruling, X-9 §2)** — this bullet
+  originally read: "Does not change `GET /api/reports/inventory-valuation`'s
+  existing `purchase_gbp` / `purchase_plus_repair_gbp` figures — those
+  remain the raw `cost_ledger`-only aggregates they always were;
+  `acquisition_cost_gbp` is a new, separate, CSV-export-facing figure
+  with the goods-in fallback, not a replacement for the report's
+  existing basis." That is no longer true and is left struck through
+  here rather than silently deleted, per the standing instruction that
+  an unamended doc contradicting live behaviour is itself a Z-16
+  instance. As of `src/routes/reports.ts`'s X-9 §2 change (same commit
+  as this amendment), the report's headline/by_stage/by_provenance
+  figures DO now read the fallback-aware `acquisition_cost_gbp` basis
+  (cost_ledger 'purchase' sum, else goods-in `buy_price`, else none) —
+  the same three-way precedence as `computeAcquisitionCostGbp()` and
+  the CSV export. Reason: with `cost_ledger` at 0 rows in production,
+  the raw-ledger-only report showed £0 across all 1,486 devices next to
+  a CSV export quoting real `buy_price`-backed numbers for the same
+  devices — two contradictory valuations in one system. The report's
+  own `by_acquisition_source` field (renamed from `costed_vs_uncosted`)
+  now states explicitly, per response, how many devices are
+  ledger-backed, buy_price-backed, or neither, so the provisional
+  nature of a fallback-sourced figure stays visible rather than being
+  smoothed into a single number. `repair_gbp` has NO such fallback (no
+  in-house-labour equivalent exists) and is unchanged — still a raw
+  `cost_ledger` 'repair' sum only, per the report's own `basis` field
+  LIMITATION 1.
 - Does not touch `zoho_batches` / `zoho_batch_devices` (confirmed via grep
   to have zero application-code writers as of this ticket) or implement
   the snapshot-at-send-time requirement described above — that write path

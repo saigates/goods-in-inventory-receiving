@@ -187,9 +187,21 @@ type InventoryValuationResponse = {
     total_devices: number
     balanced: boolean
   }
-  costed_vs_uncosted: {
-    costed: number
-    uncosted: number
+  // Operator ruling (2026-09-28, X-9 §2): re-expressed from the original
+  // costed/uncosted boolean into a breakdown by acquisition_source, the
+  // same three-way source Z-2's computeAcquisitionCostGbp() reports per
+  // device (src/lib/acquisitionCost.ts) — 'cost_ledger' (a bill-backed or
+  // manually-entered purchase row exists), 'goods_in_buy_price' (no
+  // ledger row, but the goods-in buy_price fallback covers it), or
+  // 'none' (neither exists — this device is genuinely uncosted). The
+  // fallback-backed count is kept SEPARATE from the ledger-backed count,
+  // never merged into one "costed" figure, so the provisional nature of
+  // a buy_price-sourced valuation stays visible on the response's own
+  // face rather than being smoothed away into a single boolean.
+  by_acquisition_source: {
+    cost_ledger: number
+    goods_in_buy_price: number
+    none: number
     total_devices: number
     // The figure to surface most prominently per spec — repeated here at
     // the top level too so a caller reading only `headline` can't miss it.
@@ -271,27 +283,44 @@ app.get('/inventory-valuation', async (c) => {
   // rows yields 0/NULL, not an absent row) — this is what makes the
   // uncosted count and zero-value stage totals correct without a
   // separate query.
+  // Operator ruling (2026-09-28, X-9 §2): purchase_gbp below is the RAW
+  // cost_ledger sum only — it is NOT the headline figure any more. The
+  // headline now reads acquisition_cost_gbp (Z-2's fallback-aware
+  // figure: ledger sum when a 'purchase' row exists, else the goods-in
+  // buy_price, else genuinely none), computed in JS below from
+  // purchase_gbp/purchase_row_count/buy_price using the exact same
+  // precedence as src/lib/acquisitionCost.ts's computeAcquisitionCostGbp()
+  // and devices.ts's CSV export (devices.ts:726-730) — three independent
+  // call sites now share one rule, not three copies that could drift.
+  // Reason: with cost_ledger currently EMPTY in production (0 rows), the
+  // pre-ruling raw-ledger figure put a real, populated screen at £0
+  // across all 1,486 devices next to a CSV export quoting real buy_price
+  // numbers for the same devices — two contradictory valuations in one
+  // system. repair_gbp stays ledger-only (no fallback exists for repair
+  // cost; that gap is separately recorded in the `basis` field below).
   const { results: deviceRows } = await db.prepare(
     `SELECT
         rd.id AS device_id,
         rd.status AS status,
         rd.vat_type AS vat_type,
         COALESCE(SUM(CASE WHEN cl.cost_type = 'purchase' THEN cl.amount_gbp ELSE 0 END), 0) AS purchase_gbp,
-        COALESCE(SUM(CASE WHEN cl.cost_type IN ('purchase','repair') THEN cl.amount_gbp ELSE 0 END), 0) AS purchase_plus_repair_gbp,
+        COALESCE(SUM(CASE WHEN cl.cost_type = 'repair' THEN cl.amount_gbp ELSE 0 END), 0) AS repair_gbp,
         SUM(CASE WHEN cl.cost_type = 'purchase' THEN 1 ELSE 0 END) AS purchase_row_count,
-        SUM(CASE WHEN cl.id IS NOT NULL THEN 1 ELSE 0 END) AS any_ledger_row_count
+        SUM(CASE WHEN cl.id IS NOT NULL THEN 1 ELSE 0 END) AS any_ledger_row_count,
+        rd.buy_price AS buy_price
      FROM received_devices rd
      LEFT JOIN cost_ledger cl ON cl.received_device_id = rd.id AND cl.organisation_id = rd.organisation_id
      WHERE rd.organisation_id = ?
-     GROUP BY rd.id, rd.status, rd.vat_type`
+     GROUP BY rd.id, rd.status, rd.vat_type, rd.buy_price`
   ).bind(user.organisation_id).all<{
     device_id: number
     status: DeviceStatus
     vat_type: string | null
     purchase_gbp: number
-    purchase_plus_repair_gbp: number
+    repair_gbp: number
     purchase_row_count: number
     any_ledger_row_count: number
+    buy_price: number | null
   }>()
 
   // Provenance breakdown needs its own query: it's a per-ROW (not
@@ -318,14 +347,15 @@ app.get('/inventory-valuation', async (c) => {
   let purchaseValue = 0
   let purchasePlusRepairCount = 0
   let purchasePlusRepairValue = 0
-  // costed_vs_uncosted intentionally covers EVERY device in the org
+  // by_acquisition_source intentionally covers EVERY device in the org
   // regardless of valuation-inclusion category — it is a data-quality
-  // metric ("how much of our cost data is actually populated"), not a
-  // valuation total, so REJECTED/SOLD devices still count here even
-  // though their value is excluded from purchase_only/
-  // purchase_plus_repair above.
-  let costedCount = 0
-  let uncostedCount = 0
+  // metric ("how much of our cost data is actually populated, and by
+  // which of the two routes"), not a valuation total, so REJECTED/SOLD
+  // devices still count here even though their value is excluded from
+  // purchase_only/purchase_plus_repair above.
+  let ledgerBackedCount = 0
+  let buyPriceBackedCount = 0
+  let noneBackedCount = 0
   let multiPurchaseRowDeviceCount = 0
 
   // ── rejected / sold headline lines — own accumulators, same
@@ -357,8 +387,19 @@ app.get('/inventory-valuation', async (c) => {
   vatRawAgg.set('unset', { count: 0, value: 0 })
 
   for (const row of deviceRows) {
-    const purchaseGbp = round2(row.purchase_gbp)
-    const purchasePlusRepairGbp = round2(row.purchase_plus_repair_gbp)
+    // acquisitionGbp: Z-2's fallback precedence, applied per-device —
+    // cost_ledger 'purchase' sum wins if any such row exists (>0 rows,
+    // not merely non-zero, matching computeAcquisitionCostGbp()'s own
+    // `row.row_count > 0` check exactly, so a legitimate £0 purchase row
+    // is still ledger-sourced, not silently reclassified as
+    // buy_price-backed) — else the goods-in buy_price — else 0 (no
+    // acquisition figure at all; by_acquisition_source.none tracks this
+    // count separately below so it is never mistaken for a real £0).
+    const acquisitionGbp = row.purchase_row_count > 0
+      ? round2(row.purchase_gbp)
+      : round2(row.buy_price ?? 0)
+    const purchaseGbp = acquisitionGbp
+    const purchasePlusRepairGbp = round2(acquisitionGbp + row.repair_gbp)
 
     // Headline totals: every device in VALUATION_INCLUDED_STATUSES
     // contributes its count, even at zero value (spec: "devices with no
@@ -383,14 +424,19 @@ app.get('/inventory-valuation', async (c) => {
     // live CHECK constraint guarantees row.status is one of the 14
     // known values — so falling through all three is not reachable.
 
-    // costed_vs_uncosted is a data-quality metric over EVERY device in
-    // the org, independent of valuation-inclusion category (see the
+    // by_acquisition_source is a data-quality metric over EVERY device
+    // in the org, independent of valuation-inclusion category (see the
     // accumulator declarations above) — REJECTED/SOLD devices still
-    // count here.
+    // count here. Same three-way precedence as Z-2's
+    // computeAcquisitionCostGbp(): a cost_ledger 'purchase' row wins if
+    // one exists; otherwise the goods-in buy_price fallback; otherwise
+    // genuinely uncosted.
     if (row.purchase_row_count > 0) {
-      costedCount++
+      ledgerBackedCount++
+    } else if (row.buy_price != null) {
+      buyPriceBackedCount++
     } else {
-      uncostedCount++
+      noneBackedCount++
     }
     if (row.purchase_row_count > 1) multiPurchaseRowDeviceCount++
 
@@ -452,19 +498,23 @@ app.get('/inventory-valuation', async (c) => {
       total_devices: deviceRows.length,
       balanced: purchaseCount + rejectedCount + soldCount === deviceRows.length,
     },
-    costed_vs_uncosted: {
-      costed: costedCount,
-      uncosted: uncostedCount,
+    by_acquisition_source: {
+      cost_ledger: ledgerBackedCount,
+      goods_in_buy_price: buyPriceBackedCount,
+      none: noneBackedCount,
       total_devices: deviceRows.length,
       // Computed at runtime, not static prose, so this can never say one
-      // thing while the totals above say another (reviewer correction:
-      // an earlier draft's surrounding commentary asserted "device cost
-      // + repair cost" in one place and "£0 across the board" in
-      // another for the same all-uncosted state — those must not be
-      // able to diverge again).
-      note: uncostedCount === deviceRows.length && deviceRows.length > 0
-        ? `All ${deviceRows.length} device(s) in this organisation are currently uncosted (0 cost_ledger rows) — every value total in this response is £0 for that reason, not because purchase prices are actually zero.`
-        : 'An uncosted device contributes zero to every value total above; costed/uncosted counts determine how much of the headline figures reflect real data versus missing data.',
+      // thing while the totals above say another (reviewer correction,
+      // carried forward from the original costed_vs_uncosted field: an
+      // earlier draft's surrounding commentary asserted "device cost +
+      // repair cost" in one place and "£0 across the board" in another
+      // for the same all-uncosted state — those must not be able to
+      // diverge again).
+      note: buyPriceBackedCount === deviceRows.length && deviceRows.length > 0
+        ? `All ${deviceRows.length} device(s) in this organisation are currently valued via the goods-in buy_price fallback (0 cost_ledger 'purchase' rows exist anywhere) — every acquisition figure in this response is buy-price-backed, not bill-backed, for that reason.`
+        : noneBackedCount === deviceRows.length && deviceRows.length > 0
+          ? `All ${deviceRows.length} device(s) in this organisation are currently uncosted (no cost_ledger row AND no goods-in buy_price) — every value total in this response is £0 for that reason, not because purchase prices are actually zero.`
+          : 'A device with neither a cost_ledger purchase row nor a goods-in buy_price contributes zero to every value total above; the three counts here determine how much of the headline figures reflect a bill-backed figure, a buy-price fallback, or missing data entirely.',
     },
     by_stage: DEVICE_STATUSES.map(status => {
       const s = stageAgg.get(status)!
@@ -495,7 +545,7 @@ app.get('/inventory-valuation', async (c) => {
       'write-downs / impairment adjustments',
       'SOLD devices (headline.sold; excluded because a sold device is no longer the operator\'s owned stock — currently always £0/0 because SOLD is unreachable by any transition today)',
     ],
-    basis: 'This is a management valuation at device purchase price plus any posted repair cost — an "item cost" figure, not a "landed cost" figure. It excludes freight, duty, VAT and write-downs, and is not a statutory inventory-cost figure under any accounting standard. Any system consuming this response should treat it as device purchase/repair cost only, not a balance-sheet or landed-cost number. LIMITATION: the "repair" component of "purchase plus repair" covers bought-in (third-party-invoiced) repair costs only — cost_ledger rows with cost_type=\'repair\' are written exclusively by postRepairCostToLedger() for bought-in work. Nothing is currently recorded anywhere in this system for in-house repair parts or labour, so purchase_plus_repair systematically UNDERSTATES true cost for any device repaired in-house, with no flag distinguishing an in-house-repaired device from one that was never repaired at all. Devices in headline.rejected and headline.sold are excluded from purchase_only/purchase_plus_repair above — see reconciliation for how every device is accounted for across included/rejected/sold.',
+    basis: 'This is a management valuation at device acquisition cost plus any posted repair cost — an "item cost" figure, not a "landed cost" figure. Acquisition cost here is Z-2\'s fallback-aware acquisition_cost_gbp (src/lib/acquisitionCost.ts computeAcquisitionCostGbp(), the same figure devices.ts\'s CSV export uses): the cost_ledger \'purchase\' sum where at least one such row exists for the device, and the goods-in buy_price OTHERWISE — so a device with no bill-backed purchase row is still valued from its receipt-time buy_price rather than reported at zero. by_acquisition_source below states, per this response, how many devices are on each of those two paths (or on neither). It excludes freight, duty, VAT and write-downs, and is not a statutory inventory-cost figure under any accounting standard. Any system consuming this response should treat it as device acquisition/repair cost only, not a balance-sheet or landed-cost number. LIMITATION 1: the "repair" component of "purchase plus repair" covers bought-in (third-party-invoiced) repair costs only — cost_ledger rows with cost_type=\'repair\' are written exclusively by postRepairCostToLedger() for bought-in work, and unlike the acquisition figure above, has NO buy_price-style fallback for in-house work. Nothing is currently recorded anywhere in this system for in-house repair parts or labour, so purchase_plus_repair systematically UNDERSTATES true cost for any device repaired in-house, with no flag distinguishing an in-house-repaired device from one that was never repaired at all. LIMITATION 2: a buy_price-backed figure is a single mutable goods-in value with no history and no source attribution (unlike a cost_ledger row); it is a legitimate stand-in, not a verified figure, and by_acquisition_source.goods_in_buy_price\'s count is how a caller can see how much of this valuation currently rests on that basis rather than a bill. Devices in headline.rejected and headline.sold are excluded from purchase_only/purchase_plus_repair above — see reconciliation for how every device is accounted for across included/rejected/sold.',
     vat_bucket_basis: "The grouped by_vat_bucket breakdown is for human reading only: STANDARD and PVAT are combined into 'standard_and_net_recoverable' for readability, MARGIN and ZERO stay separate, unset vat_type gets its own row. This system's vat_type vocabulary (MARGIN/STANDARD/ZERO/PVAT) has no 'REVERSE_CHARGE' value — that is recorded here as an absence, not something mapped onto another bucket. Grouping a stored field is not the same operation as calculating VAT: this endpoint only does the former. Any system consuming this response programmatically should use by_vat_type_raw (ungrouped, per-stored-value) instead of by_vat_bucket.",
   }
 

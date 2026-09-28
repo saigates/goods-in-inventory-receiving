@@ -21,7 +21,7 @@ sync with its own record for the exact reason it exists: a fact true in
 someone's head, not in a file. That gap is itself the drift mechanism
 Z-16 exists to catch, and it caught itself (2026-09-28, operator §3).
 
-## The ten instances on record
+## The eleven instances on record
 
 1. **FK-ordered teardown needing three separate manual fixes** —
    `test/oprImport.spec.ts`'s `afterAll` cleanup deletes rows in an order
@@ -218,17 +218,59 @@ Z-16 exists to catch, and it caught itself (2026-09-28, operator §3).
    smoke check standardises on SHA-256 going forward; `sha256sum`, not
    `md5sum`.
 
+11. **A complete, tested, deployed endpoint that is functionally absent
+   because nobody can reach it** — `GET /api/reports/inventory-valuation`
+   (`src/routes/reports.ts`) was built across four commits (`7d20d47`
+   2026-08-24, `939b7a1` accounting-review amendments, `fd200b9`
+   valuation-inclusion partition, `b3d9401` 2026-09-09), mounted at
+   `src/index.tsx:57`, and covered by a dedicated 4-case test file
+   (`test/inventoryValuationReport.spec.ts`) — every box a "was this
+   built and tested" check would tick. It was still, until this pass,
+   invisible to any actual user: zero references to `inventory-valuation`
+   or `/api/reports` anywhere in `public/static/app.js` (confirmed via
+   grep — no nav entry, no fetch call, nothing), and no README/openapi
+   entry (`fd200b9`'s own commit message records this explicitly: "No
+   README.md/openapi.yaml entry exists for this endpoint and none is
+   added here"). `README.md:523` is the direct evidence someone went
+   looking for it and failed: a deploy-checklist note says "the pending
+   inventory-valuation 'status list' refinement could not be located,"
+   written by a pass that didn't know the endpoint already existed. The
+   operator's own board audit (2026-09-28 §1) concluded "there is no
+   valuation report... anywhere" — true of the board, false of the
+   codebase, and the gap between those two statements is a new variant
+   of the pattern this document exists to name: instances 1-10 are all
+   cases of a STATEMENT going stale relative to the SYSTEM; this one is
+   a SYSTEM going stale relative to anyone's knowledge that it exists,
+   because "built and tested" was silently treated as equivalent to
+   "shipped and discoverable" when the two are not the same claim.
+   Standing rule from here (2026-09-28, operator §1): before ticketing
+   work as new, check `src/index.tsx`'s mounted routes against the
+   board — a mount with no frontend caller and no README entry is
+   exactly the shape this instance describes, and the operator has
+   asked for a one-pass sweep of all mounted routes against the board
+   for any other case in this state, ahead of Sprint 3 planning.
+
 ## The through-line
 
-In all ten cases, a STATEMENT (a comment, a test assertion, a design
-note, an out-of-band git ref) described the system accurately at the
-moment it was written, and nothing in the system's own mechanics forced
-that statement to be re-checked or updated when the underlying reality
+In cases 1-10, a STATEMENT (a comment, a test assertion, a design note,
+an out-of-band git ref) described the system accurately at the moment it
+was written, and nothing in the system's own mechanics forced that
+statement to be re-checked or updated when the underlying reality
 changed. The statement did not fail loudly — it kept looking like
 documentation, kept passing (in the test cases), and actively misled the
 next reader until something else (a full-suite run, a contradicting test
 block a few lines below, an explicit operator ruling) surfaced the gap by
 accident rather than by design.
+
+Instance 11 is the same family with the direction reversed: nothing
+false was ever stated — the code and its own tests were accurate the
+whole time — but the SYSTEM went stale relative to everyone's knowledge
+that it existed, because nothing forced "built and tested" to also
+produce "documented and reachable." A statement drifting from the
+system and a system drifting from anyone's awareness of it are the same
+underlying failure — an artefact's true state and what people believe
+about that state are allowed to silently diverge — just observed from
+opposite ends.
 
 ## Two forward rules this note exists to state
 
