@@ -82,6 +82,33 @@ this requirement yet; it governs the schema that stage (i) will introduce.
   plans (see `docs/plan/device-lifecycle-slice1.md` and the OPR Auth Batch
   reporting in conversation/commit history).
 
+## V-1 ruling (2026-09-28): CSV route, not the Zoho API — recorded same-pass per the ruling-is-not-real-until-filed rule
+
+**V-1 CLOSED.** The operator's own decision window ("V-1 closes 9 Oct —
+silence reads as CSV") expired with an explicit CSV ruling rather than by
+silence, but the ruling is filed here regardless, since a ruling issued in
+conversation is not a ruling recorded (Z-16's own head-note,
+`docs/plan/z16-convention-drift.md`).
+
+**Y-1 (Zoho bill exporter) and Y-3 (batch-generation snapshot into
+`zoho_batch_devices`, see `docs/plan/device-lifecycle-slice1.md`) are both
+built against the CSV/file route, not a live Zoho API integration.** The
+Zoho API integration itself stays parked as stage (iv)'s later upgrade —
+see "Rehome Amazon" above, which already names the API-integration work as
+its own scoped, separately-signed-off project and the gate for switching
+Zoho off. This ruling does not change that staging; it fixes which route
+Y-1/Y-3 build against NOW, inside the currently-active Device Lifecycle
+workstream, while stage (iv) remains future and unscoped.
+
+**The CSV work is not throwaway.** The mapping table (`sku_map`/
+`zoho_items`, Z-4) and the bill-build logic Y-1 introduces are shared by
+both routes — a future API integration reads the same mapping and the same
+computed cost breakdown (`acquisitionCost.ts`), it just replaces the
+file-generation step with a direct API call. Building Y-1/Y-3 against CSV
+now is not scope that later needs to be re-done from zero when/if stage
+(iv) upgrades to the API; it is the foundation stage (iv) will sit on top
+of.
+
 ## Relationship to the two active workstreams
 
 Kept strictly separate, per the standing rule that a change in one

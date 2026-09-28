@@ -285,6 +285,20 @@ cost_type='freight'`-shaped-but-repair-typed sum once the denominator is
 confirmed. Z-2 does not touch `freightApportionment.ts` or attempt to
 pre-empt X-8's design.
 
+## Shipment 3 — known, accepted 4p variance against INV-260067 (2026-09-28, no code change)
+
+The app keeps `repair_cost` at `20,627.21` and computes `£4,144.01` from it;
+INV-260067 itself states `20,627.40` / `£4,144.05`. The operator ruled this
+variance (four pence, on both the underlying figure and its GBP conversion)
+**immaterial to the customs position and the VAT**, and **deliberately not
+corrected** — accepted as-is on 2026-09-28. Filed here, same pass as the
+ruling, specifically so a reconciliation exercise months from now that
+finds this exact 4p gap against INV-260067 has a written record that the
+discrepancy was seen, checked, and knowingly left alone, rather than
+spending time re-investigating a non-issue as if it were newly discovered.
+No `shipments.repair_cost` value change, no code change, no migration —
+this section is the entire scope of this ruling.
+
 ## Non-goals
 
 - Does not add a stored `acquisition_cost` column to `received_devices` or
