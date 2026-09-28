@@ -190,6 +190,34 @@ export const REPAIR_WORKFLOW_ONLY_STATUSES: readonly DeviceStatus[] = [
   'READY_FOR_ZOHO',
 ] as const
 
+// Z-4 phase 3 fix (2026-09-28, operator §1 — the unmapped-queue status
+// filter bug): statuses a device can be in while it still MIGHT need a
+// Zoho bill line eventually. Used to scope BOTH GET /sku-map/unmapped
+// (the JSON queue) and GET /sku-map/unmapped/export (the CSV download) —
+// before this fix, neither route filtered by status at all, so a device
+// already SOLD, REJECTED, QC_FAILED, or moved into any
+// OPR_WORKFLOW_ONLY_STATUSES status (exported/returned/in a consignment)
+// counted as "unmapped" exactly the same as a device still sitting in
+// goods-in. On production data (2026-09-28) this inflated the queue from
+// the real 32 distinct SKUs / 42 devices to a reported 90 SKUs / 248
+// devices — a device that has already left the country under OPR, or
+// already sold, will never generate a Zoho bill line and mapping it
+// wastes the operator's time. QC_FAILED is deliberately EXCLUDED here
+// (unlike REPAIR_WORKFLOW_ONLY_STATUSES above, which is a different axis
+// entirely — that constant is about which ROUTE may set the status, not
+// whether the device is still bill-relevant): a QC_FAILED device is
+// blocked from ever reaching READY_FOR_ZOHO without a re-open decision,
+// so it is not yet "might need a mapping" in the way RECEIVED/SORTING/
+// ACTIVE_INVENTORY/IN_HOUSE_REPAIR/READY_FOR_EXPORT/READY_FOR_ZOHO are.
+export const SKU_MAP_RELEVANT_STATUSES: readonly DeviceStatus[] = [
+  'RECEIVED',
+  'SORTING',
+  'ACTIVE_INVENTORY',
+  'IN_HOUSE_REPAIR',
+  'READY_FOR_EXPORT',
+  'READY_FOR_ZOHO',
+] as const
+
 // ── Z-5 (2026-09-27): location DISPLAY rule — NOT a sellability test ──
 // A device's location string reads 'SW001' while it is physically abroad
 // under a FINALISED OPR/temp-export consignment ('device is currently out

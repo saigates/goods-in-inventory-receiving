@@ -659,6 +659,61 @@ describe('GET /api/sku-map/unmapped — grouped by our SKU with device counts, n
     const body = await res.json() as { unmapped: Array<{ goods_in_sku: string }> }
     expect(body.unmapped.find(r => r.goods_in_sku === 'MAPPED-EXCLUDED-SKU')).toBeUndefined()
   })
+
+  // Bug fix (2026-09-28, operator §1): before this fix, GET /unmapped had
+  // NO status filter at all — an unmapped SKU whose only devices were
+  // already SOLD/REJECTED/QC_FAILED, or already moved into any
+  // OPR_WORKFLOW_ONLY_STATUSES status, counted as "unmapped" identically
+  // to a device still sitting in goods-in. On production data this
+  // inflated the queue from the real 32 SKUs/42 devices to 90 SKUs/248
+  // devices. Each status below is unmapped (no sku_map row at all) so the
+  // ONLY variable under test is the status filter itself.
+  it('a SKU whose only device is SOLD is excluded — it will never need a Zoho bill line', async () => {
+    await db().prepare(
+      `INSERT INTO received_devices (organisation_id, uuid, imei, sku, source, status) VALUES (1, ?, ?, 'SOLD-EXCLUDED-SKU', 'manual', 'SOLD')`
+    ).bind('sold-excluded-uuid', '994000000000001').run()
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/unmapped')
+    const body = await res.json() as { unmapped: Array<{ goods_in_sku: string }> }
+    expect(body.unmapped.find(r => r.goods_in_sku === 'SOLD-EXCLUDED-SKU')).toBeUndefined()
+  })
+
+  it('a SKU whose only device is REJECTED is excluded', async () => {
+    await db().prepare(
+      `INSERT INTO received_devices (organisation_id, uuid, imei, sku, source, status) VALUES (1, ?, ?, 'REJECTED-EXCLUDED-SKU', 'manual', 'REJECTED')`
+    ).bind('rejected-excluded-uuid', '994100000000001').run()
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/unmapped')
+    const body = await res.json() as { unmapped: Array<{ goods_in_sku: string }> }
+    expect(body.unmapped.find(r => r.goods_in_sku === 'REJECTED-EXCLUDED-SKU')).toBeUndefined()
+  })
+
+  it('a SKU whose only device is QC_FAILED is excluded — SKU_MAP_RELEVANT_STATUSES deliberately omits it', async () => {
+    await db().prepare(
+      `INSERT INTO received_devices (organisation_id, uuid, imei, sku, source, status) VALUES (1, ?, ?, 'QCFAIL-EXCLUDED-SKU', 'manual', 'QC_FAILED')`
+    ).bind('qcfail-excluded-uuid', '994200000000001').run()
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/unmapped')
+    const body = await res.json() as { unmapped: Array<{ goods_in_sku: string }> }
+    expect(body.unmapped.find(r => r.goods_in_sku === 'QCFAIL-EXCLUDED-SKU')).toBeUndefined()
+  })
+
+  it('a SKU whose only device is EXPORTED_UNDER_OPR is excluded — already abroad, never bill-relevant', async () => {
+    await db().prepare(
+      `INSERT INTO received_devices (organisation_id, uuid, imei, sku, source, status) VALUES (1, ?, ?, 'EXPORTED-EXCLUDED-SKU', 'manual', 'EXPORTED_UNDER_OPR')`
+    ).bind('exported-excluded-uuid', '994300000000001').run()
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/unmapped')
+    const body = await res.json() as { unmapped: Array<{ goods_in_sku: string }> }
+    expect(body.unmapped.find(r => r.goods_in_sku === 'EXPORTED-EXCLUDED-SKU')).toBeUndefined()
+  })
+
+  it('a SKU whose only device is IN_HOUSE_REPAIR still appears — genuinely bill-relevant, still might reach Zoho', async () => {
+    await db().prepare(
+      `INSERT INTO received_devices (organisation_id, uuid, imei, sku, source, status) VALUES (1, ?, ?, 'REPAIR-INCLUDED-SKU', 'manual', 'IN_HOUSE_REPAIR')`
+    ).bind('repair-included-uuid', '994400000000001').run()
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/unmapped')
+    const body = await res.json() as { unmapped: Array<{ goods_in_sku: string; device_count: number }> }
+    const entry = body.unmapped.find(r => r.goods_in_sku === 'REPAIR-INCLUDED-SKU')
+    expect(entry).toBeDefined()
+    expect(entry!.device_count).toBe(1)
+  })
 })
 
 describe('GET /api/sku-map/unmapped/export — the download half of the Excel round trip (Z-4 phase 2)', () => {
@@ -707,6 +762,29 @@ describe('GET /api/sku-map/unmapped/export — the download half of the Excel ro
     const res = await apiAs(MANAGER_USER, '/api/sku-map/unmapped/export')
     const text = await res.text()
     expect(text).not.toContain('EXPORT-MAPPED-EXCLUDED')
+  })
+
+  // Bug fix (2026-09-28, operator §1): same missing status filter as the
+  // JSON /unmapped endpoint above — see that describe block's tests for
+  // the full status-by-status breakdown. This is the DOWNLOAD half of
+  // the same query, so it needed the identical fix and needs its own
+  // direct coverage rather than relying on the JSON route's tests alone.
+  it('a SKU whose only device is SOLD is excluded from the CSV export too', async () => {
+    await db().prepare(
+      `INSERT INTO received_devices (organisation_id, uuid, imei, sku, source, status) VALUES (1, ?, ?, 'EXPORT-SOLD-EXCLUDED', 'manual', 'SOLD')`
+    ).bind('export-sold-excluded-uuid', '994500000000001').run()
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/unmapped/export')
+    const text = await res.text()
+    expect(text).not.toContain('EXPORT-SOLD-EXCLUDED')
+  })
+
+  it('a SKU whose only device is EXPORTED_UNDER_OPR is excluded from the CSV export too', async () => {
+    await db().prepare(
+      `INSERT INTO received_devices (organisation_id, uuid, imei, sku, source, status) VALUES (1, ?, ?, 'EXPORT-OPR-EXCLUDED', 'manual', 'EXPORTED_UNDER_OPR')`
+    ).bind('export-opr-excluded-uuid', '994600000000001').run()
+    const res = await apiAs(MANAGER_USER, '/api/sku-map/unmapped/export')
+    const text = await res.text()
+    expect(text).not.toContain('EXPORT-OPR-EXCLUDED')
   })
 
   it('rejects a non-manager with 403, same role gate as the rest of the write/export surface', async () => {
