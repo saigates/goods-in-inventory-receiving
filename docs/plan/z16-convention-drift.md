@@ -14,7 +14,14 @@ it recurs. Parked here per operator instruction (2026-09-27) rather than
 tracked as an open ticket, since there is no single fix — each instance
 below was fixed locally, in the commit that found it.
 
-## The seven instances on record
+A ruling issued in conversation is not a ruling recorded. Three of the
+instances below (6, 7, 8) were each ruled on in a prior pass but never
+actually written into this file — this document went briefly out of
+sync with its own record for the exact reason it exists: a fact true in
+someone's head, not in a file. That gap is itself the drift mechanism
+Z-16 exists to catch, and it caught itself (2026-09-28, operator §3).
+
+## The ten instances on record
 
 1. **FK-ordered teardown needing three separate manual fixes** —
    `test/oprImport.spec.ts`'s `afterAll` cleanup deletes rows in an order
@@ -107,7 +114,72 @@ below was fixed locally, in the commit that found it.
    process itself flags "the fact you are about to rely on has already
    changed."
 
-6. **`rm -rf .wrangler/state/v3/d1` treated as a routine pre-build
+6. **Silent null-to-zero coercion of `acquisition_cost_gbp` inside
+   `total_cost_gbp`** — `computeAcquisitionCostGbp()` correctly returns
+   `acquisition_cost_gbp: null` for a device with no `cost_ledger`
+   purchase row and no `buy_price` (`acquisition_source: 'none'`,
+   `src/lib/acquisitionCost.ts:63`). But `computeDeviceCostBreakdown()`
+   silently treats that `null` as `0` when summing `total_cost_gbp`
+   (`const totalCostGbp = round2((acquisition.acquisition_cost_gbp ?? 0)
+   + repairCostGbp + freightCostGbp)`, `acquisitionCost.ts:91`). The
+   `null`/`'none'` distinction is preserved correctly in
+   `acquisition_cost_gbp`/`acquisition_source` themselves — nothing here
+   is a bug in the existing code — but any caller that reads only
+   `total_cost_gbp` without also checking `acquisition_source` sees an
+   indistinguishable `0`, the same value a genuinely free/zero-cost
+   device would produce. Ruled during the Z-5/V-6 review pass
+   (2026-09-27) as a real drift risk for V-6 specifically (an Amazon-
+   facing cost feed reading `total_cost_gbp` verbatim would report a
+   fallback-costed device as literally free), and flagged as one of
+   V-6's still-open build-time questions
+   (`docs/plan/v6-amazon-cost-feed.md:179-185`) — but the ruling that
+   this is a Z-16-shaped drift risk in its own right was never written
+   into this file until now.
+
+7. **`h()` hyperscript helper's undefined/null-only attribute skip,
+   producing `disabled="false"`** — `public/static/app.js`'s `h()`
+   helper only skips `el.setAttribute(k, v)` for `v === undefined` or
+   `v === null` (`app.js:20`, `else if (v !== undefined && v !== null)
+   el.setAttribute(k, v)`). HTML's `disabled` is a boolean PRESENCE
+   attribute, so a raw `false` passed as `disabled: false` still calls
+   `setAttribute('disabled', false)`, which the DOM treats as present
+   (disabled) — identical to `setAttribute('disabled', 'disabled')`.
+   Three call sites in the SKU-map modals used this broken raw-boolean
+   pattern instead of the working `condition ? 'disabled' : null` idiom
+   used at ~15 other sites in the same file; one of the three (the
+   Commit-import button) reached production and was reported by the
+   operator as a live bug (154-row clean dry run, button permanently
+   disabled). Fixed in commit `7bd0d68` (2026-09-27/28). Ruled at the
+   time as opening Z-17 (systemic review of the `h()` helper's
+   attribute-setting logic for any other boolean-presence attributes
+   misused this way) — Z-17 is correctly listed as parked for Sprint 2
+   grooming elsewhere in this project's tracking, but the drift-log
+   entry for the underlying defect class itself was never written here
+   until now.
+
+8. **Genspark auto-backup pushing a sibling commit ahead of the agent's
+   own commit** — during the Z-4 unmapped-queue-filter pass
+   (2026-09-28), the platform's end-of-turn auto-backup mechanism
+   captured this pass's working-tree changes as commit `cfdc305`
+   ("genspark auto-backup") and pushed it directly to `genspark/main`
+   BEFORE the agent committed the same changes itself, under a
+   descriptive message, as `7374112`. Both commits shared the same
+   parent (`7bd0d68`) and an identical tree
+   (`cb108b09a30c346e135c887f1dc0afadd5cff9a1`) — true siblings, not a
+   content conflict — but `git merge-base --is-ancestor genspark/main
+   main` returned **false** for the first time this session (five prior
+   benign auto-backup collisions, instance 5 above, had all returned
+   true). `git push genspark main` was rejected as non-fast-forward.
+   Resolved via a content-no-op merge commit (`dc9b533`) rather than a
+   force-push, restoring the three-way `main`/`origin/main`/
+   `genspark/main` HEAD match. This is a genuinely new failure MODE of
+   instance 5's mechanism (identical content but non-ancestor history,
+   not just an advanced-past-expectation tip), ruled as its own
+   distinct instance at the time rather than folded into instance 5 —
+   but, per the pattern this whole file exists to catch, that ruling
+   itself was never written down until now.
+
+9. **`rm -rf .wrangler/state/v3/d1` treated as a routine pre-build
    precaution, then reported as an incremental migration apply** — during
    the Z-4 unmapped-queue-filter pass (2026-09-28), this command was run
    against the local sandbox D1 without stating its blast radius first —
@@ -131,7 +203,7 @@ below was fixed locally, in the commit that found it.
    stating the intent and the expected blast radius in the same pass,
    before running it.
 
-7. **Smoke-check hash algorithm not pinned across passes** — the
+10. **Smoke-check hash algorithm not pinned across passes** — the
    `/static/app.js` content-presence smoke check has been run at least
    twice this project with two different hash algorithms reported: a
    prior pass recorded a 64-hex SHA-256 digest (`840b9fef…`), this pass's
@@ -148,7 +220,7 @@ below was fixed locally, in the commit that found it.
 
 ## The through-line
 
-In all seven cases, a STATEMENT (a comment, a test assertion, a design
+In all ten cases, a STATEMENT (a comment, a test assertion, a design
 note, an out-of-band git ref) described the system accurately at the
 moment it was written, and nothing in the system's own mechanics forced
 that statement to be re-checked or updated when the underlying reality
