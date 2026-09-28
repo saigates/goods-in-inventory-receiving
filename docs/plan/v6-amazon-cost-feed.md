@@ -42,15 +42,31 @@ Per device row, exactly:
 - `location`
 - `acquisition_cost_gbp`
 - `total_cost_gbp`
-- the Z-2 source flag (i.e. whichever field `computeDeviceCostBreakdown()` /
-  the Z-2 cost-ledger machinery already exposes to mark a cost as
-  fallback-costed vs. ledger-sourced — reuse that field's existing name,
-  do not invent a new one for this route)
+- `acquisition_source` — the Z-2 source flag, exactly as
+  `computeDeviceCostBreakdown()` already returns it
+  (`docs/plan/z2-acquisition-cost.md:69`, values
+  `'cost_ledger' | 'goods_in_buy_price' | 'none'`). Reuse this field name
+  and these three values verbatim — do not invent a new name or a
+  different value set for this route.
 
 No other fields. In particular: no raw cost-ledger rows, no shipment/
 consignment detail beyond what `status`/`location` already imply, no
 internal IDs beyond what's needed to key the row (IMEI is the natural key
 Amazon-side).
+
+**Fallback-costed devices are provisional, because this is a computed
+read, not a stored figure.** Per Z-2's own design
+(`docs/plan/z2-acquisition-cost.md:54-71,160`),
+`acquisition_cost_gbp`/`total_cost_gbp` are never written to a column —
+they are recomputed at read time from `cost_ledger` (or the goods-in
+`buy_price` fallback when no ledger row exists yet). A device returned
+with `acquisition_source: 'goods_in_buy_price'` or `'none'` today can
+change its cost — and therefore its `total_cost_gbp` — the moment a bill
+posts a `cost_ledger` row for it, with no event firing to tell V-6's
+caller that happened. Any consumer of this feed (Amazon-side pricing
+logic in particular) must treat a non-`'cost_ledger'` `acquisition_source`
+as **provisional**, not final, and should expect the number to move
+without notice until a real ledger entry lands.
 
 ## The four decisions already made, verified against the code as it stands
 
@@ -160,3 +176,10 @@ than defaulting either way silently.
   not yet written.
 - The `READY_FOR_EXPORT` question (decision 4) — needs an explicit operator
   answer before ship.
+- What the feed returns when `acquisition_source` is `'none'` — a device
+  with no `cost_ledger` purchase row AND no `buy_price` has
+  `acquisition_cost_gbp: null` (`src/lib/acquisitionCost.ts:63`), and
+  `computeDeviceCostBreakdown()` silently treats that null as `0` inside
+  `total_cost_gbp` (`acquisitionCost.ts:91`). Whether V-6 passes `null`
+  through as-is, substitutes `0`, or excludes `'none'`-sourced devices
+  from the feed entirely is not decided here — flagged for build time.
