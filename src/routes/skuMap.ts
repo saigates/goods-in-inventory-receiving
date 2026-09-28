@@ -15,6 +15,7 @@ import {
   parseSkuMapCsv,
   validateSkuMapCsv,
 } from '../lib/skuMapImport'
+import { SKU_MAP_RELEVANT_STATUSES } from '../lib/deviceLifecycle'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
@@ -82,19 +83,31 @@ app.get('/orphans', async (c) => {
 // satisfy the export gate, so it must not disappear from this queue either
 // — NOT EXISTS is scoped to orphaned_at IS NULL, deliberately not just "any
 // row exists".
+//
+// Bug fix (2026-09-28, operator §1): this query used to have NO status
+// filter at all, so a device already SOLD/REJECTED/QC_FAILED, or moved
+// into any OPR_WORKFLOW_ONLY_STATUSES status (already exported/returned/
+// on a consignment), counted as "unmapped" identically to a device still
+// in goods-in. On production data this inflated the queue from 32
+// distinct SKUs / 42 devices (the real, bill-relevant set) to 90 SKUs /
+// 248 devices — see SKU_MAP_RELEVANT_STATUSES's own comment in
+// deviceLifecycle.ts for the full status list and why QC_FAILED is
+// deliberately excluded from it.
 app.get('/unmapped', async (c) => {
   const user = currentUser(c)
+  const statusPlaceholders = SKU_MAP_RELEVANT_STATUSES.map(() => '?').join(',')
   const { results } = await c.env.DB.prepare(
     `SELECT rd.sku AS goods_in_sku, COUNT(*) AS device_count
      FROM received_devices rd
      WHERE rd.organisation_id = ?
+       AND rd.status IN (${statusPlaceholders})
        AND NOT EXISTS (
          SELECT 1 FROM sku_map m
          WHERE m.goods_in_sku = rd.sku AND m.organisation_id = rd.organisation_id AND m.orphaned_at IS NULL
        )
      GROUP BY rd.sku
      ORDER BY device_count DESC, rd.sku ASC`
-  ).bind(user.organisation_id).all()
+  ).bind(user.organisation_id, ...SKU_MAP_RELEVANT_STATUSES).all()
   return c.json({ unmapped: results })
 })
 
@@ -143,19 +156,25 @@ app.get('/unmapped/export', async (c) => {
   const user = currentUser(c)
   if (!requireManager(c)) return c.json({ error: 'Manager or admin role required' }, 403)
 
+  // Bug fix (2026-09-28, operator §1): same missing status filter as
+  // GET /unmapped above — see that route's comment and
+  // SKU_MAP_RELEVANT_STATUSES's own comment in deviceLifecycle.ts for the
+  // full history (32 real SKUs/42 devices vs. 90/248 unfiltered).
+  const statusPlaceholders = SKU_MAP_RELEVANT_STATUSES.map(() => '?').join(',')
   const { results } = await c.env.DB.prepare(
     `SELECT rd.sku AS goods_in_sku, COUNT(*) AS device_count,
             MIN(rd.brand) AS brand, MIN(rd.model) AS model,
             MIN(rd.capacity) AS capacity, MIN(rd.color) AS color, MIN(rd.grade) AS grade
      FROM received_devices rd
      WHERE rd.organisation_id = ?
+       AND rd.status IN (${statusPlaceholders})
        AND NOT EXISTS (
          SELECT 1 FROM sku_map m
          WHERE m.goods_in_sku = rd.sku AND m.organisation_id = rd.organisation_id AND m.orphaned_at IS NULL
        )
      GROUP BY rd.sku
      ORDER BY device_count DESC, rd.sku ASC`
-  ).bind(user.organisation_id).all<{
+  ).bind(user.organisation_id, ...SKU_MAP_RELEVANT_STATUSES).all<{
     goods_in_sku: string; device_count: number
     brand: string | null; model: string | null; capacity: string | null; color: string | null; grade: string | null
   }>()
