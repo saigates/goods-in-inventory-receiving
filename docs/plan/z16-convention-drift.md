@@ -21,7 +21,7 @@ sync with its own record for the exact reason it exists: a fact true in
 someone's head, not in a file. That gap is itself the drift mechanism
 Z-16 exists to catch, and it caught itself (2026-09-28, operator §3).
 
-## The thirteen instances on record
+## The fourteen instances on record
 
 1. **FK-ordered teardown needing three separate manual fixes** —
    `test/oprImport.spec.ts`'s `afterAll` cleanup deletes rows in an order
@@ -335,6 +335,77 @@ Z-16 exists to catch, and it caught itself (2026-09-28, operator §3).
    a test that qualifies for one of these constants gets a one-line
    comment at the call site saying which class it belongs to and why —
    never a bare number, and never routed through the global default.
+
+14. **The mounted-routes sweep (Z-16 §1's original mandate, finally run)
+   finds the same shape of gap again, at larger scale than instance 11.**
+   Instance 11 found ONE route (`GET /api/reports/inventory-valuation`)
+   built, tested, and mounted, but invisible to anyone who didn't already
+   know it existed — no frontend caller, no README/openapi entry. The
+   operator's own standing instruction after that finding was "a one-pass
+   sweep of all mounted routes against the board for any other case in
+   this state." Running that sweep now (2026-10-05, cross-checking every
+   `app.get/post/patch/delete` across all 13 route files against
+   `public/static/app.js` by regex, then against `openapi.yaml`, with
+   false positives from dynamic-path template literals — `${kind}`,
+   `${d.kind}` — manually re-checked by reading the surrounding UI code
+   rather than trusted from a bare grep miss) finds **33 genuinely
+   uncalled-from-the-UI endpoints**, not one:
+   - **Whole config surface, never given a management screen**: `GET/POST
+     /api/webhooks`, `POST /webhooks/:id/toggle`, `DELETE /webhooks/:id`
+     — the underlying delivery mechanism (`dispatchDeviceStatusWebhooks`)
+     IS wired and fires for real on every device transition (confirmed in
+     `devices.ts`/`opr.ts`); it is only the CRUD *configuration* routes
+     that have no UI, so an operator can receive webhooks today but can
+     only register/edit one via a raw API call. Different shape from
+     instance 11: the capability is live, only its admin surface is
+     missing.
+   - **A large OPR-correspondence/correction/declaration cluster, built
+     and tested but never wired into the SPA's OPR panel**: `GET
+     /opr/shipments/:id/{scan-out,value-deltas,misdeclaration-acks,
+     partial-return-declarations,corrections,replies,follow-up,checklist}`,
+     `POST /opr/shipments/:id/{reconcile-value,misdeclaration-ack,
+     import-proof,correspondence,replies,checklist,scan-bulk,bulk-serials}`,
+     `POST /opr/shipments/:id/lines/:lineId/{correction,correction/review}`.
+     Confirmed real (not dead/abandoned code) via direct test-file
+     cross-reference: `oprComms.spec.ts`, `oprAutomation.spec.ts`,
+     `oprImport.spec.ts`, `bulkSerials.spec.ts`, `rowCountRegression.spec.ts`,
+     `ce1154Golden.spec.ts` all exercise one or more of these paths against
+     the real app. The SPA's OPR detail panel (`public/static/app.js`
+     ~line 2200+) wires `scan`/`lines` (remove)/`finalise`/`restock`/
+     `export-proof`/`prealert`/`clearance`/`invoice`/`ce1154` — a genuine,
+     working subset — but stops there; every correspondence-tracking,
+     value-correction, and bulk-add path above it has no button, no
+     panel, nothing in the DOM that could call it.
+   - **Smaller single-route gaps, same pattern**: `GET
+     /opr/authorisations/:id` + `PATCH /opr/authorisations/:id` (the UI's
+     own authorisations dropdown literally reads "No authorisations —
+     create one via the API first" — list-only, no detail/edit screen
+     exists); `POST /opr/shipments/:id/lines` (add-by-device-id — the
+     scan-by-IMEI sibling IS wired, this one isn't); `GET
+     /inventory/sku-grade-consistency`; `GET /inventory/grade-audit/:id`
+     (though curiously present in `openapi.yaml`); `GET /print/job/:id`
+     (ditto, in openapi but not called); `POST
+     /devices/:id/{repair/cost-ledger,purchase/cost-ledger}`; `POST
+     /bills/:id/repair-control`; `GET /sku-map/{orphans,shared,version}`.
+   - **`openapi.yaml` does not independently catch any of these** — it
+     documents `webhooks` and two of the smaller gaps
+     (`grade-audit/:id`, `print/job/:id`) but is silent on the entire OPR
+     cluster and the rest, confirming the spec file is itself stale
+     relative to `opr.ts` (41 of its 44 endpoints appear to predate the
+     correspondence/correction/value-reconciliation work) rather than a
+     usable cross-check for this sweep on its own.
+   This is the same category of gap as instance 11 — "built and tested"
+   silently treated as equivalent to "shipped and discoverable" — just
+   found at the scale the operator's "any OTHER case in this state"
+   phrasing anticipated. Standing rule from here: a newly-built OPR (or
+   any) endpoint is not done when its test file is green; it is done when
+   either a UI control calls it or a conscious "deferred, API-only for
+   now" note says why not — the same bar instance 11 set for the
+   valuation report, now stated as the general rule rather than
+   re-derived per endpoint. No code change is made by this instance —
+   logged as a sweep finding for Sprint 3 scoping, per the operator's own
+   framing of the original ask as "ahead of Sprint 3 planning," not an
+   in-pass fix.
 
 ## The through-line
 
