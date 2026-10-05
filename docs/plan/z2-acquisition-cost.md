@@ -285,19 +285,44 @@ cost_type='freight'`-shaped-but-repair-typed sum once the denominator is
 confirmed. Z-2 does not touch `freightApportionment.ts` or attempt to
 pre-empt X-8's design.
 
-## Shipment 3 — known, accepted 4p variance against INV-260067 (2026-09-28, no code change)
+## Shipment 3 — repair_cost variance against INV-260067 — SUPERSEDED, pending FedEx IDS (originally ruled immaterial 2026-09-28; reopened 2026-10-05)
 
-The app keeps `repair_cost` at `20,627.21` and computes `£4,144.01` from it;
+**Original ruling (2026-09-28), now superseded, kept for the record:** the
+app keeps `repair_cost` at `20,627.21` and computes `£4,144.01` from it;
 INV-260067 itself states `20,627.40` / `£4,144.05`. The operator ruled this
 variance (four pence, on both the underlying figure and its GBP conversion)
 **immaterial to the customs position and the VAT**, and **deliberately not
-corrected** — accepted as-is on 2026-09-28. Filed here, same pass as the
-ruling, specifically so a reconciliation exercise months from now that
-finds this exact 4p gap against INV-260067 has a written record that the
-discrepancy was seen, checked, and knowingly left alone, rather than
-spending time re-investigating a non-issue as if it were newly discovered.
-No `shipments.repair_cost` value change, no code change, no migration —
-this section is the entire scope of this ruling.
+corrected** — accepted as-is. Filed same pass as the ruling, specifically
+so a reconciliation exercise months later that found this exact 4p gap
+would have a written record that it was seen, checked, and knowingly left
+alone rather than newly discovered. No `shipments.repair_cost` value
+change, no code change, no migration at that time.
+
+**Why this is reopened (2026-10-05):** the variance is no longer purely
+internal. £4,144.09 has gone to a customs broker in writing and will
+appear on an official declaration — a THIRD figure, distinct from both the
+system's £4,144.01 and the invoice's (understood-to-read) £4,144.05. The
+operator's standing principle: materiality is not a fixed property of a
+number, it depends on who has already acted on it and in what capacity.
+Three figures for one value, one of them now public, is no longer the
+immaterial-rounding case the 2026-09-28 ruling addressed.
+
+**Current ruling — no action until the IDS lands:** per the operator
+(2026-10-05), take no action on `repair_cost` until FedEx returns the
+import MRN and IDS (Import Declaration Statement). Once that document
+lands, the declared figure on it becomes the single source of truth, and
+`repair_cost` is corrected to match it everywhere — in the ledger, in the
+system's own computed `£4,144.0x`, and against whichever of £4,144.01 /
+£4,144.05 / £4,144.09 the IDS actually confirms. This note is the
+superseding record; the 2026-09-28 "immaterial, accepted" language above
+no longer governs and must not be cited as closing this out.
+
+**Still outstanding, separately** (operator's passive ask, not yet
+actioned — no sighting of INV-260067 this pass): confirm directly against
+the invoice document whether it reads £4,144.09 or £4,144.05 — this
+figure needs to resolve to one value across system/invoice/broker, and the
+£4,144.05 reading above is itself only "understood to read .05," not
+independently re-confirmed in this pass.
 
 ## Non-goals
 
