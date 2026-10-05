@@ -21,7 +21,7 @@ sync with its own record for the exact reason it exists: a fact true in
 someone's head, not in a file. That gap is itself the drift mechanism
 Z-16 exists to catch, and it caught itself (2026-09-28, operator §3).
 
-## The twelve instances on record
+## The thirteen instances on record
 
 1. **FK-ordered teardown needing three separate manual fixes** —
    `test/oprImport.spec.ts`'s `afterAll` cleanup deletes rows in an order
@@ -300,6 +300,42 @@ Z-16 exists to catch, and it caught itself (2026-09-28, operator §3).
    found in new code — never a footnote, never deferred past the next
    deploy without an explicit operator ruling to defer it.
 
+13. **Ad-hoc per-file test timeouts, discovered by a second gate-check
+   flake rather than by design** — immediately after instance 12's fix
+   was verified, a second full-suite run (done specifically to confirm
+   the gate was "genuinely green" before deploy) came back red on an
+   UNRELATED file: `test/auth.spec.ts`'s password-change test timed out
+   at vitest's DEFAULT 5000ms — a margin that had never been given a
+   named override at all, let alone one visible as a convention. Root
+   cause: the test chains six real PBKDF2-SHA256 derivations (100,000
+   iterations each — the Cloudflare Workers cap, see
+   `src/lib/password.ts`) in strict sequence (a login, change-password's
+   own internal verify, two post-change logins, a restore `hashPassword`
+   call, and a final restore-login verify), and that chain's combined
+   cost was thin enough against the unnamed 5000ms default that ordinary
+   full-suite parallel contention pushed it over — the same underlying
+   shape as instance 12 (CPU-heavy sequential work vs. a timeout margin
+   under contention), but a DIFFERENT file, a DIFFERENT kind of work
+   (password hashing, not sequential HTTP writes), and no override to
+   even point at as "this file's known margin." Three consecutive
+   full-suite runs this pass produced three different results (341/341
+   red, then clean, then `auth.spec.ts` red) — see Z-20 (gate
+   reliability, Sprint 2) for the standing finding that this makes the
+   suite non-deterministic as a gate, not just two isolated slow tests.
+   Fixed by extracting a shared, named-by-purpose constants module
+   (`test/testTimeouts.ts` — `SEQUENTIAL_BATCH_WRITE_TIMEOUT_MS` for
+   instance 12's class, `PASSWORD_HASH_CHAIN_TIMEOUT_MS` for this one)
+   rather than a third bare number invented at the call site, so the
+   next qualifying test inherits a convention instead of rediscovering
+   the problem from scratch — deliberately NOT a change to
+   `vitest.config.ts`'s global default (operator §1, 2026-09-28): raising
+   the suite-wide timeout would hide a genuine performance regression in
+   any of the other ~800 tests, which is a materially worse failure mode
+   than an occasional named per-test override. Standing rule from here:
+   a test that qualifies for one of these constants gets a one-line
+   comment at the call site saying which class it belongs to and why —
+   never a bare number, and never routed through the global default.
+
 ## The through-line
 
 In cases 1-10, a STATEMENT (a comment, a test assertion, a design note,
@@ -334,6 +370,17 @@ apparatus of "full suite green before a commit lands" stops meaning
 anything. The fix for instances 1-11 is to look somewhere new (a mount
 point, a stale annotation); the fix for instance 12 is procedural
 discipline about a signal that was already firing correctly.
+
+Instance 13 sits directly underneath instance 12, found only because
+confirming instance 12's fix meant actually running the gate again
+rather than trusting the diagnosis alone — and the second run surfaced a
+second, unrelated margin that instance 12's own fix did nothing to
+touch. Taken together, the two are the same lesson told twice in one
+pass: a gate that is sometimes green and sometimes red for reasons that
+have nothing to do with the code under test cannot be read as a
+statement about that code at all, only as one draw from a distribution.
+See Z-20 (gate reliability) for the standing response to that, which is
+broader than either individual fix here.
 
 ## Two forward rules this note exists to state
 

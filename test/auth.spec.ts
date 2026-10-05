@@ -16,6 +16,7 @@ import { env } from 'cloudflare:workers'
 import { beforeAll, describe, expect, it } from 'vitest'
 import app from '../src/index'
 import { hashPassword } from '../src/lib/password'
+import { PASSWORD_HASH_CHAIN_TIMEOUT_MS } from './testTimeouts'
 
 const JWT_SECRET = 'test-only-secret'
 const testEnv = () => ({ ...(env as unknown as Record<string, unknown>), JWT_SECRET })
@@ -250,6 +251,15 @@ describe('self-service password change', () => {
     expect(still.status).toBe(200)
   })
 
+  // Per-test timeout (Z-16 instance 13, 2026-09-28): this test chains six
+  // real PBKDF2-SHA256 derivations (100,000 iterations each — the login
+  // inside change-password's own verify, the two post-change logins, the
+  // restore hashPassword() call, and the final restore-login's verify)
+  // in strict sequence. Found red under full-suite PARALLEL contention
+  // at the vitest DEFAULT 5000ms (no override existed before this pass)
+  // — see test/testTimeouts.ts's PASSWORD_HASH_CHAIN_TIMEOUT_MS and
+  // docs/plan/z16-convention-drift.md instance 13 for the shared-class
+  // finding this timeout belongs to.
   it('valid change: new password works, old password stops working (then restored for suite isolation)', async () => {
     const { json: b } = await login('ops@saigates.com', PW_B)
     const NEW_PW = 'rotated-test-password-3'
@@ -262,5 +272,5 @@ describe('self-service password change', () => {
     await db().prepare('UPDATE users SET password_hash = ? WHERE email = ?')
       .bind(await hashPassword(PW_B), 'ops@saigates.com').run()
     expect((await login('ops@saigates.com', PW_B)).res.status).toBe(200)
-  })
+  }, PASSWORD_HASH_CHAIN_TIMEOUT_MS)
 })

@@ -28,6 +28,7 @@ import { env } from 'cloudflare:workers'
 import { describe, it, expect, beforeAll } from 'vitest'
 import app from '../src/index'
 import { signAuthToken } from '../src/lib/auth'
+import { SEQUENTIAL_BATCH_WRITE_TIMEOUT_MS } from './testTimeouts'
 
 const JWT_SECRET = 'test-secret-row-count-regression'
 const testEnv = { ...env, JWT_SECRET } as typeof env & { JWT_SECRET: string }
@@ -121,23 +122,17 @@ async function seedReceivedDevices(n: number, overrides: {
 
 const SIZES = [103, 155, 181, 217, 341]
 
-// Per-test timeout (Z-16 instance 12, 2026-09-28): the file's original
-// flat 30000ms margin was too tight for Site 1 (bulk-serials) at n=341
-// under full-suite PARALLEL contention specifically — Site 1 is the one
-// site of the four that writes sequentially, one addDeviceToShipment()
-// call (its own INSERT + transitionDevice()) per matched device, so its
-// wall-clock scales linearly with N unlike the batched writes in Sites
-// 2-4. Observed: 12589ms for the 341 case running alone just now vs.
-// 36983ms (>30000ms timeout) for the SAME case caught mid a from-scratch
-// full-suite parallel run earlier the same day — over 2x slower purely
-// from other test files' workerd instances competing for the runner's
-// CPU, not a chunking defect (chunking itself is what these tests exist
-// to prove correct, and every SELECT/UPDATE chunking assertion at every
-// size, including the operator-flagged 217 boundary case, passed both
-// times). 60000ms matches the existing precedent for exactly this class
-// of margin issue: test/oprExport.spec.ts and test/oprImport.spec.ts
-// already use 60000ms for their own heaviest real-HTTP-round-trip cases.
-const TEST_TIMEOUT_MS = 60000
+// Per-test timeout: this file's Site 1 (bulk-serials) does a sequential
+// per-device write loop at real production batch sizes up to 341 — see
+// test/testTimeouts.ts's SEQUENTIAL_BATCH_WRITE_TIMEOUT_MS for the full
+// rationale and Z-16 instance 12/13 (docs/plan/z16-convention-drift.md)
+// for the investigation that found the file's original flat 30000ms was
+// too tight under full-suite PARALLEL contention specifically (37s
+// loaded vs. 12.6s unloaded for the 341 case) — a timeout margin issue,
+// not a chunking defect (every SELECT/UPDATE chunking assertion at every
+// size, including the operator-flagged 217 boundary, passed in both the
+// failing and the clean runs).
+const TEST_TIMEOUT_MS = SEQUENTIAL_BATCH_WRITE_TIMEOUT_MS
 
 // ═════════ Site 1: opr.ts:2519 — POST /shipments/:id/bulk-serials ═════════
 describe('Row-count regression — opr.ts bulk-serials (SELECT chunking)', () => {
