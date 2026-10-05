@@ -405,7 +405,17 @@ Z-16 exists to catch, and it caught itself (2026-09-28, operator §3).
    re-derived per endpoint. No code change is made by this instance —
    logged as a sweep finding for Sprint 3 scoping, per the operator's own
    framing of the original ask as "ahead of Sprint 3 planning," not an
-   in-pass fix.
+   in-pass fix. Follow-up: the operator's §2 ruling (2026-10-05) ordered a
+   read-only triage table over these 33 — route / auth level / spec
+   coverage / wire-keep headless-retire verdict — plus an openapi.yaml
+   reconciliation folded into the same pass. See
+   `docs/plan/z16-triage-33.md` for the table (24 wire, 7 keep headless, 2
+   retire-candidate) and for why the openapi reconciliation itself was
+   NOT completed in that pass — the spec turned out to have zero `/opr`,
+   `/sku-map`, or `/bills` path entries at all (not just the 33-endpoint
+   gap), making "bring it back in line with opr.ts" a multi-hour
+   from-scratch authoring task rather than a patch, flagged there for
+   separate sequencing rather than rushed.
 
 ## The through-line
 
