@@ -131,6 +131,20 @@ type OprContext = Context<OprEnv>
 
 const app = new Hono<OprEnv>()
 
+// Z-22 (2026-10-07 ruling, §2): manager-gate for the operational/daily
+// OPR write routes (moving stock, scanning, finalising, proof capture,
+// comms logging) — distinct from requireAdmin below, which covers the
+// financial/customs-integrity routes (changing what was declared or what
+// something cost, or closing a record against HMRC). Same
+// duplicated-not-shared convention as requireManager() in
+// src/routes/devices.ts:1311 / src/routes/reports.ts:13 /
+// src/routes/skuMap.ts:30 — this file had no manager-gate before this
+// change; this is a fresh local copy, not an import.
+function requireManager(c: OprContext): boolean {
+  const role = (c.var.user as AuthUser).role
+  return role === 'manager' || role === 'admin'
+}
+
 // ═════════ Authorisations ═════════
 
 // Fire-and-forget shipment webhook. Same executionCtx caveat as
@@ -242,6 +256,8 @@ function parseAuthorisationBody(body: AuthBody, partial: boolean):
 
 app.post('/authorisations', async (c) => {
   const user = currentUser(c)
+  const adminGate = requireAdmin(c, user)
+  if (adminGate) return adminGate
   const body = await c.req.json<AuthBody>().catch(() => null)
   if (!body) return c.json({ error: 'Invalid JSON body' }, 400)
 
@@ -279,6 +295,8 @@ app.patch('/authorisations/:id', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const adminGate = requireAdmin(c, user)
+  if (adminGate) return adminGate
   const existing = await c.env.DB.prepare(
     'SELECT id FROM opr_authorisations WHERE id = ? AND organisation_id = ?'
   ).bind(id, user.organisation_id).first()
@@ -972,6 +990,7 @@ app.post('/shipments/:id/lines', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Adding a line to a consignment is manager-only' }, 403)
 
   const gate = await loadDraftShipment(c, user, id)
   if (!gate.ok) return gate.response
@@ -997,6 +1016,7 @@ app.post('/shipments/:id/scan', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Scanning a device onto a consignment is manager-only' }, 403)
 
   const gate = await loadDraftShipment(c, user, id)
   if (!gate.ok) return gate.response
@@ -1021,6 +1041,7 @@ app.delete('/shipments/:id/lines/:lineId', async (c) => {
   const id = Number(c.req.param('id'))
   const lineId = Number(c.req.param('lineId'))
   if (!id || !lineId) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Removing a line from a consignment is manager-only' }, 403)
 
   const shipment = await c.env.DB.prepare(
     'SELECT status, reference, direction FROM shipments WHERE id = ? AND organisation_id = ?'
@@ -1489,6 +1510,8 @@ app.post('/shipments/:id/reconcile-value', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const adminGate = requireAdmin(c, user)
+  if (adminGate) return adminGate
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
   const { shipment, lines } = bundle
@@ -1562,6 +1585,8 @@ app.post('/shipments/:id/misdeclaration-ack', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  const adminGate = requireAdmin(c, user)
+  if (adminGate) return adminGate
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
   const { shipment, lines, authorisation, relatedExport } = bundle
@@ -1709,6 +1734,8 @@ app.post('/shipments/:id/lines/:lineId/correction', async (c) => {
   const id = Number(c.req.param('id'))
   const lineId = Number(c.req.param('lineId'))
   if (!id || !lineId) return c.json({ error: 'Invalid id' }, 400)
+  const adminGate = requireAdmin(c, user)
+  if (adminGate) return adminGate
 
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
@@ -2064,6 +2091,7 @@ app.post('/shipments/:id/finalise', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Finalising a consignment is manager-only' }, 403)
 
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
@@ -2295,6 +2323,7 @@ app.post('/shipments/:id/export-proof', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Recording export proof is manager-only' }, 403)
 
   const shipment = await c.env.DB.prepare(
     'SELECT * FROM shipments WHERE id = ? AND organisation_id = ?'
@@ -2375,6 +2404,7 @@ app.post('/shipments/:id/import-proof', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Recording import proof is manager-only' }, 403)
 
   const shipment = await c.env.DB.prepare(
     'SELECT * FROM shipments WHERE id = ? AND organisation_id = ?'
@@ -2491,6 +2521,7 @@ app.post('/shipments/:id/restock', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Restocking a consignment is manager-only' }, 403)
 
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
@@ -2621,6 +2652,7 @@ app.post('/shipments/:id/prealert/mark-sent', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Logging a pre-alert as sent is manager-only' }, 403)
 
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
@@ -2652,6 +2684,7 @@ app.post('/shipments/:id/clearance/mark-sent', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Logging clearance instructions as sent is manager-only' }, 403)
 
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
@@ -2685,6 +2718,7 @@ app.post('/shipments/:id/prealert/send', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Sending a pre-alert is manager-only' }, 403)
 
   const cfg = gmailConfigFromEnv(c.env as unknown as Record<string, unknown>)
   if (!cfg) {
@@ -2733,6 +2767,7 @@ app.post('/shipments/:id/clearance/send', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Sending clearance instructions is manager-only' }, 403)
 
   const cfg = gmailConfigFromEnv(c.env as unknown as Record<string, unknown>)
   if (!cfg) {
@@ -2828,6 +2863,7 @@ app.post('/shipments/:id/correspondence', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Logging correspondence is manager-only' }, 403)
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
 
@@ -2862,6 +2898,7 @@ app.post('/shipments/:id/replies', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Logging a reply is manager-only' }, 403)
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
 
@@ -2946,6 +2983,7 @@ app.post('/shipments/:id/checklist', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Updating the outstanding-items checklist is manager-only' }, 403)
   const bundle = await loadShipmentBundle(c, user, id)
   if (!bundle.ok) return bundle.response
   const { shipment } = bundle
@@ -3011,6 +3049,7 @@ app.post('/shipments/:id/scan-bulk', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Bulk-scanning devices onto a consignment is manager-only' }, 403)
 
   const gate = await loadDraftShipment(c, user, id)
   if (!gate.ok) return gate.response
@@ -3079,6 +3118,7 @@ app.post('/shipments/:id/bulk-serials', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   if (!id) return c.json({ error: 'Invalid id' }, 400)
+  if (!requireManager(c)) return c.json({ error: 'Bulk-importing serials onto a consignment is manager-only' }, 403)
 
   const gate = await loadDraftShipment(c, user, id)
   if (!gate.ok) return gate.response

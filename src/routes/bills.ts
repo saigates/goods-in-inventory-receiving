@@ -11,6 +11,27 @@ import { reconcileManifestAgainstBill, type ManifestLineForReconciliation } from
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
+// Z-22 (2026-10-07 ruling, §2): bill creation and every bill-close/cost-
+// posting route changes what was declared or what something cost, or
+// closes a record against HMRC — admin-gated per the operator's stated
+// principle. repair-control is deliberately excluded: it performs no
+// database write at all (pure read + computed comparison returned to the
+// caller — see its handler below), so there is nothing here to protect.
+//
+// Same duplicated-not-shared convention as requireManager() in
+// src/routes/devices.ts:1311 / src/routes/reports.ts:13 /
+// src/routes/skuMap.ts:30 — bills.ts had neither requireManager nor
+// requireAdmin before this change; this is a fresh local copy, following
+// the boolean-returning shape (not opr.ts's Response-returning
+// requireAdmin) since three of the four existing precedents in this repo
+// use the boolean shape and this file's call sites read more simply that
+// way. If a shared lib module is ever justified by a further use, this
+// is one of the four call sites that would move.
+function requireAdmin(c: any): boolean {
+  const role = (c.var.user as AuthUser).role
+  return role === 'admin'
+}
+
 // GET /api/bills — list, org-scoped, optional ?bill_type=&status=
 app.get('/', async (c) => {
   const user = currentUser(c)
@@ -87,6 +108,7 @@ app.get('/:id', async (c) => {
 // a gate on receiving); this is the owner's stated default, noted here
 // per the explicit instruction to record it in the commit.
 app.post('/', async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'Bill creation is admin-only' }, 403)
   const user = currentUser(c)
   const orgId = user.organisation_id
   const body = await c.req.json<{
@@ -208,6 +230,7 @@ app.post('/', async (c) => {
 // POST /api/bills/:id/close — normal close: only succeeds when
 // sum(lines) == declared header GBP total.
 app.post('/:id/close', async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'Closing a bill is admin-only' }, 403)
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   const bill = await c.env.DB.prepare('SELECT * FROM bills WHERE id = ? AND organisation_id = ?')
@@ -238,6 +261,7 @@ app.post('/:id/close', async (c) => {
 // bill_close_overrides row (the misdeclaration-ack pattern, reused) then
 // closes regardless of variance.
 app.post('/:id/force-close', async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'Force-closing a bill is admin-only' }, 403)
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   const body = await c.req.json<{ reason?: string }>().catch(() => ({} as any))
@@ -284,6 +308,7 @@ app.post('/:id/force-close', async (c) => {
 // Both coexist; a device can move from the no-bill path to a bill-backed
 // one later without either writer needing to know about the other.
 app.post('/:id/write-cost-ledger', async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: 'Posting bill costs to the cost ledger is admin-only' }, 403)
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
   const bill = await c.env.DB.prepare('SELECT * FROM bills WHERE id = ? AND organisation_id = ?')
@@ -339,6 +364,13 @@ app.post('/:id/write-cost-ledger', async (c) => {
 // lines sum to the customs-declared process charge (already established
 // on the relevant OPR import shipment, e.g. Ce1154.process_charge_gbp /
 // shipments.repair_cost). Flags variance; never reconciles silently.
+//
+// Z-22 (2026-10-07 ruling): deliberately left UNGATED. Despite being a
+// POST, this handler performs no database write whatsoever — it SELECTs
+// the bill and returns a computed comparison via
+// checkRepairBillAgainstDeclaredCharge(). There is no state to protect,
+// so no role gate was added here; re-classify if a future change gives
+// this route a write.
 app.post('/:id/repair-control', async (c) => {
   const user = currentUser(c)
   const id = Number(c.req.param('id'))
