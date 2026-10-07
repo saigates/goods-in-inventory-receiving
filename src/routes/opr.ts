@@ -522,6 +522,15 @@ function parseRepairFields(body: ShipmentBody, direction: string):
 
 app.post('/shipments', async (c) => {
   const user = currentUser(c)
+  // Z-22 (2026-10-07 ruling, §2): same tier as PATCH /shipments/:id just
+  // below — both are "owner-only DRAFT editing" (Task L) on the shipment
+  // header, which carries direction/procedure codes/currency/authorisation
+  // linkage, i.e. the declaration skeleton. Not explicitly named in the
+  // operator's §2 list (which covered existing write routes); reasoned by
+  // consistency with its own immediate PATCH sibling rather than left
+  // ungated by omission — flagged here as a pick-and-note judgment call.
+  const adminGate = requireAdmin(c, user)
+  if (adminGate) return adminGate
   const body = await c.req.json<ShipmentBody>().catch(() => null)
   if (!body) return c.json({ error: 'Invalid JSON body' }, 400)
 
