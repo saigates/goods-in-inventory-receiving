@@ -213,6 +213,8 @@
     devicesAllSearch: '',        // q= search box for All Devices
     devicesAllPage: 1,           // current page (B2, 2026-09-07 — "only 200 of N shown" fix)
     devicesAllTotal: 0,          // total row count matching the current filter, from the server
+    devicesAllSort: 'id',        // column key sent as sort= to GET /devices (id = server default, newest-first)
+    devicesAllSortDir: 'desc',   // 'asc' | 'desc' — sent as dir=
     repairQueue: [],             // GET /api/devices/repair-queue rows
     qcFailedDevices: [],         // GET /api/devices?status=QC_FAILED
     readyForZohoDevices: [],     // GET /api/devices?status=READY_FOR_ZOHO
@@ -471,7 +473,10 @@
   // so the UI silently rendered page 1 of 200 as if it were the whole list.
   async function refreshDevicesAll() {
     const statusParam = state.devicesAllFilter || ALL_DEVICES_DEFAULT_STATUSES.join(',');
-    const params = new URLSearchParams({ status: statusParam, page_size: '200', page: String(state.devicesAllPage) });
+    const params = new URLSearchParams({
+      status: statusParam, page_size: '200', page: String(state.devicesAllPage),
+      sort: state.devicesAllSort, dir: state.devicesAllSortDir,
+    });
     if (state.devicesAllSearch) params.set('q', state.devicesAllSearch);
     const r = await api.get(`/devices?${params.toString()}`);
     state.devicesAll = r.devices || [];
@@ -939,6 +944,38 @@
     }
   }
 
+  // Column-header click-to-sort cell, shared by every sortable <th> in
+  // AllDevicesSubview's table. `sortKey` is one of DEVICE_SORT_COLUMNS'
+  // keys on the server (src/routes/devices.ts) — clicking the currently-
+  // active column flips direction; clicking a different column switches to
+  // it, defaulting to ascending. Server-side sort (not a client-side array
+  // sort) so ordering is correct across all matching devices, not just the
+  // 200 rows on the current page.
+  function SortableTh(label, sortKey, align) {
+    const active = state.devicesAllSort === sortKey;
+    const dirIcon = active
+      ? (state.devicesAllSortDir === 'asc' ? 'fa-sort-up' : 'fa-sort-down')
+      : 'fa-sort';
+    return h('th', {
+      class: `${align === 'right' ? 'text-right' : 'text-left'} px-4 py-3 cursor-pointer select-none hover:text-slate-200 ${active ? 'text-cyan-300' : ''}`,
+      onclick: () => {
+        if (state.devicesAllSort === sortKey) {
+          state.devicesAllSortDir = state.devicesAllSortDir === 'asc' ? 'desc' : 'asc';
+        } else {
+          state.devicesAllSort = sortKey;
+          state.devicesAllSortDir = 'asc';
+        }
+        state.devicesAllPage = 1;
+        refreshDevicesAll().then(render);
+      },
+    },
+      h('span', { class: 'inline-flex items-center gap-1.5' },
+        label,
+        h('i', { class: `fas ${dirIcon} text-[10px] ${active ? '' : 'text-slate-600'}` }),
+      )
+    );
+  }
+
   function AllDevicesSubview() {
     const statuses = (state.deviceStatuses && state.deviceStatuses.statuses) || [];
     const transitions = (state.deviceStatuses && state.deviceStatuses.transitions) || {};
@@ -972,15 +1009,16 @@
         h('table', { class: 'w-full text-sm' },
           h('thead', { class: 'bg-slate-900/50 text-xs uppercase text-slate-400' },
             h('tr', {},
-              h('th', { class: 'text-left px-4 py-3' }, 'IMEI'),
-              h('th', { class: 'text-left px-4 py-3' }, 'SKU / Device'),
-              h('th', { class: 'text-left px-4 py-3' }, 'Status'),
+              SortableTh('IMEI', 'imei'),
+              SortableTh('SKU / Device', 'sku'),
+              SortableTh('Status', 'status'),
+              SortableTh('Last Updated', 'last_updated'),
               h('th', { class: 'text-right px-4 py-3' }, 'Move to'),
             )
           ),
           h('tbody', { class: 'divide-y divide-slate-800' },
             !state.devicesAll.length
-              ? h('tr', {}, h('td', { colspan: 4, class: 'text-center py-10 text-slate-500' }, 'No devices match this filter.'))
+              ? h('tr', {}, h('td', { colspan: 5, class: 'text-center py-10 text-slate-500' }, 'No devices match this filter.'))
               : state.devicesAll.map(d => {
                   const nextStatuses = transitions[d.status] || [];
                   const canStartRepair = REPAIR_STARTABLE.includes(d.status);
@@ -990,6 +1028,12 @@
                       h('div', { class: 'font-medium text-cyan-300 mono' }, d.sku),
                       h('div', { class: 'text-slate-500' }, deviceLabel(d))),
                     h('td', { class: 'px-4 py-2' }, deviceStatusBadge(d.status)),
+                    // Last Updated = received_devices.updated_at, set by
+                    // transitionDevice() on every status change (see
+                    // DEVICE_SORT_COLUMNS comment in src/routes/devices.ts
+                    // for the one known non-status-change exception this
+                    // label intentionally hedges against).
+                    h('td', { class: 'px-4 py-2 text-xs text-slate-400' }, fmtDate(d.updated_at)),
                     h('td', { class: 'px-4 py-2 text-right' },
                       h('div', { class: 'flex items-center justify-end gap-2' },
                         // Owner-only visibility (isAdmin()) is UI decluttering,

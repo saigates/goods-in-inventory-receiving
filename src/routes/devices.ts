@@ -19,7 +19,29 @@ import { chunkArray } from '../lib/d1Chunk'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: AuthUser } }>()
 
-// GET /api/devices?status=&source=&q=&page=&page_size=
+// Columns the All-Devices table (and any future caller) may sort by,
+// mapped to their real SQL column — allow-listed rather than interpolating
+// the client-supplied name directly, since column identifiers can't be
+// parameter-bound the way values can. `last_updated` is deliberately an
+// alias for the existing `updated_at` column (migration 0023b), NOT a new
+// column: `updated_at` is set by transitionDevice() on every status change
+// (src/lib/deviceLifecycle.ts:411, the sole choke point for
+// received_devices.status writes — see that file's own header), so it is
+// already a reliable "when did this device's status last change" signal
+// with zero migration needed. One known imprecision, accepted rather than
+// hidden: zohoSaleImport.ts's non-revenue disposition writes also bump
+// updated_at without going through transitionDevice() (no status change
+// involved) — this is why the UI column is labelled "Last Updated", not
+// "Status changed at".
+const DEVICE_SORT_COLUMNS: Record<string, string> = {
+  imei: 'imei',
+  sku: 'sku',
+  status: 'status',
+  last_updated: 'updated_at',
+  id: 'id',
+}
+
+// GET /api/devices?status=&source=&q=&page=&page_size=&sort=&dir=
 // Org-scoped, filterable, paginated. This is the primary read seam a
 // future CRM integration will poll/subscribe against.
 app.get('/', async (c) => {
@@ -53,12 +75,28 @@ app.get('/', async (c) => {
 
   const whereSql = `WHERE ${where.join(' AND ')}`
 
+  // Default unchanged (id DESC = newest-first) when no sort param is given,
+  // so every other existing caller of this endpoint (CSV export tooling,
+  // future CRM poller, etc.) sees identical behaviour to before this change.
+  let orderSql = 'id DESC'
+  if (q.sort) {
+    const sortCol = DEVICE_SORT_COLUMNS[q.sort]
+    if (!sortCol) {
+      return c.json({ error: `Invalid sort value — must be one of: ${Object.keys(DEVICE_SORT_COLUMNS).join(', ')}` }, 400)
+    }
+    const dir = String(q.dir || 'asc').toLowerCase() === 'desc' ? 'DESC' : 'ASC'
+    // Secondary `id` tiebreaker for stable ordering across equal-value rows
+    // (e.g. many devices sharing the same status or sku) — without it,
+    // page-to-page ordering of tied rows is not guaranteed stable.
+    orderSql = `${sortCol} ${dir}, id ${dir}`
+  }
+
   const countRow = await c.env.DB.prepare(
     `SELECT COUNT(*) AS total FROM received_devices ${whereSql}`
   ).bind(...binds).first<{ total: number }>()
 
   const { results } = await c.env.DB.prepare(
-    `SELECT * FROM received_devices ${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`
+    `SELECT * FROM received_devices ${whereSql} ORDER BY ${orderSql} LIMIT ? OFFSET ?`
   ).bind(...binds, pageSize, offset).all<Record<string, unknown>>()
 
   // Z-5: location is DERIVED from status via deviceLocation(), never its
